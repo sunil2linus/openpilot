@@ -200,6 +200,7 @@ class FrogPilotPlanner:
 
     user_disabled = frogpilot_toggles.conditional_experimental_mode and self.cem.status_value == frogpilot_variables.CE_STATUS["USER_DISABLED"]
     frogpilotPlan.experimentalMode = (self.cem.experimental_mode or self.frogpilot_vcruise.slc.experimental_mode) and not user_disabled
+    frogpilot_variables.params_memory.put_int("CEStatus", self.cem.status_value if frogpilotPlan.experimentalMode else 0)
 
     frogpilotPlan.forcingStop = self.frogpilot_vcruise.forcing_stop
     frogpilotPlan.forcingStopLength = self.frogpilot_vcruise.stop_distance

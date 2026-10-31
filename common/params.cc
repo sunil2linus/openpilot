@@ -585,6 +585,16 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"WeatherToken", PERSISTENT | DONT_LOG},
     {"WheelIcon", PERSISTENT},
     {"WheelSpeed", PERSISTENT},
+
+    {"CEStatus", CLEAR_ON_OFFROAD_TRANSITION},
+    {"RecordRoad", PERSISTENT},
+    {"TorqueInterceptorEnabled", PERSISTENT},
+    {"RadarInterceptorEnabled", PERSISTENT},
+    {"NoMRCC", PERSISTENT},
+    {"NoFSC", PERSISTENT},
+    {"BlendedACC", PERSISTENT},
+    {"ManualTransmission", PERSISTENT},
+    {"RemoteAccess", PERSISTENT},
 };
 
 } // namespace
