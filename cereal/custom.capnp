@@ -97,6 +97,10 @@ struct FrogPilotCarEvent @0x81c2f05a394cf4af {
     vCruise69 @33;
     yourFrogTriedToKillMe @34;
     youveGotMail @35;
+
+    # Stop warnings (cars where openpilot cannot brake)
+    stopAheadWarning @36;
+    stoppedLeadWarning @37;
   }
 }
 

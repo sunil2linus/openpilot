@@ -10,6 +10,7 @@ from openpilot.selfdrive.controls.lib.events import ET, EVENT_NAME, FROGPILOT_EV
 from openpilot.selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 
 from openpilot.frogpilot.common import frogpilot_paths, frogpilot_variables
+from openpilot.frogpilot.controls.lib.stop_warning import STOP_AHEAD, STOPPED_LEAD, StopWarning
 
 DEJA_VU_G_FORCE = 0.75
 GREEN_LIGHT_LOOKAHEAD = 6
@@ -26,6 +27,12 @@ class FrogPilotEvents:
     self.theme_manager = ThemeManager
 
     self.events = Events(frogpilot=True)
+
+    # Stop ahead / stopped car warnings (Off / Test / On settings)
+    try:
+      self.stop_warning = StopWarning(frogpilot_variables.params, frogpilot_variables.params_memory)
+    except Exception:
+      self.stop_warning = None
 
     self.always_on_lateral_allowed_previously = False
     self.previous_traffic_mode = False
@@ -91,6 +98,17 @@ class FrogPilotEvents:
     else:
       self.green_light_timer = 0
       self.stopped_for_light = False
+
+    if self.stop_warning is not None:
+      try:
+        for kind in self.stop_warning.update(sm, self.frogpilot_planner):
+          if kind == STOP_AHEAD:
+            self.events.add(FrogPilotEventName.stopAheadWarning)
+          elif kind == STOPPED_LEAD:
+            self.events.add(FrogPilotEventName.stoppedLeadWarning)
+      except Exception:
+        # Never let the optional warning break the planner: turn it off for this drive.
+        self.stop_warning = None
 
     holiday_unplayed = "holidayActive" not in self.played_events
     if holiday_unplayed and self.startup_seen and alerts_empty and len(self.events) == 0 and frogpilot_toggles.current_holiday_theme != "stock":

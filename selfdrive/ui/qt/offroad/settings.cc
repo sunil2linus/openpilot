@@ -173,6 +173,20 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
                                         "curve needs, up to this limit. Larger drops take a few seconds of button presses. "
                                         "In km/h: 8, 16 or 24 km/h. Takes effect on the next drive."),
                                      "../assets/offroad/icon_speed_limit.png", drop_texts));
+
+      // Stop warnings: Off / Test (log only, no sound) / On
+      std::vector<QString> warn_texts{tr("Off"), tr("Test"), tr("On")};
+      addItem(new ButtonParamControl("StopWarningRedLight", tr("Stop Ahead Warning"),
+                                     tr("Warns when the driving model plans to stop soon (red light, stop sign...), there is no car "
+                                        "ahead, you are above 25 mph and the car is not slowing down. This is the model's plan to stop, "
+                                        "not a traffic light colour detector. \"Test\" makes no sound and only records each time it "
+                                        "would have warned (in stop_warnings.csv) so you can check for false alarms first."),
+                                     "../assets/offroad/icon_warning.png", warn_texts, 150));
+      addItem(new ButtonParamControl("StopWarningStoppedCar", tr("Stopped Car Warning"),
+                                     tr("Warns when the car ahead is stopped or nearly stopped, you are closing in fast above 20 mph "
+                                        "and the car is not slowing down. Your stock radar cruise may not stop for cars that are "
+                                        "already stopped. \"Test\" makes no sound and only records each time it would have warned."),
+                                     "../assets/offroad/icon_warning.png", warn_texts, 150));
     }
   }
 

@@ -1076,6 +1076,22 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.warningSoft, .1),
   },
 
+  FrogPilotEventName.stopAheadWarning: {
+    ET.PERMANENT: Alert(
+      "STOP AHEAD - SLOW DOWN",
+      "Cruise may not stop for this",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+
+  FrogPilotEventName.stoppedLeadWarning: {
+    ET.PERMANENT: Alert(
+      "STOPPED CAR AHEAD - BRAKE",
+      "Cruise may not stop for this",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+
   FrogPilotEventName.leadDeparting: {
     ET.PERMANENT: Alert(
       "Lead Departed",
