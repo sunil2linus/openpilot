@@ -1,1 +1,4 @@
 tests/test_logger
+loggerd
+encoderd
+bootlog
