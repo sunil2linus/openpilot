@@ -80,7 +80,15 @@ def evaluate_comm_issue(all_checks: bool, all_alive: bool, all_freq_ok: bool,
 def commanded_torque_at_max_for_saturation(CP, output: float) -> bool:
   torque_controller = (CP.steerControlType == car.CarParams.SteerControlType.torque and
                        CP.lateralTuning.which() == "torque")
-  has_controller_grace = CP.carFingerprint == HYUNDAI_CAR.GENESIS_GV70_ELECTRIFIED_1ST_GEN
+  # Cars that only use the normal saturation timer (LatControl._check_saturation: steerLimitTimer
+  # of continuous saturation above 10 m/s, not while the driver is touching the wheel or the
+  # output is rate/driver limited), which is also what upstream and mazda-frogpilot-dev do.
+  # Mazda Gen1 (TI port): on the first CX-5 drive this instant path raised "Turn Exceeds
+  # Steering Limit" at the first full-torque frame of a turn-in, 0.4-1.3 s before the timer,
+  # while the car was already tracking the curve, and at 15-18 mph (below the timer's
+  # 10 m/s floor), where the timer never fires. 4 of the 7 alerts on that drive came from here.
+  has_controller_grace = (CP.carFingerprint == HYUNDAI_CAR.GENESIS_GV70_ELECTRIFIED_1ST_GEN or
+                          CP.brand == "mazda")
   return torque_controller and not has_controller_grace and abs(output) > 0.99
 
 

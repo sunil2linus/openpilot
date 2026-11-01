@@ -162,6 +162,18 @@ def test_gv70_uses_normal_saturation_timer_at_max_output():
   assert not commanded_torque_at_max_for_saturation(CP, 1.0)
 
 
+def test_mazda_uses_normal_saturation_timer_at_max_output():
+  # Mazda Gen1 + Torque Interceptor: the instant max-output path raised false "Turn Exceeds
+  # Steering Limit" alerts during turn-in and below the timer's 10 m/s floor (CX-5 drive logs).
+  CP = car.CarParams.new_message()
+  CP.carFingerprint = "MAZDA_CX5"
+  CP.brand = "mazda"
+  CP.steerControlType = car.CarParams.SteerControlType.torque
+  CP.lateralTuning.init("torque")
+
+  assert not commanded_torque_at_max_for_saturation(CP, 1.0)
+
+
 def test_ecu_disable_fallback_synchronizes_behavior_and_safety_params():
   initial_cp = car.CarParams.new_message()
   initial_cp.carFingerprint = NISSAN_CAR.NISSAN_LEAF
