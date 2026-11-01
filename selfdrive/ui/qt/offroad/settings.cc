@@ -61,7 +61,7 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
     },
     {
       "MazdaCurveSlowdown",
-      tr("Curve Slowdown with Cruise Buttons (Experimental)"),
+      tr("Curve Slowdown (Experimental)"),
       tr("Gen1 Mazda with stock radar cruise only. Lowers the stock cruise set speed before curves by pressing SET- for you, "
          "as much as the Curve Speed Controller says the curve needs (up to the maximum drop below, never below 25 mph), then "
          "raises it back with SET+ while you exit the curve, never above your own set speed. Needs the Curve Speed Controller "
@@ -168,11 +168,11 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
     // Mazda curve slowdown: maximum drop selector right after its toggle
     if (param == "MazdaCurveSlowdown") {
       std::vector<QString> drop_texts{tr("5 mph"), tr("10 mph"), tr("15 mph")};
-      addItem(new ButtonParamControl("MazdaCurveSlowdownMaxDrop", tr("Curve Slowdown: Maximum Drop"),
+      addItem(new ButtonParamControl("MazdaCurveSlowdownMaxDrop", tr("Curve Slowdown: Max Drop"),
                                      tr("How far below your set speed the curve slowdown may go. It only drops as much as the "
                                         "curve needs, up to this limit. Larger drops take a few seconds of button presses. "
                                         "In km/h: 8, 16 or 24 km/h. Takes effect on the next drive."),
-                                     "../assets/offroad/icon_speed_limit.png", drop_texts));
+                                     "../assets/offroad/icon_speed_limit.png", drop_texts, 150));
 
       // Stop warnings: Off / Test (log only, no sound) / On
       std::vector<QString> warn_texts{tr("Off"), tr("Test"), tr("On")};
