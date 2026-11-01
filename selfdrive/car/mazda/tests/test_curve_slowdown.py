@@ -106,9 +106,10 @@ class StoppedLead:
     return (True, self.prob, self.d, self.v, self.y)
 
   def radar(self, f):
+    """Stock radar per the DBC value table: bucket 1 = farthest .. 5 = nearest, 0 = no lead."""
     if self.radar_from is None or not self.radar_present(f) or self.d > self.radar_from:
       return False, 0
-    return True, max(1, min(5, int(self.d // 20) + 1))
+    return True, max(1, min(5, 5 - int(self.d // 20)))
 
   def tick(self, car):
     self.frame += 1

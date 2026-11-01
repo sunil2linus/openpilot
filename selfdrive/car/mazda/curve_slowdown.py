@@ -52,6 +52,7 @@ DEFAULT_MAX_DROP_MPH = 10
 MIN_SET_SPEED = 25.0 * MS_PER_MPH     # never set cruise below 25 mph
 START_SPEED = 25.0 * MS_PER_MPH       # only start a slowdown at 25 mph or more (true speed)
 KEEP_SPEED = 12.0 * MS_PER_MPH        # keep managing (incl. restoring) down to 12 mph (a 20 mph set speed reads ~18 true)
+RESTORE_MOVING_SPEED = 2.0            # m/s: after a stopped car, the driver's speed comes back once we move again
 CURVE_MARGIN = 0.3                    # m/s: stay this far above the curve target
 CRUISE_SETTLE = 0.3                   # s: cruise must be engaged this long before we press
 RESTORE_DELAY = 0.5                   # s of FrogPilot saying the curve no longer limits us before raising
@@ -85,7 +86,8 @@ HOLD_MAX_SECONDS = 4.0                   # a hold is released after this at the 
 HOLD_NO_EFFECT_SECONDS = 1.0             # a hold with no set speed change by then is released (the car ignores it)
 HOLD_QUANTUM_MPH = 5                     # the car's long-press step
 HOLD_SETTLE = 1.5                        # s after the last frame or landing during which changes are still the hold's
-HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after release, until measured
+HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after a SET- release, until measured
+HOLD_UP_OVERRUN_DEFAULT = 3              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
 HOLD_MISS_LIMIT = 2                      # holds with no effect before holds are off for the drive
 HOLD_GOALS_MPH = (15, 10)                # stopped car: first hold aims 15 mph down, the second 10 more, then taps
 SET_MINUS = "SET_MINUS"
@@ -245,6 +247,10 @@ class CurveSlowdownLogic:
 
   def _quantum_steps(self):
     return int(round(HOLD_QUANTUM_MPH * 1.609344)) if self.step < MS_PER_MPH else HOLD_QUANTUM_MPH
+
+  def _up_overrun(self):
+    """Quanta assumed to land after a SET+ release: conservative until a hold has measured the car."""
+    return (self.hold_overrun + 1) if self.hold_measured else HOLD_UP_OVERRUN_DEFAULT
 
   def _hold_reserve(self):
     """Steps a hold may still take after we stop sending (we release right after a quantum lands, so
@@ -492,8 +498,10 @@ class CurveSlowdownLogic:
     if self.offset == 0 and not self.inflight or i.stop_active:
       self.restore_pending = False
     speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED)
-    can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and
-               ((not i.standstill and speed_ok) or self.restore_pending) and
+    # Never press at standstill (SET at standstill is unverified on the car); after a stopped car the driver's
+    # speed comes back as soon as we are moving again.
+    can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and not i.standstill and
+               (speed_ok or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED)) and
                self.cruise_on_frames >= _frames(CRUISE_SETTLE))
     if not can_act:
       self.hold = None
@@ -525,7 +533,7 @@ class CurveSlowdownLogic:
       q = self._quantum_steps()
       d = self.hold.direction
       # the quantum still to come while holding plus the overrun after the release must fit the bound
-      overrun = (1 + self.hold_overrun) * q * self.step
+      overrun = (1 + (self.hold_overrun if d == SET_MINUS else self._up_overrun())) * q * self.step
       crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
                  (i.set_speed + overrun > self.hold_bound + self.half_step))
       reason_gone = (reason != "stop") if d == SET_MINUS else (reason is not None or offset <= 0)
@@ -594,7 +602,10 @@ class CurveSlowdownLogic:
           self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif button == SET_PLUS and self.stop_episode and not want_lower:
-        hold = set_speed + worst <= driver_speed + self.half_step
+        # upwards the bound is the driver's speed itself: a tap, the first quantum and the quanta that may
+        # follow the release (3 until a hold has measured the car, then the worst seen plus one) must fit
+        worst_up = (q + self._up_overrun() * q + 1) * self.step
+        hold = set_speed + worst_up <= driver_speed + self.half_step
         if hold:
           self.hold_bound = driver_speed
     if want_lower and reason == "stop":

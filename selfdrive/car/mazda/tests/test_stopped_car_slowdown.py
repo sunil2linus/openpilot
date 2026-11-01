@@ -282,15 +282,31 @@ def test_lead_moves_during_first_hold_abort_and_immediate_restore():
   plus = [f for f, b in r["presses"] if b == cs.SET_PLUS] + [f for f in r["holds"] if f > h0 + 40]
   assert plus and r["max"] <= 45 + 1e-6
   assert near(r["final"], 45), r["final"]
-  assert any(h["direction"] == cs.SET_PLUS for h in r["logic"].hold_log)
+  assert min(plus) < h0 + 40 + 50 + 400, min(plus)          # restore begins promptly after the 0.5 s moving check
 
 
-def test_ego_stops_behind_lead_restores_at_standstill():
-  lead = StoppedLead(60)
+def test_set_plus_hold_never_above_driver_speed_for_overrun_0_to_3_quanta():
+  # S3: the lead departs after a tap-only lowering (nothing measured) and after holds (measured): with a release
+  # overrun of 0, 1, 2 or 3 quanta the SET+ restore must never go above the driver's speed.
+  for latency in (0.0, 0.6, 1.2, 1.8):
+    for d0 in (200, 60):
+      lead = StoppedLead(d0, present=lambda f: f < 1500)
+      r = run(Car(55, dash_offset_mph=0.0, hold_latency=latency), NO_CURVE, 6000, lead=lead, max_drop=10)
+      assert r["max"] <= 55 + 1e-6, (latency, d0, r["max"])
+      assert near(r["final"], 55), (latency, d0, r["final"])
+      assert r["min"] >= 20 - 1e-6, (latency, d0, r["min"])
+
+
+def test_ego_stops_behind_lead_no_press_at_standstill_restore_once_moving():
+  # S4: we stop behind the stopped car; nothing is pressed while stopped; when the lead drives off and
+  # we move again (> 2 m/s), the driver's speed comes back.
+  lead = StoppedLead(60, moves_at=2500, drive_off_mph=25)
   car = Car(45, dash_offset_mph=0.0, decel=2.5)
-  r = run(car, NO_CURVE, 6000, lead=lead, max_drop=10)
+  r = run(car, NO_CURVE, 7000, lead=lead, max_drop=10)
   tr = r["trigger"]
-  assert tr.release_reason == "ego stopped behind the lead", tr.release_reason
+  assert tr.release_reason in ("ego stopped behind the lead", "lead moved away (vision)"), tr.release_reason
+  plus = [f for f, b in r["presses"] if b == cs.SET_PLUS] + [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert plus and min(plus) >= 2500, (min(plus) if plus else None)        # only after the lead moved and we rolled
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, r["final"]
 
 
@@ -306,11 +322,28 @@ def test_radar_dropout_does_not_raise_early():
   assert r["trigger"].radar_rises, "radar pick-ups are logged"
 
 
-def test_lead_lost_by_vision_but_radar_still_sees_it_keeps_the_reason():
-  lead = StoppedLead(80, present=lambda f: f < 600, radar_from=100)
-  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=lead, max_drop=10)
+def test_vanished_vision_lead_with_radar_lead_releases_within_2_s():
+  # S2: the stock radar reports a lead most of the time in traffic; it must never keep the reason alive.
+  lead = StoppedLead(60, present=lambda f: f < 200, radar_from=200)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2000, lead=lead, max_drop=10)
   assert r["ever_active"]
-  assert r["trigger"].release_reason in (None, "ego stopped behind the lead"), r["trigger"].release_reason
+  assert r["trigger"].release_reason == "lead lost (vision)", r["trigger"].release_reason
+  last_minus = max([f for f, b in r["presses"] if b == cs.SET_MINUS] +
+                   [h["release_frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS])
+  assert last_minus <= 200 + 200 + 20, last_minus                       # nothing lowered after ~2 s
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_radar_locked_on_during_approach_never_releases_before_the_lead_moves():
+  # S1 regression (reviewer's MMMMMMMMMPPPPPPPMPPPP trace): the stock radar's distance bucket rises as the stopped
+  # car gets nearer (5 = nearest); that must not read as "moved away". Vision lost by the model, then back.
+  lead = StoppedLead(120, radar_from=100, moves_at=600, drive_off_mph=25)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 4000, lead=lead, max_drop=10)
+  first_plus = min([f for f, b in r["presses"] if b == cs.SET_PLUS] +
+                   [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS] + [10**9])
+  assert first_plus >= 600, first_plus
+  assert r["trigger"].release_reason == "lead moved away (vision)", r["trigger"].release_reason
+  assert r["trigger"].radar_rises
 
 
 def test_curve_slowdown_still_uses_taps_only():

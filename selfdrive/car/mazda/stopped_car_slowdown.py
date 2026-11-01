@@ -29,8 +29,13 @@ START_SPEED = 20 * MS_PER_MPH
 CRUISE_SETTLE = 0.3         # s
 RELEASE_LEAD_SPEED = 4.0    # m/s: the lead moved away (vision), held for RELEASE_MOVING_TIME
 RELEASE_MOVING_TIME = 0.5   # s
-RELEASE_LOST_TIME = 2.0     # s without the lead (vision and stock radar), or out of the lane, before the reason clears
-EGO_STOPPED_SPEED = 1.0     # m/s: we have stopped behind the lead: the driver's set speed can come back
+RELEASE_LOST_TIME = 2.0     # s without a stopped vision lead in our lane before the reason clears
+LOST_MIN_PROB = 0.5         # a vision lead below this no longer counts as "still there"
+EGO_STOPPED_SPEED = 1.0     # m/s: we have stopped behind the lead: the driver's set speed can come back (once moving)
+# Stock radar (CRZ_CTRL): RADAR_HAS_LEAD and RADAR_LEAD_RELATIVE_DISTANCE, a bucket 1 = FARTHEST .. 5 = NEAREST
+# (0 = no lead). It is logged, and its pick-up times are kept, but it never keeps the reason active and never
+# releases it: in traffic it almost always reports some lead, and a dropped stationary target must not raise the
+# set speed while we are still approaching.
 FLOOR_SPEED = 20 * MS_PER_MPH
 TARGET_DECEL = 1.0          # m/s^2 the stock cruise slows at once the set speed is lowered
 TARGET_MARGIN = 15.0        # m behind the lead where the floor speed should be reached
@@ -60,8 +65,8 @@ class StoppedCarInputs:
   lead_d: float
   lead_v: float
   lead_y: float
-  radar_has_lead: bool = False      # stock MRCC radar (CRZ_CTRL.RADAR_HAS_LEAD)
-  radar_lead_distance: int = 0      # stock MRCC radar distance bucket (CRZ_CTRL.RADAR_LEAD_RELATIVE_DISTANCE, 0-5)
+  radar_has_lead: bool = False      # stock MRCC radar (CRZ_CTRL.RADAR_HAS_LEAD), logged only
+  radar_lead_distance: int = 0      # its distance bucket (CRZ_CTRL.RADAR_LEAD_RELATIVE_DISTANCE: 1 farthest .. 5 nearest), logged only
 
 
 def stopped_car_target(d_rel, floor=FLOOR_SPEED, decel=TARGET_DECEL, margin=TARGET_MARGIN):
@@ -95,11 +100,7 @@ class StoppedCarTrigger:
     self.release_reason = None
     self.restore_now = False         # set for one frame when the reason clears for good (restore at once)
     self.moving_frames = 0
-    self.radar_away_frames = 0
     self.prev_radar_has_lead = False
-    self.prev_radar_distance = 0
-    self.radar_distance_frame = 0
-    self.radar_away_bucket = 0
     self.radar_rises = []            # frames at which the stock radar picked up a lead (for the logs)
 
   def _lead_ok(self, i):
@@ -144,14 +145,6 @@ class StoppedCarTrigger:
     if i.radar_has_lead and not self.prev_radar_has_lead:
       self.radar_rises.append(self.frame)
     self.prev_radar_has_lead = i.radar_has_lead
-    # Stock radar "moving away": its distance bucket went up (while it kept the lead) and stayed up
-    if i.radar_has_lead and self.prev_radar_distance > 0 and i.radar_lead_distance > self.prev_radar_distance:
-      self.radar_distance_frame = self.frame
-      self.radar_away_bucket = i.radar_lead_distance
-    self.prev_radar_distance = i.radar_lead_distance if i.radar_has_lead else 0
-    radar_away = (i.radar_has_lead and self.radar_distance_frame > 0 and i.radar_lead_distance >= self.radar_away_bucket and
-                  self.frame - self.radar_distance_frame <= _frames(2 * RELEASE_MOVING_TIME))
-    self.radar_away_frames = self.radar_away_frames + 1 if radar_away else 0
     lead_ok = self._lead_ok(i)
     gates = (i.enabled and i.cruise_enabled and not i.brake_pressed and
              self.cruise_on_frames >= _frames(CRUISE_SETTLE))
@@ -166,23 +159,23 @@ class StoppedCarTrigger:
         self.lost_frames = self.out_of_lane_frames = 0
         self.release_reason = None
     else:
-      self.moving_frames = self.moving_frames + 1 if (i.lead_alive and i.lead_status and i.lead_v > RELEASE_LEAD_SPEED) else 0
-      lost = not (i.lead_alive and i.lead_status) and not i.radar_has_lead
-      out = i.lead_alive and i.lead_status and abs(i.lead_y) > MAX_LATERAL
-      self.lost_frames = self.lost_frames + 1 if lost else 0
+      vision = i.lead_alive and i.lead_status and i.lead_prob >= LOST_MIN_PROB
+      self.moving_frames = self.moving_frames + 1 if (vision and i.lead_v > RELEASE_LEAD_SPEED) else 0
+      # "still there" = a vision lead in our lane that is not driving away; the stock radar never counts
+      still_there = vision and abs(i.lead_y) <= MAX_LATERAL and i.lead_v <= RELEASE_LEAD_SPEED
+      out = vision and abs(i.lead_y) > MAX_LATERAL
+      self.lost_frames = 0 if still_there else self.lost_frames + 1
       self.out_of_lane_frames = self.out_of_lane_frames + 1 if out else 0
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif self.moving_frames >= _frames(RELEASE_MOVING_TIME):
         self._release("lead moved away (vision)")
-      elif self.radar_away_frames >= _frames(RELEASE_MOVING_TIME):
-        self._release("lead moved away (stock radar)")
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
-      elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
-        self._release("lead lost (vision and radar)")
       elif self.out_of_lane_frames >= _frames(RELEASE_LOST_TIME):
         self._release("lead left the lane")
+      elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
+        self._release("lead lost (vision)")
     if self.active and i.lead_status:
       self.target = stopped_car_target(i.lead_d)
     return self.active
@@ -190,7 +183,7 @@ class StoppedCarTrigger:
   def _release(self, reason, restore_now=True):
     self.active = False
     self.hold_frames = 0
-    self.moving_frames = self.radar_away_frames = 0
+    self.moving_frames = 0
     self.release_reason = reason
     self.restore_now = restore_now
 
