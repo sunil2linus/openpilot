@@ -61,9 +61,10 @@ MIN_DWELL = 1.0                       # s at least between the last SET- and a S
 PENDING_TIMEOUT = 0.5                 # s to wait for a press to show on the set speed (the car answers in < 0.2 s)
 LATE_WINDOW = 3.0                     # s after the timeout during which a late change is still ours (car speed unknown)
 LATE_FACTOR = 4                       # once the car's answer time is known, a press is lost after this many times it
-ECHO_GUARD = 0.15                     # s after our own press during which a button seen on CAN could be our own frame
+MIN_IN_FLIGHT_WINDOW = 1.0            # s: a press is never forgotten sooner than this
+DRIVER_RECENT = 1.5                   # s after the driver's last SET+/SET- edge (or while held): changes are theirs
 MAX_IN_FLIGHT = 3                     # presses that may be unaccounted for before we stop sending
-NO_EFFECT_LIMIT = 4                   # presses in a row with no effect before backing off
+NO_EFFECT_LIMIT = 6                   # presses in a row with no effect before backing off (1 in 4 ignored is normal)
 NO_EFFECT_BACKOFF = 10.0              # s to wait after that before trying again
 NO_EFFECT_TRIPS = 3                   # back-offs before giving up (speed left alone)
 PAUSE_ABANDON = 30.0                  # s paused before we forget the driver's speed
@@ -110,8 +111,10 @@ class CurveSlowdownLogic:
     self.pending = None              # (direction, frame) of the newest press, until it lands or times out
     self.inflight = []               # [(direction, frame)] of presses not yet seen on the set speed, oldest first
     self.latencies = []              # frames from our press to the set speed change, learned on the road
+    self.expired = []                # [(direction, frame)] of our presses given up on, still claimable for a while
     self.driver_taps = []            # [(direction, frame)] of the driver's own recent taps, not yet seen on the set speed
     self.prev_driver_button = None
+    self.last_driver_edge = {SET_MINUS: -10_000, SET_PLUS: -10_000}
     self.no_effect = 0
     self.no_effect_trips = 0
     self.backoff_until = 0
@@ -135,20 +138,21 @@ class CurveSlowdownLogic:
     return [d for d, _ in self.inflight]
 
   def _matching_press(self, direction):
-    """Which press a one-step change in `direction` most likely is: ("ours", k) for inflight[k],
-    ("driver", k) for driver_taps[k], or None.
+    """Which press a one-step change in `direction` most likely is: ("driver", k) for driver_taps[k]
+    when the driver tapped that button recently (their tap first: being wrong leaves one of ours to
+    expire and ends one step below the driver's speed, the safe side), else ("ours", k) for the
+    oldest of our presses in flight (FIFO: the count in flight is what the limits depend on, and
+    keeping the newest only makes us wait longer), else None."""
+    for k, (d, _) in enumerate(self.driver_taps):
+      if d == direction:
+        return ("driver", k)
+    for k, (d, _) in enumerate(self.inflight):
+      if d == direction:
+        return ("ours", k)
+    return None
 
-    Once we have seen how fast this car answers (learned from landings with a single press in
-    flight), it is the press whose age is closest to that; an older press was ignored by the
-    car. Before that: the oldest one (a slow car answers in order)."""
-    candidates = [(("ours", k), self.frame - f) for k, (d, f) in enumerate(self.inflight) if d == direction]
-    candidates += [(("driver", k), self.frame - f) for k, (d, f) in enumerate(self.driver_taps) if d == direction]
-    if not candidates:
-      return None
-    latency = self.latency
-    if latency is None:
-      return max(candidates, key=lambda c: c[1])[0]
-    return min(candidates, key=lambda c: abs(c[1] - latency))[0]
+  def _oldest_ours(self, direction):
+    return next(k for k, (d, _) in enumerate(self.inflight) if d == direction)
 
   @property
   def latency(self):
@@ -162,7 +166,7 @@ class CurveSlowdownLogic:
     latency = self.latency
     if latency is None:
       return _frames(PENDING_TIMEOUT + LATE_WINDOW)
-    return max(_frames(PENDING_TIMEOUT), int(LATE_FACTOR * latency))
+    return max(_frames(MIN_IN_FLIGHT_WINDOW), int(LATE_FACTOR * latency))
 
   def _forget(self):
     """Leave the set speed where it is and stop managing it."""
@@ -193,15 +197,19 @@ class CurveSlowdownLogic:
     match = self._matching_press(direction)
     ours_k = match[1] if match is not None and match[0] == "ours" else None
     driver_k = match[1] if match is not None and match[0] == "driver" else None
-    any_driver = any(d == direction for d, _ in self.driver_taps)
+    driver_recent = (driver_k is not None or self.prev_driver_button == direction or
+                     self.frame - self.last_driver_edge[direction] <= _frames(DRIVER_RECENT))
+    n_ours = sum(1 for d, _ in self.inflight if d == direction)
+    expired_k = next((k for k, (d, _) in enumerate(self.expired) if d == direction), None)
     if abs(steps - round(steps)) > 0.25:
-      if ours_k is not None and not any_driver and not after_gap and steps < 2.5:
+      if ours_k is not None and not driver_recent and not after_gap and steps < 2.5:
         # Our press landed as a fraction of a step: the car's set speed steps don't match our
         # unit (e.g. km/h setting with an mph dash). We cannot tell our presses from the
         # driver's: switch off for this drive.
         self._forget()
         self.pending = None
         self.inflight = []
+        self.expired = []
         self.disabled = True
       else:
         # Not ours and not a whole step: the driver (e.g. the first tap above the car's
@@ -225,6 +233,11 @@ class CurveSlowdownLogic:
       del self.inflight[ours_k]
       self.pending = None
       self._apply_ours(direction)
+    elif one_step and expired_k is not None and not driver_recent and not after_gap:
+      # A press we had given up on landed late. Counting it as ours keeps the driver's speed
+      # reference right; if we already restored, the next pass corrects the extra step.
+      del self.expired[expired_k]
+      self._apply_ours(direction)
     elif after_gap:
       # Cruise was re-engaged at a different speed: the driver chose a new speed.
       self._forget()
@@ -236,18 +249,24 @@ class CurveSlowdownLogic:
       # No more lowering for this curve.
       self.restoring = False
       self.blocked = True
-    elif any_driver:
+    elif driver_recent:
       # The driver held the button: they set a new speed.
       self.driver_taps = [(d, f) for d, f in self.driver_taps if d != direction]
       self._forget()
       self.blocked = True
+    elif ours_k is not None and round(steps) <= n_ours:
+      # Several of our presses landed between two set speed samples: count them all, oldest first.
+      for _ in range(int(round(steps))):
+        del self.inflight[self._oldest_ours(direction)]
+        self._apply_ours(direction)
+      self.pending = None
     elif ours_k is not None:
-      # Several steps in the direction of our own press: the car may step more than once per
-      # press (or the driver held the button at the same moment). We can't keep the limits
-      # reliably, so switch off for this drive and leave the speed alone.
+      # More steps than we have presses in flight, in our direction: the car may step more than
+      # once per press. We can't keep the limits reliably, so switch off for this drive.
       self._forget()
       self.pending = None
       self.inflight = []
+      self.expired = []
       self.disabled = True
     else:
       # Several steps at once (e.g. holding the button): the driver set a new speed.
@@ -269,13 +288,15 @@ class CurveSlowdownLogic:
       if self.pending is not None:
         self.pending = (self.pending[0], self.pending[1] + 1)
       self.inflight = [(d, f + 1) for d, f in self.inflight]
+      self.expired = [(d, f + 1) for d, f in self.expired]
 
-    # The driver's own SET+/SET- taps (rising edge), ignoring the short window in which a frame
-    # we sent ourselves could be read back.
-    if (i.driver_button in (SET_MINUS, SET_PLUS) and i.driver_button != self.prev_driver_button and
-        self.frame - self.last_send_frame > _frames(ECHO_GUARD)):
-      self.driver_taps.append((i.driver_button, self.frame))
-      self.blocked = True
+    # The driver's own SET+/SET- taps (rising edge). Our own frames are never read back here:
+    # pandad reports transmitted frames on bus + 128 and the bus-0 parser ignores those.
+    if i.driver_button in (SET_MINUS, SET_PLUS):
+      if i.driver_button != self.prev_driver_button:
+        self.driver_taps.append((i.driver_button, self.frame))
+        self.blocked = True
+      self.last_driver_edge[i.driver_button] = self.frame     # kept fresh while held
     self.prev_driver_button = i.driver_button
     self.driver_taps = [(d, f) for d, f in self.driver_taps if self.frame - f <= self._in_flight_window()]
 
@@ -286,7 +307,10 @@ class CurveSlowdownLogic:
     if self.pending is not None and self.frame - self.pending[1] > _frames(PENDING_TIMEOUT):
       self.pending = None
       self.no_effect += 1
-    self.inflight = [(d, f) for d, f in self.inflight if self.frame - f <= self._in_flight_window()]
+    window = self._in_flight_window()
+    self.expired += [(d, f) for d, f in self.inflight if self.frame - f > window]
+    self.inflight = [(d, f) for d, f in self.inflight if self.frame - f <= window]
+    self.expired = [(d, f) for d, f in self.expired if self.frame - f <= _frames(PENDING_TIMEOUT + LATE_WINDOW)]
     if self.no_effect >= NO_EFFECT_LIMIT:
       self.no_effect = 0
       self.no_effect_trips += 1

@@ -19,12 +19,13 @@ DT = 0.01
 
 
 class Car:
-  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None):
+  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
+    self.lag_fn = lag_fn              # lag_fn(n) -> frames until our n-th press lands (overrides lag)
     self.pending, self.frame, self.op_presses = [], 0, 0
     self.driver_button, self.driver_button_until = None, -1
 
@@ -40,7 +41,8 @@ class Car:
       self.driver_button_until = self.frame + 10      # the stock switch reports the tap for one 10 Hz frame
       self.driver_button = button
     d = -self.step if button == cs.SET_MINUS else self.step
-    self.pending.append((self.frame + self.lag, d))
+    lag = self.lag_fn(self.op_presses) if (who == "op" and self.lag_fn is not None) else self.lag
+    self.pending.append((self.frame + lag, d))
 
   def tick(self):
     self.frame += 1
@@ -596,6 +598,104 @@ def test_driver_hold_while_our_press_in_flight_is_not_a_unit_mismatch():
   r = run(Car(65, lag=60), between(100, 1500, 45), 5000, events={first + 30: hold})
   assert not r["logic"].disabled
   assert r["max"] <= 65 + 1e-6
+
+
+# ---------------- review of 4f85eb1b7 (F1-F4) ----------------
+
+def test_jittery_answer_time_lossless_keeps_limits():
+  # F1: answer time varying 0.24-0.64 s with no losses must not orphan a press and send one too many.
+  import random
+  rng = random.Random(252)
+  for _ in range(12):
+    lags = [rng.randint(24, 64) for _ in range(400)]
+    r = run(Car(35, dash_offset_mph=0.0, lag_fn=lambda n, lags=lags: lags[n % 400]),
+            lambda f: 15 * MPH if (100 <= f < 1500 or 2500 <= f < 3600) else None, 6000, max_drop=10)
+    assert r["min"] >= 25 - 1e-6 and r["max"] <= 35 + 1e-6, (r["min"], r["max"])
+    assert near(r["final"], 35), r["final"]
+    assert not r["logic"].disabled
+
+
+def test_late_landing_after_window_does_not_shift_reference():
+  # F1: one press answered 1.5 s late (after the in-flight window once the answer time is ~0.1 s) must
+  # still count as ours: the restore must end at the driver's speed, not one step above or below.
+  for late_n in (3, 6):
+    r = run(Car(65, lag_fn=lambda n, late_n=late_n: 150 if n == late_n else 10), between(100, 1500, 45), 5000, max_drop=10)
+    assert r["max"] <= 65 + 1e-6, (late_n, r["max"])
+    assert near(r["final"], 65), (late_n, r["final"])
+
+
+def test_driver_hold_pattern_with_press_in_flight_and_unknown_latency():
+  # F2: the real Mazda hold: to the next multiple of 5, then -5 every ~0.6 s while the button is held.
+  for start_after in (5, 15, 25):
+    def hold(s, c, start_after=start_after):
+      c.driver_button, c.driver_button_until = cs.SET_MINUS, c.frame + 200
+      first = (c.set_speed / MPH - 0.01) // 5 * 5
+      c.pending.append((c.frame + c.lag, first * MPH - c.set_speed))
+      c.pending.append((c.frame + c.lag + 60, -5 * MPH))
+      c.pending.append((c.frame + c.lag + 120, -5 * MPH))
+    first = run(Car(50, lag=60), between(100, 3000, 30), 3000)["presses"][0][0]
+    r = run(Car(50, lag=60), between(100, 3000, 30), 6000, max_drop=10, events={first + start_after: hold})
+    assert not r["logic"].disabled, start_after
+    assert r["max"] <= 50 + 1e-6
+
+
+def _logic_inputs(set_mph, csc=True, csc_mph=45.0, v_mph=65.0, button=None):
+  return cs.SlowdownInputs(True, True, set_mph * MPH, v_mph * MPH, False, False, False, True, csc, csc_mph * MPH, False, button)
+
+
+def test_two_landings_in_one_sample_with_three_in_flight():
+  # F3: three presses out, two of them show up in the same set speed sample: count both, do not disable.
+  logic = cs.CurveSlowdownLogic(False, 10)
+  set_mph = 65.0
+  for f in range(400):
+    b, _ = logic.update(_logic_inputs(set_mph))
+    if len(logic.inflight) == 3 and b is None:
+      break
+  assert len(logic.inflight) == 3
+  logic.update(_logic_inputs(set_mph - 2))          # two of ours landed at once
+  assert not logic.disabled and logic.offset == 2 and len(logic.inflight) == 1
+  logic.update(_logic_inputs(set_mph - 3))          # the third
+  assert logic.offset == 3 and not logic.inflight
+  # more steps than we have in flight is still the "car steps twice" case
+  logic2 = cs.CurveSlowdownLogic(False, 10)
+  for f in range(60):
+    logic2.update(_logic_inputs(65.0))
+  assert len(logic2.inflight) == 1
+  logic2.update(_logic_inputs(63.0))
+  assert logic2.disabled
+
+
+def test_late_landing_is_claimed_from_the_expired_list():
+  # F1: a press that lands after the in-flight window is still ours (no reference shift).
+  logic = cs.CurveSlowdownLogic(False, 10)
+  logic.latencies = [10] * 5                        # answer time known: window = 1.0 s
+  sent = None
+  for f in range(400):
+    b, _ = logic.update(_logic_inputs(65.0, csc=sent is None))   # curve ends right after our first press
+    if b is not None and sent is None:
+      sent = logic.frame
+    if sent is not None and logic.frame - sent > cs._frames(cs.MIN_IN_FLIGHT_WINDOW) + 5:
+      break
+  assert not logic.inflight and logic.expired, (logic.inflight, logic.expired)
+  logic.update(_logic_inputs(64.0, csc=False))      # lands 1 s+ late
+  assert logic.offset == 1 and not logic.blocked and not logic.expired
+  # and it is restored afterwards (the reference did not shift)
+  plus = None
+  for f in range(400):
+    b, _ = logic.update(_logic_inputs(64.0, csc=False))
+    if b == cs.SET_PLUS:
+      plus = logic.frame
+      break
+  assert plus is not None
+
+
+def test_visible_driver_tap_while_our_presses_were_ignored_is_the_drivers():
+  # F4: both our presses ignored, the driver taps SET- (seen on the bus) and it lands: restore to 64, not 65.
+  first = run(Car(65), between(100, 1500, 45), 3000)["presses"][0][0]
+  r = run(Car(65, lose=lambda n: n in (1, 2)), between(100, 1500, 45), 5000, max_drop=10,
+          events={first + 55: lambda s, c: c.press(cs.SET_MINUS, who="driver")})
+  assert r["max"] <= 65 + 1e-6
+  assert near(r["final"], 64), r["final"]
 
 
 def test_random_lossy_drives_never_break_limits():
