@@ -33,15 +33,23 @@ class CarController(CarControllerBase):
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
 
-    # Optional: lower the stock cruise set speed for curves with SET-/SET+ button presses.
-    # Gen1 with stock MRCC only (no Radar Interceptor, no openpilot longitudinal alpha). Default off.
+    # Optional: lower the stock cruise set speed for curves and for stopped cars ahead with
+    # SET-/SET+ button presses. Gen1 with stock MRCC only (no Radar Interceptor, no openpilot
+    # longitudinal alpha). Both default off.
     self.curve_slowdown = None
-    if (CP.flags & MazdaFlags.GEN1 and not CP.flags & (MazdaFlags.RADAR_INTERCEPTOR | MazdaFlags.NO_MRCC) and
-        self.params.get_bool("MazdaCurveSlowdown") and not self.params.get_bool("ExperimentalLongitudinalEnabled")):
+    if CP.flags & MazdaFlags.GEN1 and not CP.flags & (MazdaFlags.RADAR_INTERCEPTOR | MazdaFlags.NO_MRCC) and \
+       not self.params.get_bool("ExperimentalLongitudinalEnabled"):
       try:
-        self.curve_slowdown = CurveSlowdown(CP, self.params)
+        curve_enabled = self.params.get_bool("MazdaCurveSlowdown")
+        try:
+          stop_mode = int(self.params.get("MazdaStoppedCarSlowdown", encoding="utf8") or 0)
+        except (TypeError, ValueError):
+          stop_mode = 0
+        stop_mode = stop_mode if stop_mode in (0, 1, 2) else 0
+        if curve_enabled or stop_mode:
+          self.curve_slowdown = CurveSlowdown(CP, self.params, curve_enabled=curve_enabled, stop_mode=stop_mode)
       except Exception:
-        cloudlog.exception("mazda curve slowdown init failed, disabled")
+        cloudlog.exception("mazda set speed slowdown init failed, disabled")
         self.curve_slowdown = None
 
 

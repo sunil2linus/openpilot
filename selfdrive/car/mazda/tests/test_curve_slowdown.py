@@ -12,6 +12,10 @@ _spec = importlib.util.spec_from_file_location(
   "curve_slowdown", os.path.join(os.path.dirname(__file__), "..", "curve_slowdown.py"))
 cs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cs)
+_spec2 = importlib.util.spec_from_file_location(
+  "stopped_car_slowdown", os.path.join(os.path.dirname(__file__), "..", "stopped_car_slowdown.py"))
+scs = importlib.util.module_from_spec(_spec2)
+_spec2.loader.exec_module(scs)
 
 MPH = cs.MS_PER_MPH
 KPH = cs.MS_PER_KPH
@@ -19,15 +23,47 @@ DT = 0.01
 
 
 class Car:
-  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None):
+  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
+               hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
+    self.decel = decel
     self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
     self.lag_fn = lag_fn              # lag_fn(n) -> frames until our n-th press lands (overrides lag)
     self.pending, self.frame, self.op_presses = [], 0, 0
     self.driver_button, self.driver_button_until = None, -1
+    # Long-press model, as measured on the owner's car: 1 mph at the first frame, after `hold_start` s a
+    # jump to the next multiple of 5 mph, then 5 mph every 5/hold_rate s while frames keep coming; steps
+    # already due within `hold_latency` s after the last frame still land.
+    self.hold_rate, self.hold_start, self.hold_latency, self.hold_ignored = hold_rate, hold_start, hold_latency, hold_ignored
+    self.hold_last, self.hold_next, self.hold_count = None, None, 0
+
+  def hold_frame(self, button=cs.SET_MINUS):
+    if self.hold_ignored:
+      return
+    if self.hold_last is None or self.frame - self.hold_last > 15:
+      self.hold_count += 1
+      self.hold_dir = -1 if button == cs.SET_MINUS else 1
+      self.pending.append((self.frame + self.lag, self.hold_dir * self.step))   # the tap on button-down
+      self.hold_next = self.frame + int(self.hold_start * 100) + self.lag
+    self.hold_last = self.frame
+
+  def _hold_tick(self):
+    if self.hold_last is None:
+      return
+    released = self.frame - self.hold_last > 15
+    if self.frame >= self.hold_next and (not released or self.frame - self.hold_last <= 15 + int(self.hold_latency * 100)):
+      mph = round((self.set_speed + sum(d for _, d in self.pending)) / MPH)
+      if self.hold_dir < 0:
+        new = ((mph - 1) // 5) * 5
+      else:
+        new = ((mph + 5) // 5) * 5
+      self.set_speed += (new - mph) * MPH
+      self.hold_next += int(100 * 5 / self.hold_rate)
+    if released and self.frame - self.hold_last > 15 + int(self.hold_latency * 100):
+      self.hold_last = None
 
   def driver_button_now(self):
     return self.driver_button if self.frame < self.driver_button_until else None
@@ -49,8 +85,38 @@ class Car:
     for f, d in [p for p in self.pending if p[0] <= self.frame]:
       self.set_speed += d
     self.pending = [p for p in self.pending if p[0] > self.frame]
+    self._hold_tick()
     tgt = self.set_speed - self.dash_offset
-    self.v_ego += max(-self.accel * DT, min(self.accel * DT, tgt - self.v_ego))
+    self.v_ego += max(-self.decel * DT, min(self.accel * DT, tgt - self.v_ego))
+
+
+class StoppedLead:
+  """A lead car `d0` m ahead at `v_mph`, in our lane (y) with `prob`; the gap closes with our speed.
+  `moves_at`: frame from which the lead drives off at `drive_off_mph`. `radar_from`: distance below which
+  the stock radar reports it (None: never); `radar_present(f)`: radar dropout control."""
+  def __init__(self, d0, v_mph=0.0, prob=0.95, y=0.1, present=lambda f: True, moves_at=None, drive_off_mph=15.0,
+               radar_from=None, radar_present=lambda f: True):
+    self.d, self.v, self.prob, self.y, self.present = d0, v_mph * MPH, prob, y, present
+    self.moves_at, self.drive_off, self.radar_from, self.radar_present = moves_at, drive_off_mph * MPH, radar_from, radar_present
+    self.frame = 0
+
+  def state(self, f, car):
+    if not self.present(f):
+      return (False, 0.0, 0.0, 0.0, 0.0)
+    return (True, self.prob, self.d, self.v, self.y)
+
+  def radar(self, f):
+    if self.radar_from is None or not self.radar_present(f) or self.d > self.radar_from:
+      return False, 0
+    return True, max(1, min(5, int(self.d // 20) + 1))
+
+  def tick(self, car):
+    self.frame += 1
+    if self.moves_at is not None and self.frame >= self.moves_at:
+      self.v = min(self.v + 2.0 * DT, self.drive_off)
+    self.d = max(self.d - (car.v_ego - self.v) * DT, 0.0)
+    if self.present(self.frame) and self.d < 12.0 and car.v_ego > self.v:
+      car.v_ego = max(car.v_ego - 3.0 * DT, self.v)      # the MRCC (or the driver) brakes behind the lead
 
 
 class CSC:
@@ -75,11 +141,13 @@ class CSC:
     self.active = self.target < v_cruise
 
 
-def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5):
+def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2):
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   csc = CSC()
+  trigger = scs.StoppedCarTrigger()
   st = dict(enabled=True, cruise=True, gas=False, brake=False, plan_alive=True)
-  hist, presses = [], []
+  hist, presses, holds = [], [], []
+  ever_active = False
   start = car.set_speed
   min_set = max_set = car.set_speed
   for f in range(frames):
@@ -89,19 +157,37 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       csc.update(curve_fn(f), car.set_speed, car.v_ego)
     hist.append((csc.active, csc.speed))
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
+    stop_active, stop_target, stop_urgent, restore_now = False, 0.0, False, False
+    if lead is not None:
+      status, prob, d, v, y = lead.state(f, car)
+      r_has, r_dist = lead.radar(f)
+      li = scs.StoppedCarInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], brake_pressed=st["brake"],
+                                v_ego=car.v_ego, lead_alive=True, lead_status=status, lead_prob=prob, lead_d=d,
+                                lead_v=v, lead_y=y, radar_has_lead=r_has, radar_lead_distance=r_dist)
+      active = trigger.update(li)
+      ever_active = ever_active or active
+      stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
+      restore_now = trigger.restore_now and stop_mode == 2
     inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
-                            v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=False,
+                            v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=car.v_ego < 0.3,
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
-                            driver_button=car.driver_button_now())
+                            driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
+                            stop_urgent=stop_urgent, stop_restore_now=restore_now)
     btn, off = logic.update(inp)
     if btn is not None:
       assert off in (0, 1)
-      presses.append((f, btn))
-      car.press(btn)
+      if logic.last_action == "hold":
+        holds.append(f)
+        car.hold_frame(btn)
+      else:
+        presses.append((f, btn))
+        car.press(btn)
     car.tick()
+    if lead is not None:
+      lead.tick(car)
     min_set, max_set = min(min_set, car.set_speed), max(max_set, car.set_speed)
-  return dict(presses=presses, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
-              start=start / MPH, logic=logic)
+  return dict(presses=presses, holds=holds, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
+              start=start / MPH, logic=logic, trigger=trigger, ever_active=ever_active)
 
 
 def between(a, b, mph):

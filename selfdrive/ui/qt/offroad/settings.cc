@@ -174,6 +174,16 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
                                         "In km/h: 8, 16 or 24 km/h. Takes effect on the next drive."),
                                      "../assets/offroad/icon_speed_limit.png", drop_texts, 150));
 
+      // Stopped car slowdown: Off / Test (log only, no presses) / On
+      std::vector<QString> stop_texts{tr("Off"), tr("Test"), tr("On")};
+      addItem(new ButtonParamControl("MazdaStoppedCarSlowdown", tr("Stopped Car Slowdown"),
+                                     tr("When the car ahead is stopped in your lane, lowers the stock cruise set speed early "
+                                        "(down to 20 mph, never below) with the same SET- button presses, so you approach slower "
+                                        "and the radar cruise has time to react. It never stops the car: the cruise or you do the "
+                                        "braking. \"Test\" presses nothing and only records what it would have done. Takes effect "
+                                        "on the next drive."),
+                                     "../assets/offroad/icon_speed_limit.png", stop_texts, 150));
+
       // Stop warnings: Off / Test (log only, no sound) / On
       std::vector<QString> warn_texts{tr("Off"), tr("Test"), tr("On")};
       addItem(new ButtonParamControl("StopWarningRedLight", tr("Stop Ahead Warning"),

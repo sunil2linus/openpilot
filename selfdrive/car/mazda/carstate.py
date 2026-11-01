@@ -19,6 +19,8 @@ class CarState(CarStateBase):
     self.crz_btns_counter = 0
     self.crz_set_plus = False     # driver's SET+ / SET- from the stock steering wheel switch (Gen1)
     self.crz_set_minus = False
+    self.radar_has_lead = False   # stock MRCC radar lead (CRZ_CTRL, Gen1 without Radar Interceptor)
+    self.radar_lead_distance = 0  # its distance bucket (0-5)
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -143,6 +145,8 @@ class CarState(CarStateBase):
     else:
       ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
       ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
+      self.radar_has_lead = cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"] == 1
+      self.radar_lead_distance = int(cp.vl["CRZ_CTRL"]["RADAR_LEAD_RELATIVE_DISTANCE"])
 
     # Check if LKAS is disabled due to lack of driver torque when all other states indicate
     # it should be enabled (steer lockout). Don't warn until we actually get lkas active
