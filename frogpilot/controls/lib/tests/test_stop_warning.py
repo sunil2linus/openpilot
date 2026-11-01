@@ -191,6 +191,22 @@ def test_slowdown_beyond_horizon_ignored():
   assert run(repeat(i, 3)) == []
 
 
+def test_stop_ahead_detection_carries_lead_data():
+  # A slowing lead 90 m ahead that is not "relevant" yet: the CSV line must still show it.
+  i = inputs(40, model=model_stop(40 * MPH, 60), lead=(90, 20, 0.85), lead_y=0.4)
+  logic = sw.StopWarningLogic()
+  fired = []
+  for _ in range(int(round(5 / sw.DT))):
+    fired += logic.update(i, BOTH_TEST)
+  kinds = [d.kind for d, _ in fired]
+  assert sw.STOP_AHEAD in kinds, kinds
+  det = next(d for d, _ in fired if d.kind == sw.STOP_AHEAD)
+  assert det.lead_status and abs(det.lead_d - 90) < 1e-6 and abs(det.lead_speed - 20 * MPH) < 1e-6
+  assert abs(det.lead_prob - 0.85) < 1e-6 and abs(det.lead_y - 0.4) < 1e-6 and not det.lead_relevant
+  line = sw.format_log_line(det, sw.TEST, 40 * MPH, 0.0)
+  assert line.strip().split(",")[10:14] == ["1", "90.0", "0.4", "0"], line
+
+
 def test_far_horizon_single_dip_no_warning():
   v = 40 * MPH
   mv, mx = model_cruise(v)
@@ -252,11 +268,12 @@ def test_modes():
 
 
 def test_log_line_and_rotation():
-  det = sw.Detection(sw.STOPPED_LEAD, 70.0, 2.1, 3.1, 0.0, 0.9)
+  det = sw.Detection(sw.STOPPED_LEAD, 70.0, 2.1, 3.1, 0.0, 0.9, True, 70.0, 0.3, False)
   line = sw.format_log_line(det, sw.TEST, 50 * MPH, 0.1, {"latitude": 42.5, "longitude": -83.1})
   parts = line.strip().split(",")
   assert len(parts) == len(sw.LOG_HEADER.strip().split(",")), parts
   assert parts[1] == sw.STOPPED_LEAD and parts[2] == "test" and parts[3] == "50.0"
+  assert parts[10] == "1" and parts[11] == "70.0" and parts[12] == "0.3" and parts[13] == "0"
   with tempfile.TemporaryDirectory() as d:
     p = os.path.join(d, "log.csv")
     sw.append_log(line, p)

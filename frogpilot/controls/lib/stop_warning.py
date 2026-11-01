@@ -66,7 +66,8 @@ STOPPED_LEAD = "stoppedLead"
 
 LOG_PATH = "/data/media/0/stop_warnings.csv"
 LOG_MAX_BYTES = 1_000_000
-LOG_HEADER = "time,kind,mode,speed_mph,a_ego,distance_m,required_decel,time_s,lead_speed_mph,lead_prob,lat,lon\n"
+LOG_HEADER = ("time,kind,mode,speed_mph,a_ego,distance_m,required_decel,time_s,lead_speed_mph,lead_prob,"
+              "lead_status,lead_d_m,lead_y_m,lead_relevant,lat,lon\n")
 
 
 def _frames(seconds):
@@ -113,6 +114,11 @@ class Detection:
   time: float
   lead_speed: float = 0.0
   lead_prob: float = 0.0
+  # The lead the planner saw at the time, for both kinds (lets lead-following false alarms be told apart)
+  lead_status: bool = False
+  lead_d: float = 0.0
+  lead_y: float = 0.0
+  lead_relevant: bool = False
 
 
 class _Gate:
@@ -200,6 +206,9 @@ class StopWarningLogic:
       mode = modes.get(kind, OFF)
       det = detect(i) if (active and mode != OFF) else None
       if self.gates[kind].update(det is not None, self.frame) and det is not None:
+        det.lead_status, det.lead_d, det.lead_y, det.lead_relevant = i.lead_status, i.lead_d, i.lead_y, i.lead_relevant
+        if kind == STOP_AHEAD:
+          det.lead_speed, det.lead_prob = i.lead_v, i.lead_prob
         fired.append((det, mode))
     return fired
 
@@ -210,7 +219,8 @@ def format_log_line(det, mode, v_ego, a_ego, gps=None, now=None):
   lon = f"{gps['longitude']:.6f}" if gps else ""
   return (f"{now.isoformat(timespec='seconds')},{det.kind},{'test' if mode == TEST else 'on'},"
           f"{v_ego / MS_PER_MPH:.1f},{a_ego:.2f},{det.distance:.1f},{det.required_decel:.2f},{det.time:.1f},"
-          f"{det.lead_speed / MS_PER_MPH:.1f},{det.lead_prob:.2f},{lat},{lon}\n")
+          f"{det.lead_speed / MS_PER_MPH:.1f},{det.lead_prob:.2f},{int(det.lead_status)},{det.lead_d:.1f},{det.lead_y:.1f},"
+          f"{int(det.lead_relevant)},{lat},{lon}\n")
 
 
 def append_log(line, path=LOG_PATH):
