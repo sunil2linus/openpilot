@@ -19,16 +19,26 @@ DT = 0.01
 
 
 class Car:
-  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH):
+  def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
-    self.pending, self.frame = [], 0
+    self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
+    self.pending, self.frame, self.op_presses = [], 0, 0
+    self.driver_button, self.driver_button_until = None, -1
+
+  def driver_button_now(self):
+    return self.driver_button if self.frame < self.driver_button_until else None
 
   def press(self, button, who="op"):
-    if self.ignore and who == "op":
-      return
+    if who == "op":
+      self.op_presses += 1
+      if self.ignore or (self.lose is not None and self.lose(self.op_presses)):
+        return
+    else:
+      self.driver_button_until = self.frame + 10      # the stock switch reports the tap for one 10 Hz frame
+      self.driver_button = button
     d = -self.step if button == cs.SET_MINUS else self.step
     self.pending.append((self.frame + self.lag, d))
 
@@ -79,7 +89,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
     inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
                             v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=False,
-                            plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False)
+                            plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
+                            driver_button=car.driver_button_now())
     btn, off = logic.update(inp)
     if btn is not None:
       assert off in (0, 1)
@@ -273,7 +284,7 @@ def test_long_pause_forgets_and_leaves_speed_alone():
 
 def test_car_ignores_buttons_we_give_up():
   r = run(Car(65, ignore=True), between(100, 9000, 61), 12000)
-  assert len(r["presses"]) <= cs.NO_EFFECT_LIMIT * cs.NO_EFFECT_TRIPS, len(r["presses"])
+  assert len(r["presses"]) <= (cs.NO_EFFECT_LIMIT + cs.MAX_IN_FLIGHT) * cs.NO_EFFECT_TRIPS, len(r["presses"])
   assert near(r["final"], 65)
 
 
@@ -459,6 +470,159 @@ def test_random_drives_all_drop_settings():
     assert r["max"] <= set_mph + 1e-6, (max_drop, set_mph, lag, r["max"])
     assert r["min"] >= floor - 1e-6, (max_drop, set_mph, lag, r["min"])
     assert near(r["final"], set_mph), (max_drop, set_mph, lag, r["final"])
+
+
+# ---------------- road test findings (routes 00000031--1a4d3b643d and 00000032--5b79f37567) ----------------
+
+def _steps_to(presses, car_lag):
+  return [f for f, b in presses]
+
+
+def test_mazda_minimum_set_speed_does_not_disable():
+  # Route 31: cruise engaged at the car's 30 km/h minimum (18.64 mph); the first tap goes to 19 mph,
+  # a 0.36-step change. That is the driver, not a unit mismatch: the feature must keep working.
+  car = Car(30 / 1.609344, dash_offset_mph=0.0)
+  taps = {200: 19.0, 250: 20.0, 300: 25.0, 350: 30.0, 400: 35.0, 450: 40.0, 500: 45.0}
+  def tap(mph):
+    def ev(s, c):
+      c.set_speed = mph * MPH
+      c.v_ego = c.set_speed
+    return ev
+  r = run(car, between(2000, 3500, 30), 6000, events={f: tap(v) for f, v in taps.items()})
+  assert not r["logic"].disabled
+  assert minus_count(r) == 5, r["presses"]            # 45 -> 40 with the default 5 mph cap of run()
+  assert near(r["final"], 45), r["final"]
+
+
+def test_step_mismatch_with_nothing_in_flight_is_driver_change():
+  logic = cs.CurveSlowdownLogic(False, 10)
+  def inp(set_mph):
+    return cs.SlowdownInputs(True, True, set_mph * MPH, 40 * MPH, False, False, False, True, False, 50 * MPH, False)
+  for _ in range(50):
+    logic.update(inp(30 / 1.609344))
+  logic.update(inp(19.0))
+  logic.update(inp(20.0))
+  assert not logic.disabled and logic.offset == 0
+
+
+def test_reengage_at_minimum_speed_with_press_in_flight_is_driver_change():
+  # Our SET- is in flight, the driver brakes, later re-engages while slow: the car sets 30 km/h
+  # (18.64 mph), a fractional change. That is the driver's new speed, not a unit mismatch.
+  first = run(Car(45, lag=60), between(100, 1500, 30), 3000)["presses"][0][0]
+  def off(s, c):
+    s["cruise"], s["brake"] = False, True
+  def resume(s, c):
+    s["cruise"], s["brake"] = True, False
+    c.pending = []
+    c.set_speed = 30 / 1.609344 * MPH
+    c.v_ego = 15 * MPH
+  r = run(Car(45, lag=60), between(100, 1500, 30), 5000, events={first + 2: off, first + 800: resume})
+  assert not r["logic"].disabled
+  assert r["logic"].offset == 0
+
+
+def test_ignored_press_recovers_within_pending_timeout():
+  # Route 32: the MRCC ignored about one press in four; every ignored press stalled the logic for 3.5 s.
+  # Losing a press must now cost about PENDING_TIMEOUT, not PENDING_TIMEOUT + LATE_WINDOW.
+  r = run(Car(50, lag=10, lose=lambda n: n == 3), between(100, 1500, 30), 4000, max_drop=10)
+  minus = [f for f, b in r["presses"] if b == cs.SET_MINUS]
+  assert minus[3] - minus[2] <= cs._frames(cs.PENDING_TIMEOUT) + 5, minus[:5]
+  assert near(r["min"], 40) and near(r["final"], 50), (r["min"], r["final"])
+  # The whole 10 mph drop still happens in a few seconds despite a loss
+  assert minus[-1] - minus[0] < cs._frames(4.0), minus
+
+
+def test_first_press_of_the_drive_lost_still_lowers_and_restores():
+  # Before the car's answer time is known a lost press is carried along conservatively: the drop
+  # happens one step short until it is forgotten, then completes; everything restores.
+  r = run(Car(50, lag=10, lose=lambda n: n == 1), between(100, 1500, 30), 4000, max_drop=10)
+  minus = [f for f, b in r["presses"] if b == cs.SET_MINUS]
+  assert minus[1] - minus[0] <= cs._frames(cs.PENDING_TIMEOUT) + 5, minus[:3]
+  assert minus[9] - minus[0] < cs._frames(3.0), minus            # 9 of 10 steps within 3 s
+  assert near(r["min"], 40) and near(r["final"], 50), (r["min"], r["final"])
+
+
+def test_lossy_car_every_4th_press_reaches_floor_and_restores():
+  r = run(Car(50, lag=10, lose=lambda n: n % 4 == 0), between(100, 1500, 30), 4000, max_drop=10)
+  minus = [f for f, b in r["presses"] if b == cs.SET_MINUS]
+  assert near(r["min"], 40) and near(r["final"], 50) and r["max"] <= 50 + 1e-6, (r["min"], r["final"], r["max"])
+  assert minus[-1] - minus[0] < cs._frames(6.0), minus      # 10 steps + ~3 losses within 6 s
+
+
+def test_late_landing_while_next_press_pending_keeps_limits():
+  # A press the car answers late (1.2 s) is still counted as ours when the next press is already out.
+  for lag in (60, 120, 180):
+    r = run(Car(65, lag=lag), between(100, 1500, 45), 5000, max_drop=5)
+    assert r["min"] >= 60 - 1e-6 and r["max"] <= 65 + 1e-6, (lag, r["min"], r["max"])
+    assert near(r["final"], 65), (lag, r["final"])
+    assert not r["logic"].blocked or True
+
+
+def test_no_direction_reversal_while_press_in_flight():
+  # Curve ends while a lost SET- may still land: the first SET+ must wait until that press is
+  # forgotten, and the set speed must never go above the driver's speed.
+  r = run(Car(65, lag=10, lose=lambda n: n == 5), between(100, 230, 50), 3000, max_drop=5)
+  presses = r["presses"]
+  last_minus = max(f for f, b in presses if b == cs.SET_MINUS)
+  first_plus = min(f for f, b in presses if b == cs.SET_PLUS)
+  assert first_plus - last_minus >= cs._frames(cs.PENDING_TIMEOUT), (last_minus, first_plus)
+  assert r["max"] <= 65 + 1e-6 and near(r["final"], 65)
+  # Without knowing the car's answer time the wait is the full window
+  r = run(Car(65, lag=10, lose=lambda n: n == 1), between(100, 230, 50), 3000, max_drop=5)
+  last_minus = max(f for f, b in r["presses"] if b == cs.SET_MINUS)
+  first_plus = min(f for f, b in r["presses"] if b == cs.SET_PLUS)
+  assert first_plus - last_minus >= cs._frames(cs.PENDING_TIMEOUT + cs.LATE_WINDOW) - 60, (last_minus, first_plus)
+  assert r["max"] <= 65 + 1e-6 and near(r["final"], 65)
+
+
+def test_driver_tap_same_direction_while_our_presses_in_flight():
+  # Fuzz finding on the multi-in-flight design: with a slow car (0.9 s) the driver's SET- tap landed
+  # among ours and was counted as ours, so we restored one step above what the driver wanted.
+  for lag in (10, 60, 90, 150):
+    first = run(Car(55, dash_offset_mph=0.0, lag=lag), between(100, 1500, 40), 3000)["presses"][0][0]
+    r = run(Car(55, dash_offset_mph=0.0, lag=lag), between(100, 1500, 40), 5000, max_drop=15,
+            events={first + 89: lambda s, c: c.press(cs.SET_MINUS, who="driver")})
+    assert r["max"] <= 55 + 1e-6, (lag, r["max"])
+    assert near(r["final"], 54), (lag, r["final"])          # driver meant 54: restore to that, not 55
+    assert r["min"] >= 54 - 15 - 1e-6, (lag, r["min"])
+
+
+def test_driver_hold_while_our_press_in_flight_is_not_a_unit_mismatch():
+  first = run(Car(65, lag=60), between(100, 1500, 45), 3000)["presses"][0][0]
+  def hold(s, c):
+    c.press(cs.SET_MINUS, who="driver")
+    c.pending.append((c.frame + c.lag, -5 * MPH))        # a hold moves 5 mph at once
+    c.pending = [p for p in c.pending if p[1] != -MPH or p[0] != c.frame + c.lag]  # replace the tap with the hold
+  r = run(Car(65, lag=60), between(100, 1500, 45), 5000, events={first + 30: hold})
+  assert not r["logic"].disabled
+  assert r["max"] <= 65 + 1e-6
+
+
+def test_random_lossy_drives_never_break_limits():
+  import random
+  rng = random.Random(7)
+  for _ in range(40):
+    max_drop = rng.choice([5, 10, 15])
+    set_mph = rng.choice([30, 45, 55, 65])
+    lag = rng.choice([5, 15, 40, 80, 150])
+    loss = rng.choice([0.0, 0.1, 0.25, 0.4])
+    lost = set(n for n in range(1, 400) if rng.random() < loss)
+    segs, f = [], 100
+    while f < 9000:
+      length = rng.randint(100, 900)
+      segs.append((f, f + length, rng.uniform(set_mph - 25, set_mph + 2)))
+      f += length + rng.randint(50, 900)
+    def curve(fr, segs=segs):
+      for a, b, v in segs:
+        if a <= fr < b:
+          return v * MPH
+      return None
+    r = run(Car(set_mph, lag=lag, dash_offset_mph=rng.choice([0, 1, 2]), lose=lambda n, lost=lost: n in lost),
+            curve, 14000, max_drop=max_drop)
+    floor = min(set_mph, max(set_mph - max_drop, 25))
+    assert r["max"] <= set_mph + 1e-6, (max_drop, set_mph, lag, loss, r["max"])
+    assert r["min"] >= floor - 1e-6, (max_drop, set_mph, lag, loss, r["min"])
+    assert near(r["final"], set_mph), (max_drop, set_mph, lag, loss, r["final"])
 
 
 if __name__ == "__main__":

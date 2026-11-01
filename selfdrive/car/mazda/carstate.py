@@ -17,6 +17,8 @@ class CarState(CarStateBase):
       self.shifter_values = can_define.dv["MANUAL_GEAR"]["GEAR"]
 
     self.crz_btns_counter = 0
+    self.crz_set_plus = False     # driver's SET+ / SET- from the stock steering wheel switch (Gen1)
+    self.crz_set_minus = False
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -150,6 +152,8 @@ class CarState(CarStateBase):
     self.acc_active_last = ret.cruiseState.enabled
 
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
+    self.crz_set_plus = cp.vl["CRZ_BTNS"]["SET_P"] == 1
+    self.crz_set_minus = cp.vl["CRZ_BTNS"]["SET_M"] == 1
 
     # camera signals
     if not self.CP.flags & MazdaFlags.NO_FSC:

@@ -11,12 +11,20 @@ tested. The CAN timing follows sunnypilot's Mazda ICBM implementation (a message
 least 0.2 s apart, counter offsets [1, 1, 0, skip]).
 
 Design rules (each enforced by the logic itself, not by timing assumptions):
-  * One press at a time. After a press nothing else is sent until the set speed moves
-    one step in that direction, or a long timeout passes (and then a late arrival is
-    still recognised before anything else is sent). A lost or slow press can only make
-    the system do less, never more.
-  * Any set speed change that is not exactly our pending step is the driver: we stop
-    and leave the set speed where the driver put it.
+  * One unconfirmed press at a time. After a press nothing else is sent until the set speed
+    moves one step in that direction or PENDING_TIMEOUT passes. The car ignores roughly one
+    press in four (seen on the road), so every press stays "in flight" for LATE_WINDOW after
+    that: a late landing is still ours, and the next press is only sent if the limits below
+    hold even if every press in flight still lands. A lost or slow press can only make the
+    system do less, never more, and we never send in the opposite direction while a press
+    is in flight.
+  * The driver's own SET+/SET- taps are read from the stock steering wheel switch message, so a
+    tap in the same direction as our presses is not mistaken for one of ours landing. Any other
+    set speed change that is not exactly our pending step is the driver too: we stop
+    and leave the set speed where the driver put it. A change that is not a whole number
+    of steps is also the driver's (the Mazda minimum set speed is 30 km/h = 18.6 mph, so the
+    first tap above it is a 0.4 mph step) unless it arrives while our own press is in
+    flight, which means the dash steps in another unit: then we switch off for the drive.
   * Never press SET+ if that could go above the driver's set speed (baseline).
     Never press SET- below max(driver's speed - max drop, MIN_SET_SPEED), and never below the
     curve target plus a margin (so FrogPilot's curve flag stays on through the curve).
@@ -50,13 +58,16 @@ RESTORE_DELAY = 0.5                   # s of FrogPilot saying the curve no longe
 FLICKER_RESTORE_DELAY = 2.0           # used instead while the curve flag has just flickered back on
 FLICKER_WINDOW = 3.0                  # s: flag coming back on this soon after going off = flicker
 MIN_DWELL = 1.0                       # s at least between the last SET- and a SET+
-PENDING_TIMEOUT = 1.5                 # s to wait for a press to show on the set speed
-LATE_WINDOW = 2.0                     # s after the timeout during which a late change is still ours
-NO_EFFECT_LIMIT = 3                   # presses in a row with no effect before backing off
+PENDING_TIMEOUT = 0.5                 # s to wait for a press to show on the set speed (the car answers in < 0.2 s)
+LATE_WINDOW = 3.0                     # s after the timeout during which a late change is still ours (car speed unknown)
+LATE_FACTOR = 4                       # once the car's answer time is known, a press is lost after this many times it
+ECHO_GUARD = 0.15                     # s after our own press during which a button seen on CAN could be our own frame
+MAX_IN_FLIGHT = 3                     # presses that may be unaccounted for before we stop sending
+NO_EFFECT_LIMIT = 4                   # presses in a row with no effect before backing off
 NO_EFFECT_BACKOFF = 10.0              # s to wait after that before trying again
 NO_EFFECT_TRIPS = 3                   # back-offs before giving up (speed left alone)
 PAUSE_ABANDON = 30.0                  # s paused before we forget the driver's speed
-EXTRA_LOWER_PRESSES = 4               # SET- budget per curve = max drop steps + this
+EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
@@ -79,6 +90,7 @@ class SlowdownInputs:
   csc_active: bool         # FrogPilot Curve Speed Controller wants to slow down
   csc_speed: float         # Curve Speed Controller target, true speed m/s
   other_button_active: bool  # openpilot is sending CANCEL/RESUME this frame
+  driver_button: object = None  # SET_MINUS / SET_PLUS while the driver holds that stock button, else None
 
 
 class CurveSlowdownLogic:
@@ -95,8 +107,11 @@ class CurveSlowdownLogic:
     self.curve_free_frames = _frames(RESTORE_DELAY)
 
     self.offset = 0                  # steps we are below the driver's speed (negative: above)
-    self.pending = None              # (direction, frame) of a press not yet seen on the set speed
-    self.late = None                 # (direction, frame) of a press that timed out
+    self.pending = None              # (direction, frame) of the newest press, until it lands or times out
+    self.inflight = []               # [(direction, frame)] of presses not yet seen on the set speed, oldest first
+    self.latencies = []              # frames from our press to the set speed change, learned on the road
+    self.driver_taps = []            # [(direction, frame)] of the driver's own recent taps, not yet seen on the set speed
+    self.prev_driver_button = None
     self.no_effect = 0
     self.no_effect_trips = 0
     self.backoff_until = 0
@@ -112,7 +127,42 @@ class CurveSlowdownLogic:
 
   @property
   def managing(self):
-    return self.offset != 0 or self.pending is not None or self.late is not None
+    return self.offset != 0 or self.in_flight
+
+  @property
+  def in_flight(self):
+    """Directions of presses sent but not yet seen on the set speed, oldest first."""
+    return [d for d, _ in self.inflight]
+
+  def _matching_press(self, direction):
+    """Which press a one-step change in `direction` most likely is: ("ours", k) for inflight[k],
+    ("driver", k) for driver_taps[k], or None.
+
+    Once we have seen how fast this car answers (learned from landings with a single press in
+    flight), it is the press whose age is closest to that; an older press was ignored by the
+    car. Before that: the oldest one (a slow car answers in order)."""
+    candidates = [(("ours", k), self.frame - f) for k, (d, f) in enumerate(self.inflight) if d == direction]
+    candidates += [(("driver", k), self.frame - f) for k, (d, f) in enumerate(self.driver_taps) if d == direction]
+    if not candidates:
+      return None
+    latency = self.latency
+    if latency is None:
+      return max(candidates, key=lambda c: c[1])[0]
+    return min(candidates, key=lambda c: abs(c[1] - latency))[0]
+
+  @property
+  def latency(self):
+    """Typical frames from our press to the set speed change (median of what we have seen), or None."""
+    if not self.latencies:
+      return None
+    return sorted(self.latencies)[len(self.latencies) // 2]
+
+  def _in_flight_window(self):
+    """Frames after a press during which its landing is still recognised as ours."""
+    latency = self.latency
+    if latency is None:
+      return _frames(PENDING_TIMEOUT + LATE_WINDOW)
+    return max(_frames(PENDING_TIMEOUT), int(LATE_FACTOR * latency))
 
   def _forget(self):
     """Leave the set speed where it is and stop managing it."""
@@ -140,19 +190,40 @@ class CurveSlowdownLogic:
     self.last_set_speed = i.set_speed
     direction = SET_PLUS if delta > 0 else SET_MINUS
     steps = abs(delta) / self.step
+    match = self._matching_press(direction)
+    ours_k = match[1] if match is not None and match[0] == "ours" else None
+    driver_k = match[1] if match is not None and match[0] == "driver" else None
+    any_driver = any(d == direction for d, _ in self.driver_taps)
     if abs(steps - round(steps)) > 0.25:
-      # The car's set speed steps don't match our unit (e.g. km/h setting with an mph dash).
-      # We cannot tell our presses from the driver's: switch off for this drive.
-      self._forget()
-      self.disabled = True
+      if ours_k is not None and not any_driver and not after_gap and steps < 2.5:
+        # Our press landed as a fraction of a step: the car's set speed steps don't match our
+        # unit (e.g. km/h setting with an mph dash). We cannot tell our presses from the
+        # driver's: switch off for this drive.
+        self._forget()
+        self.pending = None
+        self.inflight = []
+        self.disabled = True
+      else:
+        # Not ours and not a whole step: the driver (e.g. the first tap above the car's
+        # 30 km/h minimum set speed, which is 18.6 mph on an mph dash).
+        self._forget()
+        self.blocked = True
       return
     one_step = round(steps) == 1
-    if one_step and self.pending is not None and self.pending[0] == direction:
+    if one_step and driver_k is not None:
+      # The driver tapped this button just before: their step, even if ours is in flight too.
+      # Their speed moves by this step: keep `offset`, so driver_speed = set_speed + offset * step
+      # shifts with it. No more lowering for this curve.
+      del self.driver_taps[driver_k]
+      self.restoring = False
+      self.blocked = True
+    elif one_step and ours_k is not None:
+      # Ours. Any landing also confirms that the car is listening, so the next press may go out.
+      if len(self.inflight) == 1 and not after_gap:
+        # Unambiguous landing with cruise on throughout: learn how fast this car answers.
+        self.latencies = (self.latencies + [self.frame - self.inflight[0][1]])[-9:]
+      del self.inflight[ours_k]
       self.pending = None
-      self._apply_ours(direction)
-    elif (one_step and self.late is not None and self.late[0] == direction and
-          self.frame - self.late[1] <= _frames(PENDING_TIMEOUT + LATE_WINDOW)):
-      self.late = None
       self._apply_ours(direction)
     elif after_gap:
       # Cruise was re-engaged at a different speed: the driver chose a new speed.
@@ -165,14 +236,18 @@ class CurveSlowdownLogic:
       # No more lowering for this curve.
       self.restoring = False
       self.blocked = True
-    elif ((self.pending is not None and self.pending[0] == direction) or
-          (self.late is not None and self.late[0] == direction)):
+    elif any_driver:
+      # The driver held the button: they set a new speed.
+      self.driver_taps = [(d, f) for d, f in self.driver_taps if d != direction]
+      self._forget()
+      self.blocked = True
+    elif ours_k is not None:
       # Several steps in the direction of our own press: the car may step more than once per
       # press (or the driver held the button at the same moment). We can't keep the limits
       # reliably, so switch off for this drive and leave the speed alone.
       self._forget()
       self.pending = None
-      self.late = None
+      self.inflight = []
       self.disabled = True
     else:
       # Several steps at once (e.g. holding the button): the driver set a new speed.
@@ -193,19 +268,25 @@ class CurveSlowdownLogic:
       # recognised as ours when cruise comes back (the set speed is not observed meanwhile).
       if self.pending is not None:
         self.pending = (self.pending[0], self.pending[1] + 1)
-      if self.late is not None:
-        self.late = (self.late[0], self.late[1] + 1)
+      self.inflight = [(d, f + 1) for d, f in self.inflight]
+
+    # The driver's own SET+/SET- taps (rising edge), ignoring the short window in which a frame
+    # we sent ourselves could be read back.
+    if (i.driver_button in (SET_MINUS, SET_PLUS) and i.driver_button != self.prev_driver_button and
+        self.frame - self.last_send_frame > _frames(ECHO_GUARD)):
+      self.driver_taps.append((i.driver_button, self.frame))
+      self.blocked = True
+    self.prev_driver_button = i.driver_button
+    self.driver_taps = [(d, f) for d, f in self.driver_taps if self.frame - f <= self._in_flight_window()]
 
     if cruise_ok:
       self._observe_set_speed(i)
 
-    # A press that never showed up: count it, but remember it for a late arrival.
+    # A press that has not shown up yet: count it; it stays in flight for a late arrival.
     if self.pending is not None and self.frame - self.pending[1] > _frames(PENDING_TIMEOUT):
-      self.late = self.pending
       self.pending = None
       self.no_effect += 1
-    if self.late is not None and self.frame - self.late[1] > _frames(PENDING_TIMEOUT + LATE_WINDOW):
-      self.late = None
+    self.inflight = [(d, f) for d, f in self.inflight if self.frame - f <= self._in_flight_window()]
     if self.no_effect >= NO_EFFECT_LIMIT:
       self.no_effect = 0
       self.no_effect_trips += 1
@@ -221,7 +302,7 @@ class CurveSlowdownLogic:
         self.flicker = True
       self.prev_csc_active = i.csc_active
       self.curve_free_frames = 0 if i.csc_active else self.curve_free_frames + 1
-    if self.offset == 0 and self.pending is None and self.late is None:
+    if self.offset == 0 and not self.in_flight:
       self.flicker = False
     restore_delay = FLICKER_RESTORE_DELAY if self.flicker else RESTORE_DELAY
     curve_over = self.curve_free_frames >= _frames(restore_delay)
@@ -241,12 +322,15 @@ class CurveSlowdownLogic:
       return None, None
     self.pause_frames = 0
 
-    # One press at a time; also wait during a back-off.
-    if self.pending is not None or self.late is not None or self.frame < self.backoff_until:
+    # One unconfirmed press at a time, a bounded number in flight; also wait during a back-off.
+    if self.pending is not None or len(self.inflight) >= MAX_IN_FLIGHT or self.frame < self.backoff_until:
       return None, None
 
-    set_speed = i.set_speed
-    driver_speed = set_speed + self.offset * self.step
+    # Decide as if every press in flight still lands: the limits then hold whether it does or not.
+    flying = sum(1 if d == SET_MINUS else -1 for d in self.in_flight)
+    set_speed = i.set_speed - flying * self.step
+    offset = self.offset + flying
+    driver_speed = set_speed + offset * self.step
     floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
     target = max(i.csc_speed + CURVE_MARGIN, floor)
 
@@ -259,13 +343,16 @@ class CurveSlowdownLogic:
     if want_lower:
       self.restoring = False
       button = SET_MINUS
-    elif self.offset != 0 and curve_over and self.frame - self.last_minus_frame >= _frames(MIN_DWELL):
+    elif offset != 0 and curve_over and self.frame - self.last_minus_frame >= _frames(MIN_DWELL):
       self.restoring = True
-      button = SET_PLUS if self.offset > 0 else SET_MINUS
-    elif self.offset == 0:
+      button = SET_PLUS if offset > 0 else SET_MINUS
+    elif offset == 0:
       self.restoring = False
 
     if button is None or i.gas_pressed or i.other_button_active:
+      return None, None
+    if any(d != button for d in self.in_flight):
+      # Never reverse direction while a press may still land.
       return None, None
     if self.frame - self.last_send_frame <= BUTTON_GAP_FRAMES:
       return None, None
@@ -277,6 +364,7 @@ class CurveSlowdownLogic:
 
     self.last_send_frame = self.frame
     self.pending = (button, self.frame)
+    self.inflight.append(self.pending)
     if button == SET_MINUS and want_lower:
       self.lower_presses += 1
       self.last_minus_frame = self.frame
@@ -313,6 +401,7 @@ class CurveSlowdown:
       csc_active=bool(plan.cscActive),
       csc_speed=float(plan.cscSpeed),
       other_button_active=other_button_active,
+      driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
     )
     button, offset = self.logic.update(inputs)
     if button is None:
