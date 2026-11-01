@@ -123,6 +123,74 @@ def test_lead_outside_our_lane_no_warning():
   assert run(repeat(inputs(50, lead=(70, 0, 0.9), lead_y=2.5), 3)) == []
 
 
+# ---------------- real plans from the 2026-11-01 drive (route 00000032--5b79f37567, Mazda CX-5, stock MRCC) ----------------
+
+REAL_T = [0.0, 0.01, 0.04, 0.09, 0.16, 0.24, 0.35, 0.48, 0.62, 0.79, 0.98, 1.18, 1.41, 1.65, 1.91, 2.2, 2.5, 2.82, 3.16, 3.53,
+          3.91, 4.31, 4.73, 5.17, 5.62, 6.1, 6.6, 7.12, 7.66, 8.21, 8.79, 9.38, 10.0]
+# t=1050.1: 50 mph, red light 4.5 s before the driver braked; the plan only eases off (min 78 %): no warning yet
+PLAN_1050 = (22.45, [22.3, 22.29, 22.29, 22.29, 22.28, 22.28, 22.25, 22.25, 22.24, 22.23, 22.19, 22.21, 22.14, 22.1, 22.07, 22.0, 21.94,
+                     21.87, 21.75, 21.63, 21.47, 21.35, 21.19, 20.98, 20.72, 20.46, 20.12, 19.77, 19.37, 18.95, 18.47, 18.02, 17.56],
+             [0.0, 0.2, 0.9, 2.0, 3.5, 5.4, 7.8, 10.7, 13.9, 17.6, 21.7, 26.3, 31.2, 36.7, 42.5, 48.7, 55.4, 62.4, 69.8, 77.7, 85.9,
+              94.5, 103.5, 112.7, 122.1, 132.1, 142.1, 152.7, 163.3, 174.0, 184.4, 195.8, 206.8])
+# t=1052.1: same light 2.5 s before the driver braked (hard, -2.8 m/s^2): plan min 63 % at 7.7 s, 148 m -> warn
+PLAN_1052 = (22.67, [22.39, 22.4, 22.4, 22.4, 22.35, 22.34, 22.31, 22.25, 22.18, 22.1, 21.99, 21.9, 21.73, 21.58, 21.42, 21.21, 21.01,
+                     20.74, 20.46, 20.13, 19.73, 19.33, 18.87, 18.31, 17.65, 16.88, 16.04, 15.13, 14.19, 13.18, 12.16, 11.22, 10.28],
+             [0.0, 0.2, 0.9, 2.0, 3.5, 5.5, 7.9, 10.7, 13.9, 17.6, 21.7, 26.2, 31.1, 36.4, 42.1, 48.0, 54.5, 61.1, 68.1, 75.5, 83.1,
+              90.8, 99.0, 107.1, 115.1, 123.7, 131.8, 139.8, 147.8, 155.4, 162.7, 170.0, 177.0])
+# t=1054.1: 0.5 s before the brake: plan min 38 %, never below 1 m/s inside the horizon (the old full-stop rule missed this)
+PLAN_1054 = (22.65, [21.8, 21.79, 21.76, 21.73, 21.67, 21.62, 21.55, 21.41, 21.26, 21.09, 20.88, 20.67, 20.37, 20.07, 19.73, 19.42,
+                     18.97, 18.47, 17.94, 17.31, 16.63, 15.91, 15.1, 14.21, 13.2, 12.11, 10.91, 9.78, 8.63, 7.5, 6.42, 5.49, 4.65],
+             [0.0, 0.2, 0.9, 1.9, 3.4, 5.3, 7.6, 10.4, 13.5, 17.0, 20.9, 25.1, 29.7, 34.7, 40.0, 45.5, 51.2, 57.3, 63.4, 69.9, 76.3,
+              82.9, 89.3, 95.7, 101.7, 107.9, 113.5, 118.8, 123.8, 128.4, 132.2, 136.1, 139.4])
+# t=1152.1: another red light 1.7 s before the brake: min 65 % at 7.7 s, 148 m (borderline deceleration, 1.0 m/s^2)
+PLAN_1152 = (22.64, [22.28, 22.25, 22.22, 22.19, 22.14, 22.1, 22.07, 22.01, 21.92, 21.84, 21.72, 21.64, 21.5, 21.36, 21.2, 21.02,
+                     20.84, 20.59, 20.31, 20.0, 19.59, 19.23, 18.77, 18.25, 17.66, 17.0, 16.27, 15.53, 14.77, 13.96, 13.17, 12.42, 11.69],
+             [0.0, 0.2, 0.9, 2.0, 3.5, 5.4, 7.8, 10.6, 13.8, 17.4, 21.5, 25.9, 30.8, 36.0, 41.6, 47.5, 53.9, 60.5, 67.6, 74.9, 82.4,
+              90.0, 98.1, 106.2, 114.3, 122.8, 131.1, 139.3, 147.5, 155.7, 163.3, 171.3, 179.0])
+
+
+def real_inputs(plan, a_ego=0.0):
+  v, mv, mx = plan
+  return sw.StopWarningInputs(cruise_enabled=True, v_ego=v, a_ego=a_ego, brake_pressed=False, standstill=False,
+                              model_t=REAL_T, model_v=mv, model_x=mx)
+
+
+def test_real_red_light_plans_warn_before_the_driver_braked():
+  for plan in (PLAN_1052, PLAN_1054, PLAN_1152):
+    out = run(repeat(real_inputs(plan), 3))
+    assert [k for _, k, _ in out] == [sw.STOP_AHEAD], (plan[0], out)
+
+
+def test_real_red_light_plan_too_early_no_warning():
+  assert run(repeat(real_inputs(PLAN_1050), 3)) == []
+
+
+def test_real_plan_sequence_fires_once_about_a_second_after_the_plan_commits():
+  frames = repeat(real_inputs(PLAN_1050), 2) + repeat(real_inputs(PLAN_1052), 2) + repeat(real_inputs(PLAN_1054), 2)
+  out = run(frames)
+  assert len(out) == 1 and out[0][1] == sw.STOP_AHEAD
+  assert abs(out[0][0] - (2 * 20 + sw._frames(sw.STOP_DEBOUNCE) - 1)) <= 1, out
+
+
+def test_short_plan_dropout_does_not_restart_debounce():
+  warn = real_inputs(PLAN_1052)
+  go = real_inputs(PLAN_1050)
+  frames = repeat(warn, 0.6) + repeat(go, sw.STOP_DROPOUT - 0.05) + repeat(warn, 0.6)
+  assert len(run(frames)) == 1
+  frames = repeat(warn, 0.6) + repeat(go, sw.STOP_DROPOUT + 0.1) + repeat(warn, 0.6)
+  assert run(frames) == []
+
+
+def test_slowdown_beyond_horizon_ignored():
+  # The plan only gets slow after 8 s: not within the horizon
+  v = 20.0
+  mv = [v if t <= 8.3 else 5.0 for t in REAL_T]
+  mx = [v * t for t in REAL_T]
+  i = sw.StopWarningInputs(cruise_enabled=True, v_ego=v, a_ego=0.0, brake_pressed=False, standstill=False,
+                           model_t=REAL_T, model_v=mv, model_x=mx)
+  assert run(repeat(i, 3)) == []
+
+
 def test_far_horizon_single_dip_no_warning():
   v = 40 * MPH
   mv, mx = model_cruise(v)

@@ -177,10 +177,11 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       // Stop warnings: Off / Test (log only, no sound) / On
       std::vector<QString> warn_texts{tr("Off"), tr("Test"), tr("On")};
       addItem(new ButtonParamControl("StopWarningRedLight", tr("Stop Ahead Warning"),
-                                     tr("Warns when the driving model plans to stop soon (red light, stop sign...), there is no car "
-                                        "ahead, you are above 25 mph and the car is not slowing down. This is the model's plan to stop, "
-                                        "not a traffic light colour detector. \"Test\" makes no sound and only records each time it "
-                                        "would have warned (in stop_warnings.csv) so you can check for false alarms first."),
+                                     tr("Warns when the driving model plans to slow down a lot within the next 8 seconds (red light, "
+                                        "stop sign, turn...), there is no car ahead, you are above 25 mph and the car is not slowing "
+                                        "down. This is the model's plan, not a traffic light colour detector. \"Test\" makes no sound "
+                                        "and only records each time it would have warned (in stop_warnings.csv) so you can check for "
+                                        "false alarms first."),
                                      "../assets/offroad/icon_warning.png", warn_texts, 150));
       addItem(new ButtonParamControl("StopWarningStoppedCar", tr("Stopped Car Warning"),
                                      tr("Warns when the car ahead is stopped or nearly stopped, you are closing in fast above 20 mph "

@@ -2,9 +2,13 @@
 Stop warnings for cars where openpilot cannot brake (e.g. Gen1 Mazda on stock radar cruise).
 
 Two independent warnings, each with its own setting (0 = off, 1 = test, 2 = on):
-  * Stop ahead ("red light"): the driving model plans a full stop soon, there is no relevant
-    lead car, and the car is not slowing down. Note: this is the model's *plan* to stop
-    (red light, stop sign, sharp turn...), not a traffic light colour detector.
+  * Stop ahead ("red light"): the driving model plans to slow down a lot soon (to at most
+    STOP_SLOWDOWN of the current speed within STOP_HORIZON, the same rule FrogPilot's own
+    stop light detection uses), the planned deceleration is significant, there is no relevant
+    lead car, and the car is not slowing down. Note: this is the model's *plan* (red light,
+    stop sign, sharp turn...), not a traffic light colour detector. At 45-50 mph the model's
+    plan does not reach a full stop inside its horizon before the driver brakes (seen on the
+    road), so a full-stop criterion would never fire; the slowdown fraction does.
   * Stopped car ahead: the lead car is stopped or nearly stopped, we are closing in fast,
     and the car is not slowing down.
 
@@ -31,14 +35,15 @@ MS_PER_MPH = 0.44704
 
 OFF, TEST, ON = 0, 1, 2
 
-# Stop ahead (model plans to stop)
-STOP_SPEED = 1.0                # m/s: the model's planned speed below this counts as stopped
-STOP_HORIZON = 8.0              # s: the planned stop must be within this time (urgency is checked by STOP_DECEL)
+# Stop ahead (model plans to slow down a lot / stop)
+STOP_SLOWDOWN = 0.70            # planned minimum speed <= this fraction of the current speed (FrogPilot's SLOWDOWN_PERCENTAGE)
+STOP_HORIZON = 8.0              # s of the plan that count (FrogPilot's STOP_TIME)
 STOP_MIN_SPEED = 25 * MS_PER_MPH
-STOP_DECEL = 2.0                # m/s^2: required deceleration to stop in time
-STOP_BUFFER = 2.0               # m subtracted from the stop distance
-STOP_HOLD_POINTS = 2            # the planned speed must stay below STOP_SPEED for this many points
+STOP_DECEL = 0.9                # m/s^2: deceleration the plan implies to reach that speed where it is planned
+STOP_BUFFER = 2.0               # m subtracted from the planned distance
 STOP_DEBOUNCE = 1.0             # s
+STOP_DROPOUT = 0.25             # s: the plan may miss the condition this long without restarting the debounce
+STOP_HOLD_POINTS = 2            # the slowdown must hold for this many consecutive plan points (single dips are noise)
 
 # Stopped car ahead
 LEAD_MIN_SPEED = 20 * MS_PER_MPH
@@ -111,9 +116,10 @@ class Detection:
 
 
 class _Gate:
-  """Debounce + one-per-event latch + minimum gap for one warning kind."""
-  def __init__(self, debounce):
+  """Debounce (tolerating short dropouts) + one-per-event latch + minimum gap for one warning kind."""
+  def __init__(self, debounce, dropout=0.0):
     self.debounce_frames = _frames(debounce)
+    self.dropout_frames = _frames(dropout)
     self.true_frames = 0
     self.false_frames = _frames(REARM_TIME)
     self.latched = False
@@ -124,8 +130,9 @@ class _Gate:
       self.true_frames += 1
       self.false_frames = 0
     else:
-      self.true_frames = 0
       self.false_frames += 1
+      if self.false_frames > self.dropout_frames:
+        self.true_frames = 0
       if self.false_frames >= _frames(REARM_TIME):
         self.latched = False
     if (condition and not self.latched and self.true_frames >= self.debounce_frames and
@@ -139,7 +146,7 @@ class _Gate:
 class StopWarningLogic:
   def __init__(self):
     self.frame = 0
-    self.gates = {STOP_AHEAD: _Gate(STOP_DEBOUNCE), STOPPED_LEAD: _Gate(LEAD_DEBOUNCE)}
+    self.gates = {STOP_AHEAD: _Gate(STOP_DEBOUNCE, STOP_DROPOUT), STOPPED_LEAD: _Gate(LEAD_DEBOUNCE)}
     self.a_filtered = None
 
   def not_slowing(self, i):
@@ -150,24 +157,24 @@ class StopWarningLogic:
   def stop_ahead(self, i):
     if i.lead_relevant or i.v_ego < STOP_MIN_SPEED or not i.model_t or len(i.model_t) != len(i.model_v):
       return None
-    # First time the plan drops below STOP_SPEED and stays there for STOP_HOLD_POINTS points
-    # (a single low point far ahead is model noise, not a planned stop).
-    t_stop = None
+    # Slowest point of the plan within the horizon (FrogPilot's stop light rule: <= 70 % of our
+    # speed), counting only points where the next point is slow too (a single dip is model noise).
+    slow = STOP_SLOWDOWN * i.v_ego
+    t_min, v_min = None, None
     for k, (t, v) in enumerate(zip(i.model_t, i.model_v)):
       if t > STOP_HORIZON:
         break
       held = i.model_v[k:k + STOP_HOLD_POINTS]
-      if len(held) == STOP_HOLD_POINTS and all(x < STOP_SPEED for x in held):
-        t_stop = t
-        break
-    if t_stop is None:
+      if len(held) == STOP_HOLD_POINTS and all(x <= slow for x in held) and (v_min is None or v < v_min):
+        t_min, v_min = t, v
+    if t_min is None:
       return None
     xs = i.model_x if len(i.model_x) == len(i.model_t) else []
-    d_stop = _interp(t_stop, i.model_t, xs) if xs else i.v_ego * t_stop / 2
-    required = i.v_ego ** 2 / (2 * max(d_stop - STOP_BUFFER, 1.0))
+    d_min = _interp(t_min, i.model_t, xs) if xs else (i.v_ego + v_min) * t_min / 2
+    required = (i.v_ego ** 2 - max(v_min, 0.0) ** 2) / (2 * max(d_min - STOP_BUFFER, 1.0))
     if required < STOP_DECEL:
       return None
-    return Detection(STOP_AHEAD, d_stop, required, t_stop)
+    return Detection(STOP_AHEAD, d_min, required, t_min)
 
   def stopped_lead(self, i):
     if not i.lead_status or i.lead_prob < LEAD_MIN_PROB or i.v_ego < LEAD_MIN_SPEED:
