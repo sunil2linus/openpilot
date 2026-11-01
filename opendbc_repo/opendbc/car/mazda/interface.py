@@ -89,7 +89,10 @@ class CarInterface(CarInterfaceBase):
       ret.transmissionType = structs.CarParams.TransmissionType.automatic
 
     if candidate in GEN1:
-      ret.steerActuatorDelay = 0.335
+      # 0.1 s is the Gen1 value of both upstream StarPilot and mazda-frogpilot-dev (0.335 came from
+      # MoreTore's StarPilot-dev, where it was copied from the Gen2 value). lagd starts from this
+      # value until it has learned the real delay, so it matters for the first drives.
+      ret.steerActuatorDelay = 0.1
       ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.GEN1.value
       if p.get_bool("TorqueInterceptorEnabled"): # Torque Interceptor Installed
         ret.flags |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
