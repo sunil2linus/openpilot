@@ -9,7 +9,7 @@ from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.carlog import carlog
 from opendbc.car.structs import CarParams, CarParamsT
 from opendbc.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
-from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_present_ecus, match_fw_to_car
+from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_present_ecus, match_fw_to_car, reattribute_fw_versions
 from opendbc.car.hyundai.values import kia_ray_ev_vin
 from opendbc.car.mock.values import CAR as MOCK
 from opendbc.car.toyota.values import ToyotaSafetyFlags
@@ -204,6 +204,38 @@ def _get_gm_stored_candidate_fallback(fingerprints: dict[int, dict], stored_cand
   return None
 
 
+def _get_vin_matched_stored_candidate(params: Params, vin: str) -> str | None:
+  """Last live-fingerprinted platform of this exact car (same VIN), for when the live FW query fails.
+
+  The FW query is a timing-sensitive exchange (0.1 s ISO-TP timeouts) that can miss when the panda
+  is slow to transmit or busy with a bus in error (seen on a Mazda CX-5: all three Mazda queries
+  timed out and the car fell to MOCK although every FW version was known). A valid VIN that equals
+  the VIN of the CarParams persisted from a previous live FW fingerprint identifies the same car.
+  """
+  if not is_valid_vin(vin) or vin == VIN_UNKNOWN:
+    return None
+  try:
+    persistent_raw = params.get("CarParamsPersistent")
+  except Exception:
+    return None
+  if persistent_raw is None:
+    return None
+  try:
+    with CarParams.from_bytes(persistent_raw) as persistent:
+      stored_vin = str(persistent.carVin)
+      stored_candidate = _normalize_forced_candidate(str(persistent.carFingerprint))
+      # fw: previous live FW fingerprint of this car; fixed: a previous use of this fallback (or the
+      # FINGERPRINT env). A forced/CAN-fingerprinted or MOCK CarParams never qualifies.
+      trusted_source = persistent.fingerprintSource in (CarParams.FingerprintSource.fw, CarParams.FingerprintSource.fixed)
+  except Exception:
+    return None
+  if stored_vin != vin or not trusted_source:
+    return None
+  if stored_candidate is None or stored_candidate == MOCK.MOCK or stored_candidate not in interfaces:
+    return None
+  return stored_candidate
+
+
 def _apply_starpilot_access_policy(candidate: str, starpilot_toggles: SimpleNamespace | None) -> str:
   # Branch-based dashcam gating was removed. Keep the resolved candidate even if
   # an older serialized toggle payload still contains block_user=True.
@@ -289,6 +321,18 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
       cached = False
 
     exact_fw_match, fw_candidates = match_fw_to_car(car_fw, vin)
+    if not len(fw_candidates) and len(car_fw):
+      # A brand's own query can time out while a later brand's byte-identical query to the
+      # same ECUs succeeds (seen on a Mazda CX-5: the panda stalled for ~0.3 s during the Mazda
+      # queries, Ford's identical requests 1.6 s later got all five Mazda ECUs' versions, and the
+      # car fell to MOCK). Those responses are valid for every brand that sends the same query.
+      reattributed = reattribute_fw_versions(car_fw)
+      if len(reattributed):
+        exact_fw_match, fw_candidates = match_fw_to_car(car_fw + reattributed, vin)
+        if len(fw_candidates):
+          carlog.error({"event": "fingerprinted with re-attributed FW responses", "candidates": [str(c) for c in fw_candidates],
+                        "reattributed": [(str(f.brand), hex(f.address), f.bus) for f in reattributed]})
+          car_fw = car_fw + reattributed
   else:
     vin_rx_addr, vin_rx_bus, vin = -1, -1, VIN_UNKNOWN
     exact_fw_match, fw_candidates, car_fw = True, set(), []
@@ -353,6 +397,17 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
         "cached_candidate": cached_candidate,
       })
       candidate = gm_fallback_candidate
+
+  if candidate is None:
+    vin_fallback_candidate = _get_vin_matched_stored_candidate(params, vin)
+    if vin_fallback_candidate is not None:
+      carlog.error({
+        "event": "using stored candidate with matching VIN after failed live fingerprint",
+        "candidate": vin_fallback_candidate,
+        "vin": vin,
+      })
+      candidate = vin_fallback_candidate
+      source = CarParams.FingerprintSource.fixed
 
   if candidate is None or starpilot_toggles.force_fingerprint:
     if starpilot_toggles.force_fingerprint:

@@ -143,6 +143,83 @@ def match_fw_to_car_exact(live_fw_versions: LiveFwVersions, match_brand: str = N
   return set(candidates.keys()) - invalid
 
 
+def _request_signature(request: list[bytes], bus: int, obd_multiplexing: bool, rx_offset: int) -> tuple:
+  return (tuple(bytes(r) for r in request), bus, bool(obd_multiplexing), rx_offset)
+
+
+def reattribute_fw_versions(fw_versions: list[CarParams.CarFw]) -> list[CarParams.CarFw]:
+  """Re-tag FW responses for every other brand that sends the byte-identical query.
+
+  get_fw_versions() tags each response with the brand whose query produced it, and
+  match_fw_to_car() only looks at a brand's own responses. Several brands send the same
+  UDS query (e.g. [TESTER_PRESENT, MANUFACTURER_SOFTWARE_VERSION_REQUEST] on bus 0 with
+  OBD multiplexing) to the same ECU addresses, so when one brand's query times out (slow
+  panda, bus error storm) and a later brand's identical query to the same ECU succeeds,
+  the response is valid for the first brand too, but is never matched against its database.
+
+  Returns copies of the responses tagged with each other brand that has an identical
+  non-logging request (request bytes, response bytes, bus, OBD multiplexing, rx offset) and
+  that knows the ECU at that address (whitelisted for that request, not one of its
+  extra_ecus). The origin brand's logging flags do not matter: they express that brand's
+  own policy for its own cars (e.g. Ford logs 0x7E0 and its bus-1 responses), while the
+  bytes on the wire are the same answer the other brand's identical query would have
+  received. The FW strings are untouched, so exact matching stays exact.
+  """
+  # (brand, request signature) -> response bytes
+  responses_by_request: dict[tuple, tuple] = {}
+  for brand, _, r in REQUESTS:
+    responses_by_request[(brand, _request_signature(r.request, r.bus, r.obd_multiplexing, r.rx_offset))] = \
+      tuple(bytes(x) for x in r.response)
+
+  ecu_types_by_brand: dict[str, dict[AddrType, int]] = {}
+  for brand, config in FW_QUERY_CONFIGS.items():
+    ecu_types_by_brand[brand] = {(addr, sub_addr): ecu_type for ecu_type, addr, sub_addr in config.get_all_ecus(VERSIONS[brand])}
+
+  seen = {(fw.brand, fw.address, fw.subAddress, bytes(fw.fwVersion), fw.bus) for fw in fw_versions}
+  extra: list[CarParams.CarFw] = []
+  for fw in fw_versions:
+    sub_addr = fw.subAddress if fw.subAddress != 0 else None
+    rx_offset = fw.responseAddress - fw.address
+    if rx_offset <= 0:
+      continue
+    signature = _request_signature(list(fw.request), fw.bus, fw.obdMultiplexing, rx_offset)
+    origin_response = responses_by_request.get((fw.brand, signature))
+    if origin_response is None:
+      continue
+
+    for brand, config, r in REQUESTS:
+      if brand == fw.brand or r.logging:
+        continue
+      if _request_signature(r.request, r.bus, r.obd_multiplexing, r.rx_offset) != signature:
+        continue
+      if tuple(bytes(x) for x in r.response) != origin_response:
+        continue
+      ecu = ecu_types_by_brand[brand].get((fw.address, sub_addr))
+      if ecu is None or (ecu, fw.address, sub_addr) in config.extra_ecus:
+        continue
+      if len(r.whitelist_ecus) and ecu not in r.whitelist_ecus:
+        continue
+      key = (brand, fw.address, fw.subAddress, bytes(fw.fwVersion), fw.bus)
+      if key in seen:
+        continue
+      seen.add(key)
+
+      f = CarParams.CarFw()
+      f.ecu = ecu
+      f.fwVersion = bytes(fw.fwVersion)
+      f.address = fw.address
+      f.subAddress = fw.subAddress
+      f.responseAddress = fw.responseAddress
+      f.request = [bytes(x) for x in fw.request]
+      f.brand = brand
+      f.bus = fw.bus
+      f.logging = False
+      f.obdMultiplexing = fw.obdMultiplexing
+      extra.append(f)
+
+  return extra
+
+
 def match_fw_to_car(fw_versions: list[CarParams.CarFw], vin: str, allow_exact: bool = True,
                     allow_fuzzy: bool = True, log: bool = True) -> tuple[bool, set[str]]:
   # Try exact matching first
