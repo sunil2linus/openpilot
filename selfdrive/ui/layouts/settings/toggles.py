@@ -32,12 +32,15 @@ DESCRIPTIONS = {
   "IsRHD": tr_noop("Use right-hand-drive driver monitoring. This follows the auto-detected side until changed manually."),
   "IsMetric": tr_noop("Display speed in km/h instead of mph."),
   "RecordAudio": tr_noop("Record and store microphone audio while driving. The audio will be included in the dashcam video in comma connect."),
-  "TorqueInterceptorEnabled": tr_noop("Enable the torque interceptor to control the steering wheel."),
-  "RadarInterceptorEnabled": tr_noop("Enable if you have installed the radar Iterceptor."),
-  "NoMRCC": tr_noop("Enable if your car does not have stock MRCC."),
-  "NoFSC": tr_noop("Enable if your car does not have stock FSC."),
-  "ManualTransmission": tr_noop("Enable if your car has a manual transmission."),
+  "TorqueInterceptorEnabled": tr_noop("Mazda: a MoreTorque Torque Interceptor is installed. openpilot steers through it, also below the stock LKAS speed."),
+  "RadarInterceptorEnabled": tr_noop("Mazda: a Radar Interceptor is installed. openpilot controls gas and brakes through it."),
+  "NoMRCC": tr_noop("Mazda: the car does not have stock radar cruise control (MRCC)."),
+  "NoFSC": tr_noop("Mazda: the car does not have the stock front camera (FSC)."),
+  "ManualTransmission": tr_noop("Mazda: the car has a manual transmission."),
+  "BlendedACC": tr_noop("Mazda with Radar Interceptor: blend openpilot and stock cruise acceleration. openpilot's value is used when Conditional Experimental Mode is active."),
 }
+
+MAZDA_TOGGLES = ("TorqueInterceptorEnabled", "RadarInterceptorEnabled", "NoMRCC", "NoFSC", "ManualTransmission", "BlendedACC")
 
 
 class TogglesLayout(Widget):
@@ -122,13 +125,13 @@ class TogglesLayout(Widget):
         True,
       ),
       "NoMRCC": (
-        lambda: tr("Disable Stock MRCC"),
+        lambda: tr("No Stock MRCC"),
         DESCRIPTIONS["NoMRCC"],
         "chffr_wheel.png",
         True,
       ),
       "NoFSC": (
-        lambda: tr("Disable Stock FSC"),
+        lambda: tr("No Stock Front Camera (FSC)"),
         DESCRIPTIONS["NoFSC"],
         "chffr_wheel.png",
         True,
@@ -136,6 +139,12 @@ class TogglesLayout(Widget):
       "ManualTransmission": (
         lambda: tr("Manual Transmission"),
         DESCRIPTIONS["ManualTransmission"],
+        "chffr_wheel.png",
+        True,
+      ),
+      "BlendedACC": (
+        lambda: tr("Blended ACC"),
+        DESCRIPTIONS["BlendedACC"],
         "chffr_wheel.png",
         True,
       ),
@@ -177,6 +186,10 @@ class TogglesLayout(Widget):
       # track for engaged state updates
       if locked:
         self._locked_toggles.add(param)
+
+      # Mazda-only hardware toggles: hide them once the car is known and it is not a Mazda
+      if param in MAZDA_TOGGLES:
+        toggle.set_visible(lambda: ui_state.CP is None or ui_state.CP.brand == "mazda")
 
       self._toggles[param] = toggle
 

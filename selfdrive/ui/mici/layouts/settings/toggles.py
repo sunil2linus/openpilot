@@ -34,6 +34,7 @@ class TogglesLayoutMici(NavScroller):
     enable_no_mrcc = BigParamControl("no stock MRCC", "NoMRCC", toggle_callback=restart_needed_callback)
     enable_no_fsc = BigParamControl("no stock FSC", "NoFSC", toggle_callback=restart_needed_callback)
     enable_manual_transmission = BigParamControl("manual transmission", "ManualTransmission", toggle_callback=restart_needed_callback)
+    enable_blended_acc = BigParamControl("blended acc", "BlendedACC", toggle_callback=restart_needed_callback)
 
     self._scroller.add_widgets([
       self._personality_toggle,
@@ -51,6 +52,7 @@ class TogglesLayoutMici(NavScroller):
       enable_no_mrcc,
       enable_no_fsc,
       enable_manual_transmission,
+      enable_blended_acc,
     ])
 
     # Toggle lists
@@ -69,11 +71,19 @@ class TogglesLayoutMici(NavScroller):
       ("NoMRCC", enable_no_mrcc),
       ("NoFSC", enable_no_fsc),
       ("ManualTransmission", enable_manual_transmission),
+      ("BlendedACC", enable_blended_acc),
     )
 
     enable_openpilot.set_enabled(lambda: not ui_state.engaged)
     record_front.set_enabled(False if ui_state.params.get_bool("RecordFrontLock") else (lambda: not ui_state.engaged))
     record_mic.set_enabled(lambda: not ui_state.engaged)
+
+    # Mazda-only hardware toggles: they restart openpilot, so block them while engaged,
+    # and hide them once the car is known and it is not a Mazda
+    for mazda_toggle in (enable_torque_interceptor, enable_radar_interceptor, enable_no_mrcc,
+                         enable_no_fsc, enable_manual_transmission, enable_blended_acc):
+      mazda_toggle.set_enabled(lambda: not ui_state.engaged)
+      mazda_toggle.set_visible(lambda: ui_state.CP is None or ui_state.CP.brand == "mazda")
 
     if ui_state.params.get_bool("ShowDebugInfo"):
       gui_app.set_show_touches(True)

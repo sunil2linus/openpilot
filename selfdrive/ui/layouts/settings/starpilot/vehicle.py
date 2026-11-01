@@ -435,14 +435,14 @@ class VehicleSettingsManagerView(PanelManagerView):
         "set_state": lambda s: self._controller._on_toggle("RadarInterceptorEnabled"),
       })
       toggles.append({
-        "title": tr("Disable Stock MRCC"),
-        "subtitle": tr("Enable if your car does not have stock MRCC."),
+        "title": tr("No Stock MRCC"),
+        "subtitle": tr("Enable if your car does not have stock radar cruise control (MRCC)."),
         "get_state": lambda: self._controller._params.get_bool("NoMRCC"),
         "set_state": lambda s: self._controller._on_toggle("NoMRCC"),
       })
       toggles.append({
-        "title": tr("Disable Stock FSC"),
-        "subtitle": tr("Enable if your car does not have stock FSC."),
+        "title": tr("No Stock Front Camera (FSC)"),
+        "subtitle": tr("Enable if your car does not have the stock front camera (FSC)."),
         "get_state": lambda: self._controller._params.get_bool("NoFSC"),
         "set_state": lambda s: self._controller._on_toggle("NoFSC"),
       })
@@ -451,6 +451,12 @@ class VehicleSettingsManagerView(PanelManagerView):
         "subtitle": tr("Enable if your car has a manual transmission."),
         "get_state": lambda: self._controller._params.get_bool("ManualTransmission"),
         "set_state": lambda s: self._controller._on_toggle("ManualTransmission"),
+      })
+      toggles.append({
+        "title": tr("Blended ACC"),
+        "subtitle": tr("With a Radar Interceptor: blend openpilot and stock cruise acceleration."),
+        "get_state": lambda: self._controller._params.get_bool("BlendedACC"),
+        "set_state": lambda s: self._controller._on_toggle("BlendedACC"),
       })
 
     return toggles
