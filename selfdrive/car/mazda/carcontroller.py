@@ -3,6 +3,8 @@ from opendbc.can.packer import CANPacker
 from openpilot.selfdrive.car import apply_driver_steer_torque_limits, apply_ti_steer_torque_limits
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.car.mazda import mazdacan
+from openpilot.selfdrive.car.mazda.curve_slowdown import CurveSlowdown
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
 from openpilot.common.realtime import ControlsTimer as Timer, DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -30,6 +32,17 @@ class CarController(CarControllerBase):
     self.long_active_last = False
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
+
+    # Optional: lower the stock cruise set speed for curves with SET-/SET+ button presses.
+    # Gen1 with stock MRCC only (no Radar Interceptor, no openpilot longitudinal alpha). Default off.
+    self.curve_slowdown = None
+    if (CP.flags & MazdaFlags.GEN1 and not CP.flags & (MazdaFlags.RADAR_INTERCEPTOR | MazdaFlags.NO_MRCC) and
+        self.params.get_bool("MazdaCurveSlowdown") and not self.params.get_bool("ExperimentalLongitudinalEnabled")):
+      try:
+        self.curve_slowdown = CurveSlowdown(CP, self.params)
+      except Exception:
+        cloudlog.exception("mazda curve slowdown init failed, disabled")
+        self.curve_slowdown = None
 
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
@@ -68,6 +81,15 @@ class CarController(CarControllerBase):
           # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
           # Send Resume button when planner wants car to move
           can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+
+      if self.curve_slowdown is not None:
+        try:
+          other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume)
+          can_sends.extend(self.curve_slowdown.update(CC, CS, self.packer, self.CP, other_button_active))
+        except Exception:
+          # Never let this optional feature affect steering: turn it off for the rest of the drive.
+          cloudlog.exception("mazda curve slowdown failed, disabling")
+          self.curve_slowdown = None
 
       # send HUD alerts
       if self.frame % 50 == 0:

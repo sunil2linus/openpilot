@@ -60,6 +60,16 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "../assets/offroad/icon_openpilot.png",
     },
     {
+      "MazdaCurveSlowdown",
+      tr("Curve Slowdown with Cruise Buttons (Experimental)"),
+      tr("Gen1 Mazda with stock radar cruise only. Lowers the stock cruise set speed before curves by pressing SET- for you, "
+         "as much as the Curve Speed Controller says the curve needs (up to the maximum drop below, never below 25 mph), then "
+         "raises it back with SET+ while you exit the curve, never above your own set speed. Needs the Curve Speed Controller "
+         "turned on. If you brake and resume at the lowered speed, it still restores your speed. If you change the set speed "
+         "yourself, it uses your new speed. The stock cruise still does all braking. Takes effect on the next drive."),
+      "../assets/offroad/icon_openpilot.png",
+    },
+    {
       "NoMRCC",
       tr("Car Does not have stock MRCC"),
       tr("Enable if your car does not have stock MRCC."),
@@ -153,6 +163,16 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
     // insert longitudinal personality after NDOG toggle
     if (param == "DisengageOnAccelerator") {
       addItem(long_personality_setting);
+    }
+
+    // Mazda curve slowdown: maximum drop selector right after its toggle
+    if (param == "MazdaCurveSlowdown") {
+      std::vector<QString> drop_texts{tr("5 mph"), tr("10 mph"), tr("15 mph")};
+      addItem(new ButtonParamControl("MazdaCurveSlowdownMaxDrop", tr("Curve Slowdown: Maximum Drop"),
+                                     tr("How far below your set speed the curve slowdown may go. It only drops as much as the "
+                                        "curve needs, up to this limit. Larger drops take a few seconds of button presses. "
+                                        "In km/h: 8, 16 or 24 km/h. Takes effect on the next drive."),
+                                     "../assets/offroad/icon_speed_limit.png", drop_texts));
     }
   }
 

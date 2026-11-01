@@ -593,6 +593,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"NoMRCC", PERSISTENT},
     {"NoFSC", PERSISTENT},
     {"BlendedACC", PERSISTENT},
+    {"MazdaCurveSlowdown", PERSISTENT},
+    {"MazdaCurveSlowdownMaxDrop", PERSISTENT},
     {"ManualTransmission", PERSISTENT},
     {"RemoteAccess", PERSISTENT},
 };

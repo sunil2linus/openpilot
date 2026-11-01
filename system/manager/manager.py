@@ -49,6 +49,8 @@ def manager_init() -> None:
     ("OpenpilotEnabledToggle", "1"),
     ("LongitudinalPersonality", str(log.LongitudinalPersonality.standard)),
     ("BlendedACC", "1"),
+    ("MazdaCurveSlowdown", "0"),
+    ("MazdaCurveSlowdownMaxDrop", "1"),
     ("RecordRoad", "1"),
     ("RemoteAccess", "0"),
     ("TorqueInterceptorEnabled", "1"),
