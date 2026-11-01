@@ -18,7 +18,7 @@ def get_calibration(params):
   yaw = None
   msg_bytes = params.get("CalibrationParams")
   if msg_bytes:
-    calibration = messaging.log_from_bytes(msg_bytes, log.Event).liveCalibration
+    calibration = messaging.log_from_bytes(msg_bytes).liveCalibration
     if calibration.calStatus != log.LiveCalibrationData.Status.uncalibrated:
       pitch = math.degrees(calibration.rpyCalib[1])
       yaw = math.degrees(calibration.rpyCalib[2])
