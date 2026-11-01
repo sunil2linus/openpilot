@@ -160,12 +160,14 @@ class StopWarningLogic:
     self.a_filtered = i.a_ego if self.a_filtered is None else self.a_filtered + alpha * (i.a_ego - self.a_filtered)
     return not i.brake_pressed and self.a_filtered > NOT_SLOWING_ACCEL
 
-  def stop_ahead(self, i):
-    if i.lead_relevant or i.v_ego < STOP_MIN_SPEED or not i.model_t or len(i.model_t) != len(i.model_v):
+  @staticmethod
+  def plan_slowdown(i, fraction=STOP_SLOWDOWN):
+    """Slowest point of the plan within the horizon that is <= fraction of our speed for
+    STOP_HOLD_POINTS consecutive points (a single dip is model noise): (t, v, distance, implied
+    deceleration to get there) or None."""
+    if not i.model_t or len(i.model_t) != len(i.model_v):
       return None
-    # Slowest point of the plan within the horizon (FrogPilot's stop light rule: <= 70 % of our
-    # speed), counting only points where the next point is slow too (a single dip is model noise).
-    slow = STOP_SLOWDOWN * i.v_ego
+    slow = fraction * i.v_ego
     t_min, v_min = None, None
     for k, (t, v) in enumerate(zip(i.model_t, i.model_v)):
       if t > STOP_HORIZON:
@@ -178,23 +180,94 @@ class StopWarningLogic:
     xs = i.model_x if len(i.model_x) == len(i.model_t) else []
     d_min = _interp(t_min, i.model_t, xs) if xs else (i.v_ego + v_min) * t_min / 2
     required = (i.v_ego ** 2 - max(v_min, 0.0) ** 2) / (2 * max(d_min - STOP_BUFFER, 1.0))
-    if required < STOP_DECEL:
+    return t_min, v_min, d_min, required
+
+  def stop_ahead(self, i):
+    if i.lead_relevant or i.v_ego < STOP_MIN_SPEED:
       return None
+    plan = self.plan_slowdown(i)
+    if plan is None or plan[3] < STOP_DECEL:
+      return None
+    t_min, v_min, d_min, required = plan
     return Detection(STOP_AHEAD, d_min, required, t_min)
+
+  @staticmethod
+  def lead_metrics(i):
+    """(closing speed, time to collision, required deceleration) for the current lead."""
+    closing = i.v_ego - i.lead_v
+    ttc = i.lead_d / closing if closing > 0.1 else float("inf")
+    required = closing ** 2 / (2 * max(i.lead_d - LEAD_BUFFER, 1.0)) if closing > 0 else 0.0
+    return closing, ttc, required
 
   def stopped_lead(self, i):
     if not i.lead_status or i.lead_prob < LEAD_MIN_PROB or i.v_ego < LEAD_MIN_SPEED:
       return None
     if i.lead_v > LEAD_STOPPED_SPEED or i.lead_d <= 0 or abs(i.lead_y) > LEAD_MAX_LATERAL:
       return None
-    closing = i.v_ego - i.lead_v
+    closing, ttc, required = self.lead_metrics(i)
     if closing < LEAD_MIN_CLOSING:
       return None
-    ttc = i.lead_d / closing
-    required = closing ** 2 / (2 * max(i.lead_d - LEAD_BUFFER, 1.0))
     if ttc > LEAD_MAX_TTC or required < LEAD_DECEL:
       return None
     return Detection(STOPPED_LEAD, i.lead_d, required, ttc, i.lead_v, i.lead_prob)
+
+  # ---- diagnostics for the per-event logs (what blocked a candidate) ----
+  def common_blockers(self, i, mode):
+    out = []
+    if mode == OFF:
+      out.append("setting off")
+    if not i.cruise_enabled:
+      out.append("cruise off")
+    if i.standstill:
+      out.append("standstill")
+    if i.brake_pressed:
+      out.append("brake pressed")
+    if self.a_filtered is not None and self.a_filtered <= NOT_SLOWING_ACCEL:
+      out.append(f"already slowing aEgo {self.a_filtered:.2f} <= {NOT_SLOWING_ACCEL}")
+    return out
+
+  def stop_ahead_blockers(self, i, mode):
+    out = self.common_blockers(i, mode)
+    if i.lead_relevant:
+      out.append(f"lead relevant d {i.lead_d:.0f} m vLead {i.lead_v / MS_PER_MPH:.0f} mph")
+    if i.v_ego < STOP_MIN_SPEED:
+      out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {STOP_MIN_SPEED / MS_PER_MPH:.0f} mph")
+    plan = self.plan_slowdown(i)
+    if plan is None:
+      loose = self.plan_slowdown(i, 1.0)
+      ratio = loose[1] / max(i.v_ego, 0.1) if loose else 1.0
+      out.append(f"plan min {ratio:.2f} > {STOP_SLOWDOWN:.2f} of speed (2 points)")
+    elif plan[3] < STOP_DECEL:
+      out.append(f"implied decel {plan[3]:.2f} < {STOP_DECEL}")
+    if not out:
+      gate = self.gates[STOP_AHEAD]
+      out.append("debounce" if gate.true_frames < gate.debounce_frames else "latched or min gap")
+    return out
+
+  def stopped_lead_blockers(self, i, mode):
+    out = self.common_blockers(i, mode)
+    if not i.lead_status:
+      out.append("no lead")
+    else:
+      if i.lead_prob < LEAD_MIN_PROB:
+        out.append(f"prob {i.lead_prob:.2f} < {LEAD_MIN_PROB}")
+      if abs(i.lead_y) > LEAD_MAX_LATERAL:
+        out.append(f"yRel {i.lead_y:.1f} > {LEAD_MAX_LATERAL}")
+      if i.lead_v > LEAD_STOPPED_SPEED:
+        out.append(f"vLead {i.lead_v:.1f} > {LEAD_STOPPED_SPEED} m/s")
+      closing, ttc, required = self.lead_metrics(i)
+      if closing < LEAD_MIN_CLOSING:
+        out.append(f"closing {closing:.1f} < {LEAD_MIN_CLOSING} m/s")
+      if ttc > LEAD_MAX_TTC:
+        out.append(f"ttc {ttc:.1f} > {LEAD_MAX_TTC} s")
+      if required < LEAD_DECEL:
+        out.append(f"required decel {required:.2f} < {LEAD_DECEL}")
+    if i.v_ego < LEAD_MIN_SPEED:
+      out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {LEAD_MIN_SPEED / MS_PER_MPH:.0f} mph")
+    if not out:
+      gate = self.gates[STOPPED_LEAD]
+      out.append("debounce" if gate.true_frames < gate.debounce_frames else "latched or min gap")
+    return out
 
   def update(self, i: StopWarningInputs, modes: dict):
     """Returns a list of (Detection, mode) that fired this frame (mode TEST or ON)."""
@@ -239,6 +312,15 @@ def append_log(line, path=LOG_PATH):
 class StopWarning:
   """Planner-side wrapper: reads settings, builds inputs from SubMaster data, logs, returns events to add."""
   PARAM_KEYS = {STOP_AHEAD: "StopWarningRedLight", STOPPED_LEAD: "StopWarningStoppedCar"}
+  EVENT_COLUMNS = ["t_wall", "vEgo_mph", "aEgo", "aEgo_filtered", "brake", "gas", "cruise", "set_mph",
+                   "lead_status", "lead_prob", "lead_d", "lead_v", "lead_y", "lead_relevant",
+                   "plan_min_mps", "plan_ratio", "plan_decel", "csc_active", "csc_mph",
+                   "curve_offset", "curve_in_flight", "stop_ahead_cond", "stopped_lead_cond"]
+  NEAR_MISS_STOP_AHEAD_RATIO = 0.80
+  NEAR_MISS_STOP_AHEAD_SPEED = 20 * MS_PER_MPH
+  NEAR_MISS_LEAD_SPEED = 3.0
+  NEAR_MISS_LEAD_DISTANCE = 120.0
+  NEAR_MISS_EGO_SPEED = 15 * MS_PER_MPH
 
   def __init__(self, params, params_memory):
     self.params = params
@@ -246,6 +328,15 @@ class StopWarning:
     self.logic = StopWarningLogic()
     self.modes = {STOP_AHEAD: OFF, STOPPED_LEAD: OFF}
     self.read_counter = 0
+    self.recorder = None
+    self.near_miss = {}
+    try:
+      from openpilot.frogpilot.common.feature_events import EventRecorder, NearMissTracker
+      self.recorder = EventRecorder(self.EVENT_COLUMNS, hz=20, params=params)
+      self.near_miss = {STOP_AHEAD: NearMissTracker(self.recorder, STOP_AHEAD),
+                        STOPPED_LEAD: NearMissTracker(self.recorder, STOPPED_LEAD)}
+    except Exception:
+      self.recorder = None
 
   def _read_modes(self):
     for kind, key in self.PARAM_KEYS.items():
@@ -283,7 +374,8 @@ class StopWarning:
       lead_relevant=bool(frogpilot_planner.lead_relevant),
     )
     alerts = []
-    for det, mode in self.logic.update(inputs, self.modes):
+    fired = self.logic.update(inputs, self.modes)
+    for det, mode in fired:
       gps = None
       try:
         gps = json.loads(self.params_memory.get("LastGPSPosition") or "null")
@@ -292,4 +384,70 @@ class StopWarning:
       append_log(format_log_line(det, mode, inputs.v_ego, inputs.a_ego, gps))
       if mode == ON:
         alerts.append(det.kind)
+    try:
+      self._log(sm, frogpilot_planner, inputs, fired)
+    except Exception:
+      pass
     return alerts
+
+  # ---- per-event logs (never raises into the planner: called inside try/except) ----
+  def _log(self, sm, frogpilot_planner, i, fired):
+    if self.recorder is None:
+      return
+    import time
+    t = time.monotonic()
+    logic = self.logic
+    plan = logic.plan_slowdown(i, 1.0)
+    plan_min = plan[1] if plan else float("nan")
+    ratio = plan_min / max(i.v_ego, 0.1) if plan else float("nan")
+    decel = plan[3] if plan else float("nan")
+    try:
+      csc_active = bool(frogpilot_planner.frogpilot_vcruise.csc_active)
+      csc_speed = float(frogpilot_planner.frogpilot_vcruise.csc_target) / MS_PER_MPH
+    except Exception:
+      csc_active, csc_speed = False, 0.0
+    try:
+      fpcs = sm["frogpilotCarState"]
+      curve_offset, curve_in_flight = int(fpcs.curveSlowdownOffset), int(fpcs.curveSlowdownInFlight)
+    except Exception:
+      curve_offset, curve_in_flight = 0, 0
+    sa = logic.stop_ahead(i) is not None
+    sl = logic.stopped_lead(i) is not None
+    self.recorder.add_row(t, (
+      f"{time.time():.2f}", i.v_ego / MS_PER_MPH, i.a_ego, logic.a_filtered if logic.a_filtered is not None else 0.0,
+      i.brake_pressed, False, i.cruise_enabled, float(sm["carState"].cruiseState.speed) / MS_PER_MPH,
+      i.lead_status, i.lead_prob, i.lead_d, i.lead_v, i.lead_y, i.lead_relevant,
+      plan_min, ratio, decel, csc_active, csc_speed, curve_offset, curve_in_flight, sa, sl))
+    fired_kinds = {det.kind for det, _ in fired}
+    for det, mode in fired:
+      self.recorder.record(det.kind, t, {
+        "mode": "test" if mode == TEST else "on", "speed_mph": i.v_ego / MS_PER_MPH, "a_ego": i.a_ego,
+        "distance_m": det.distance, "required_decel": det.required_decel, "time_s": det.time,
+        "lead_status": det.lead_status, "lead_d": det.lead_d, "lead_v": det.lead_speed, "lead_prob": det.lead_prob,
+        "lead_y": det.lead_y, "lead_relevant": det.lead_relevant, "plan_min_mps": plan_min, "plan_ratio": ratio,
+        "gps": self._gps()})
+    # near-misses: a candidate was seen but the warning did not fire
+    if self.modes[STOP_AHEAD] != OFF:
+      cand = (not i.standstill and i.v_ego >= self.NEAR_MISS_STOP_AHEAD_SPEED and plan is not None and
+              ratio <= self.NEAR_MISS_STOP_AHEAD_RATIO)
+      self.near_miss[STOP_AHEAD].update(t, cand, STOP_AHEAD in fired_kinds,
+                                        logic.stop_ahead_blockers(i, self.modes[STOP_AHEAD]) if cand else (),
+                                        {"speed_mph": i.v_ego / MS_PER_MPH, "plan_ratio": ratio, "plan_decel": decel,
+                                         "lead_d": i.lead_d, "lead_v": i.lead_v, "lead_relevant": i.lead_relevant})
+    if self.modes[STOPPED_LEAD] != OFF:
+      cand = (i.lead_status and i.lead_v <= self.NEAR_MISS_LEAD_SPEED and 0 < i.lead_d <= self.NEAR_MISS_LEAD_DISTANCE and
+              i.v_ego >= self.NEAR_MISS_EGO_SPEED)
+      closing, ttc, required = logic.lead_metrics(i)
+      self.near_miss[STOPPED_LEAD].update(t, cand, STOPPED_LEAD in fired_kinds,
+                                          logic.stopped_lead_blockers(i, self.modes[STOPPED_LEAD]) if cand else (),
+                                          {"speed_mph": i.v_ego / MS_PER_MPH, "lead_d": i.lead_d, "lead_v": i.lead_v,
+                                           "lead_prob": i.lead_prob, "lead_y": i.lead_y, "ttc": min(ttc, 99.0),
+                                           "required_decel": required})
+    self.recorder.tick(t)
+
+  def _gps(self):
+    try:
+      gps = json.loads(self.params_memory.get("LastGPSPosition") or "null")
+      return f"{gps['latitude']:.6f},{gps['longitude']:.6f}" if gps else ""
+    except Exception:
+      return ""

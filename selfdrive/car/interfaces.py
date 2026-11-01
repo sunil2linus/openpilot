@@ -346,6 +346,10 @@ class CarInterfaceBase(ABC):
 
     # FrogPilot variables
     fp_ret.distancePressed = bool(self.CS.distance_button)
+    slowdown = getattr(self.CC, "curve_slowdown", None)
+    if slowdown is not None:
+      fp_ret.curveSlowdownOffset = max(-127, min(127, int(slowdown.logic.offset)))
+      fp_ret.curveSlowdownInFlight = len(slowdown.logic.inflight)
     fp_ret.ecoGear |= ret.gearShifter == GearShifter.eco
     fp_ret.sportGear |= ret.gearShifter == GearShifter.sport
 

@@ -137,6 +137,8 @@ struct FrogPilotCarState @0xda96579883444c35 {
   sportGear @17 :Bool;
   trafficModeEnabled @18 :Bool;
   vEgo @19 :Float32;
+  curveSlowdownOffset @20 :Int8;     # Mazda set speed slowdown: steps below the driver's set speed
+  curveSlowdownInFlight @21 :Int8;   # our SET presses not yet seen on the set speed
 
   enum DoorLockStatus {
     unavailable @0;
