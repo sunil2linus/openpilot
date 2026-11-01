@@ -297,17 +297,84 @@ def test_set_plus_hold_never_above_driver_speed_for_overrun_0_to_3_quanta():
       assert r["min"] >= 20 - 1e-6, (latency, d0, r["min"])
 
 
+def _releases(fn):
+  """Run `fn()` with every trigger release recorded as (frame, reason, restore_now)."""
+  rel = []
+  orig = scs.StoppedCarTrigger._release
+
+  def recording(self, reason, restore_now=True):
+    rel.append((self.frame, reason, restore_now))
+    orig(self, reason, restore_now)
+  scs.StoppedCarTrigger._release = recording
+  try:
+    return fn(), rel
+  finally:
+    scs.StoppedCarTrigger._release = orig
+
+
+def _plus_frames(r):
+  return sorted([f for f, b in r["presses"] if b == cs.SET_PLUS] +
+                [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS])
+
+
 def test_ego_stops_behind_lead_no_press_at_standstill_restore_once_moving():
-  # S4: we stop behind the stopped car; nothing is pressed while stopped; when the lead drives off and
-  # we move again (> 2 m/s), the driver's speed comes back.
+  # S4 / R3-2: we stop behind the stopped car; nothing is pressed while stopped or creeping; when the lead
+  # drives off and we are clearly rolling again (> 5 m/s), the driver's speed comes back.
   lead = StoppedLead(60, moves_at=2500, drive_off_mph=25)
   car = Car(45, dash_offset_mph=0.0, decel=2.5)
+  speeds = {}
+  orig_tick = lead.tick
+
+  def tick(c):
+    orig_tick(c)
+    speeds[lead.frame] = c.v_ego
+  lead.tick = tick
   r = run(car, NO_CURVE, 7000, lead=lead, max_drop=10)
   tr = r["trigger"]
   assert tr.release_reason in ("ego stopped behind the lead", "lead moved away (vision)"), tr.release_reason
-  plus = [f for f, b in r["presses"] if b == cs.SET_PLUS] + [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
-  assert plus and min(plus) >= 2500, (min(plus) if plus else None)        # only after the lead moved and we rolled
+  plus = _plus_frames(r)
+  assert plus and plus[0] >= 2500, plus[:1]                                # only after the lead moved and we rolled
+  assert speeds[plus[0] - 1] > cs.RESTORE_MOVING_SPEED, speeds[plus[0] - 1]   # and only above 5 m/s
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, r["final"]
+
+
+def test_lost_release_restores_gently_and_the_retrigger_wins():
+  # R3-1 (reviewer's trace): vision loses the stopped car for 2.5 s at ~26 m / 29 mph during the approach. The
+  # 2 s "lost" release must not restore with a SET+ hold: at most a tap or two go out before the lead is seen
+  # again and the slowdown re-arms, and the car still ends up stopped behind the lead with the set speed at 20.
+  lead = StoppedLead(120, present=lambda f: not (350 <= f < 600))
+  car = Car(45, dash_offset_mph=0.0, lag=10)
+  r, rel = _releases(lambda: run(car, NO_CURVE, 5000, lead=lead, max_drop=10))
+  reasons = [reason for _, reason, _ in rel]
+  assert reasons == ["lead lost (vision)", "ego stopped behind the lead"], rel
+  assert rel[0][2] is False and rel[1][2] is True, rel                     # gentle restore, then restore at once
+  stop_f = rel[1][0]
+  plus_before = [f for f in _plus_frames(r) if f < stop_f]
+  assert 1 <= len(plus_before) <= 2, plus_before
+  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] < stop_f], "no SET+ hold"
+  assert near(r["min"], 20) and r["final"] <= 20 + 1e-6, (r["min"], r["final"])
+  assert r["max"] <= 45 + 1e-6
+
+
+def test_left_lane_release_restores_by_taps_only():
+  # R3-1: the lead drifts out of our lane for good: a correct release, restored by taps at the relaxed pacing
+  # (no SET+ hold), never above the driver's speed.
+  lead = StoppedLead(120)
+  orig_state = lead.state
+  lead.state = lambda f, c: (lambda st: (st[0], st[1], st[2], st[3], 1.6 if f >= 350 else st[4]))(orig_state(f, c))
+
+  def tick(c):      # the MRCC does not brake for a car in the next lane: we drive past it
+    lead.frame += 1
+    lead.d = max(lead.d - c.v_ego * T.DT, 0.0)
+  lead.tick = tick
+  car = Car(45, dash_offset_mph=0.0, lag=10)
+  r, rel = _releases(lambda: run(car, NO_CURVE, 3000, lead=lead, max_drop=10))
+  assert [reason for _, reason, _ in rel] == ["lead left the lane"], rel
+  assert rel[0][2] is False
+  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS], "no SET+ hold"
+  plus = _plus_frames(r)
+  assert plus and all(b - a >= cs.RELAXED_GAP_FRAMES for a, b in zip(plus, plus[1:])), plus
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
 
 
 def test_radar_dropout_does_not_raise_early():

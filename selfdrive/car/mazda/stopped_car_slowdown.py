@@ -98,7 +98,9 @@ class StoppedCarTrigger:
     self.ttc = float("inf")
     self.start_frame = -1
     self.release_reason = None
-    self.restore_now = False         # set for one frame when the reason clears for good (restore at once)
+    self.restore_now = False         # set for one frame when the lead has clearly gone (moved away, or we stopped
+                                     # behind it): restore at once, SET+ holds allowed. Lost / left-lane releases
+                                     # use the normal restore instead, since the car may still be ahead.
     self.moving_frames = 0
     self.prev_radar_has_lead = False
     self.radar_rises = []            # frames at which the stock radar picked up a lead (for the logs)
@@ -173,9 +175,10 @@ class StoppedCarTrigger:
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
       elif self.out_of_lane_frames >= _frames(RELEASE_LOST_TIME):
-        self._release("lead left the lane")
+        # the car may still be ahead: the gentle restore (taps, normal pacing) so a re-trigger wins
+        self._release("lead left the lane", False)
       elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
-        self._release("lead lost (vision)")
+        self._release("lead lost (vision)", False)
     if self.active and i.lead_status:
       self.target = stopped_car_target(i.lead_d)
     return self.active

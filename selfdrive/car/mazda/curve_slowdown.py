@@ -52,7 +52,8 @@ DEFAULT_MAX_DROP_MPH = 10
 MIN_SET_SPEED = 25.0 * MS_PER_MPH     # never set cruise below 25 mph
 START_SPEED = 25.0 * MS_PER_MPH       # only start a slowdown at 25 mph or more (true speed)
 KEEP_SPEED = 12.0 * MS_PER_MPH        # keep managing (incl. restoring) down to 12 mph (a 20 mph set speed reads ~18 true)
-RESTORE_MOVING_SPEED = 2.0            # m/s: after a stopped car, the driver's speed comes back once we move again
+RESTORE_MOVING_SPEED = 5.0            # m/s: after stopping behind a car, the driver's speed comes back once we are
+                                      # clearly rolling again (not while creeping in a queue)
 CURVE_MARGIN = 0.3                    # m/s: stay this far above the curve target
 CRUISE_SETTLE = 0.3                   # s: cruise must be engaged this long before we press
 RESTORE_DELAY = 0.5                   # s of FrogPilot saying the curve no longer limits us before raising
@@ -498,8 +499,8 @@ class CurveSlowdownLogic:
     if self.offset == 0 and not self.inflight or i.stop_active:
       self.restore_pending = False
     speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED)
-    # Never press at standstill (SET at standstill is unverified on the car); after a stopped car the driver's
-    # speed comes back as soon as we are moving again.
+    # Never press at standstill (SET at standstill is unverified on the car); after stopping behind a car the
+    # driver's speed comes back once we are clearly rolling again.
     can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and not i.standstill and
                (speed_ok or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED)) and
                self.cruise_on_frames >= _frames(CRUISE_SETTLE))
@@ -582,13 +583,17 @@ class CurveSlowdownLogic:
       # Never reverse direction while a press may still land.
       return None, None
     urgent = want_lower and reason == "stop" and i.stop_urgent
-    gap = RELAXED_GAP_FRAMES if (want_lower and reason == "stop" and not urgent) else BUTTON_GAP_FRAMES
+    # Relaxed pacing for a stopped car that is not urgent, and for the gentle restore after a lost /
+    # left-lane release (the car may still be ahead: a re-trigger should win over the taps).
+    gentle = (want_lower and reason == "stop" and not urgent) or \
+             (not want_lower and self.stop_episode and not self.restore_pending)
+    gap = RELAXED_GAP_FRAMES if gentle else BUTTON_GAP_FRAMES
     if self.frame - self.last_send_frame <= gap:
       return None, None
 
     # Long presses. Lowering for a confirmed stopped car: the first hold aims HOLD_GOALS_MPH[0] down,
     # the second HOLD_GOALS_MPH[1] more, bounded by max(target, 20 mph floor); then taps. Restoring
-    # after a stopped car: SET+ holds bounded by the driver's speed, then taps. A hold only starts
+    # after a stopped car has clearly gone: SET+ holds bounded by the driver's speed, then taps. A hold only starts
     # when its first quantum plus what may still land after the release stays inside the bound.
     q = self._quantum_steps()
     worst = (q + self._hold_reserve()) * self.step      # tap + first quantum + pending quantum + measured overrun
@@ -601,7 +606,9 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
-      elif button == SET_PLUS and self.stop_episode and not want_lower:
+      elif button == SET_PLUS and self.stop_episode and self.restore_pending and not want_lower:
+        # only when the lead has clearly gone (moved away, or we stopped behind it); a lost or left-lane
+        # release restores by taps so a re-trigger wins if the car is still there.
         # upwards the bound is the driver's speed itself: a tap, the first quantum and the quanta that may
         # follow the release (3 until a hold has measured the car, then the worst seen plus one) must fit
         worst_up = (q + self._up_overrun() * q + 1) * self.step
