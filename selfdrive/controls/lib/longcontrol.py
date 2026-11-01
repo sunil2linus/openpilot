@@ -119,7 +119,9 @@ class LongControl:
     self.long_control_state = LongCtrlState.off
     self.experimental_mode = False
     self.experimental_mode_last = False
-    self.params = Params()
+    # Mazda Radar Interceptor / Gen2 "Blended ACC": read once here instead of every control cycle,
+    # and only for Mazda so other brands are not affected.
+    self.blended_acc = CP.brand == "mazda" and Params().get_bool("BlendedACC")
     self.params_memory = Params("/dev/shm/params")
     self.pid = PIDController((CP.longitudinalTuning.kpBP, CP.longitudinalTuning.kpV),
                              (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
@@ -263,7 +265,7 @@ class LongControl:
                                                        CS.cruiseState.standstill, starpilot_toggles,
                                                        allow_stopping_release=allow_stopping_release)
 
-    if self.params.get_bool("BlendedACC"):
+    if self.blended_acc:
       experimental_mode = self.params_memory.get_int("CEStatus") # 0 means experimental mode is off
       if experimental_mode and not self.experimental_mode_last:
         self.reset()

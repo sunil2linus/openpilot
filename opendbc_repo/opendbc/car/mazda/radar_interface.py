@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import math
 
-from opendbc.can.parser import CANParser
+from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.interfaces import RadarInterfaceBase
 from opendbc.car.mazda.values import DBC, MazdaSafetyFlags
@@ -27,7 +27,7 @@ class RadarInterface(RadarInterfaceBase):
   def update(self, can_strings):
     if self.radar_off_can or (self.rcp is None):
       return super().update(None)
-    vls = self.rcp.update_strings(can_strings)
+    vls = self.rcp.update(can_strings)
     self.updated_messages.update(vls)
     rr = self._update(self.updated_messages)
     self.updated_messages.clear()
@@ -38,10 +38,8 @@ class RadarInterface(RadarInterfaceBase):
     ret = structs.RadarData()
     if self.rcp is None:
       return ret
-    errors = []
     if not self.rcp.can_valid:
-      errors.append("canError")
-    ret.errors = errors
+      ret.errors.canError = True
     for addr in range(361,367):
       msg = self.rcp.vl[f"RADAR_TRACK_{addr}"]
       if addr not in self.pts:
@@ -58,6 +56,6 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[addr].aRel = float('nan')
         self.pts[addr].yvRel = float('nan')
       else:
-        del self.pts[addr]
+        self.pts.pop(addr, None)
     ret.points = list(self.pts.values())
     return ret

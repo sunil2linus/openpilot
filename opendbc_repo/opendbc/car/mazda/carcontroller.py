@@ -15,7 +15,6 @@ class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
     self.apply_torque_last = 0
-    self.ti_apply_torque_last = 0
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
     self.ccp = CarControllerParams(CP)
@@ -34,21 +33,14 @@ class CarController(CarControllerBase):
     can_sends = []
 
     apply_torque = 0
-    ti_apply_torque = 0
 
     if CC.latActive:
       # calculate steer and also set limits due to driver torque
       new_torque = int(round(CC.actuators.torque * self.ccp.STEER_MAX))
       apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last,
                                                       CS.out.steeringTorque, self.ccp)
-      if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
-        if CS.ti_lkas_allowed:
-          ti_new_torque = int(round(CC.actuators.torque * self.ccp.STEER_MAX))
-          ti_apply_torque = apply_driver_steer_torque_limits(ti_new_torque, self.apply_torque_last,
-                                                    CS.out.steeringTorque, self.ccp)
 
     self.apply_torque_last = apply_torque
-    self.ti_apply_torque_last = ti_apply_torque
 
     if self.CP.flags & MazdaSafetyFlags.GEN1:
       if CC.cruiseControl.cancel:
@@ -74,7 +66,8 @@ class CarController(CarControllerBase):
         steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
         # TODO: find a way to silence audible warnings so we can add more hud alerts
         steer_required = steer_required and CS.lkas_allowed_speed
-        can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
+        if not self.CP.flags & MazdaSafetyFlags.NO_FSC:
+          can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
 
       if self.CP.openpilotLongitudinalControl:
         hold = False
@@ -150,9 +143,15 @@ class CarController(CarControllerBase):
 
 
     # send steering command
+    # Gen1 + Torque Interceptor: like mazda-frogpilot-dev, the TI (CAM_LKAS2, bus 1) gets the very same
+    # command as CAM_LKAS on bus 0. StarPilot-dev only sent a non-zero TI command while the TI already
+    # reported RUN (ti_lkas_allowed); below the stock LKAS speed (~28 mph) the stock EPS ignores CAM_LKAS,
+    # so the TI is the only actuator there, and that gating left it with zero commands and a
+    # steerFaultTemporary ("steering temporarily unavailable"). The panda checks both messages
+    # against the same limits (opendbc/safety/modes/mazda.h).
     can_sends.extend(mazdacan.create_steering_control(
       self.packer, self.CP, self.frame, apply_torque, CS.cam_lkas,
-      ti_apply_torque if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else None))
+      apply_torque if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else None))
 
     new_actuators = CC.actuators.as_builder()
     new_actuators.torque = apply_torque / self.ccp.STEER_MAX

@@ -20,7 +20,9 @@ class CarState(CarStateBase):
 
     self.crz_btns_counter = 0
     self.acc_active_last = False
+    self.low_speed_alert = False
     self.lkas_allowed_speed = False
+    self.lkas_disabled = False
     self.cam_lkas = 0
     self.params = CarControllerParams(CP)
 
@@ -69,6 +71,8 @@ class CarState(CarStateBase):
                                                                       cp.vl["BLINK_INFO"]["RIGHT_BLINK"] == 1)
 
     if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
+      # Driver torque comes from the TI's own sensor. The panda safety (mazda.h) uses this same
+      # signal (0x24A on bus 1) for its driver-torque limit, so the carcontroller limits must use it too.
       ret.steeringTorque = cp_body.vl["TI_FEEDBACK"]["TI_TORQUE_SENSOR"]
 
       self.ti_version = cp_body.vl["TI_FEEDBACK"]["VERSION_NUMBER"]
@@ -152,8 +156,11 @@ class CarState(CarStateBase):
 
     # camera signals
     if not self.CP.flags & MazdaSafetyFlags.NO_FSC:
-      ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
+      # LANE_LINES == 0 is used as "stock LKAS is off". With a Torque Interceptor the stock LKAS state
+      # does not matter (mazda-frogpilot-dev ignores it, and steering works down to 0 mph), and this
+      # alert was seen below ~28 mph on StarPilot-dev, so only raise "Invalid LKAS setting" without a TI.
       self.lkas_disabled = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
+      ret.invalidLkasSetting = self.lkas_disabled
       self.cam_lkas = cp_cam.vl["CAM_LKAS"]
       self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
       ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False

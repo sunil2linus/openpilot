@@ -127,7 +127,9 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
     }
 
     // enter controls on rising edge of ACC, exit controls on ACC off
-    if (msg->addr == MAZDA_CRZ_CTRL) {
+    // Not for Gen1: there bus 1 is the Torque Interceptor / OBD bus and engagement comes from
+    // CRZ_CTRL (or PEDALS) on the main bus, like mazda-frogpilot-dev.
+    if ((msg->addr == MAZDA_CRZ_CTRL) && !gen1) {
       bool cruise_engaged = msg->data[0] & 0x8U;
       pcm_cruise_check(cruise_engaged);
 
@@ -180,6 +182,18 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     .type = TorqueDriverLimited,
   };
 
+  // Gen1 + Torque Interceptor: carcontroller STEER_MAX is 600 (mazda-frogpilot-dev value) and the same
+  // command goes to CAM_LKAS (bus 0) and to the TI as CAM_LKAS2 (bus 1), so both are limited to 600.
+  const TorqueSteeringLimits MAZDA_TI_STEERING_LIMITS = {
+    .max_torque = 600,
+    .max_rate_up = 10,
+    .max_rate_down = 25,
+    .max_rt_delta = 300,
+    .driver_torque_multiplier = 1,
+    .driver_torque_allowance = 15,
+    .type = TorqueDriverLimited,
+  };
+
   const TorqueSteeringLimits MAZDA_2019_STEERING_LIMITS = {
     .max_torque = 8000,
     .max_rate_up = 45,
@@ -191,13 +205,14 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   };
 
   bool tx = true;
+  const TorqueSteeringLimits gen1_limits = torque_interceptor ? MAZDA_TI_STEERING_LIMITS : MAZDA_STEERING_LIMITS;
   // Check if msg is sent on the main BUS
   if (msg->bus == (unsigned char)MAZDA_MAIN) {
     // steer cmd checks
     if (msg->addr == MAZDA_LKAS) {
       int desired_torque = (((msg->data[0] & 0x0FU) << 8) | msg->data[1]) - 2048U;
 
-      if (steer_torque_cmd_checks(desired_torque, -1, MAZDA_STEERING_LIMITS)) {
+      if (steer_torque_cmd_checks(desired_torque, -1, gen1_limits)) {
         tx = false;
       }
     }
@@ -212,6 +227,17 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
       }
     }
   }
+  // Gen1 Torque Interceptor command (DBC CAM_LKAS2): LKAS_REQUEST uses the same 12-bit, offset 2048
+  // encoding as CAM_LKAS. It carries the same value as CAM_LKAS in the same frame, so checking it with
+  // the same limits is a no-op for a valid command, and it can no longer bypass the torque checks
+  // (mazda-frogpilot-dev only had the TX allow list for it).
+  if (gen1 && torque_interceptor && (msg->bus == MAZDA_AUX) && (msg->addr == MAZDA_TI_LKAS)) {
+    int desired_torque = (((msg->data[0] & 0x0FU) << 8) | msg->data[1]) - 2048U;
+    if (steer_torque_cmd_checks(desired_torque, -1, gen1_limits)) {
+      tx = false;
+    }
+  }
+
   if ((gen2 || gen3) && (msg->bus == MAZDA_AUX) && (msg->addr == MAZDA_TI_LKAS)) {
     int desired_torque = (int16_t)((msg->data[0] << 8) | msg->data[1]);  // signal is signed
     if (steer_torque_cmd_checks(desired_torque, -1, MAZDA_2019_STEERING_LIMITS)) {
@@ -236,8 +262,18 @@ static safety_config mazda_init(uint16_t param) {
 
   static const CanMsg MAZDA_2019_TX_MSGS[] = {{MAZDA_TI_LKAS, 1, 8, .check_relay = false}, {MAZDA_2019_ACC, 2, 8, .check_relay = true}};
 
+  // Gen1 RX checks. CRZ_CTRL (0x21c) on the main bus is the engagement source with stock MRCC, so it
+  // is only checked then. With a Radar Interceptor or NoMRCC engagement comes from PEDALS (0x165)
+  // and CRZ_CTRL is not used by the safety, so it is not required (mazda-frogpilot-dev also dropped
+  // it in TI mode). With a Torque Interceptor the TI feedback (0x24A, bus 1, driver torque) is required.
   static RxCheck mazda_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  };
+  static RxCheck mazda_no_mrcc_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -250,7 +286,13 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{TI_STEER_TORQUE,    1, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-
+  };
+  static RxCheck mazda_ti_no_mrcc_rx_checks[] = {
+    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{TI_STEER_TORQUE,    1, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
   static RxCheck mazda_2019_rx_checks[] = {
     {.msg = {{MAZDA_2019_BRAKE,         0, 8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -280,14 +322,26 @@ static safety_config mazda_init(uint16_t param) {
   safety_config ret = BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
 
   if (gen1) {
-    SET_RX_CHECKS(mazda_rx_checks, ret);
+    const bool stock_mrcc = !no_mrcc && !radar_interceptor;
+    if (torque_interceptor) {
+      if (stock_mrcc) {
+        SET_RX_CHECKS(mazda_ti_rx_checks, ret);
+      } else {
+        SET_RX_CHECKS(mazda_ti_no_mrcc_rx_checks, ret);
+      }
+    } else {
+      if (stock_mrcc) {
+        SET_RX_CHECKS(mazda_rx_checks, ret);
+      } else {
+        SET_RX_CHECKS(mazda_no_mrcc_rx_checks, ret);
+      }
+    }
+
     if (radar_interceptor && torque_interceptor) {
-      SET_RX_CHECKS(mazda_ti_rx_checks, ret);
       SET_TX_MSGS(MAZDA_TI_RI_TX_MSGS, ret);
     } else if (radar_interceptor) {
       SET_TX_MSGS(MAZDA_RI_TX_MSGS, ret);
     } else if (torque_interceptor) {
-      SET_RX_CHECKS(mazda_ti_rx_checks, ret);
       SET_TX_MSGS(MAZDA_TI_TX_MSGS, ret);
     } else {
       SET_TX_MSGS(MAZDA_TX_MSGS, ret);

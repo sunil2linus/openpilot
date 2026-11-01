@@ -7,7 +7,8 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase, TorqueFromLateralAccelCallbackType, LateralAccelFromTorqueCallbackType
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
-from opendbc.car.mazda.values import CAR, LKAS_LIMITS, MazdaSafetyFlags, MazdaSafetyFlags, GEN1, GEN2, GEN3
+from opendbc.car.mazda.radar_interface import RadarInterface
+from opendbc.car.mazda.values import CAR, LKAS_LIMITS, MazdaSafetyFlags, GEN1, GEN2, GEN3
 from openpilot.common.params import Params
 
 NON_LINEAR_TORQUE_PARAMS = {
@@ -20,6 +21,7 @@ NON_LINEAR_TORQUE_PARAMS = {
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
+  RadarInterface = RadarInterface
 
   def get_lataccel_torque_siglin(self) -> float:
 
@@ -37,7 +39,6 @@ class CarInterface(CarInterfaceBase):
 
     lataccel_values = np.arange(-8.0, 8.0, 0.01)
     torque_values = [torque_from_lateral_accel_siglin_func(x) for x in lataccel_values]
-    print(torque_values)
     assert min(torque_values) < -1 and max(torque_values) > 1, "The torque values should cover the range [-1, 1]"
     return torque_values, lataccel_values
 
@@ -93,8 +94,9 @@ class CarInterface(CarInterfaceBase):
       if p.get_bool("TorqueInterceptorEnabled"): # Torque Interceptor Installed
         ret.flags |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
         ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.TORQUE_INTERCEPTOR.value
+        # The TI steers below the stock LKAS speed, so there is no minimum steer speed.
+        # steerAtStandstill stays False like mazda-frogpilot-dev: no TI torque while stopped.
         ret.minSteerSpeed = 0.0
-        ret.steerAtStandstill = True
       if p.get_bool("RadarInterceptorEnabled"): # Radar Interceptor Installed
         ret.flags |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value
         ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value

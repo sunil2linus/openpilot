@@ -13,7 +13,9 @@ class CarControllerParams:
   def __init__(self, CP):
     self.STEER_STEP = 1 # 100 Hz
     if CP.flags & MazdaSafetyFlags.GEN1:
-      self.STEER_MAX = 800                # theoretical max_steer 2047
+      # With a Torque Interceptor the same command is also sent to the TI (CAM_LKAS2), so use the
+      # proven mazda-frogpilot-dev Gen1+TI limit of 600. The panda safety (mazda.h) uses the same limit.
+      self.STEER_MAX = 600 if CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else 800  # theoretical max_steer 2047
       self.STEER_DELTA_UP = 10             # torque increase per refresh
       self.STEER_DELTA_DOWN = 25           # torque decrease per refresh
       self.STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
