@@ -4,8 +4,8 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
 
   * Curve ahead (or the one we are in): the set speed allowed now so that a gentle cruise slowdown
     (MAP_DECEL, after the cruise's MAP_REACTION_TIME) reaches the curve's speed (MAP_LATERAL_ACCEL, or the car's
-    lateral limit if lower) MAP_LEAD_TIME before its entry. Same
-    2 mph start gap / 1 mph end gap as the camera curve target.
+    lateral limit if lower) MAP_LEAD_TIME before its entry. It starts at the first 1 mph step and ends with
+    the camera curve target's 1 mph end gap. Ramp curves and exits use the firmer MAP_RAMP_DECEL.
   * Ramps (we are on an exit / entrance / interchange ramp and the curve is on it): may go past the
     driver's Max Drop, down to 25 mph, with a bigger SET- budget.
   * Navigation exit before the split: never on navigation alone. Once the driver signals toward the exit's side
@@ -27,7 +27,7 @@ Pure logic (no openpilot imports) so it can be unit tested; the wrapper in curve
 from dataclasses import dataclass
 
 try:
-  from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL
+  from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL
 except ImportError:          # offline tests load this file directly
   from curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL
 
@@ -91,7 +91,7 @@ class MapCurveControl:
   def __init__(self, lat_accel):
     lat_accel = min(lat_accel, MAP_LATERAL_ACCEL)
     self.curve = MapCurveTarget(lat_accel)
-    self.nav = MapCurveTarget(lat_accel)
+    self.nav = MapCurveTarget(lat_accel, MAP_RAMP_DECEL)
     self.on_street_exit = False
     self.exit_intent = False      # the driver signalled for the announced exit
     self.nav_grace = 0
@@ -134,7 +134,8 @@ class MapCurveControl:
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
     radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
-    a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory)
+    a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory,
+                              MAP_RAMP_DECEL if (f.status == STATUS_RAMP_CURVE or f.on_ramp) else MAP_DECEL)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
     nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held)
     na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)

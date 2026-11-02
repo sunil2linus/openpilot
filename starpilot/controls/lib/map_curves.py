@@ -37,7 +37,7 @@ EARTH_R = 6371008.8
 
 LOOKAHEAD = 1000.0        # m along the road
 PLAN_LAT = 2.2            # m/s^2: as the car side (curve_target.MAP_LATERAL_ACCEL)
-PLAN_DECEL = 0.5          # m/s^2: as the car side (curve_target.MAP_DECEL)
+PLAN_DECEL = 0.25         # m/s^2: as the car side for road curves (curve_target.MAP_DECEL)
 PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry
 PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET- press
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this

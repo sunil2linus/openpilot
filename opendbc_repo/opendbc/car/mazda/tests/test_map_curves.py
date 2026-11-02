@@ -397,12 +397,12 @@ def test_planner_uses_its_own_matching_when_the_map_program_gives_none():
 
   la, lo = pos(0, -250)
   gps = {"latitude": la, "longitude": lo, "bearing": 0.0}
-  mp.update(SM(), gps, 20.0, 20.0)        # loads the files, then matches way 1
-  mp.update(SM(), gps, 20.0, 20.0)
+  mp.update(SM(), gps, 18.0, 18.0)        # loads the files, then matches way 1
+  mp.update(SM(), gps, 18.0, 18.0)
   assert mp.mc.curve is not None and abs(mp.mc.radius - curves[0]["r"]) < 1e-6
-  assert mp.notice is None                 # 250 m out at 45 mph the curve does not need slowing yet
+  assert mp.notice is None                 # 250 m out at 40 mph the curve does not need slowing yet
   la, lo = pos(0, -90)
-  mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 20.0, 20.0)
+  mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 18.0, 18.0)
   assert mp.notice == "curve"
 
 
@@ -423,31 +423,37 @@ def test_never_keeps_a_lowered_speed_when_the_next_road_is_a_freeway():
 
 
 def test_west_utica_slows_before_the_curve_not_in_it():
-  # route 36: 45 mph, the 117 m curve. Start early enough that the stock cruise (1.5 s to react, then the planned
-  # 0.5 m/s^2) is at the curve's speed (~36 mph) just before the curve starts (1 s), coming down ~1 mph a second.
+  # route 36: 45 mph, the 117 m curve (~36 mph). The set speed comes down in 1 mph steps that the stock cruise can
+  # follow: drive 38 showed it follows small steps at only ~0.28 m/s^2, ~1.5 s after each press.
   c = CTL.MapCurveControl(3.0)
   start = None
-  for d in range(400, -1, -2):
+  for d in range(500, -1, -2):
     if c.update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).active:
       start = d
       break
-  assert start is not None and 165 <= start <= 195, start
-  # the cruise from 45 mph, reacting then slowing at its measured 0.6 m/s^2, starting at `start`
-  v, x, t = 45 * MPH, float(start), 0.0
+  assert start is not None and 280 <= start <= 340, start
+  # the set speed (whole mph, following the plan at the car's position) and the cruise following it like on drive 38
   v_curve = math.sqrt(2.2 * 116.6)
+  ctl = CTL.MapCurveControl(3.0)
+  v, x, t, sets, max_gap = 45 * MPH, 500.0, 0.0, [], 0.0
   while x > 0:
-    if t >= 1.5:
-      v = max(v - 0.6 * 0.01, v_curve)
+    out = ctl.update(F(status=1, radius=116.6, distance=x), 45 * MPH, 0)
+    target = math.ceil(out.speed / MPH - 1e-9) * MPH if out.active else 45 * MPH
+    sets.append((t, min(45 * MPH, target)))
+    lagged = [sp for tt, sp in sets if tt <= t - 1.5]
+    set_now = lagged[-1] if lagged else 45 * MPH
+    if v > set_now + 0.05:
+      v = max(v - 0.28 * 0.01, set_now)
+    max_gap = max(max_gap, (v - sets[-1][1]) / MPH)
     x -= v * 0.01
     t += 0.01
-    if v <= v_curve + 1e-6:
-      break
-  assert x >= v_curve * 1.0 - 1.0, x                          # at the curve's speed ~1 s before the curve
-  # gradual: the planned speed comes down by about 1 mph per second, never in jumps
+  assert v <= v_curve + 0.6 * MPH, v / MPH                     # at the curve's speed (within ~0.5 mph) at its entry
+  assert max_gap <= 2.0, max_gap                               # the cruise never falls far behind the set speed
+  # gradual: the planned speed comes down by well under 1 mph per second, never in jumps
   prev, steps = None, []
   for d in range(start, -1, -1):
     sp = CTL.MapCurveControl(3.0).update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).speed
     if prev is not None:
       steps.append((prev - sp) / MPH / (1.0 / 18.0))          # mph per second at ~40 mph (18 m/s)
     prev = sp
-  assert max(steps) < 1.3, max(steps)
+  assert max(steps) < 0.7, max(steps)
