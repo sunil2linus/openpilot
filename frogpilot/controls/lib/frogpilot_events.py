@@ -110,6 +110,16 @@ class FrogPilotEvents:
         # Never let the optional warning break the planner: turn it off for this drive.
         self.stop_warning = None
 
+    map_curves = getattr(self.frogpilot_planner, "map_curves", None)
+    if map_curves is not None and map_curves.notice:
+      notice = map_curves.notice
+      if notice == "curve":
+        self.events.add(FrogPilotEventName.mapCurveAhead)
+      elif notice == "exit_data":
+        self.events.add(FrogPilotEventName.mapExitCurveData)
+      elif notice == "exit_no_data":
+        self.events.add(FrogPilotEventName.mapExitNoCurveData)
+
     holiday_unplayed = "holidayActive" not in self.played_events
     if holiday_unplayed and self.startup_seen and alerts_empty and len(self.events) == 0 and frogpilot_toggles.current_holiday_theme != "stock":
       self.events.add(FrogPilotEventName.holidayActive)

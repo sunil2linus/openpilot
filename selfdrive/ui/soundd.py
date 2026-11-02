@@ -60,7 +60,13 @@ sound_list: dict[Any, tuple[str, int | None, float]] = {
   FrogPilotAudibleAlert.startup: ("startup.wav", 1, MAX_VOLUME),
   FrogPilotAudibleAlert.thisIsFine: ("this_is_fine.wav", 1, MAX_VOLUME),
   FrogPilotAudibleAlert.uwu: ("uwu.wav", 1, MAX_VOLUME),
+
+  # Map curves: soft chimes at their own fixed volume (MazdaMapCurveChime), never raised for road noise
+  FrogPilotAudibleAlert.curveChime: ("curve_chime.wav", 1, MAX_VOLUME),
+  FrogPilotAudibleAlert.curveNoData: ("curve_no_data.wav", 1, MAX_VOLUME),
 }
+
+MAP_CURVE_CHIME_VOLUMES = (0, 5, 10, 20)   # MazdaMapCurveChime index -> % (0 = off)
 
 def check_controls_timeout_alert(sm):
   controls_missing = time.monotonic() - sm.recv_time['controlsState']
@@ -273,6 +279,16 @@ class Soundd:
       FrogPilotAudibleAlert.startup: self.frogpilot_toggles.engage_volume
     }
     self.alert_volumes = {alert: volume / 100.0 for alert, volume in volumes.items() if volume <= 100}
+
+    # Map curve chimes: fixed volume from their own setting (default 5 %)
+    try:
+      from openpilot.common.params import Params
+      idx = int(Params().get("MazdaMapCurveChime", encoding="utf8") or 1)
+      chime = MAP_CURVE_CHIME_VOLUMES[idx] if 0 <= idx < len(MAP_CURVE_CHIME_VOLUMES) else 5
+    except Exception:
+      chime = 5
+    self.alert_volumes[FrogPilotAudibleAlert.curveChime] = chime / 100.0
+    self.alert_volumes[FrogPilotAudibleAlert.curveNoData] = chime / 100.0
 
     self.sound_directory = frogpilot_paths.ACTIVE_THEME_PATH / "sounds"
 

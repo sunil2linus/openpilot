@@ -376,6 +376,39 @@ def holiday_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, 
     Priority.LOWEST, VisualAlert.none, FrogPilotAudibleAlert.startup, 5.)
 
 
+def _map_distance(meters: float, metric: bool) -> str:
+  if metric:
+    return f"{int(round(meters / 10.0) * 10)} m"
+  feet = meters * 3.28084
+  return f"{feet / 5280:.1f} mi" if feet >= 1000 else f"{int(round(feet / 50.0) * 50)} ft"
+
+
+def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
+  fp = sm["frogpilotPlan"]
+  needs = math.sqrt(3.0 * fp.mapCurveRadius) if fp.mapCurveRadius > 0 else 0.0
+  what = "Ramp curve" if fp.mapCurveStatus == 2 else "Map curve"
+  where = "now" if fp.mapCurveDistance <= 1 else "in " + _map_distance(fp.mapCurveDistance, metric)
+  action = "Test: would slow to" if fp.mapCurveMode == 1 else "Slowing to"
+  return Alert(
+    f"{what} {where} · {action} {get_display_speed(needs, metric)}",
+    "",
+    FrogPilotAlertStatus.frogpilot, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 3.)
+
+
+def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
+  fp = sm["frogpilotPlan"]
+  if fp.mapNavCurveRadius > 0:
+    text = f"Exit ahead · curve data · needs {get_display_speed(math.sqrt(3.0 * fp.mapNavCurveRadius), metric)}"
+  else:
+    text = "Exit ahead · curve data · no sharp curves"
+  return Alert(
+    text,
+    "",
+    FrogPilotAlertStatus.frogpilot, AlertSize.small,
+    Priority.LOW, VisualAlert.none, FrogPilotAudibleAlert.curveChime, 4.)
+
+
 def nnff_loaded_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
   return Alert(
     "NNFF Torque Controller loaded with:",
@@ -1082,6 +1115,22 @@ FROGPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Cruise may not stop for this",
       AlertStatus.userPrompt, AlertSize.mid,
       Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+
+  FrogPilotEventName.mapCurveAhead: {
+    ET.PERMANENT: map_curve_alert,
+  },
+
+  FrogPilotEventName.mapExitCurveData: {
+    ET.PERMANENT: map_exit_alert,
+  },
+
+  FrogPilotEventName.mapExitNoCurveData: {
+    ET.PERMANENT: Alert(
+      "Exit ahead · no curve data",
+      "",
+      FrogPilotAlertStatus.frogpilot, AlertSize.small,
+      Priority.LOW, VisualAlert.none, FrogPilotAudibleAlert.curveNoData, 4.),
   },
 
   FrogPilotEventName.stoppedLeadWarning: {

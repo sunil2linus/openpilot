@@ -120,6 +120,9 @@ class SlowdownInputs:
   stop_target: float = 0.0      # m/s, true speed; clipped to [STOP_MIN_SET_SPEED, driver's speed] here
   stop_urgent: bool = False     # fast pace for the stopped car
   stop_restore_now: bool = False  # the stopped car reason just cleared (lead moving, ego stopped, lead lost): restore at once
+  curve_floor: float = 0.0        # m/s: when > 0 the curve may go this low (a ramp), past the max drop
+  curve_budget: int = 0           # SET- presses allowed for this curve when more than the usual budget (a ramp)
+  fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
 
 
 @dataclass
@@ -500,6 +503,8 @@ class CurveSlowdownLogic:
 
     if i.stop_restore_now and self.offset != 0:
       self.restore_pending = True
+    if i.fast_restore and self.offset > 0 and not i.csc_active and not i.stop_active:
+      self.restore_pending = True
     if self.offset == 0 and not self.inflight or i.stop_active:
       self.restore_pending = False
     speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED)
@@ -529,7 +534,10 @@ class CurveSlowdownLogic:
     driver_speed = set_speed + offset * self.step
     targets = []
     if i.csc_active:
-      floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
+      if i.curve_floor > 0:
+        floor = max(i.curve_floor, MIN_SET_SPEED)
+      else:
+        floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
       targets.append(("curve", max(i.csc_speed + CURVE_MARGIN, floor)))
     if i.stop_active:
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
@@ -569,7 +577,8 @@ class CurveSlowdownLogic:
     if reason is not None and not self.blocked:
       # How many more steps down this wants (re-lowering while restoring needs 2 steps).
       room = int((set_speed - target + 1e-3) // self.step)
-      budget_ok = (self.lower_presses < self.max_lower_presses) if reason == "curve" else (self.stop_presses < MAX_STOP_PRESSES)
+      budget_ok = (self.lower_presses < max(self.max_lower_presses, i.curve_budget)) if reason == "curve" else \
+                  (self.stop_presses < MAX_STOP_PRESSES)
       want_lower = budget_ok and room >= (2 if self.restoring else 1)
 
     button = None
@@ -614,7 +623,7 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
-      elif button == SET_PLUS and self.stop_episode and self.restore_pending and not want_lower:
+      elif button == SET_PLUS and (self.stop_episode or i.fast_restore) and self.restore_pending and not want_lower:
         # only when the lead has clearly gone (moved away, or we stopped behind it); a lost or left-lane
         # release restores by taps so a re-trigger wins if the car is still there.
         # upwards the bound is the driver's speed itself: a tap, the first quantum and the quanta that may
@@ -646,9 +655,11 @@ class CurveSlowdown:
                    "road_curv", "fp_csc_active", "fp_csc_mph",
                    "lead_status", "lead_prob", "lead_d", "lead_v", "lead_y", "radar_has_lead", "radar_dist_bucket",
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
-                   "hold", "press", "driver_btn", "blocked", "restoring"]
+                   "hold", "press", "driver_btn", "blocked", "restoring",
+                   "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
+                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker"]
 
-  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False):
+  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
     import cereal.messaging as messaging
     from openpilot.selfdrive.car.mazda.values import MazdaFlags
     from openpilot.selfdrive.car.mazda.curve_target import CurveTarget, lateral_limit
@@ -663,6 +674,13 @@ class CurveSlowdown:
     self.has_ti = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
+    self.map_mode = map_mode
+    self.map_control = None
+    self.map_out = None
+    self.map_event = None
+    if map_mode:
+      from openpilot.selfdrive.car.mazda.map_curve_control import MapCurveControl
+      self.map_control = MapCurveControl(self.lat_limit)
     self.learner = None
     services = ['frogpilotPlan', 'radarState']
     if learning:
@@ -715,9 +733,26 @@ class CurveSlowdown:
     lg = self.logic
     plan_alive = self._alive('frogpilotPlan')
     blinker = bool(CS.out.leftBlinker or CS.out.rightBlinker)
+    self._blinker = blinker
     set_speed = float(CS.out.cruiseState.speed)
     driver_speed = set_speed + lg.offset * lg.step if (cruise_enabled and set_speed > 0) else 0.0
     curve_active, curve_speed = self.curve_target.update(float(plan.roadCurvature), driver_speed, plan_alive, blinker)
+    curve_active = curve_active and self.curve_enabled
+
+    # Map curves (Test: computed and logged only; On: combined with the camera curve target)
+    curve_floor, curve_budget, fast_restore = 0.0, 0, False
+    self.map_out = None
+    if self.map_control is not None and plan_alive:
+      from openpilot.selfdrive.car.mazda.map_curve_control import MapFields, ON as MAP_ON
+      mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, blinker)
+      if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
+        lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
+      if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
+        if mo.active and (not curve_active or mo.speed < curve_speed):
+          curve_speed = mo.speed
+          curve_floor, curve_budget = mo.floor, mo.budget
+        curve_active = curve_active or mo.active
+        fast_restore = mo.fast_restore
 
     inputs = SlowdownInputs(
       enabled=bool(CC.enabled),
@@ -728,8 +763,11 @@ class CurveSlowdown:
       brake_pressed=bool(CS.out.brakePressed),
       standstill=bool(CS.out.standstill),
       plan_alive=plan_alive,
-      csc_active=curve_active and self.curve_enabled,
+      csc_active=curve_active,
       csc_speed=min(float(curve_speed), 100.0),
+      curve_floor=curve_floor,
+      curve_budget=curve_budget,
+      fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
       stop_active=stop_active and self.stop_mode == ON,
@@ -815,6 +853,46 @@ class CurveSlowdown:
     except Exception:
       pass
 
+  # ---- map curve logs ----
+  def _map_row(self, plan):
+    mo = self.map_out
+    if plan is None or self.map_control is None:
+      return (0,) * 16
+    return (int(plan.mapCurveMode), int(plan.mapCurveStatus), float(plan.mapCurveDistance), float(plan.mapCurveRadius),
+            bool(mo.active) if mo else False, (mo.speed / MS_PER_MPH if mo and mo.active else 0.0), (mo.why if mo else ""),
+            bool(plan.mapOnRamp), int(plan.mapRampType), float(plan.mapRampToSpeed) / MS_PER_MPH, bool(plan.mapRampToHighway),
+            float(plan.mapRampEndDistance), int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
+            bool(getattr(self, "_blinker", False)))
+
+  def _map_episode(self, t, i, plan):
+    """One event per map curve / ramp action (Test or On): from the map reason starting until it is over
+    and the set speed is back (On) or the reason is gone (Test)."""
+    mo = self.map_out
+    if self.recorder is None or mo is None or plan is None:
+      return
+    lg = self.logic
+    if self.map_event is None and mo.active:
+      self.map_event = self.recorder.open("mapCurve", t, {
+        "mode": "test" if self.map_mode == 1 else "on", "why": mo.why, "name": plan.mapCurveName,
+        "radius_m": float(plan.mapCurveRadius), "distance_m": float(plan.mapCurveDistance),
+        "target_mph": mo.speed / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
+        "lat_limit": self.lat_limit, "on_ramp": bool(plan.mapOnRamp), "ramp_type": int(plan.mapRampType),
+        "ramp_to_mph": float(plan.mapRampToSpeed) / MS_PER_MPH, "ramp_to_highway": bool(plan.mapRampToHighway),
+        "nav_exit": int(plan.mapNavExit), "nav_exit_m": float(plan.mapNavExitDistance)})
+      self.map_min_speed = i.v_ego
+      self.map_min_set = i.set_speed
+      self.map_brake = False
+    if self.map_event is not None:
+      self.map_min_speed = min(self.map_min_speed, i.v_ego)
+      self.map_min_set = min(self.map_min_set, i.set_speed) if i.set_speed > 0 else self.map_min_set
+      self.map_brake |= i.brake_pressed
+      done = not mo.active and (self.map_mode == 1 or (lg.offset == 0 and not lg.inflight))
+      if done:
+        self.recorder.close(self.map_event, t, {"min_speed_mph": self.map_min_speed / MS_PER_MPH,
+                                                "min_set_mph": self.map_min_set / MS_PER_MPH, "driver_braked": self.map_brake,
+                                                "set_mph_after": i.set_speed / MS_PER_MPH, "last_why": mo.why})
+        self.map_event = None
+
   # ---- per-event logs (never raises into the car controller: called inside try/except) ----
   def _log(self, i, si, stop_active, button, a_ego, plan=None):
     if self.recorder is None:
@@ -831,7 +909,9 @@ class CurveSlowdown:
         si.lead_status, si.lead_prob, si.lead_d, si.lead_v, si.lead_y, si.radar_has_lead, si.radar_lead_distance,
         stop_active, self.trigger.target / MS_PER_MPH,
         self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), lg.offset, len(lg.inflight),
-        lg.hold is not None, {SET_MINUS: "M", SET_PLUS: "P"}.get(button, ""), i.driver_button or "", lg.blocked, lg.restoring))
+        lg.hold is not None, {SET_MINUS: "M", SET_PLUS: "P"}.get(button, ""), i.driver_button or "", lg.blocked, lg.restoring,
+        *self._map_row(plan)))
+    self._map_episode(t, i, plan)
     # curve slowdown episode: from the first SET- for a curve to the restore being complete
     if self.curve_event is None and button == SET_MINUS and lg.last_action in ("tap", "hold") and not stop_active and i.csc_active:
       self.curve_event = self.recorder.open("curveSlowdown", t, {

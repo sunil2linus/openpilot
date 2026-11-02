@@ -596,6 +596,8 @@ std::unordered_map<std::string, uint32_t> keys = {
     {"MazdaCurveSlowdown", PERSISTENT},
     {"MazdaCurveSlowdownMaxDrop", PERSISTENT},
     {"MazdaCurveLearning", PERSISTENT},
+    {"MazdaMapCurves", PERSISTENT},
+    {"MazdaMapCurveChime", PERSISTENT},
     {"MazdaStoppedCarSlowdown", PERSISTENT},
     {"StopWarningRedLight", PERSISTENT},
     {"StopWarningStoppedCar", PERSISTENT},

@@ -39,6 +39,10 @@ struct FrogPilotCarControl {
       startup @20;
       thisIsFine @21;
       uwu @22;
+
+      # Map curves: soft chimes with their own fixed volume (MazdaMapCurveChime)
+      curveChime @23;
+      curveNoData @24;
     }
   }
 }
@@ -101,6 +105,11 @@ struct FrogPilotCarEvent @0x81c2f05a394cf4af {
     # Stop warnings (cars where openpilot cannot brake)
     stopAheadWarning @36;
     stoppedLeadWarning @37;
+
+    # Map curves
+    mapCurveAhead @38;
+    mapExitCurveData @39;
+    mapExitNoCurveData @40;
   }
 }
 
@@ -234,6 +243,22 @@ struct FrogPilotPlan @0xa1680744031fdb2d {
   weatherDaytime @36 :Bool;
   weatherId @37 :Int16;
   wheelImageUpdateCount @38 :UInt64;
+
+  # Map curves (curve files from tools/curve_map), see frogpilot/controls/lib/map_curves.py
+  mapCurveMode @39 :UInt8;           # MazdaMapCurves: 0 off, 1 test, 2 on
+  mapCurveStatus @40 :UInt8;         # 0 none, 1 curve ahead, 2 ramp curve ahead, 3 no curve data here
+  mapCurveDistance @41 :Float32;     # m to the governing curve's entry (0 = in it)
+  mapCurveRadius @42 :Float32;       # m (0 = no curve)
+  mapCurveName @43 :Text;
+  mapOnRamp @44 :Bool;
+  mapRampType @45 :UInt8;            # 0 none, 1 exit, 2 entrance, 3 interchange, 4 other link
+  mapRampToSpeed @46 :Float32;       # speed limit (m/s) of the road the ramp leads into (0 unknown)
+  mapRampToHighway @47 :Bool;
+  mapRampEndDistance @48 :Float32;   # m to the end of the ramp we are on
+  mapNavExit @49 :UInt8;             # navigation exit ahead: 0 none, 1 with curve data, 2 no curves on it, 3 no data
+  mapNavExitDistance @50 :Float32;
+  mapNavCurveRadius @51 :Float32;    # tightest curve on the announced exit (0 none)
+  mapNavCurveDistance @52 :Float32;  # m to its entry
 }
 
 struct FrogPilotProcessState @0x9ccdc8676701b412 {

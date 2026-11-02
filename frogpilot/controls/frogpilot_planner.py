@@ -32,6 +32,13 @@ class FrogPilotPlanner:
     self.frogpilot_weather = WeatherChecker(frogpilot_api)
     self.speed_limit_filler = SpeedLimitFiller()
 
+    # Map curves from the curve files (setting MazdaMapCurves: Off / Test / On)
+    try:
+      from openpilot.frogpilot.controls.lib.map_curves import MapCurvesPlanner
+      self.map_curves = MapCurvesPlanner(frogpilot_variables.params, frogpilot_variables.params_memory)
+    except Exception:
+      self.map_curves = None
+
     self.accel_pressed = False
     self.curve_ahead = False
     self.decel_pressed = False
@@ -113,6 +120,14 @@ class FrogPilotPlanner:
       gps_position = None
 
       frogpilot_variables.params_memory.remove("LastGPSPosition")
+
+    if self.map_curves is not None:
+      try:
+        set_speed = sm["carState"].cruiseState.speed if sm["carState"].cruiseState.enabled else 0.0
+        set_speed += max(sm["frogpilotCarState"].curveSlowdownOffset, 0) * 0.44704
+        self.map_curves.update(sm, gps_position, v_ego, set_speed)
+      except Exception:
+        self.map_curves = None
 
     map_match = {}
     if gps_position and (frogpilot_toggles.speed_limit_controller or frogpilot_toggles.show_speed_limits or frogpilot_toggles.speed_limit_filler):
@@ -224,6 +239,12 @@ class FrogPilotPlanner:
     frogpilotPlan.redLight = self.cem.stop_light_detected
 
     frogpilotPlan.roadCurvature = self.road_curvature
+
+    if self.map_curves is not None:
+      try:
+        self.map_curves.publish(frogpilotPlan)
+      except Exception:
+        pass
 
     frogpilotPlan.slcMapSpeedLimit = self.frogpilot_vcruise.slc.map_speed_limit
     frogpilotPlan.slcMapboxSpeedLimit = self.frogpilot_vcruise.slc.mapbox_speed_limit

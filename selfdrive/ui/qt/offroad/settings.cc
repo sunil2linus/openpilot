@@ -188,6 +188,24 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       addItem(learning);
       toggles["MazdaCurveLearning"] = learning;
 
+      // Map curves from the curve files (tools/curve_map): Off / Test / On, plus the exit chime volume
+      std::vector<QString> map_texts{tr("Off"), tr("Test"), tr("On")};
+      addItem(new ButtonParamControl("MazdaMapCurves", tr("Map Curves"),
+                                     tr("Uses the curve files on the device (/data/media/0/curve_map, made with tools/curve_map) to know "
+                                        "the curves ahead on your road, including exit and entrance ramps, before the camera sees them. "
+                                        "\"On\" lowers the set speed early with SET- presses (ramps may go past the Max Drop, never "
+                                        "below 25 mph), raises it quickly where a ramp joins a highway, and keeps the street's speed "
+                                        "limit after an exit onto a street. With navigation, the exit's curve is known before the "
+                                        "split; it starts early only while your turn signal is on. \"Test\" shows and records what "
+                                        "it would do and presses nothing. Takes effect on the next drive."),
+                                     "../assets/offroad/icon_speed_limit.png", map_texts, 150));
+      std::vector<QString> chime_texts{tr("Off"), tr("5%"), tr("10%"), tr("20%")};
+      addItem(new ButtonParamControl("MazdaMapCurveChime", tr("Map Curves: Exit Chime"),
+                                     tr("A short soft chime when navigation announces an exit: rising if the exit's curve "
+                                        "data is on the device, falling if not. Fixed volume, not raised for road noise. "
+                                        "Takes effect on the next drive."),
+                                     "../assets/offroad/icon_speed_limit.png", chime_texts, 150));
+
       // Stopped car slowdown: Off / Test (log only, no presses) / On
       std::vector<QString> stop_texts{tr("Off"), tr("Test"), tr("On")};
       addItem(new ButtonParamControl("MazdaStoppedCarSlowdown", tr("Stopped Car Slowdown"),

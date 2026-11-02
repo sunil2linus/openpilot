@@ -81,3 +81,34 @@ class CurveTarget:
     else:
       self.active = self.speed < driver_speed - END_GAP
     return self.active, self.speed
+
+
+# ---------------- map curves (from frogpilotPlan, see frogpilot/controls/lib/map_curves.py) ----------------
+
+MAP_DECEL = 0.6               # m/s^2: the stock cruise's slowdown after a set speed drop (0.6-0.7 measured)
+MAP_MARGIN = 30.0             # m before the curve's entry where its speed should be reached
+
+
+def map_curve_speed(radius, distance, lat_accel, decel=MAP_DECEL, margin=MAP_MARGIN):
+  """Set speed allowed now (m/s, true speed) for a map curve of `radius` m starting `distance` m ahead."""
+  if radius <= 0:
+    return NO_CURVE
+  v_curve = math.sqrt(lat_accel * radius)
+  return math.sqrt(v_curve ** 2 + 2 * decel * max(distance - margin, 0.0))
+
+
+class MapCurveTarget:
+  """Same gap and hysteresis as CurveTarget, without the 1 s confirmation (the map does not flicker)."""
+
+  def __init__(self, lat_accel):
+    self.lat_accel = lat_accel
+    self.active = False
+    self.speed = NO_CURVE
+
+  def update(self, radius, distance, driver_speed):
+    self.speed = map_curve_speed(radius, distance, self.lat_accel)
+    if not self.active:
+      self.active = radius > 0 and self.speed <= driver_speed - START_GAP
+    else:
+      self.active = radius > 0 and self.speed < driver_speed - END_GAP
+    return self.active, self.speed

@@ -52,6 +52,8 @@ def manager_init() -> None:
     ("MazdaCurveSlowdown", "0"),
     ("MazdaCurveSlowdownMaxDrop", "1"),
     ("MazdaCurveLearning", "0"),
+    ("MazdaMapCurves", "0"),
+    ("MazdaMapCurveChime", "1"),
     ("MazdaStoppedCarSlowdown", "0"),
     ("StopWarningRedLight", "0"),
     ("StopWarningStoppedCar", "0"),

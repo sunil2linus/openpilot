@@ -237,7 +237,8 @@ def frogpilot_thread():
   sm = messaging.SubMaster(["carControl", "carState", "controlsState", "deviceState",
                             "liveLocationKalman", "liveParameters", "longitudinalPlan", "modelV2",
                             "radarState", "frogpilotCarParams", "frogpilotCarState", "frogpilotControlsState",
-                            "frogpilotDeviceState", "frogpilotModelV2", "frogpilotNavigation", "frogpilotSignReading"],
+                            "frogpilotDeviceState", "frogpilotModelV2", "frogpilotNavigation", "frogpilotSignReading",
+                            "navInstruction"],
                             poll="modelV2")
 
   manual_update_previously = False
