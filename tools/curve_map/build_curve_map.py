@@ -469,11 +469,13 @@ def simplify(x, y, tol):
   return [i for i in range(n) if keep[i]]
 
 
-def road_shapes(ways):
-  """Road shapes for matching the car to a road: {tile name: [{"w": way id, "p": [lat0, lon0, dlat, dlon, ...]}]}
-  with each way in its OSM node order (so the direction of travel gives FrogPilot's is_forward), simplified to
-  SHAPE_TOLERANCE, in micro-degrees (first point absolute, then differences), split by 0.25 deg square with one
-  point of overlap. All classes the chains use (no residential streets)."""
+def road_shapes(ways, chain_of=None):
+  """Road shapes for matching the car to a road: {tile name: [{"w": way id, "c": chain id, "k": road class,
+  "o": 1 if one-way, "p": [lat0, lon0, dlat, dlon, ...]}]} with each way in its OSM node order (so the direction of travel gives
+  FrogPilot's is_forward), simplified to SHAPE_TOLERANCE, in micro-degrees (first point absolute, then
+  differences), split by 0.25 deg square with one point of overlap. All classes the chains use (no residential
+  streets). The chain id (the road the way belongs to) lets the car stay on a road across its way splits."""
+  chain_of = chain_of or {}
   out = {}
   for w in ways.values():
     if w.cls in SKIP_CLASSES or len(w.lat) < 2:
@@ -494,7 +496,10 @@ def road_shapes(ways):
         flat = [pts[run[0]][0], pts[run[0]][1]]
         for a, b in zip(run, run[1:]):
           flat += [pts[b][0] - pts[a][0], pts[b][1] - pts[a][1]]
-        out.setdefault(t, []).append({"w": int(w.id), "p": flat})
+        rec = {"w": int(w.id), "c": int(chain_of.get(w.id, w.id)), "k": int(w.cls), "p": flat}
+        if w.oneway:
+          rec["o"] = 1
+        out.setdefault(t, []).append(rec)
   return out
 
 
@@ -535,7 +540,8 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False):
     t = tile(tile_of(*r["start"]))
     t["ramps"].append(r)
     t["chains"].add(r["chain"])
-  for name, shapes in road_shapes(ways).items():
+  chain_of = {w.id: int(ch[0][0].id) for ch in chains for w, _rev in ch}
+  for name, shapes in road_shapes(ways, chain_of).items():
     tile(name)["roads"] = shapes
   os.makedirs(out_dir, exist_ok=True)
   for name, d in by_tile.items():

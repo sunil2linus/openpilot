@@ -149,6 +149,22 @@ class _Gate:
     return False
 
 
+# FrogPilot's lead relevance (frogpilot_planner.is_lead_relevant), for planners without it (StarPilot)
+_STOP_DISTANCE = 6.0
+_LEAD_STOP_MARGIN = 4.0
+_MAX_T_FOLLOW = 3.0
+_PLANNER_TIME = 10.0
+_CRUISING_SPEED = 5.0
+
+
+def lead_is_relevant(lead_status, lead_d, lead_v, lead_a, standstill, v_ego, model_length):
+  following_speed = max(v_ego, _CRUISING_SPEED)
+  lead_speed = lead_v + min(lead_a, 0.0) * _PLANNER_TIME / 2
+  return bool(lead_status and
+              lead_d < (0.0 if standstill else model_length) + _STOP_DISTANCE + _LEAD_STOP_MARGIN and
+              lead_d < _STOP_DISTANCE + following_speed * _MAX_T_FOLLOW + max(following_speed - lead_speed, 0.0) * _PLANNER_TIME)
+
+
 class StopWarningLogic:
   def __init__(self):
     self.frame = 0
@@ -462,7 +478,7 @@ class StopWarning:
       lead_v=float(lead.vLead),
       lead_prob=float(lead.modelProb),
       lead_y=float(lead.yRel),
-      lead_relevant=bool(getattr(planner, "lead_relevant", getattr(planner, "tracking_lead", False))),
+      lead_relevant=self._lead_relevant(planner, lead, cs),
     )
     alerts = []
     fired = self.logic.update(inputs, self.modes)
@@ -480,6 +496,14 @@ class StopWarning:
     except Exception:
       pass
     return alerts
+
+  @staticmethod
+  def _lead_relevant(planner, lead, cs):
+    if hasattr(planner, "lead_relevant"):          # FrogPilot
+      return bool(planner.lead_relevant)
+    model_length = float(getattr(planner, "model_length", 0.0) or 0.0)
+    return lead_is_relevant(bool(lead.status), float(lead.dRel), float(lead.vLead), float(getattr(lead, "aLeadK", 0.0)),
+                            bool(cs.standstill), float(cs.vEgo), model_length)
 
   # ---- per-event logs (never raises into the planner: called inside try/except) ----
   def _log(self, sm, planner, i, fired):

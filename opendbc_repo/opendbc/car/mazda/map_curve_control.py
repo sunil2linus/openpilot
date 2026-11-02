@@ -13,6 +13,9 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
     planned the same way (so the slowdown starts only as late as that curve allows). Forgotten when the car is
     on the ramp (the ramp's own curves take over), when navigation no longer shows that exit for NAV_GRACE
     (passed it, rerouted), or when the driver signals the other way.
+  * Ramp rules (ramp curves, fast restore, street cap) only start after the car has been on the ramp for
+    RAMP_HOLD, and the street rules only after STREET_PROGRESS along the exit, so a short wrong ramp match
+    (passing an exit in the right lane) changes nothing.
   * End of a ramp onto a highway: restore at once with SET+ holds (merge).
   * End of an exit onto a street with a known speed limit: within STREET_CAP_DISTANCE of the end, cap the
     set speed at the street's limit; once off the ramp, that lowered set speed becomes the driver's speed
@@ -34,8 +37,11 @@ RAMP_BUDGET = 60                # SET- presses for one ramp (70 -> 25 mph plus i
 NAV_GRACE = 3.0                 # s the exit plan is kept while navigation drops it (map match catching up at the split)
 DT_CTRL = 0.01
 STREET_CAP_DISTANCE = 200.0     # m before the end of an exit onto a street
+RAMP_HOLD = 1.0                 # s on the ramp before ramp rules apply (a short wrong ramp match does nothing)
+STREET_PROGRESS = 50.0          # m driven along an exit (its end getting closer) before the street rules apply
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
 RAMP_EXIT = 1
+HIGHWAY_CLASSES = (1, 3)        # motorway, trunk
 
 
 @dataclass
@@ -56,6 +62,7 @@ class MapFields:
   nav_exit_side: int = 0          # -1 left, 1 right, 0 unknown
   advisory: float = 0.0           # m/s, yellow sign speed of the curve (0 none)
   nav_curve_advisory: float = 0.0
+  road_class: int = 0             # matched road (0 unknown); a freeway never takes the street rules
 
   @staticmethod
   def from_plan(plan):
@@ -64,7 +71,8 @@ class MapFields:
                      float(plan.mapRampToSpeed), bool(plan.mapRampToHighway), float(plan.mapRampEndDistance),
                      int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
                      float(plan.mapNavCurveDistance), int(getattr(plan, "mapNavExitSide", 0)),
-                     float(getattr(plan, "mapCurveAdvisory", 0.0)), float(getattr(plan, "mapNavCurveAdvisory", 0.0)))
+                     float(getattr(plan, "mapCurveAdvisory", 0.0)), float(getattr(plan, "mapNavCurveAdvisory", 0.0)),
+                     int(getattr(plan, "mapRoadClass", 0)))
 
 
 @dataclass
@@ -86,8 +94,10 @@ class MapCurveControl:
     self.exit_intent = False      # the driver signalled for the announced exit
     self.nav_grace = 0
     self.last_nav = (0.0, 0.0, 0.0)  # radius, distance, advisory of the remembered exit curve
+    self.ramp_frames = 0          # consecutive updates on a ramp
+    self.ramp_end_first = 0.0     # distance to the ramp's end when it was first matched
 
-  def _exit_intent(self, f, signal):
+  def _exit_intent(self, f, signal, ramp_held=True):
     """signal: -1 left, 1 right, 0 none. Returns (radius, distance, advisory) of the exit curve to plan, or zeros."""
     nav_ok = f.nav_exit == 1 and f.nav_curve_radius > 0 and not f.on_ramp
     if signal != 0 and f.nav_exit_side != 0 and signal == -f.nav_exit_side:
@@ -101,7 +111,7 @@ class MapCurveControl:
       self.last_nav = (f.nav_curve_radius, f.nav_curve_distance, f.nav_curve_advisory)
       return self.last_nav
     self.nav_grace += 1
-    if f.on_ramp or self.nav_grace > NAV_GRACE / DT_CTRL:
+    if (f.on_ramp and ramp_held) or self.nav_grace > NAV_GRACE / DT_CTRL:
       self.exit_intent = False
       return 0.0, 0.0, 0.0
     return self.last_nav          # brief drop-out: keep the last plan (a ceiling, the ramp curve is lower)
@@ -109,22 +119,31 @@ class MapCurveControl:
   def update(self, f: MapFields, driver_speed, signal):
     """signal: turn signal side, -1 left, 1 right, 0 none."""
     out = MapOutput()
+    if f.on_ramp:
+      if self.ramp_frames == 0:
+        self.ramp_end_first = f.ramp_end_distance
+      self.ramp_frames += 1
+    else:
+      self.ramp_frames = 0
+    ramp_held = self.ramp_frames >= RAMP_HOLD / DT_CTRL
     if f.mode == OFF or driver_speed <= 0:
       self.curve.active = self.nav.active = False
       self.exit_intent = False
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
-    radius = f.radius if f.status in (STATUS_CURVE, STATUS_RAMP_CURVE) else 0.0
+    radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
-    nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal))
+    nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held)
     na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)
     speed, why = NO_CURVE, ""
     if a:
       speed, why = sp, ("ramp" if ramp_curve else "curve")
     if na and nsp < speed:
       speed, why = nsp, "nav exit"
-    street_exit = f.on_ramp and f.ramp_type == RAMP_EXIT and not f.ramp_to_highway and f.ramp_to_speed > 0
+    exit_to_street = f.on_ramp and ramp_held and f.ramp_type == RAMP_EXIT and not f.ramp_to_highway
+    progress = self.ramp_end_first - f.ramp_end_distance >= STREET_PROGRESS
+    street_exit = exit_to_street and progress and f.ramp_to_speed > 0
     capped = False
     if street_exit and f.ramp_end_distance <= STREET_CAP_DISTANCE and f.ramp_to_speed < driver_speed - START_GAP:
       if f.ramp_to_speed < speed:
@@ -134,8 +153,10 @@ class MapCurveControl:
     out.speed = speed
     if ramp_curve or na or capped:
       out.floor, out.budget = RAMP_FLOOR, RAMP_BUDGET
-    out.fast_restore = f.on_ramp and f.ramp_to_highway and not out.active
-    out.adopt = self.on_street_exit and not f.on_ramp
-    self.on_street_exit = street_exit or (self.on_street_exit and f.on_ramp)
+    out.fast_restore = f.on_ramp and ramp_held and f.ramp_to_highway and not out.active
+    out.adopt = self.on_street_exit and not f.on_ramp and f.road_class not in HIGHWAY_CLASSES
+    # keep the lowered speed after an exit onto a street: known when the road after it is matched as not a freeway
+    # (own road matching), otherwise only after driving along the exit
+    self.on_street_exit = (exit_to_street and (progress or f.road_class != 0)) or (self.on_street_exit and f.on_ramp)
     out.why = why
     return out

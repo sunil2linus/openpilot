@@ -150,6 +150,10 @@ SAFE_MODE_MANAGED_KEYS = (
   "ShowCCMStatus",
   "CurveSpeedController",
   "SpeedLimitController",
+  # Mazda Gen1 stock cruise helpers that press SET-/SET+ (default off)
+  "MazdaCurveSlowdown",
+  "MazdaMapCurves",
+  "MazdaStoppedCarSlowdown",
   "SetSpeedLimit",
   "SLCFallback",
   "SLCMapboxFiller",

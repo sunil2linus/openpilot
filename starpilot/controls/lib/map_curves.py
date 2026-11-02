@@ -44,7 +44,8 @@ NEAR = 15.0               # m
 TILE_KEEP = 25            # squares kept in memory
 MATCH_DIST = 20.0         # m: the car is on a road shape within this distance (GPS error + road width)
 MATCH_HEADING = 35.0      # deg: and heading along it (either direction) within this
-MATCH_KEEP = 8.0          # m: another road must be this much closer to take over from the matched one
+MATCH_STAY = 12.0         # m: the car stays on the road it is on until that road is this far away (or turns away)
+LINK_CLASSES = (2, 4, 6, 8, 10)   # ramps and other link roads (highwayClass)
 MATCH_CELL = 500          # grid cells of 1/500 deg (~220 m) for the road shape index
 NAV_EXIT_TYPES = ("off ramp", "fork")
 NAV_EXIT_RANGE = 1500.0   # m: exits matched from this far
@@ -116,13 +117,17 @@ class RoadIndex:
 
   def __init__(self, shapes):
     self.lat1, self.lon1, self.lat2, self.lon2 = array("i"), array("i"), array("i"), array("i")
-    self.way = array("q")
+    self.way, self.chain = array("q"), array("q")
+    self.oneway, self.cls = array("b"), array("b")
     cells = {}
     for shape in shapes:
       p = shape.get("p", [])
       if len(p) < 4:
         continue
       wid = int(shape.get("w", 0))
+      cid = int(shape.get("c", wid))
+      one = 1 if shape.get("o") else 0
+      cls = int(shape.get("k", 0))
       lat, lon = p[0], p[1]
       for k in range(2, len(p) - 1, 2):
         la2, lo2 = lat + p[k], lon + p[k + 1]
@@ -132,6 +137,9 @@ class RoadIndex:
         self.lat2.append(la2)
         self.lon2.append(lo2)
         self.way.append(wid)
+        self.chain.append(cid)
+        self.oneway.append(one)
+        self.cls.append(cls)
         n = max(1, int(dist_m(lat / 1e6, lon / 1e6, la2 / 1e6, lo2 / 1e6) / 100.0) + 1)
         seen = set()
         for j in range(n + 1):
@@ -145,18 +153,29 @@ class RoadIndex:
 
   def segments(self, cell):
     for i in self.cells.get(cell, ()):
-      yield self.lat1[i] / 1e6, self.lon1[i] / 1e6, self.lat2[i] / 1e6, self.lon2[i] / 1e6, self.way[i]
+      yield (self.lat1[i] / 1e6, self.lon1[i] / 1e6, self.lat2[i] / 1e6, self.lon2[i] / 1e6, self.way[i], self.chain[i],
+             self.oneway[i], self.cls[i])
 
 
 class RoadMatcher:
   """The road (way id) the car is on and its direction along the way's node order (is_forward), from the
-  road shapes in the curve files: the nearest shape segment within MATCH_DIST whose direction (either way)
-  is within MATCH_HEADING of the car's heading. The road matched last keeps the match unless another is
-  MATCH_KEEP closer (no flicker between a ramp and the main road at a split)."""
+  road shapes in the curve files: shape segments within MATCH_DIST whose direction is within MATCH_HEADING of
+  the car's heading (either way along it, but only the open direction of a one-way road).
+
+  The car stays on the road (chain) it is on while that road is within MATCH_STAY and still runs its way, also
+  where OSM starts a new way at an exit: a car in the right lane past an exit is closer to the start of the
+  ramp than to the middle of the freeway for a while, but it has not left the freeway until the freeway is
+  MATCH_STAY away. Where the main road itself changes at the split (a new name or ref), or before anything
+  is matched, a main road within MATCH_STAY is taken before a ramp. Only then the nearest road is taken (so
+  from an entrance ramp the car joins the freeway it merges into, not the next ramp). Taking an exit is therefore seen once the ramp is about MATCH_STAY away from the main road (typically
+  50-150 m after the split); passing it is not mistaken for taking it."""
 
   def __init__(self, store):
     self.store = store
     self.way_id = 0
+    self.chain_id = 0
+    self.on_link = False
+    self.road_class = 0           # highwayClass of the matched road (0 unknown)
     self.is_forward = True
 
   def update(self, lat, lon, bearing):
@@ -167,10 +186,10 @@ class RoadMatcher:
     cla, clo = int(math.floor(lat * MATCH_CELL)), int(math.floor(lon * MATCH_CELL))
     kx = math.radians(1.0) * EARTH_R * math.cos(math.radians(lat))
     ky = math.radians(1.0) * EARTH_R
-    best = None
+    best, stay, kind = None, None, None
     for dla in (-1, 0, 1):
       for dlo in (-1, 0, 1):
-        for la1, lo1, la2, lo2, wid in (seg for ri in grid for seg in ri.segments(cell_key(cla + dla, clo + dlo))):
+        for la1, lo1, la2, lo2, wid, cid, one, cls in (seg for ri in grid for seg in ri.segments(cell_key(cla + dla, clo + dlo))):
           ax, ay = (lo1 - lon) * kx, (la1 - lat) * ky
           bx, by = (lo2 - lon) * kx, (la2 - lat) * ky
           dx, dy = bx - ax, by - ay
@@ -184,17 +203,24 @@ class RoadMatcher:
           diff = abs((math.degrees(math.atan2(dx, dy)) - bearing + 180.0) % 360.0 - 180.0)
           if diff <= MATCH_HEADING:
             fwd = True
-          elif diff >= 180.0 - MATCH_HEADING:
+          elif diff >= 180.0 - MATCH_HEADING and not one:
             fwd = False
           else:
             continue
-          score = d - (MATCH_KEEP if wid == self.way_id else 0.0)
-          if best is None or score < best[0]:
-            best = (score, wid, fwd)
-    if best is None:
-      self.way_id = 0
+          link = cls in LINK_CLASSES
+          cand = (d, wid, fwd, cid, link, cls)
+          if best is None or d < best[0]:
+            best = cand
+          if d <= MATCH_STAY:
+            if self.chain_id and cid == self.chain_id and (stay is None or d < stay[0]):
+              stay = cand
+            if not link and not self.on_link and (kind is None or d < kind[0]):
+              kind = cand
+    pick = stay or kind or best
+    if pick is None:
+      self.way_id, self.chain_id, self.road_class = 0, 0, 0
       return 0, True
-    self.way_id, self.is_forward = best[1], best[2]
+    _, self.way_id, self.is_forward, self.chain_id, self.on_link, self.road_class = pick
     return self.way_id, self.is_forward
 
 
@@ -445,8 +471,17 @@ class MapCurvesPlanner:
 
   def update(self, sm, gps_position, v_ego, set_speed):
     self.notice = None
-    if self.counter % 20 == 0:
+    # The car side reads the setting once when a drive starts, so read it here only then too (first call, after
+    # a pause in calls, or while not started): the screen never says "Slowing" when the car would not act.
+    import time
+    now = time.monotonic()
+    try:
+      started = bool(sm["deviceState"].started)
+    except Exception:
+      started = True
+    if self.counter == 0 or now - getattr(self, "last_call", now) > 5.0 or (not started and self.counter % 20 == 0):
       self._read_mode()
+    self.last_call = now
     self.counter += 1
     if self.mode == 0:
       if self.mc is not None:
@@ -469,6 +504,9 @@ class MapCurvesPlanner:
     if not way_id:
       # no map match from the map program (StarPilot): match the road shapes of the curve files ourselves
       way_id, is_forward = self.matcher.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"])
+      self.road_class = self.matcher.road_class
+    else:
+      self.road_class = 0
     nav = None
     try:
       if sm.alive["navInstruction"] and sm.valid["navInstruction"]:
@@ -512,6 +550,7 @@ class MapCurvesPlanner:
       plan.mapRampToSpeed = float(to.get("speed", 0.0) or 0.0)
       plan.mapRampToHighway = to.get("cls") in HIGHWAY_CLASSES
       plan.mapRampEndDistance = float(mc.ramp_end_dist)
+    plan.mapRoadClass = int(getattr(self, "road_class", 0))
     plan.mapNavExit = mc.nav_exit
     plan.mapNavExitDistance = float(mc.nav_exit_dist)
     plan.mapNavExitSide = int(mc.nav_side)

@@ -154,10 +154,40 @@ def test_curve_far_away_waits_then_acts():
   assert abs(out.speed - math.sqrt(3.0 * 115 + 2 * 0.6 * 30)) < 1e-6
 
 
+HOLD = int(CTL.RAMP_HOLD / CTL.DT_CTRL)
+
+
+def on_ramp_for(c, frames, speed, **kw):
+  out = None
+  for _ in range(frames):
+    out = c.update(F(**kw), speed, 0)
+  return out
+
+
 def test_ramp_curve_may_pass_the_max_drop_down_to_25():
   c = CTL.MapCurveControl(3.0)
-  out = c.update(F(status=2, radius=45, distance=80, on_ramp=True, ramp_type=1), 70 * MPH, False)
+  out = on_ramp_for(c, HOLD + 1, 70 * MPH, status=2, radius=45, distance=80, on_ramp=True, ramp_type=1)
   assert out.active and out.why == "ramp" and abs(out.floor - 25 * MPH) < 1e-9 and out.budget == CTL.RAMP_BUDGET
+
+
+def test_a_short_wrong_ramp_match_does_nothing():
+  # passing an exit in the right lane: the road match says "ramp" for less than RAMP_HOLD
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(status=2, radius=45, distance=60, on_ramp=True, ramp_type=1, ramp_to_highway=False,
+              ramp_to_speed=35 * MPH, ramp_end_distance=150)
+  for _ in range(HOLD - 1):
+    out = c.update(F(**ramp), 70 * MPH, 0)
+    assert not out.active and not out.fast_restore and not out.adopt
+  out = c.update(F(status=0), 70 * MPH, 0)                      # back on the freeway
+  assert not out.adopt and not out.active
+
+
+def test_street_rules_need_progress_along_the_exit():
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(on_ramp=True, ramp_type=1, ramp_to_highway=False, ramp_to_speed=45 * MPH, ramp_end_distance=150)
+  out = on_ramp_for(c, HOLD * 3, 70 * MPH, **ramp)              # matched for 3 s but its end is not getting closer
+  assert not out.active
+  assert not c.update(F(on_ramp=False), 70 * MPH, 0).adopt
 
 
 def nav(d, side=1, **kw):
@@ -203,7 +233,9 @@ def test_unknown_side_accepts_either_signal_and_ramp_takes_over():
   c.update(nav(500, side=0), 70 * MPH, -1)
   assert c.exit_intent
   assert c.update(F(nav_exit=0), 70 * MPH, 0).active       # split: map match not on the ramp yet, plan kept
-  out = c.update(F(status=2, radius=45, distance=150, on_ramp=True, ramp_type=1), 60 * MPH, 0)
+  out = c.update(F(status=2, radius=45, distance=150, on_ramp=True, ramp_type=1), 70 * MPH, 0)
+  assert c.exit_intent and out.active and out.why == "nav exit"   # just matched to the ramp: the exit plan still holds
+  out = on_ramp_for(c, HOLD, 60 * MPH, status=2, radius=45, distance=140, on_ramp=True, ramp_type=1)
   assert not c.exit_intent and out.active and out.why == "ramp"
 
 
@@ -214,8 +246,9 @@ def test_planner_reads_the_exit_side():
 def test_exit_onto_a_street_caps_then_keeps_the_street_speed():
   c = CTL.MapCurveControl(3.0)
   ramp = dict(on_ramp=True, ramp_type=1, ramp_to_highway=False, ramp_to_speed=45 * MPH)
-  assert not c.update(F(ramp_end_distance=500, **ramp), 70 * MPH, False).active
-  out = c.update(F(ramp_end_distance=150, **ramp), 70 * MPH, False)
+  for k in range(HOLD + 1):                                   # driving along the exit for a second
+    assert not c.update(F(ramp_end_distance=500 - k * 0.3, **ramp), 70 * MPH, False).active
+  out = on_ramp_for(c, 10, 70 * MPH, ramp_end_distance=150, **ramp)
   assert out.active and out.why == "street cap" and abs(out.speed - 45 * MPH) < 1e-9
   out = c.update(F(on_ramp=False), 70 * MPH, False)          # off the ramp onto the street
   assert out.adopt
@@ -224,7 +257,7 @@ def test_exit_onto_a_street_caps_then_keeps_the_street_speed():
 
 def test_ramp_onto_a_highway_restores_fast():
   c = CTL.MapCurveControl(3.0)
-  out = c.update(F(on_ramp=True, ramp_type=2, ramp_to_highway=True, ramp_end_distance=100), 70 * MPH, False)
+  out = on_ramp_for(c, HOLD, 70 * MPH, on_ramp=True, ramp_type=2, ramp_to_highway=True, ramp_end_distance=100)
   assert out.fast_restore and not out.active
   assert not c.update(F(on_ramp=True, ramp_type=2, ramp_to_highway=False, ramp_to_speed=0), 70 * MPH, False).fast_restore
 
@@ -290,7 +323,7 @@ def test_advisory_sign_caps_the_curve_speed():
   assert out.active and abs(out.speed / MPH - 40) < 0.01           # 30 + 10 mph
   # a sign above what the shape allows changes nothing (the shape is lower)
   c = CTL.MapCurveControl(3.0)
-  out = c.update(F(status=2, radius=45, distance=0, on_ramp=True, ramp_type=1, advisory=35 * MPH), 70 * MPH, 0)
+  out = on_ramp_for(c, HOLD, 70 * MPH, status=2, radius=45, distance=0, on_ramp=True, ramp_type=1, advisory=35 * MPH)
   assert abs(out.speed - math.sqrt(3.0 * 45)) < 1e-6
 
 
@@ -367,3 +400,19 @@ def test_planner_uses_its_own_matching_when_the_map_program_gives_none():
   la, lo = pos(0, -90)
   mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 20.0, 22.0)
   assert mp.notice == "curve"
+
+
+def test_off_a_short_exit_onto_a_street_keeps_the_lowered_speed():
+  # own road matching: the road after the exit is known (a primary road), so no progress along the exit is needed
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(on_ramp=True, ramp_type=1, ramp_to_highway=False, ramp_to_speed=0.0, ramp_end_distance=40, road_class=2)
+  on_ramp_for(c, HOLD + 1, 70 * MPH, **ramp)
+  assert c.update(F(on_ramp=False, road_class=5), 70 * MPH, 0).adopt
+
+
+def test_never_keeps_a_lowered_speed_when_the_next_road_is_a_freeway():
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(on_ramp=True, ramp_type=1, ramp_to_highway=False, ramp_to_speed=45 * MPH, road_class=2)
+  for k in range(HOLD * 3):
+    c.update(F(ramp_end_distance=300 - k * 0.5, **ramp), 70 * MPH, 0)
+  assert not c.update(F(on_ramp=False, road_class=1), 70 * MPH, 0).adopt

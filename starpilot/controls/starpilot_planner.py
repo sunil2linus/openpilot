@@ -255,8 +255,13 @@ class StarPilotPlanner:
     if self.map_curves is not None:
       try:
         cs = sm["carState"]
-        set_speed = cs.cruiseState.speed if cs.cruiseState.enabled else 0.0
-        set_speed += max(sm["starpilotCarState"].curveSlowdownOffset, 0) * 0.44704
+        set_speed = 0.0
+        if cs.cruiseState.enabled:
+          # the driver's own set speed: the stock set speed plus the steps the Mazda slowdown took off it
+          if not hasattr(self, "_mazda_metric"):
+            self._mazda_metric = self.params.get_bool("IsMetric")
+          step = CV.KPH_TO_MS if self._mazda_metric else CV.MPH_TO_MS
+          set_speed = cs.cruiseState.speed + max(sm["starpilotCarState"].curveSlowdownOffset, 0) * step
         self.map_curves.update(sm, self.gps_position if self.gps_valid else None, v_ego, set_speed)
       except Exception:
         self.map_curves = None

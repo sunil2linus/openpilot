@@ -269,6 +269,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapNavExitSide @59 :Int8;          # side of the announced exit: -1 left, 1 right, 0 unknown
   mapCurveAdvisory @60 :Float32;     # m/s, yellow advisory sign speed of the governing curve from the map (0 none)
   mapNavCurveAdvisory @61 :Float32;  # m/s, same for the announced exit's curve
+  mapRoadClass @62 :UInt8;           # highwayClass of the road the car is matched to (0 unknown; 1 motorway, 3 trunk)
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

@@ -374,3 +374,13 @@ def test_long_dip_closes_at_dip_max():
   out = run_dips(sw.DIP_MAX + 10, lambda t: DIP_PLAN)
   assert [a[1] for a in out][:2] == ["open", "close"]
   assert out[1][0] <= sw.DIP_MAX + 1.0 + 1e-6
+
+
+
+def test_lead_relevance_matches_frogpilot():
+  # 25 m/s, lead at 10 m/s: FrogPilot counts it out to 6 + 25*3 + 15*10 = 231 m (and within the model's path + 10 m)
+  assert sw.lead_is_relevant(True, 180.0, 15.0, 0.0, False, 25.0, 200.0)
+  assert not sw.lead_is_relevant(True, 180.0, 15.0, 0.0, False, 25.0, 150.0)   # beyond the planned path
+  assert not sw.lead_is_relevant(False, 50.0, 0.0, 0.0, False, 25.0, 200.0)
+  assert sw.lead_is_relevant(True, 8.0, 0.0, 0.0, True, 0.0, 0.0)
+  assert not sw.lead_is_relevant(True, 12.0, 0.0, 0.0, True, 0.0, 0.0)
