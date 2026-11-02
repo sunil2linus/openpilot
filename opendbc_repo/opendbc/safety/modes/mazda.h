@@ -358,8 +358,19 @@ static safety_config mazda_init(uint16_t param) {
   return ret;
 }
 
+// Like mazda-frogpilot-dev: never pass the Torque Interceptor command (0x249) between the car and the camera.
+// With a TI the command is also seen on the main bus, and the generic forwarding passed it to the camera at
+// 100 Hz. The camera then turned its LKAS off (CAM_LANEINFO.LANE_LINES = 0, the dash "LKAS off" light that the
+// LKAS button cannot clear) and the EPS ignored CAM_LKAS (STEER_RATE.LKAS_BLOCK = 1, LKAS_EFFECTIVE = 0), so only
+// the TI steered: weaker steering in curves than on mazda-frogpilot-dev (drives 36-38).
+static bool mazda_fwd_hook(int bus_num, int addr) {
+  SAFETY_UNUSED(bus_num);
+  return addr == MAZDA_TI_LKAS;
+}
+
 const safety_hooks mazda_hooks = {
   .init = mazda_init,
   .rx = mazda_rx_hook,
   .tx = mazda_tx_hook,
+  .fwd = mazda_fwd_hook,
 };

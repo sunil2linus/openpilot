@@ -15,7 +15,9 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
   TX_MSGS = [[0x243, 0], [0x09d, 0], [0x440, 0]]
   STANDSTILL_THRESHOLD = .1
   RELAY_MALFUNCTION_ADDRS = {0: (0x243, 0x440)}
-  FWD_BLACKLISTED_ADDRS = {2: [0x243, 0x440]}
+  # the TI command (0x249) is never passed between the car and the camera (forwarded to the camera, the camera
+  # turns its LKAS off and the EPS then ignores CAM_LKAS)
+  FWD_BLACKLISTED_ADDRS = {0: [0x249], 2: [0x243, 0x440, 0x249]}
 
   MAX_RATE_UP = 10
   MAX_RATE_DOWN = 25
