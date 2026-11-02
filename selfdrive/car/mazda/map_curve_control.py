@@ -54,6 +54,8 @@ class MapFields:
   nav_curve_radius: float = 0.0
   nav_curve_distance: float = 0.0
   nav_exit_side: int = 0          # -1 left, 1 right, 0 unknown
+  advisory: float = 0.0           # m/s, yellow sign speed of the curve (0 none)
+  nav_curve_advisory: float = 0.0
 
   @staticmethod
   def from_plan(plan):
@@ -61,7 +63,8 @@ class MapFields:
                      float(plan.mapCurveRadius), bool(plan.mapOnRamp), int(plan.mapRampType),
                      float(plan.mapRampToSpeed), bool(plan.mapRampToHighway), float(plan.mapRampEndDistance),
                      int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
-                     float(plan.mapNavCurveDistance), int(getattr(plan, "mapNavExitSide", 0)))
+                     float(plan.mapNavCurveDistance), int(getattr(plan, "mapNavExitSide", 0)),
+                     float(getattr(plan, "mapCurveAdvisory", 0.0)), float(getattr(plan, "mapNavCurveAdvisory", 0.0)))
 
 
 @dataclass
@@ -82,25 +85,25 @@ class MapCurveControl:
     self.on_street_exit = False
     self.exit_intent = False      # the driver signalled for the announced exit
     self.nav_grace = 0
-    self.last_nav = (0.0, 0.0)    # radius, distance of the remembered exit curve
+    self.last_nav = (0.0, 0.0, 0.0)  # radius, distance, advisory of the remembered exit curve
 
   def _exit_intent(self, f, signal):
-    """signal: -1 left, 1 right, 0 none. Returns (radius, distance) of the exit curve to plan, or (0, 0)."""
+    """signal: -1 left, 1 right, 0 none. Returns (radius, distance, advisory) of the exit curve to plan, or zeros."""
     nav_ok = f.nav_exit == 1 and f.nav_curve_radius > 0 and not f.on_ramp
     if signal != 0 and f.nav_exit_side != 0 and signal == -f.nav_exit_side:
       self.exit_intent = False    # signalling the other way: not this exit
     elif nav_ok and signal != 0:
       self.exit_intent = True
     if not self.exit_intent:
-      return 0.0, 0.0
+      return 0.0, 0.0, 0.0
     if nav_ok:
       self.nav_grace = 0
-      self.last_nav = (f.nav_curve_radius, f.nav_curve_distance)
+      self.last_nav = (f.nav_curve_radius, f.nav_curve_distance, f.nav_curve_advisory)
       return self.last_nav
     self.nav_grace += 1
     if f.on_ramp or self.nav_grace > NAV_GRACE / DT_CTRL:
       self.exit_intent = False
-      return 0.0, 0.0
+      return 0.0, 0.0, 0.0
     return self.last_nav          # brief drop-out: keep the last plan (a ceiling, the ramp curve is lower)
 
   def update(self, f: MapFields, driver_speed, signal):
@@ -112,10 +115,10 @@ class MapCurveControl:
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
     radius = f.radius if f.status in (STATUS_CURVE, STATUS_RAMP_CURVE) else 0.0
-    a, sp = self.curve.update(radius, f.distance, driver_speed)
+    a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
-    nav_r, nav_d = self._exit_intent(f, int(signal))
-    na, nsp = self.nav.update(nav_r, nav_d, driver_speed)
+    nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal))
+    na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)
     speed, why = NO_CURVE, ""
     if a:
       speed, why = sp, ("ramp" if ramp_curve else "curve")

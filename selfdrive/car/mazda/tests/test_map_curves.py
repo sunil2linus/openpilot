@@ -275,3 +275,30 @@ def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
   assert low / MPH <= 31
   assert abs(car.set_speed / MPH - 70) < 0.6, car.set_speed / MPH
   assert any(h["direction"] == cs.SET_PLUS for h in logic.hold_log), "restored with SET+ holds"
+
+
+# ---------------- yellow advisory signs ----------------
+
+def test_advisory_sign_caps_the_curve_speed():
+  # West Utica Road: 117 m radius, 45 mph limit, yellow 30 mph sign. Shape alone at 3.0 m/s^2 allows ~42 mph.
+  c = CTL.MapCurveControl(3.0)
+  out = c.update(F(status=1, radius=116.6, distance=0), 45 * MPH, 0)
+  assert out.active and 41.5 <= out.speed / MPH <= 42.5, out.speed / MPH
+  c = CTL.MapCurveControl(3.0)
+  out = c.update(F(status=1, radius=116.6, distance=0, advisory=30 * MPH), 45 * MPH, 0)
+  assert out.active and abs(out.speed / MPH - 40) < 0.01           # 30 + 10 mph
+  # a sign above what the shape allows changes nothing (the shape is lower)
+  c = CTL.MapCurveControl(3.0)
+  out = c.update(F(status=2, radius=45, distance=0, on_ramp=True, ramp_type=1, advisory=35 * MPH), 70 * MPH, 0)
+  assert abs(out.speed - math.sqrt(3.0 * 45)) < 1e-6
+
+
+def test_planner_uses_the_advisory_to_choose_and_announce():
+  assert abs(MC.curve_speed_limit(116.6, 30 * MPH) / MPH - 40) < 0.01
+  assert MC.curve_speed_limit(116.6) > MC.curve_speed_limit(116.6, 30 * MPH)
+  # an easy-looking curve with a 25 mph sign governs over a sharper unsigned one at the same distance
+  assert MC.plan_speed(300, 200, 25 * MPH) < MC.plan_speed(150, 200)
+
+
+def test_builder_keeps_a_signed_curve_that_looks_easy():
+  assert B.ADVISORY_OVER == 10 * MPH

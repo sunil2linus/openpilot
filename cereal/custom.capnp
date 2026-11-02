@@ -260,6 +260,8 @@ struct FrogPilotPlan @0xa1680744031fdb2d {
   mapNavCurveRadius @51 :Float32;    # tightest curve on the announced exit (0 none)
   mapNavCurveDistance @52 :Float32;  # m to its entry
   mapNavExitSide @53 :Int8;          # side of the announced exit: -1 left, 1 right, 0 unknown
+  mapCurveAdvisory @54 :Float32;     # m/s, yellow advisory sign speed of the governing curve from the map (0 none)
+  mapNavCurveAdvisory @55 :Float32;  # m/s, same for the announced exit's curve
 }
 
 struct FrogPilotProcessState @0x9ccdc8676701b412 {

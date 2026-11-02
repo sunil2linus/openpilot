@@ -87,13 +87,17 @@ class CurveTarget:
 
 MAP_DECEL = 0.6               # m/s^2: the stock cruise's slowdown after a set speed drop (0.6-0.7 measured)
 MAP_MARGIN = 30.0             # m before the curve's entry where its speed should be reached
+ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advisory sign the map has for the curve
 
 
-def map_curve_speed(radius, distance, lat_accel, decel=MAP_DECEL, margin=MAP_MARGIN):
-  """Set speed allowed now (m/s, true speed) for a map curve of `radius` m starting `distance` m ahead."""
+def map_curve_speed(radius, distance, lat_accel, advisory=0.0, decel=MAP_DECEL, margin=MAP_MARGIN):
+  """Set speed allowed now (m/s, true speed) for a map curve of `radius` m starting `distance` m ahead
+  (`advisory`: its yellow sign speed in m/s, 0 if the map has none)."""
   if radius <= 0:
     return NO_CURVE
   v_curve = math.sqrt(lat_accel * radius)
+  if advisory > 0:
+    v_curve = min(v_curve, advisory + ADVISORY_OVER)
   return math.sqrt(v_curve ** 2 + 2 * decel * max(distance - margin, 0.0))
 
 
@@ -105,8 +109,8 @@ class MapCurveTarget:
     self.active = False
     self.speed = NO_CURVE
 
-  def update(self, radius, distance, driver_speed):
-    self.speed = map_curve_speed(radius, distance, self.lat_accel)
+  def update(self, radius, distance, driver_speed, advisory=0.0):
+    self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory)
     if not self.active:
       self.active = radius > 0 and self.speed <= driver_speed - START_GAP
     else:

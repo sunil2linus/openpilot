@@ -657,7 +657,7 @@ class CurveSlowdown:
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
-                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent"]
+                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph"]
 
   def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
     import cereal.messaging as messaging
@@ -858,12 +858,13 @@ class CurveSlowdown:
   def _map_row(self, plan):
     mo = self.map_out
     if plan is None or self.map_control is None:
-      return (0,) * 17
+      return (0,) * 18
     return (int(plan.mapCurveMode), int(plan.mapCurveStatus), float(plan.mapCurveDistance), float(plan.mapCurveRadius),
             bool(mo.active) if mo else False, (mo.speed / MS_PER_MPH if mo and mo.active else 0.0), (mo.why if mo else ""),
             bool(plan.mapOnRamp), int(plan.mapRampType), float(plan.mapRampToSpeed) / MS_PER_MPH, bool(plan.mapRampToHighway),
             float(plan.mapRampEndDistance), int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
-            bool(getattr(self, "_blinker", False)), bool(self.map_control.exit_intent))
+            bool(getattr(self, "_blinker", False)), bool(self.map_control.exit_intent),
+            float(getattr(plan, "mapCurveAdvisory", 0.0)) / MS_PER_MPH)
 
   def _map_episode(self, t, i, plan):
     """One event per map curve / ramp action (Test or On): from the map reason starting until it is over
@@ -876,6 +877,7 @@ class CurveSlowdown:
       self.map_event = self.recorder.open("mapCurve", t, {
         "mode": "test" if self.map_mode == 1 else "on", "why": mo.why, "name": plan.mapCurveName,
         "radius_m": float(plan.mapCurveRadius), "distance_m": float(plan.mapCurveDistance),
+        "advisory_mph": float(getattr(plan, "mapCurveAdvisory", 0.0)) / MS_PER_MPH,
         "target_mph": mo.speed / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
         "lat_limit": self.lat_limit, "on_ramp": bool(plan.mapOnRamp), "ramp_type": int(plan.mapRampType),
         "ramp_to_mph": float(plan.mapRampToSpeed) / MS_PER_MPH, "ramp_to_highway": bool(plan.mapRampToHighway),

@@ -48,6 +48,7 @@ HALF_WINDOW = 30.0          # m: heading change measured between chords of this 
 JOIN_MAX_TURN = 50.0        # deg: ways only join into one road when they continue this straight
 KEEP_LAT = 3.0              # m/s^2: a curve is kept if sqrt(KEEP_LAT * R) < road speed + KEEP_OVER
 KEEP_OVER = 15 * MPH
+ADVISORY_OVER = 10 * MPH     # the car never plans a curve faster than its yellow advisory sign + this
 LAT_LEVELS = (2.5, 3.0, 3.5)
 
 # FrogPilot highwayClass values (from the offline tiles): 1 motorway, 2 motorway_link, 3 trunk,
@@ -319,7 +320,10 @@ def find_curves(chain, ways_by_id, ramp=None):
       speed = min(w.speed for w in wl) if wl else 0.0
       adv = min([w.advisory for w in wl if w.advisory > 0] or [0.0])
       cls = min(w.cls for w in wl) if wl else 0
-      if math.sqrt(KEEP_LAT * r_min) < speed + KEEP_OVER:
+      need = math.sqrt(KEEP_LAT * r_min)
+      if adv > 0:
+        need = min(need, adv + ADVISORY_OVER)   # a signed curve is kept even if its shape alone looks easy
+      if need < speed + KEEP_OVER:
         def pt(m):
           la, lo = to_latlon(float(rx[m]), float(ry[m]), lat0, lon0)
           return round(la, 6), round(lo, 6)

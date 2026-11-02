@@ -386,6 +386,8 @@ def _map_distance(meters: float, metric: bool) -> str:
 def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
   fp = sm["frogpilotPlan"]
   needs = math.sqrt(3.0 * fp.mapCurveRadius) if fp.mapCurveRadius > 0 else 0.0
+  if fp.mapCurveAdvisory > 0:
+    needs = min(needs, fp.mapCurveAdvisory + 10 * CV.MPH_TO_MS)   # never more than 10 mph over the yellow sign
   what = "Ramp curve" if fp.mapCurveStatus == 2 else "Map curve"
   where = "now" if fp.mapCurveDistance <= 1 else "in " + _map_distance(fp.mapCurveDistance, metric)
   action = "Test: would slow to" if fp.mapCurveMode == 1 else "Slowing to"
@@ -399,7 +401,10 @@ def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster
 def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, frogpilot_toggles: SimpleNamespace) -> Alert:
   fp = sm["frogpilotPlan"]
   if fp.mapNavCurveRadius > 0:
-    text = f"Exit ahead · curve data · needs {get_display_speed(math.sqrt(3.0 * fp.mapNavCurveRadius), metric)}"
+    needs = math.sqrt(3.0 * fp.mapNavCurveRadius)
+    if fp.mapNavCurveAdvisory > 0:
+      needs = min(needs, fp.mapNavCurveAdvisory + 10 * CV.MPH_TO_MS)
+    text = f"Exit ahead · curve data · needs {get_display_speed(needs, metric)}"
   else:
     text = "Exit ahead · curve data · no sharp curves"
   return Alert(

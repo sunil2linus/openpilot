@@ -36,6 +36,7 @@ LOOKAHEAD = 1000.0        # m along the road
 PLAN_LAT = 3.0            # m/s^2: only to choose the governing curve; the car uses its own limit
 PLAN_DECEL = 0.6          # m/s^2: the slowdown the stock cruise gives after a set speed drop (0.6-0.7 measured)
 PLAN_MARGIN = 30.0        # m before the entry where the curve speed should be reached
+ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
 AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our heading
 NEAR = 15.0               # m
 TILE_KEEP = 25            # squares kept in memory
@@ -87,9 +88,15 @@ def ahead(lat, lon, bearing, p_lat, p_lon):
   return math.cos(math.radians(bearing_to(lat, lon, p_lat, p_lon) - bearing)) > AHEAD_COS, d
 
 
-def plan_speed(radius, distance, lat_limit=PLAN_LAT, decel=PLAN_DECEL, margin=PLAN_MARGIN):
+def curve_speed_limit(radius, advisory=0.0, lat_limit=PLAN_LAT):
+  """Speed (m/s) a curve allows: its shape at `lat_limit`, and at most its advisory sign + ADVISORY_OVER."""
+  v = math.sqrt(lat_limit * radius)
+  return min(v, advisory + ADVISORY_OVER) if advisory > 0 else v
+
+
+def plan_speed(radius, distance, advisory=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL, margin=PLAN_MARGIN):
   """Highest speed (m/s) from which a `decel` slowdown reaches the curve speed `margin` m before its entry."""
-  v_curve = math.sqrt(lat_limit * radius)
+  v_curve = curve_speed_limit(radius, advisory, lat_limit)
   return math.sqrt(v_curve ** 2 + 2 * decel * max(distance - margin, 0.0))
 
 
@@ -204,6 +211,7 @@ class MapCurves:
     self.curve = None            # governing curve dict
     self.distance = 0.0          # m to its entry (0 = in it)
     self.radius = 0.0
+    self.advisory = 0.0
     self.on_ramp = False
     self.ramp = None
     self.ramp_end_dist = 0.0
@@ -263,8 +271,9 @@ class MapCurves:
       self.chain_id = cid
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
-        c, d = min(cands, key=lambda cd: plan_speed(cd[0]["r"], cd[1]))
+        c, d = min(cands, key=lambda cd: plan_speed(cd[0]["r"], cd[1], cd[0].get("adv", 0.0)))
         self.curve, self.distance, self.radius = c, d, c["r"]
+        self.advisory = float(c.get("adv", 0.0) or 0.0)
         self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
       ramp = self.store.ramps.get(cid)
       if ramp is not None and (ramp["travel"] == "both" or (ramp["travel"] == "ab") == increasing):
@@ -305,7 +314,7 @@ class MapCurves:
       chain_len = self.store.chains.get(best["chain"], {}).get("len", 0.0)
       def to_entry(c):
         return c["s_a"] if best["travel"] == "ab" else chain_len - c["s_b"]
-      c = min(curves, key=lambda c: plan_speed(c["r"], distance + to_entry(c)))
+      c = min(curves, key=lambda c: plan_speed(c["r"], distance + to_entry(c), c.get("adv", 0.0)))
       self.nav_curve, self.nav_curve_dist = c, distance + to_entry(c)
       self.nav_exit = NAV_EXIT_CURVES
     else:
@@ -368,8 +377,8 @@ class MapCurvesPlanner:
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
-      if key != self.announced_curve and plan_speed(mc.radius, mc.distance) < set_speed - 2 * MPH and \
-         math.sqrt(PLAN_LAT * mc.radius) < set_speed - 2 * MPH:
+      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory) < set_speed - 2 * MPH and \
+         curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"
     if mc.nav_exit != NAV_NONE:
@@ -388,6 +397,7 @@ class MapCurvesPlanner:
     plan.mapCurveStatus = mc.status if mc.curve is not None else (STATUS_NO_DATA if not mc.data_here else STATUS_NONE)
     plan.mapCurveDistance = float(mc.distance)
     plan.mapCurveRadius = float(mc.radius)
+    plan.mapCurveAdvisory = float(mc.advisory)
     plan.mapCurveName = (mc.curve or {}).get("name", "") or ""
     plan.mapOnRamp = bool(mc.on_ramp)
     r = mc.ramp if mc.on_ramp else mc.nav_ramp
@@ -403,3 +413,4 @@ class MapCurvesPlanner:
     if mc.nav_curve is not None:
       plan.mapNavCurveRadius = float(mc.nav_curve["r"])
       plan.mapNavCurveDistance = float(mc.nav_curve_dist)
+      plan.mapNavCurveAdvisory = float(mc.nav_curve.get("adv", 0.0) or 0.0)
