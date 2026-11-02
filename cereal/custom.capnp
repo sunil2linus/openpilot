@@ -48,6 +48,10 @@ struct StarPilotCarControl @0x81c2f05a394cf4af {
       startup @20;
       thisIsFine @21;
       uwu @22;
+
+      # Mazda map curves: soft exit chimes (own fixed volume)
+      curveChime @23;
+      curveNoData @24;
     }
   }
 
@@ -110,6 +114,8 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   accelHardCruise @28 :Bool;  # current/releasing accel cruise button came from GM hard-press signal
   decelHardCruise @29 :Bool;  # current/releasing decel cruise button came from GM hard-press signal
   pulseAndGlide @30 :Bool;  # developer-only wheel-button pulse-and-glide mode is enabled
+  curveSlowdownOffset @31 :Int8;     # Mazda set speed slowdown: steps below the driver's set speed
+  curveSlowdownInFlight @32 :Int8;   # our SET presses not yet seen on the set speed
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -189,6 +195,12 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     teslaCCDisengaged @38;
     teslaCCNotArmed @39;
     pedalNotCalibrated @40;
+    # Mazda stop warnings and map curves (Off / Test / On settings)
+    stopAheadWarning @41;
+    stoppedLeadWarning @42;
+    mapCurveAhead @43;
+    mapExitCurveData @44;
+    mapExitNoCurveData @45;
   }
 }
 
@@ -239,6 +251,24 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   approachStopLength @42 :Float32;  # pre-commit distance to a detected stop, m; 0 when off
   slcPresentedSpeedLimitSource @43 :Text;  # source of the shown accepted or pending posted limit
   slcIsLimitingMaxSet @44 :Bool;  # SLC target is below the configured Max Set
+  # Mazda map curves from the curve files (starpilot/controls/lib/map_curves.py)
+  mapCurveMode @45 :UInt8;           # 0 off, 1 test, 2 on
+  mapCurveStatus @46 :UInt8;         # 0 none, 1 curve, 2 ramp curve, 3 no curve data here
+  mapCurveDistance @47 :Float32;     # m to the governing curve's entry (0 = in it)
+  mapCurveRadius @48 :Float32;       # m (0 = no curve)
+  mapCurveName @49 :Text;
+  mapOnRamp @50 :Bool;
+  mapRampType @51 :UInt8;            # 0 none, 1 exit, 2 entrance, 3 interchange, 4 other link
+  mapRampToSpeed @52 :Float32;       # speed limit (m/s) of the road the ramp leads into (0 unknown)
+  mapRampToHighway @53 :Bool;
+  mapRampEndDistance @54 :Float32;   # m to the end of the ramp we are on
+  mapNavExit @55 :UInt8;             # navigation exit ahead: 0 none, 1 with curve data, 2 no curves on it, 3 no data
+  mapNavExitDistance @56 :Float32;
+  mapNavCurveRadius @57 :Float32;    # tightest curve on the announced exit (0 none)
+  mapNavCurveDistance @58 :Float32;  # m to its entry
+  mapNavExitSide @59 :Int8;          # side of the announced exit: -1 left, 1 right, 0 unknown
+  mapCurveAdvisory @60 :Float32;     # m/s, yellow advisory sign speed of the governing curve from the map (0 none)
+  mapNavCurveAdvisory @61 :Float32;  # m/s, same for the announced exit's curve
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

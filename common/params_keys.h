@@ -819,4 +819,13 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NoFSC", {PERSISTENT, BOOL}},
     {"BlendedACC", {PERSISTENT, BOOL, "1", "1"}},
     {"ManualTransmission", {PERSISTENT, BOOL}},
+    // Mazda Gen1 stock-cruise helpers and warnings (sunil2linus): all default off
+    {"MazdaCurveSlowdown", {PERSISTENT, BOOL, "0", "0"}},
+    {"MazdaCurveSlowdownMaxDrop", {PERSISTENT, INT, "1", "1"}},
+    {"MazdaCurveLearning", {PERSISTENT, BOOL, "0", "0"}},
+    {"MazdaMapCurves", {PERSISTENT, INT, "0", "0"}},
+    {"MazdaMapCurveChime", {PERSISTENT, INT, "1", "1"}},
+    {"MazdaStoppedCarSlowdown", {PERSISTENT, INT, "0", "0"}},
+    {"StopWarningRedLight", {PERSISTENT, INT, "0", "0"}},
+    {"StopWarningStoppedCar", {PERSISTENT, INT, "0", "0"}},
 };

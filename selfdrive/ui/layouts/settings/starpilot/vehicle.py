@@ -458,8 +458,54 @@ class VehicleSettingsManagerView(PanelManagerView):
         "get_state": lambda: self._controller._params.get_bool("BlendedACC"),
         "set_state": lambda s: self._controller._on_toggle("BlendedACC"),
       })
+      toggles.extend(self._mazda_cruise_helper_tiles())
 
     return toggles
+
+  def _mazda_cruise_helper_tiles(self) -> list[dict]:
+    """Gen1 Mazda with stock radar cruise: curve / map curve / stopped car slowdowns (SET-/SET+ presses) and
+    the stop warnings. Choices cycle on each tap. All take effect on the next drive."""
+    params = self._controller._params
+
+    def choice(key, labels, default=0):
+      def get_value():
+        try:
+          v = params.get_int(key, return_default=True, default=default)
+        except Exception:
+          v = default
+        return tr(labels[v]) if 0 <= v < len(labels) else tr(labels[default])
+
+      def on_click():
+        try:
+          v = params.get_int(key, return_default=True, default=default)
+        except Exception:
+          v = default
+        params.put_int(key, (v + 1) % len(labels) if 0 <= v < len(labels) else default)
+      return get_value, on_click
+
+    modes = (tr_noop("Off"), tr_noop("Test"), tr_noop("On"))
+    tiles = [{
+      "title": tr("Curve Slowdown"),
+      "subtitle": tr("Lowers the stock cruise set speed before curves with SET- presses and raises it back after."),
+      "get_state": lambda: params.get_bool("MazdaCurveSlowdown"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaCurveSlowdown"),
+    }]
+    for key, title, labels, default in (
+        ("MazdaCurveSlowdownMaxDrop", tr_noop("Curve Max Drop"), (tr_noop("5 mph"), tr_noop("10 mph"), tr_noop("15 mph")), 1),
+        ("MazdaMapCurves", tr_noop("Map Curves"), modes, 0),
+        ("MazdaMapCurveChime", tr_noop("Exit Chime"), (tr_noop("Off"), tr_noop("5%"), tr_noop("10%"), tr_noop("20%")), 1),
+        ("MazdaStoppedCarSlowdown", tr_noop("Stopped Car Slowdown"), modes, 0),
+        ("StopWarningRedLight", tr_noop("Stop Ahead Warning"), modes, 0),
+        ("StopWarningStoppedCar", tr_noop("Stopped Car Warning"), modes, 0)):
+      get_value, on_click = choice(key, labels, default)
+      tiles.append({"title": tr(title), "get_value": get_value, "on_click": on_click})
+    tiles.append({
+      "title": tr("Curve Learning (Log Only)"),
+      "subtitle": tr("Records every curve and learns this car's steering limit and your curve speed. Changes nothing yet."),
+      "get_state": lambda: params.get_bool("MazdaCurveLearning"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaCurveLearning"),
+    })
+    return tiles
 
   def _rebuild_toggle_grid(self):
     defs = self._build_driving_toggles()

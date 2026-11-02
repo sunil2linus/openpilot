@@ -456,6 +456,12 @@ class CarInterfaceBase(ABC):
     fp_ret.ecoGear |= ret.gearShifter == GearShifter.eco
     fp_ret.sportGear |= ret.gearShifter == GearShifter.sport
 
+    # Mazda set speed slowdown: how far below the driver's own set speed we hold the stock cruise
+    slowdown = getattr(self.CC, "curve_slowdown", None)
+    if slowdown is not None:
+      fp_ret.curveSlowdownOffset = max(-127, min(127, int(slowdown.logic.offset)))
+      fp_ret.curveSlowdownInFlight = max(0, min(127, len(slowdown.logic.inflight)))
+
     return ret, fp_ret
 
 

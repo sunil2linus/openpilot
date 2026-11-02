@@ -246,6 +246,45 @@ def user_soft_disable_alert(alert_text_2: str) -> AlertCallbackType:
     return UserSoftDisableAlert(alert_text_2)
   return func
 
+def _map_distance(meters: float, metric: bool) -> str:
+  if metric:
+    return f"{int(round(meters / 10.0) * 10)} m"
+  feet = meters * 3.28084
+  return f"{feet / 5280:.1f} mi" if feet >= 1000 else f"{int(round(feet / 50.0) * 50)} ft"
+
+
+def _map_curve_needs(radius: float, advisory: float) -> float:
+  needs = math.sqrt(3.0 * radius) if radius > 0 else 0.0
+  if advisory > 0:
+    needs = min(needs, advisory + 10 * CV.MPH_TO_MS)   # never more than 10 mph over the yellow sign
+  return needs
+
+
+def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  sp = sm["starpilotPlan"]
+  what = "Ramp curve" if sp.mapCurveStatus == 2 else "Map curve"
+  where = "now" if sp.mapCurveDistance <= 1 else "in " + _map_distance(sp.mapCurveDistance, metric)
+  action = "Test: would slow to" if sp.mapCurveMode == 1 else "Slowing to"
+  return Alert(
+    f"{what} {where} · {action} {get_display_speed(_map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory), metric)}",
+    "",
+    StarPilotAlertStatus.starpilot, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 3.)
+
+
+def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  sp = sm["starpilotPlan"]
+  if sp.mapNavCurveRadius > 0:
+    text = f"Exit ahead · curve data · needs {get_display_speed(_map_curve_needs(sp.mapNavCurveRadius, sp.mapNavCurveAdvisory), metric)}"
+  else:
+    text = "Exit ahead · curve data · no sharp curves"
+  return Alert(
+    text,
+    "",
+    StarPilotAlertStatus.starpilot, AlertSize.small,
+    Priority.LOW, VisualAlert.none, StarPilotAudibleAlert.curveChime, 4.)
+
+
 def startup_master_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
   branch = get_short_branch()  # Ensure get_short_branch is cached to avoid lags on startup
   if "REPLAY" in os.environ:
@@ -1189,6 +1228,40 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       StarPilotAlertStatus.starpilot, AlertSize.small,
       Priority.MID, VisualAlert.none, AudibleAlert.prompt, 3.),
+  },
+
+  # Mazda stop warnings (StopWarningRedLight / StopWarningStoppedCar: On only; Test is silent and only logs)
+  StarPilotEventName.stopAheadWarning: {
+    ET.PERMANENT: Alert(
+      "STOP AHEAD - SLOW DOWN",
+      "Cruise may not stop for this",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+
+  StarPilotEventName.stoppedLeadWarning: {
+    ET.PERMANENT: Alert(
+      "STOPPED CAR AHEAD - BRAKE",
+      "Cruise may not stop for this",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+  },
+
+  # Mazda map curves (MazdaMapCurves: Test or On)
+  StarPilotEventName.mapCurveAhead: {
+    ET.PERMANENT: map_curve_alert,
+  },
+
+  StarPilotEventName.mapExitCurveData: {
+    ET.PERMANENT: map_exit_alert,
+  },
+
+  StarPilotEventName.mapExitNoCurveData: {
+    ET.PERMANENT: Alert(
+      "Exit ahead · no curve data",
+      "",
+      StarPilotAlertStatus.starpilot, AlertSize.small,
+      Priority.LOW, VisualAlert.none, StarPilotAudibleAlert.curveNoData, 4.),
   },
 
   StarPilotEventName.holidayActive: {

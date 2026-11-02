@@ -7,6 +7,7 @@ from openpilot.selfdrive.controls.lib.desire_helper import TurnDirection
 from openpilot.selfdrive.selfdrived.events import ET, EVENT_NAME, STARPILOT_EVENT_NAME, EventName, StarPilotEventName, Events
 
 from openpilot.starpilot.common.starpilot_variables import CRUISING_SPEED, NON_DRIVING_GEARS
+from openpilot.starpilot.controls.lib.stop_warning import STOP_AHEAD, STOPPED_LEAD, StopWarning
 
 DEJA_VU_G_FORCE = 0.75
 RANDOM_EVENTS_CHANCE = 0.01 * DT_MDL
@@ -37,6 +38,12 @@ class StarPilotEvents:
     self.played_events = set()
 
     self.error_log = error_log
+
+    # Stop ahead / stopped car warnings (Off / Test / On settings)
+    try:
+      self.stop_warning = StopWarning(StarPilotPlanner.params, StarPilotPlanner.params_memory)
+    except Exception:
+      self.stop_warning = None
 
   def update(self, long_control_active, v_cruise, sm, starpilot_toggles):
     current_alert = sm["selfdriveState"].alertType
@@ -71,6 +78,27 @@ class StarPilotEvents:
       self.stopped_for_light = self.starpilot_planner.starpilot_cem.stop_light_detected
     else:
       self.stopped_for_light = False
+
+    if self.stop_warning is not None:
+      try:
+        for kind in self.stop_warning.update(sm, self.starpilot_planner):
+          if kind == STOP_AHEAD:
+            self.events.add(StarPilotEventName.stopAheadWarning)
+          elif kind == STOPPED_LEAD:
+            self.events.add(StarPilotEventName.stoppedLeadWarning)
+      except Exception:
+        # Never let the optional warning break the planner: turn it off for this drive.
+        self.stop_warning = None
+
+    map_curves = getattr(self.starpilot_planner, "map_curves", None)
+    if map_curves is not None and map_curves.notice:
+      notice = map_curves.notice
+      if notice == "curve":
+        self.events.add(StarPilotEventName.mapCurveAhead)
+      elif notice == "exit_data":
+        self.events.add(StarPilotEventName.mapExitCurveData)
+      elif notice == "exit_no_data":
+        self.events.add(StarPilotEventName.mapExitNoCurveData)
 
     if starpilot_toggles.current_holiday_theme != "stock" and "holidayActive" not in self.played_events and self.startup_seen and alerts_empty and len(self.events) == 0:
       self.events.add(StarPilotEventName.holidayActive)

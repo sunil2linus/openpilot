@@ -731,6 +731,10 @@ class PanelManagerView(AetherInteractiveMixin, Widget):
   # ── convenience builders ──────────────────────────────────
 
   def _make_toggle_tile(self, d: dict) -> ToggleTile:
+    if "get_value" in d:
+      # a setting with a few choices: tapping shows the next one (used by the Mazda cruise helpers)
+      return ValueTile(title=d["title"], get_value=d["get_value"], on_click=d["on_click"],
+                       bg_color=self.PANEL_STYLE.accent, is_enabled=d.get("is_enabled"), desc=d.get("subtitle", ""))
     cls = RowToggleTile if self.PANEL_STYLE.toggle_row_mode else ToggleTile
     return cls(
       title=d["title"],

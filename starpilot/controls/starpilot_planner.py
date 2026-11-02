@@ -76,6 +76,13 @@ class StarPilotPlanner:
     self.starpilot_vcruise = StarPilotVCruise(self)
     self.starpilot_weather = WeatherChecker(self)
 
+    # Mazda map curves from the curve files (setting MazdaMapCurves: Off / Test / On)
+    try:
+      from openpilot.starpilot.controls.lib.map_curves import MapCurvesPlanner
+      self.map_curves = MapCurvesPlanner(self.params, self.params_memory)
+    except Exception:
+      self.map_curves = None
+
     self.driving_in_curve = False
     self.gps_valid = False
     self.lateral_check = False
@@ -245,6 +252,15 @@ class StarPilotPlanner:
       self.starpilot_acceleration.max_accel = 0
       self.starpilot_acceleration.min_accel = 0
 
+    if self.map_curves is not None:
+      try:
+        cs = sm["carState"]
+        set_speed = cs.cruiseState.speed if cs.cruiseState.enabled else 0.0
+        set_speed += max(sm["starpilotCarState"].curveSlowdownOffset, 0) * 0.44704
+        self.map_curves.update(sm, self.gps_position if self.gps_valid else None, v_ego, set_speed)
+      except Exception:
+        self.map_curves = None
+
     self.starpilot_events.update(controls_enabled, v_cruise, sm, starpilot_toggles)
 
     if self.gps_valid and time_validated and starpilot_toggles.weather_presets:
@@ -374,6 +390,12 @@ class StarPilotPlanner:
     starpilotPlan.redLight = self.starpilot_cem.stop_light_detected
 
     starpilotPlan.roadCurvature = self.road_curvature
+
+    if getattr(self, "map_curves", None) is not None:
+      try:
+        self.map_curves.publish(starpilotPlan)
+      except Exception:
+        pass
 
     starpilotPlan.slcMapSpeedLimit = self.starpilot_vcruise.slc.map_speed_limit
     starpilotPlan.slcMapboxSpeedLimit = self.starpilot_vcruise.slc.mapbox_limit

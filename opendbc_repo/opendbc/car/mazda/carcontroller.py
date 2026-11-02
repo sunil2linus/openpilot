@@ -3,6 +3,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
+from opendbc.car.carlog import carlog
 from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaSafetyFlags
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -26,6 +27,33 @@ class CarController(CarControllerBase):
     self.long_active_last = False
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
+
+    # Optional: lower the stock cruise set speed for curves, map curves and stopped cars ahead with
+    # SET-/SET+ button presses. Gen1 with stock MRCC only (no Radar Interceptor, no openpilot
+    # longitudinal). All default off.
+    self.curve_slowdown = None
+    if CP.flags & MazdaSafetyFlags.GEN1 and not CP.flags & (MazdaSafetyFlags.RADAR_INTERCEPTOR | MazdaSafetyFlags.NO_MRCC) and \
+       not CP.openpilotLongitudinalControl:
+      try:
+        from opendbc.car.mazda.curve_slowdown import CurveSlowdown
+
+        def mode(key):
+          try:
+            v = int(self.params.get(key, encoding="utf8") or 0)
+          except (TypeError, ValueError):
+            v = 0
+          return v if v in (0, 1, 2) else 0
+
+        curve_enabled = self.params.get_bool("MazdaCurveSlowdown")
+        stop_mode = mode("MazdaStoppedCarSlowdown")
+        learning = self.params.get_bool("MazdaCurveLearning")
+        map_mode = mode("MazdaMapCurves")
+        if curve_enabled or stop_mode or learning or map_mode:
+          self.curve_slowdown = CurveSlowdown(CP, self.params, curve_enabled=curve_enabled, stop_mode=stop_mode,
+                                              learning=learning, map_mode=map_mode)
+      except Exception:
+        carlog.exception("mazda set speed slowdown init failed, disabled")
+        self.curve_slowdown = None
 
 
 
@@ -59,6 +87,15 @@ class CarController(CarControllerBase):
           # Mazda Stop and Go requires a RES button (or gas) press if the car stops more than 3 seconds
           # Send Resume button when planner wants car to move
           can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+
+      if self.curve_slowdown is not None:
+        try:
+          other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume)
+          can_sends.extend(self.curve_slowdown.update(CC, CS, self.packer, self.CP, other_button_active))
+        except Exception:
+          # Never let this optional feature affect steering: turn it off for the rest of the drive.
+          carlog.exception("mazda curve slowdown failed, disabling")
+          self.curve_slowdown = None
 
       # send HUD alerts
       if self.frame % 50 == 0:
