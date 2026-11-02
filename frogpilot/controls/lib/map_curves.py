@@ -52,6 +52,12 @@ STATUS_NONE, STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_NO_DATA = 0, 1, 2, 3
 NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
 
 
+def nav_side(modifier):
+  """Side of a navigation maneuver from its modifier ("slight right", "left", ...): -1 left, 1 right, 0 unknown."""
+  m = (modifier or "").lower()
+  return 1 if "right" in m else (-1 if "left" in m else 0)
+
+
 def tile_name(lat, lon):
   la = math.floor(lat * 4) / 4
   lo = math.floor(lon * 4) / 4
@@ -206,6 +212,7 @@ class MapCurves:
     self.nav_ramp = None
     self.nav_curve = None
     self.nav_curve_dist = 0.0
+    self.nav_side = 0
     self.data_here = False
     self.chain_id = 0
 
@@ -270,6 +277,7 @@ class MapCurves:
   def _nav_exit(self, lat, lon, bearing, mtype, modifier, distance):
     if mtype not in NAV_EXIT_TYPES or not (0 < distance <= NAV_EXIT_RANGE) or self.on_ramp:
       return
+    self.nav_side = nav_side(modifier)
     if not self.data_here:
       self.nav_exit, self.nav_exit_dist = NAV_EXIT_NO_DATA, distance
       return
@@ -391,6 +399,7 @@ class MapCurvesPlanner:
       plan.mapRampEndDistance = float(mc.ramp_end_dist)
     plan.mapNavExit = mc.nav_exit
     plan.mapNavExitDistance = float(mc.nav_exit_dist)
+    plan.mapNavExitSide = int(mc.nav_side)
     if mc.nav_curve is not None:
       plan.mapNavCurveRadius = float(mc.nav_curve["r"])
       plan.mapNavCurveDistance = float(mc.nav_curve_dist)

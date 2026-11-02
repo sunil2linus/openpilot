@@ -657,7 +657,7 @@ class CurveSlowdown:
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
-                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker"]
+                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent"]
 
   def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
     import cereal.messaging as messaging
@@ -744,7 +744,8 @@ class CurveSlowdown:
     self.map_out = None
     if self.map_control is not None and plan_alive:
       from openpilot.selfdrive.car.mazda.map_curve_control import MapFields, ON as MAP_ON
-      mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, blinker)
+      signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
+      mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal)
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
@@ -857,12 +858,12 @@ class CurveSlowdown:
   def _map_row(self, plan):
     mo = self.map_out
     if plan is None or self.map_control is None:
-      return (0,) * 16
+      return (0,) * 17
     return (int(plan.mapCurveMode), int(plan.mapCurveStatus), float(plan.mapCurveDistance), float(plan.mapCurveRadius),
             bool(mo.active) if mo else False, (mo.speed / MS_PER_MPH if mo and mo.active else 0.0), (mo.why if mo else ""),
             bool(plan.mapOnRamp), int(plan.mapRampType), float(plan.mapRampToSpeed) / MS_PER_MPH, bool(plan.mapRampToHighway),
             float(plan.mapRampEndDistance), int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
-            bool(getattr(self, "_blinker", False)))
+            bool(getattr(self, "_blinker", False)), bool(self.map_control.exit_intent))
 
   def _map_episode(self, t, i, plan):
     """One event per map curve / ramp action (Test or On): from the map reason starting until it is over

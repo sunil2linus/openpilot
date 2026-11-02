@@ -159,13 +159,55 @@ def test_ramp_curve_may_pass_the_max_drop_down_to_25():
   assert out.active and out.why == "ramp" and abs(out.floor - 25 * MPH) < 1e-9 and out.budget == CTL.RAMP_BUDGET
 
 
-def test_navigation_exit_only_with_the_turn_signal():
+def nav(d, side=1, **kw):
+  return F(nav_exit=1, nav_exit_distance=d, nav_curve_radius=45, nav_curve_distance=d + 100, nav_exit_side=side, **kw)
+
+
+def test_navigation_exit_needs_a_turn_signal():
   c = CTL.MapCurveControl(3.0)
-  f = F(nav_exit=1, nav_exit_distance=400, nav_curve_radius=45, nav_curve_distance=500)
-  assert not c.update(f, 70 * MPH, False).active
-  out = c.update(f, 70 * MPH, True)
+  for d in range(1400, 0, -10):           # navigation alone never slows
+    assert not c.update(nav(d), 70 * MPH, 0).active
+  out = c.update(nav(400), 70 * MPH, 1)
   assert out.active and out.why == "nav exit" and out.floor > 0
-  assert not c.update(F(nav_exit=1, nav_exit_distance=1200, nav_curve_radius=45, nav_curve_distance=1300), 70 * MPH, True).active
+
+
+def test_early_signal_is_remembered_after_it_goes_off():
+  c = CTL.MapCurveControl(3.0)
+  assert not c.update(nav(1300), 70 * MPH, 1).active    # signal 0.8 mile before: too far to slow yet
+  for d in range(1290, 900, -10):                          # moved into the exit lane, signal off
+    assert not c.update(nav(d), 70 * MPH, 0).active
+  acted = [c.update(nav(d), 70 * MPH, 0).active for d in range(900, 0, -10)]
+  assert any(acted) and c.exit_intent
+  first = 900 - 10 * acted.index(True)
+  assert 400 <= first <= 700, first                        # starts only as early as the 45 m curve needs
+
+
+def test_signal_the_wrong_way_or_passing_the_exit_forgets_it():
+  c = CTL.MapCurveControl(3.0)
+  c.update(nav(800), 70 * MPH, -1)                         # lane change to the left: not this right exit
+  assert not c.exit_intent
+  c.update(nav(800), 70 * MPH, 1)
+  c.update(nav(790), 70 * MPH, -1)                         # changed their mind
+  assert not c.exit_intent
+  c.update(nav(400), 70 * MPH, 1)
+  assert c.exit_intent
+  for _ in range(int(CTL.NAV_GRACE / CTL.DT_CTRL) + 5):    # passed the exit: navigation no longer shows it
+    out = c.update(F(nav_exit=3), 70 * MPH, 0)
+  assert not c.exit_intent and not out.active
+  assert not c.update(nav(300), 70 * MPH, 0).active        # the next exit needs its own signal
+
+
+def test_unknown_side_accepts_either_signal_and_ramp_takes_over():
+  c = CTL.MapCurveControl(3.0)
+  c.update(nav(500, side=0), 70 * MPH, -1)
+  assert c.exit_intent
+  assert c.update(F(nav_exit=0), 70 * MPH, 0).active       # split: map match not on the ramp yet, plan kept
+  out = c.update(F(status=2, radius=45, distance=150, on_ramp=True, ramp_type=1), 60 * MPH, 0)
+  assert not c.exit_intent and out.active and out.why == "ramp"
+
+
+def test_planner_reads_the_exit_side():
+  assert MC.nav_side("slight right") == 1 and MC.nav_side("left") == -1 and MC.nav_side("") == 0
 
 
 def test_exit_onto_a_street_caps_then_keeps_the_street_speed():
