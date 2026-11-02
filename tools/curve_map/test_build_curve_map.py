@@ -106,3 +106,52 @@ def test_both_ends_and_headings():
   assert abs(B.angle_diff(c["a_hdg"], 0.0)) < 10, c["a_hdg"]
   assert abs(B.angle_diff(c["b_hdg"], (-40 + 180) % 360)) < 10, c["b_hdg"]
   assert c["v"]["3.0"] == round(math.sqrt(3.0 * c["r"]), 2)
+
+
+def ramp_scene():
+  """A motorway going north; an exit ramp leaves it at (0, 0), loops right with a 50 m radius and ends on a
+  primary road; an entrance ramp leaves the primary road and joins the motorway further north."""
+  mw = way(10, straight(0, -500, 0, 1500), name="", cls=1, speed_mph=70)
+  mw.ref = "I 75"
+  loop = straight(0, 0, 20, 100)[:-1] + arc(34 + 50, 94, 50, 180, 0)[0:] + straight(134, 94, 180, 100)[1:]
+  exit_r = way(11, loop, name="", cls=2, speed_mph=45, oneway=True)
+  prim = way(12, straight(134, -6, 90, 600), name="Main Street", cls=5, speed_mph=45)
+  # the exit ends on the primary road's first node
+  prim.lat[0], prim.lon[0] = exit_r.lat[-1], exit_r.lon[-1]
+  prim.start = exit_r.end = B.key(exit_r.lat[-1], exit_r.lon[-1])
+  ent = way(13, straight(400, -6, 340, 900), name="", cls=2, speed_mph=45, oneway=True)
+  ent.lat[0], ent.lon[0] = prim.lat[3], prim.lon[3]
+  ent.start = B.key(prim.lat[3], prim.lon[3])
+  # it joins the motorway at one of its interior nodes
+  k = len(mw.lat) - 10
+  ent.lat[-1], ent.lon[-1] = mw.lat[k], mw.lon[k]
+  ent.end = B.key(mw.lat[k], mw.lon[k])
+  exit_r.lat[0], exit_r.lon[0] = mw.lat[25], mw.lon[25]
+  exit_r.start = B.key(mw.lat[25], mw.lon[25])
+  return {w.id: w for w in (mw, exit_r, prim, ent)}
+
+
+def test_ramps_know_where_they_lead():
+  ways = ramp_scene()
+  nidx = B.node_index(ways)
+  recs = {r["wdir"][0][0]: r for r in (B.ramp_record(ch, nidx, ways) for ch in B.build_chains(ways)) if r}
+  assert recs[11]["type"] == "exit" and recs[11]["to"]["name"] == "Main Street" and recs[11]["from"]["cls"] == 1
+  assert recs[13]["type"] == "entrance" and recs[13]["to"]["cls"] == 1 and recs[13]["from"]["name"] == "Main Street"
+  assert recs[11]["travel"] == "ab"
+
+
+def test_curve_on_an_exit_carries_the_ramp_and_distance_to_its_end():
+  ways = ramp_scene()
+  nidx = B.node_index(ways)
+  for ch in B.build_chains(ways):
+    rec = B.ramp_record(ch, nidx, ways)
+    if rec and rec["wdir"][0][0] == 11:
+      cs = B.find_curves(ch, ways, rec)
+      assert len(cs) == 1
+      c = cs[0]
+      assert abs(c["r"] - 50) / 50 < 0.15, c["r"]
+      assert c["ramp"]["type"] == "exit" and c["ramp"]["to"]["name"] == "Main Street"
+      assert 60 <= c["ramp"]["end_dist"] <= 130, c["ramp"]["end_dist"]
+      assert c["wdir"] == [[11, 1]]
+      return
+  raise AssertionError("exit ramp not found")

@@ -39,7 +39,19 @@ Checked against curves the car measured: the map radius was within about 10 % (1
    scp -r curves_42_-84 comma@192.168.88.13:/data/media/0/curve_map/42/-84
    ```
 
-Repeat 4–6 for each 2° folder you drive in. The device already has every US folder under
+Repeat 4–6 for each 2° folder you drive in.
+
+## Another city
+
+1. Find the city's coordinates: in Google Maps, right-click the city centre and click the numbers at the top of
+   the menu (they are copied, e.g. `41.8781, -87.6298` for Chicago).
+2. Ask the script which folders cover the area and print the commands (latitude, longitude, miles):
+   ```
+   py build_curve_map.py --which 41.8781 -87.6298 50
+   ```
+   A city near a 2° line needs 2–4 folders; each takes about 10–40 s to build.
+3. Run the printed commands in PowerShell, from the folder with the script, with the car parked and the device on
+   the same Wi-Fi (or hotspot). Add `--device <ip>` to the step-2 command if the device's address changed. The device already has every US folder under
 `/data/media/0/osm/offline` (from FrogPilot's map download), so no new download is needed.
 
 ## Output
@@ -55,5 +67,10 @@ Repeat 4–6 for each 2° folder you drive in. The device already has every US f
 | `speed`, `adv` | speed limit (m/s; road-type default if OSM has none), OSM advisory speed (m/s, 0 = none) |
 | `cls`, `name`, `oneway`, `ways` | road class, name or ref, one-way, OSM way ids |
 | `v` | speed the curve needs (m/s) at 2.5 / 3.0 / 3.5 m/s² |
+| `wdir` | `[way id, 1/0]`: travelling a → b follows that way's node order (FrogPilot's map match `is_forward`) |
+| `ramp` | on ramps only: `type` (exit / entrance / interchange / link / two-way), `travel`, the road it leads `to` and comes `from` (class, speed limit, name), `end_dist` from the curve's end to the end of the ramp, `len` |
+
+Each file also has `ramps`: every ramp (by its start square) with its `type`, `start`, `end`, `len`, `to`, `from`
+and `wdir`, also for ramps without a curve, so the car knows what road a ramp merges into.
 
 Tests: `python -m pytest tools/curve_map/test_build_curve_map.py`.

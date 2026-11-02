@@ -152,7 +152,7 @@ def load_ways(schema, files):
     if t is None:
       continue
     for w in t.ways:
-      if w.id in ways or w.highwayClass not in CLASS_NAMES or w.highwayClass in SKIP_CLASSES or len(w.nodes) < 2:
+      if w.id in ways or w.highwayClass not in CLASS_NAMES or len(w.nodes) < 2:
         continue
       wy = Way()
       wy.id, wy.name, wy.ref, wy.cls = w.id, w.name, w.ref, w.highwayClass
@@ -195,6 +195,7 @@ def end_heading(w, at_start, flip=False):
 
 def build_chains(ways):
   """Chains of (way, reversed) joined end to end along the same road, never through a turn."""
+  ways = {k: w for k, w in ways.items() if w.cls not in SKIP_CLASSES}
   ends = {}
   for w in ways.values():
     ends.setdefault(w.start, []).append((w, True))
@@ -260,7 +261,10 @@ def chain_geometry(chain):
   return np.concatenate(lats), np.concatenate(lons), np.concatenate(wid)
 
 
-def find_curves(chain, ways_by_id):
+def find_curves(chain, ways_by_id, ramp=None):
+  """Curves along one chain. `ramp`: the chain's ramp record (link roads), added to each curve with the
+  distance from the curve's end to the end of the ramp in the direction of travel."""
+  fwd = {w.id: not rev for w, rev in chain}
   lat, lon, wids = chain_geometry(chain)
   if len(lat) < 3:
     return []
@@ -312,7 +316,7 @@ def find_curves(chain, ways_by_id):
         h_in = bearing_deg(rx[min(i + 1, n - 1)] - rx[i], ry[min(i + 1, n - 1)] - ry[i])
         h_out = bearing_deg(rx[j] - rx[max(j - 1, 0)], ry[j] - ry[max(j - 1, 0)])
         name = next((w.name or w.ref for w in wl if w.name or w.ref), "")
-        curves.append({
+        c = {
           "a": pt(i), "a_hdg": round(h_in, 1),            # entry when travelling a -> b
           "b": pt(j), "b_hdg": round((h_out + 180) % 360, 1),  # entry when travelling b -> a
           "apex": pt(apex), "r": round(r_min, 1), "len": round(length, 1), "turn": round(turn, 1),
@@ -320,9 +324,101 @@ def find_curves(chain, ways_by_id):
           "speed": round(speed, 2), "adv": round(adv, 2), "cls": cls, "name": name,
           "oneway": any(w.oneway for w in wl), "ways": wset,
           "v": {str(L): round(math.sqrt(L * r_min), 2) for L in LAT_LEVELS},
-        })
+          # travelling a -> b follows each way's node order when fwd is 1 (FrogPilot's map match: is_forward)
+          "wdir": [[w, 1 if fwd.get(w, True) else 0] for w in wset],
+        }
+        if ramp is not None:
+          total = float(rs[-1])
+          end_dist = total - float(rs[j]) if ramp["travel"] != "ba" else float(rs[i])
+          c["ramp"] = {"type": ramp["type"], "travel": ramp["travel"], "to": ramp["to"], "from": ramp["from"],
+                       "end_dist": round(end_dist, 1), "len": ramp["len"]}
+        curves.append(c)
     i = j + 1
   return curves
+
+
+# ---------------- ramps ----------------
+
+HIGHWAY_CLASSES = {1, 3}
+LINK_FOLLOW_HOPS = 4
+
+
+def node_index(ways):
+  """Every node -> [(way, position)], for all classes (a ramp may end on a road's interior node)."""
+  idx = {}
+  for w in ways.values():
+    n = len(w.lat)
+    for m in range(n):
+      idx.setdefault(key(w.lat[m], w.lon[m]), []).append((w, m))
+  return idx
+
+
+def road_info(w):
+  return {"cls": w.cls, "speed": round(w.speed, 2), "name": w.name or w.ref}
+
+
+def connected(nidx, node, exclude, ways, leaving, hops=LINK_FOLLOW_HOPS):
+  """The road reached at `node`: the most important non-link road through it (motorway first). When only
+  ramps continue there, follow them (in their direction of travel, up to `hops` ramps) to where they lead.
+  leaving=True: roads we can continue onto from this node (destination); False: roads arriving (origin)."""
+  best = None
+  links = []
+  for o, m in nidx.get(node, []):
+    if o.id in exclude:
+      continue
+    if o.cls in LINK_CLASSES:
+      last = len(o.lat) - 1
+      if leaving and (m == 0 or not o.oneway):
+        links.append((o, o.end if m == 0 else (o.start if m == last else None)))
+      elif not leaving and (m == last or not o.oneway):
+        links.append((o, o.start if m == last else (o.end if m == 0 else None)))
+      continue
+    if best is None or o.cls < best.cls:
+      best = o
+  if best is not None:
+    return road_info(best)
+  if hops > 0:
+    for o, far in links:
+      if far is None:
+        continue
+      r = connected(nidx, far, exclude | {o.id}, ways, leaving, hops - 1)
+      if r is not None:
+        return r
+  return None
+
+
+def ramp_record(chain, nidx, ways):
+  if not all(w.cls in LINK_CLASSES for w, _ in chain):
+    return None
+  ids = {w.id for w, _ in chain}
+  oneway = all(w.oneway for w, _ in chain)
+  fwds = [not rev for _, rev in chain]
+  travel = ("ab" if all(fwds) else "ba" if not any(fwds) else "both") if oneway else "both"
+  first, last = chain[0], chain[-1]
+  node_a = first[0].end if first[1] else first[0].start
+  node_b = last[0].start if last[1] else last[0].end
+  lat, lon, _ = chain_geometry(chain)
+  x, y = to_xy(lat, lon, float(lat.mean()), float(lon.mean()))
+  length = float(np.sum(np.hypot(np.diff(x), np.diff(y))))
+  start_node, end_node = (node_b, node_a) if travel == "ba" else (node_a, node_b)
+  to = connected(nidx, end_node, ids, ways, leaving=True)
+  frm = connected(nidx, start_node, ids, ways, leaving=False)
+  if travel == "both":
+    kind = "two-way"
+  elif to and frm and to["cls"] in HIGHWAY_CLASSES and frm["cls"] in HIGHWAY_CLASSES:
+    kind = "interchange"
+  elif to and to["cls"] in HIGHWAY_CLASSES:
+    kind = "entrance"
+  elif frm and frm["cls"] in HIGHWAY_CLASSES:
+    kind = "exit"
+  else:
+    kind = "link"
+  s_pt = (round(float(lat[0]), 6), round(float(lon[0]), 6))
+  e_pt = (round(float(lat[-1]), 6), round(float(lon[-1]), 6))
+  return {"type": kind, "travel": travel, "len": round(length, 1), "to": to, "from": frm,
+          "start": e_pt if travel == "ba" else s_pt, "end": s_pt if travel == "ba" else e_pt,
+          "wdir": [[w.id, 0 if rev else 1] for w, rev in chain], "cls": min(w.cls for w, _ in chain),
+          "name": next((w.name or w.ref for w, _ in chain if w.name or w.ref), "")}
 
 
 def tile_of(lat, lon):
@@ -339,30 +435,70 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False):
   t0 = time.time()
   ways = load_ways(schema, files)
   chains = build_chains(ways)
-  curves = []
+  nidx = node_index(ways)
+  curves, ramps = [], []
   for ch in chains:
-    curves.extend(find_curves(ch, ways))
-  # one file per 0.25 deg square, by the curve's apex
+    ramp = ramp_record(ch, nidx, ways)
+    if ramp is not None:
+      ramps.append(ramp)
+    curves.extend(find_curves(ch, ways, ramp))
+  # one file per 0.25 deg square: curves by their apex, ramps by their start
   by_tile = {}
   for c in curves:
-    by_tile.setdefault(tile_of(*c["apex"]), []).append(c)
+    by_tile.setdefault(tile_of(*c["apex"]), {"curves": [], "ramps": []})["curves"].append(c)
+  for r in ramps:
+    by_tile.setdefault(tile_of(*r["start"]), {"curves": [], "ramps": []})["ramps"].append(r)
   os.makedirs(out_dir, exist_ok=True)
-  for name, cs in by_tile.items():
+  for name, d in by_tile.items():
     with open(os.path.join(out_dir, name + ".json"), "w") as f:
-      json.dump({"version": 1, "keep_lat": KEEP_LAT, "curves": cs}, f, separators=(",", ":"))
+      json.dump({"version": 2, "keep_lat": KEEP_LAT, "curves": d["curves"], "ramps": d["ramps"]}, f, separators=(",", ":"))
   if not quiet:
     size = sum(os.path.getsize(os.path.join(out_dir, n + ".json")) for n in by_tile)
-    print(f"{len(files)} tiles, {len(ways)} roads, {len(chains)} chains, {len(curves)} curves, "
+    kinds = {}
+    for r in ramps:
+      kinds[r["type"]] = kinds.get(r["type"], 0) + 1
+    print(f"{len(files)} tiles, {len(ways)} roads, {len(chains)} chains, {len(curves)} curves, {len(ramps)} ramps {kinds}, "
           f"{len(by_tile)} output files, {size / 1e6:.2f} MB, {time.time() - t0:.0f} s")
   return curves, ways
 
 
+def folders_for(lat, lon, miles):
+  """The 2 x 2 degree map folders (e.g. '42/-84') that cover `miles` around (lat, lon)."""
+  dlat = miles * 1609.344 / 111195.0
+  dlon = dlat / max(math.cos(math.radians(lat)), 0.1)
+  out = []
+  for la in range(int(math.floor((lat - dlat) / 2) * 2), int(math.floor((lat + dlat) / 2) * 2) + 1, 2):
+    for lo in range(int(math.floor((lon - dlon) / 2) * 2), int(math.floor((lon + dlon) / 2) * 2) + 1, 2):
+      out.append(f"{la}/{lo}")
+  return out
+
+
+def print_plan(lat, lon, miles, device="192.168.88.13"):
+  print(f"Map folders covering {miles:g} miles around {lat:.4f}, {lon:.4f}:")
+  for f in folders_for(lat, lon, miles):
+    name = f.replace("/", "_")
+    la = f.split("/")[0]
+    print(f"\n# {f}")
+    print(f"scp -r comma@{device}:/data/media/0/osm/offline/{f} osm_{name}")
+    print(f"py build_curve_map.py --tiles osm_{name} --out curves_{name}")
+    print(f'ssh comma@{device} "mkdir -p /data/media/0/curve_map/{la}"')
+    print(f"scp -r curves_{name} comma@{device}:/data/media/0/curve_map/{f}")
+
+
 def main():
   p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  p.add_argument("--tiles", required=True, help="folder with FrogPilot offline map files (one 2x2 degree folder)")
-  p.add_argument("--out", required=True, help="output folder for the curve files")
+  p.add_argument("--tiles", help="folder with FrogPilot offline map files (one 2x2 degree folder)")
+  p.add_argument("--out", help="output folder for the curve files")
   p.add_argument("--schema", help="path to offline_maps.capnp (default: from the FrogPilot repo)")
+  p.add_argument("--which", nargs=3, type=float, metavar=("LAT", "LON", "MILES"),
+                 help="print the map folders and the commands for an area, e.g. --which 41.88 -87.63 50")
+  p.add_argument("--device", default="192.168.88.13", help="the comma device's IP address (for --which)")
   a = p.parse_args()
+  if a.which:
+    print_plan(*a.which, device=a.device)
+    return
+  if not a.tiles or not a.out:
+    p.error("--tiles and --out are needed (or --which LAT LON MILES)")
   build(a.tiles, a.out, a.schema)
 
 
