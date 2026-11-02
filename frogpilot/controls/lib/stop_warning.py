@@ -286,6 +286,95 @@ class StopWarningLogic:
     return fired
 
 
+# ---- data for a later red light slowdown: every plan dip and every unannounced driver stop ----
+DIP_RATIO = 0.85                # the plan's slowest point <= this fraction of our speed (looser than STOP_SLOWDOWN)
+DIP_MIN_TIME = 1.0              # s the dip must hold (STOP_DROPOUT gaps tolerated) to count
+DIP_WATCH = 8.0                 # s after the dip starts: a brake / cruise cancel in this time = the driver stopped
+DIP_END = 2.0                   # s without the dip before an episode ends
+DIP_MAX = 60.0                  # s: an episode is closed after this at the latest
+BRAKE_LOOKBACK = 10.0           # s: a driver brake with no dip in this time before it is a "no dip" stop
+DIP_MIN_SPEED = 25 * MS_PER_MPH
+
+PLAN_DIP = "stopAhead_planDip"
+NO_DIP_BRAKE = "stopAhead_driverBrakeNoDip"
+
+
+class PlanDipTracker:
+  """Logs every time the model's plan starts to slow down (to DIP_RATIO of our speed) with cruise on, at 25 mph or
+  more and no relevant lead, and what followed: did the warning fire, did the driver brake or cancel cruise (and how
+  long after the dip started). A dip the driver does not brake for is the green light / hesitation class; the time
+  from the dip to the driver's brake is how early a red light slowdown could act. It also logs each driver brake
+  (or cruise cancel) from 25 mph with cruise on and no relevant lead that had no dip in the BRAKE_LOOKBACK before it:
+  the stops the model did not see coming (or brakes for something else; check the video).
+
+  update() returns actions for the event recorder: ("open", kind, summary), ("close", kind, extra),
+  ("point", kind, summary)."""
+
+  def __init__(self):
+    self.frame = 0
+    self.true_frames = 0
+    self.false_frames = _frames(DIP_END)
+    self.ep = None
+    self.last_dip_frame = -10_000
+    self.prev_cruise = False
+
+  def update(self, i, warning_fired, plan=None):
+    """plan: StopWarningLogic.plan_slowdown(i, DIP_RATIO) (computed by the caller to share it), or None."""
+    self.frame += 1
+    out = []
+    cond = (i.cruise_enabled and not i.standstill and i.v_ego >= DIP_MIN_SPEED and not i.lead_relevant and
+            plan is not None)
+    if cond:
+      self.true_frames += 1
+      self.false_frames = 0
+      self.last_dip_frame = self.frame
+    else:
+      self.false_frames += 1
+      if self.false_frames > _frames(STOP_DROPOUT) and self.ep is None:
+        self.true_frames = 0
+    driver_action = self.prev_cruise and (i.brake_pressed or not i.cruise_enabled)
+    driver_action_speed_ok = i.v_ego >= DIP_MIN_SPEED and not i.lead_relevant
+    self.prev_cruise = i.cruise_enabled and not i.brake_pressed
+
+    if self.ep is None and cond and self.true_frames >= _frames(DIP_MIN_TIME):
+      start = self.frame - self.true_frames + 1
+      t_min, v_min, d_min, required = plan
+      self.ep = {"start": start, "min_ratio": v_min / max(i.v_ego, 0.1), "max_decel": required, "fired": None,
+                 "brake": None, "speed": i.v_ego}
+      out.append(("open", PLAN_DIP, {
+        "speed_mph": i.v_ego / MS_PER_MPH, "plan_ratio": v_min / max(i.v_ego, 0.1), "plan_decel": required,
+        "distance_m": d_min, "time_s": t_min, "dip_ratio_threshold": DIP_RATIO,
+        "held_before_open_s": round(self.true_frames * DT, 2)}))
+    ep = self.ep
+    if ep is not None:
+      if cond:
+        ep["min_ratio"] = min(ep["min_ratio"], plan[1] / max(i.v_ego, 0.1))
+        ep["max_decel"] = max(ep["max_decel"], plan[3])
+      if warning_fired and ep["fired"] is None:
+        ep["fired"] = (self.frame - ep["start"]) * DT
+      if driver_action and ep["brake"] is None and (self.frame - ep["start"]) * DT <= DIP_WATCH + DIP_END:
+        ep["brake"] = (self.frame - ep["start"]) * DT
+      age = (self.frame - ep["start"]) * DT
+      if (self.false_frames >= _frames(DIP_END) and (age >= DIP_WATCH or ep["brake"] is not None)) or age >= DIP_MAX:
+        braked = ep["brake"] is not None and ep["brake"] <= DIP_WATCH
+        out.append(("close", PLAN_DIP, {
+          "outcome": "driver braked or cancelled cruise" if braked else
+                     "no brake within 8 s (possible green light or model hesitation)",
+          "driver_brake_after_dip_s": "" if ep["brake"] is None else round(ep["brake"], 2),
+          "warning_fired_after_dip_s": "" if ep["fired"] is None else round(ep["fired"], 2),
+          "min_plan_ratio": round(ep["min_ratio"], 3), "max_plan_decel": round(ep["max_decel"], 2),
+          "dip_duration_s": round(age, 2)}))
+        self.ep = None
+        self.true_frames = 0
+    elif driver_action and driver_action_speed_ok and self.frame - self.last_dip_frame > _frames(BRAKE_LOOKBACK):
+      out.append(("point", NO_DIP_BRAKE, {
+        "speed_mph": i.v_ego / MS_PER_MPH, "brake": i.brake_pressed, "cruise": i.cruise_enabled,
+        "seconds_since_last_dip": "none in the drive" if self.last_dip_frame < 0 else
+                                  round((self.frame - self.last_dip_frame) * DT, 1),
+        "note": "driver stopped/slowed with no plan dip before it: a missed red light, or braking for something else"}))
+    return out
+
+
 def format_log_line(det, mode, v_ego, a_ego, gps=None, now=None):
   now = now or datetime.datetime.now()
   lat = f"{gps['latitude']:.6f}" if gps else ""
@@ -330,6 +419,8 @@ class StopWarning:
     self.read_counter = 0
     self.recorder = None
     self.near_miss = {}
+    self.dips = PlanDipTracker()
+    self.dip_event = None
     try:
       from openpilot.frogpilot.common.feature_events import EventRecorder, NearMissTracker
       self.recorder = EventRecorder(self.EVENT_COLUMNS, hz=20, params=params)
@@ -443,6 +534,18 @@ class StopWarning:
                                           {"speed_mph": i.v_ego / MS_PER_MPH, "lead_d": i.lead_d, "lead_v": i.lead_v,
                                            "lead_prob": i.lead_prob, "lead_y": i.lead_y, "ttc": min(ttc, 99.0),
                                            "required_decel": required})
+    # plan dips and unannounced driver stops (data for a red light slowdown)
+    if self.modes[STOP_AHEAD] != OFF:
+      dip_plan = logic.plan_slowdown(i, DIP_RATIO)
+      for action, kind, data in self.dips.update(i, STOP_AHEAD in fired_kinds, dip_plan):
+        if action == "open":
+          data = dict(data, gps=self._gps())
+          self.dip_event = self.recorder.open(kind, t, data, min_gap=0)
+        elif action == "close":
+          self.recorder.close(self.dip_event, t, data)
+          self.dip_event = None
+        else:
+          self.recorder.record(kind, t, dict(data, gps=self._gps()), min_gap=5.0)
     self.recorder.tick(t)
 
   def _gps(self):

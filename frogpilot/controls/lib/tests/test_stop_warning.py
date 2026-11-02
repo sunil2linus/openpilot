@@ -302,3 +302,75 @@ if __name__ == "__main__":
         print("FAIL", name, repr(e))
   print(f"{failed} failed")
   sys.exit(1 if failed else 0)
+
+
+# ---------------- plan dips (data for a red light slowdown) ----------------
+
+DIP_PLAN = (6.0, 8.0, 90.0, 1.2)     # (t, v, distance, implied decel): 8 m/s at 90 m, i.e. ratio 0.4 at 45 mph
+
+
+def run_dips(seconds, plan_fn, brake_fn=lambda t: False, cruise_fn=lambda t: True, v_fn=lambda t: 45 * MPH,
+             lead_fn=lambda t: False, fired_fn=lambda t: False):
+  tr = sw.PlanDipTracker()
+  out = []
+  for k in range(int(round(seconds / sw.DT))):
+    t = k * sw.DT
+    i = sw.StopWarningInputs(cruise_enabled=cruise_fn(t), v_ego=v_fn(t), a_ego=0.0, brake_pressed=brake_fn(t),
+                             standstill=False, lead_relevant=lead_fn(t))
+    for a in tr.update(i, fired_fn(t), plan_fn(t)):
+      out.append((round(t, 2),) + a)
+  return out
+
+
+def test_dip_then_driver_brakes():
+  # the plan dips from 10 s, the warning fires at 11.5 s, the driver brakes (cruise off) at 13 s
+  out = run_dips(30, lambda t: DIP_PLAN if 10 <= t < 13 else None, brake_fn=lambda t: 13 <= t < 14,
+                 cruise_fn=lambda t: t < 13, fired_fn=lambda t: abs(t - 11.5) < 1e-6)
+  assert [a[1:3] for a in out] == [("open", sw.PLAN_DIP), ("close", sw.PLAN_DIP)], out
+  assert out[0][0] == 11.0 - sw.DT and out[0][3]["held_before_open_s"] == 1.0
+  extra = out[1][3]
+  assert extra["outcome"] == "driver braked or cancelled cruise"
+  assert abs(extra["driver_brake_after_dip_s"] - 3.0) < 1e-6 and abs(extra["warning_fired_after_dip_s"] - 1.5) < 1e-6
+  assert abs(extra["min_plan_ratio"] - 8.0 / (45 * MPH)) < 1e-3
+
+
+def test_dip_without_brake_is_the_green_light_class():
+  out = run_dips(30, lambda t: DIP_PLAN if 10 <= t < 13 else None)
+  assert [a[1] for a in out] == ["open", "close"]
+  assert out[1][3]["outcome"].startswith("no brake within 8 s")
+  assert out[1][3]["driver_brake_after_dip_s"] == ""
+  assert out[1][0] >= 10 + sw.DIP_WATCH - 1e-6           # kept open long enough to see a brake
+
+
+def test_short_dip_lead_low_speed_ignored():
+  assert run_dips(20, lambda t: DIP_PLAN if 10 <= t < 10.6 else None) == []
+  assert run_dips(20, lambda t: DIP_PLAN if 10 <= t < 13 else None, lead_fn=lambda t: True) == []
+  assert run_dips(20, lambda t: DIP_PLAN if 10 <= t < 13 else None, v_fn=lambda t: 20 * MPH) == []
+  # short plan dropouts do not restart the 1 s
+  out = run_dips(20, lambda t: DIP_PLAN if (10 <= t < 10.5 or 10.65 <= t < 11.3) else None)
+  assert out and out[0][1] == "open"
+
+
+def test_driver_brake_without_any_dip_is_logged():
+  out = run_dips(20, lambda t: None, brake_fn=lambda t: 12 <= t < 13, cruise_fn=lambda t: t < 12)
+  assert len(out) == 1 and out[0][1:3] == ("point", sw.NO_DIP_BRAKE) and abs(out[0][0] - 12.0) < 1e-6
+  assert out[0][3]["seconds_since_last_dip"] == "none in the drive"
+  # not when a dip was seen in the 10 s before, not below 25 mph, not with a relevant lead
+  out = run_dips(40, lambda t: DIP_PLAN if 5 <= t < 7 else None, brake_fn=lambda t: 15 <= t < 16, cruise_fn=lambda t: t < 15)
+  assert [a[1] for a in out] == ["open", "close"]
+  assert run_dips(20, lambda t: None, brake_fn=lambda t: 12 <= t < 13, cruise_fn=lambda t: t < 12, v_fn=lambda t: 15 * MPH) == []
+  assert run_dips(20, lambda t: None, brake_fn=lambda t: 12 <= t < 13, cruise_fn=lambda t: t < 12, lead_fn=lambda t: True) == []
+
+
+def test_driver_brake_counts_once_and_cruise_off_driving_is_quiet():
+  # cruise never on: nothing at all
+  assert run_dips(20, lambda t: DIP_PLAN, brake_fn=lambda t: 12 <= t < 13, cruise_fn=lambda t: False) == []
+  # one brake edge = one event
+  out = run_dips(30, lambda t: None, brake_fn=lambda t: 12 <= t < 15, cruise_fn=lambda t: t < 12)
+  assert len(out) == 1
+
+
+def test_long_dip_closes_at_dip_max():
+  out = run_dips(sw.DIP_MAX + 10, lambda t: DIP_PLAN)
+  assert [a[1] for a in out][:2] == ["open", "close"]
+  assert out[1][0] <= sw.DIP_MAX + 1.0 + 1e-6
