@@ -142,7 +142,9 @@ class CSC:
     self.active = self.target < v_cruise
 
 
-def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2):
+def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
+        model=lambda f: None):
+  """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   csc = CSC()
   trigger = scs.StoppedCarTrigger()
@@ -164,7 +166,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       r_has, r_dist = lead.radar(f)
       li = scs.StoppedCarInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], brake_pressed=st["brake"],
                                 v_ego=car.v_ego, lead_alive=True, lead_status=status, lead_prob=prob, lead_d=d,
-                                lead_v=v, lead_y=y, radar_has_lead=r_has, radar_lead_distance=r_dist)
+                                lead_v=v, lead_y=y, radar_has_lead=r_has, radar_lead_distance=r_dist,
+                                model_alive=model(f) is not None, model_accel=model(f) or 0.0)
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent

@@ -479,3 +479,99 @@ if __name__ == "__main__":
         print("FAIL", name, repr(e))
   print(f"{failed} failed")
   sys.exit(1 if failed else 0)
+
+
+# ---------------- stop ahead with a much slower car (red light + a car) ----------------
+
+def _sw(**kw):
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=45 * MPH, lead_alive=True, lead_status=True,
+              lead_prob=0.6, lead_d=95.0, lead_v=13 * MPH, lead_y=1.6, model_alive=True, model_accel=-0.6)
+  base.update(kw)
+  return scs.StoppedCarInputs(**base)
+
+
+def test_stop_with_a_slower_car_starts_in_half_a_second_and_is_urgent():
+  # drive 36, 4:44.8: 45 mph, the model slowing for the light, a car 95 m ahead at 13-15 mph (prob 0.6, y 1.6)
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):                        # cruise on for a while, no car yet
+    tr.update(_sw(lead_status=False))
+  n = 0
+  while not tr.update(_sw()):
+    n += 1
+    assert n < 100
+  assert 49 <= n <= 51, n
+  assert tr.kind == scs.STOP_WITH_CAR and tr.urgent
+  assert abs(tr.target - scs.stopped_car_target(95.0)) < 1e-9
+
+
+def test_no_stop_with_car_while_just_following_or_without_a_car_or_model():
+  # drive 31: the model slows down all the time to keep the gap behind a car at our speed: no slowdown
+  for kw in (dict(lead_v=42 * MPH), dict(lead_v=41 * MPH, lead_d=35.0),       # following
+             dict(lead_status=False),                                          # red light, no car: warning only
+             dict(model_accel=-0.2),                                           # model not slowing, car moving slowly
+             dict(model_alive=False),
+             dict(lead_y=2.6), dict(lead_prob=0.3), dict(lead_d=180.0),        # not our lane / unsure / too far
+             dict(v_ego=18 * MPH, lead_v=2 * MPH, lead_prob=0.6)):             # too slow to act
+    tr = scs.StoppedCarTrigger()
+    for _ in range(300):
+      assert not tr.update(_sw(**kw)), kw
+
+
+def test_stop_with_car_ignores_a_moving_lead_and_releases_when_traffic_moves():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw()):
+    pass
+  for _ in range(300):                       # the car ahead keeps rolling at 13 mph: still slowing (no "moved away")
+    assert tr.update(_sw(model_accel=-0.3, v_ego=35 * MPH))
+  for _ in range(99):                        # green: the model accelerates, the car ahead is at our speed
+    assert tr.update(_sw(model_accel=0.4, v_ego=30 * MPH, lead_v=29 * MPH))
+  assert not tr.update(_sw(model_accel=0.4, v_ego=30 * MPH, lead_v=29 * MPH))
+  assert tr.release_reason.startswith("traffic moving again") and not tr.restore_now   # gentle restore
+
+
+def test_stop_with_car_other_releases():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw()):
+    pass
+  assert not tr.update(_sw(brake_pressed=True)) and "brake" in tr.release_reason
+  while not tr.update(_sw()):
+    pass
+  assert not tr.update(_sw(v_ego=0.5, lead_v=0.0)) and tr.release_reason.startswith("ego stopped") and tr.restore_now
+  while not tr.update(_sw()):
+    pass
+  for _ in range(200):
+    tr.update(_sw(lead_status=False))
+  assert not tr.active and tr.release_reason.startswith("lead lost") and not tr.restore_now
+
+
+def test_stopped_car_rolling_forward_with_the_model_slowing_is_not_released():
+  # a confirmed stopped car starts creeping (5 m/s) towards the light: still a stop, not "moved away"
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw(lead_v=0.0, lead_prob=0.95, lead_y=0.1, model_accel=0.0, v_ego=20.0)):
+    pass
+  assert tr.kind == scs.STOPPED_CAR
+  for _ in range(200):
+    assert tr.update(_sw(lead_v=5.0, lead_prob=0.95, lead_y=0.1, v_ego=18.0))
+  assert tr.kind == scs.STOP_WITH_CAR
+  # without the model slowing a stopped car that drives off is still released as before
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw(lead_v=0.0, lead_prob=0.95, lead_y=0.1, model_accel=0.0, v_ego=20.0)):
+    pass
+  for _ in range(60):
+    tr.update(_sw(lead_v=5.0, lead_prob=0.95, lead_y=0.1, model_accel=0.0, v_ego=20.0))
+  assert not tr.active and tr.release_reason.startswith("lead moved away")
+
+
+def test_approach_45_mph_to_a_slow_car_at_a_red_light_drops_at_once_never_below_20():
+  lead = StoppedLead(95, v_mph=13.0, prob=0.7, y=1.0)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 800, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.7)
+  assert r["ever_active"] and r["trigger"].kind == scs.STOP_WITH_CAR
+  first = first_frame(r)
+  # first SET- within 0.6 s of the trigger (0.3 s cruise settle at the start of the run + 0.5 s hold)
+  assert first is not None and first <= 90, first
+  assert r["holds"] and r["holds"][0] <= 90                  # urgent: a long press straight away
+  assert r["min"] >= 20 - 1e-6 and r["min"] <= 33, r["min"]
+  # the same car with the model not slowing (just a slow car, no stop ahead): nothing happens
+  lead = StoppedLead(95, v_mph=13.0, prob=0.7, y=1.0)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 800, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0)
+  assert not r["ever_active"] and r["presses"] == [] and r["holds"] == []

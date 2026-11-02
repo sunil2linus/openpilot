@@ -727,7 +727,8 @@ class CurveSlowdown:
       enabled=bool(CC.enabled), cruise_enabled=cruise_enabled, brake_pressed=bool(CS.out.brakePressed), v_ego=v_ego,
       lead_alive=self._alive('radarState'), lead_status=bool(lead.status), lead_prob=float(lead.modelProb),
       lead_d=float(lead.dRel), lead_v=float(lead.vLead), lead_y=float(lead.yRel),
-      radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)))
+      radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)),
+      model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration))
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -942,7 +943,8 @@ class CurveSlowdown:
     # stopped car event: from the trigger going active until the reason has cleared and the restore is done
     if self.stop_event is None and stop_active:
       self.stop_event = self.recorder.open("stoppedCarSlowdown", t, {
-        "mode": "test" if self.stop_mode == 1 else "on", "set_mph_before": i.set_speed / MS_PER_MPH,
+        "mode": "test" if self.stop_mode == 1 else "on", "kind": self.trigger.kind, "model_accel": si.model_accel,
+        "set_mph_before": i.set_speed / MS_PER_MPH,
         "vEgo_mph": i.v_ego / MS_PER_MPH, "lead_d": si.lead_d, "lead_v": si.lead_v, "lead_prob": si.lead_prob,
         "lead_y": si.lead_y, "target_mph": self.trigger.target / MS_PER_MPH, "required_decel": self.trigger.required,
         "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent})
@@ -955,7 +957,8 @@ class CurveSlowdown:
       if done or (not stop_active and self.stop_mode == 1):
         holds = lg.hold_log[self.stop_holds_at_start:]
         self.recorder.close(self.stop_event, t, {
-          "release_reason": self.trigger.release_reason, "set_mph_min": self.stop_min_set / MS_PER_MPH,
+          "release_reason": self.trigger.release_reason, "kind": self.trigger.kind,
+          "set_mph_min": self.stop_min_set / MS_PER_MPH,
           "set_mph_after": i.set_speed / MS_PER_MPH, "holds": len(holds),
           "holds_detail": "; ".join(f"frames_sent {h.get('frames_sent')} landed {h.get('landed')} after_release {h.get('landed_after_release', 0)} "
                                     f"landings {[(round((f - h['frame']) * DT_CTRL, 2), n) for f, n in h.get('landings', [])]}"
@@ -968,5 +971,5 @@ class CurveSlowdown:
       cand = self.trigger.near_miss_candidate(si)
       self.near_miss.update(t, cand, stop_active, self.trigger.blockers(si) if cand else (),
                             {"lead_d": si.lead_d, "lead_v": si.lead_v, "lead_prob": si.lead_prob, "lead_y": si.lead_y,
-                             "vEgo_mph": i.v_ego / MS_PER_MPH})
+                             "vEgo_mph": i.v_ego / MS_PER_MPH, "model_accel": si.model_accel})
     self.recorder.tick(t)
