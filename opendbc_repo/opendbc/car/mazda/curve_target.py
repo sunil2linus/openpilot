@@ -116,13 +116,15 @@ class CurveTarget:
 
 MAP_LATERAL_ACCEL = 2.2       # m/s^2: map curves are planned at most at this (route 35/36: the 30 mph curve on West
                               # Utica at 45 mph = 3.2 m/s^2 with the steering at 100 % for 3.5-4.5 s, out of the lane once)
-MAP_DECEL = 0.5               # m/s^2: planned slowdown, a little gentler than the stock cruise's own (0.6-0.7 measured), so
-                              # the set speed comes down 1 mph about every second and the car follows it smoothly
+# planned slowdown, a little gentler than the stock cruise's own (0.6-0.7 measured), so the set speed comes down
+# about 1 mph every second and the car follows it smoothly
+MAP_DECEL = 0.5               # m/s^2
 MAP_LEAD_TIME = 1.0           # s: be at the curve's speed this long before its entry (slow before the curve, not in it)
 MAP_REACTION_TIME = 1.5       # s: the stock cruise starts slowing about this long after a SET- press
 ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advisory sign the map has for the curve
-MAP_START_GAP = 1.0 * MS_PER_MPH  # m/s: map curves start at the first 1 mph step (the map does not flicker, and a later
-                                  # start would need a bigger, quicker drop to catch up)
+# map curves start at the first 1 mph step (the map does not flicker, and a later start would need a bigger, quicker
+# drop to catch up)
+MAP_START_GAP = 1.0 * MS_PER_MPH  # m/s
 
 
 def map_curve_speed(radius, distance, lat_accel, advisory=0.0, reaction_speed=0.0, decel=MAP_DECEL,
