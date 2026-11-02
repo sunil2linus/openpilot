@@ -155,3 +155,12 @@ def test_curve_on_an_exit_carries_the_ramp_and_distance_to_its_end():
       assert c["wdir"] == [[11, 1]]
       return
   raise AssertionError("exit ramp not found")
+
+
+def test_chain_records_give_way_order_and_curve_position():
+  ways = curve_road(r=115, turn=40, split=True)
+  ch = B.build_chains(ways)[0]
+  rec = B.chain_record(ch)
+  assert [w[0] for w in rec["w"]] == [1, 2] and rec["w"][0][2] == 0.0 and rec["w"][1][2] > 300
+  c = B.find_curves(ch, ways)[0]
+  assert c["chain"] == rec["id"] and 280 <= c["s_a"] < c["s_b"] <= rec["len"]

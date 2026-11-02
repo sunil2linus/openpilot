@@ -249,6 +249,16 @@ def build_chains(ways):
 
 # ---------------- curves ----------------
 
+def chain_record(chain):
+  """A road as the car follows it: [[way id, 1 if the chain runs in the way's node order, start (m)], ...]."""
+  out, s0 = [], 0.0
+  for w, rev in chain:
+    x, y = to_xy(w.lat, w.lon, float(w.lat[0]), float(w.lon[0]))
+    out.append([int(w.id), 0 if rev else 1, round(s0, 1)])
+    s0 += float(np.sum(np.hypot(np.diff(x), np.diff(y))))
+  return {"id": int(chain[0][0].id), "w": out, "len": round(s0, 1)}
+
+
 def chain_geometry(chain):
   lats, lons, wid = [], [], []
   for w, rev in chain:
@@ -327,6 +337,8 @@ def find_curves(chain, ways_by_id, ramp=None):
           # travelling a -> b follows each way's node order when fwd is 1 (FrogPilot's map match: is_forward)
           "wdir": [[w, 1 if fwd.get(w, True) else 0] for w in wset],
         }
+        c["chain"] = int(chain[0][0].id)
+        c["s_a"], c["s_b"] = round(float(rs[i]), 1), round(float(rs[j]), 1)   # along the chain, from its start
         if ramp is not None:
           total = float(rs[-1])
           end_dist = total - float(rs[j]) if ramp["travel"] != "ba" else float(rs[i])
@@ -418,6 +430,7 @@ def ramp_record(chain, nidx, ways):
   return {"type": kind, "travel": travel, "len": round(length, 1), "to": to, "from": frm,
           "start": e_pt if travel == "ba" else s_pt, "end": s_pt if travel == "ba" else e_pt,
           "wdir": [[w.id, 0 if rev else 1] for w, rev in chain], "cls": min(w.cls for w, _ in chain),
+          "chain": int(chain[0][0].id),
           "name": next((w.name or w.ref for w, _ in chain if w.name or w.ref), "")}
 
 
@@ -436,22 +449,33 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False):
   ways = load_ways(schema, files)
   chains = build_chains(ways)
   nidx = node_index(ways)
-  curves, ramps = [], []
+  curves, ramps, chain_recs = [], [], {}
   for ch in chains:
     ramp = ramp_record(ch, nidx, ways)
     if ramp is not None:
       ramps.append(ramp)
-    curves.extend(find_curves(ch, ways, ramp))
+    found = find_curves(ch, ways, ramp)
+    curves.extend(found)
+    if found or ramp is not None:
+      rec = chain_record(ch)
+      chain_recs[rec["id"]] = rec
   # one file per 0.25 deg square: curves by their apex, ramps by their start
   by_tile = {}
+  def tile(name):
+    return by_tile.setdefault(name, {"curves": [], "ramps": [], "chains": set()})
   for c in curves:
-    by_tile.setdefault(tile_of(*c["apex"]), {"curves": [], "ramps": []})["curves"].append(c)
+    t = tile(tile_of(*c["apex"]))
+    t["curves"].append(c)
+    t["chains"].add(c["chain"])
   for r in ramps:
-    by_tile.setdefault(tile_of(*r["start"]), {"curves": [], "ramps": []})["ramps"].append(r)
+    t = tile(tile_of(*r["start"]))
+    t["ramps"].append(r)
+    t["chains"].add(r["chain"])
   os.makedirs(out_dir, exist_ok=True)
   for name, d in by_tile.items():
     with open(os.path.join(out_dir, name + ".json"), "w") as f:
-      json.dump({"version": 2, "keep_lat": KEEP_LAT, "curves": d["curves"], "ramps": d["ramps"]}, f, separators=(",", ":"))
+      json.dump({"version": 3, "keep_lat": KEEP_LAT, "curves": d["curves"], "ramps": d["ramps"],
+                 "chains": [chain_recs[c] for c in sorted(d["chains"]) if c in chain_recs]}, f, separators=(",", ":"))
   if not quiet:
     size = sum(os.path.getsize(os.path.join(out_dir, n + ".json")) for n in by_tile)
     kinds = {}
