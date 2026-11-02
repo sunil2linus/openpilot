@@ -64,7 +64,7 @@ StarPilot), so no new download is needed.
 |---|---|
 | `a`, `a_hdg` | entry point and heading (deg) when travelling a → b |
 | `b`, `b_hdg` | entry point and heading when travelling b → a |
-| `apex`, `r` | tightest point and its radius (m, over 60 m of road) |
+| `apex`, `r`, `r_map` | tightest point; radius the car needs (m: the map radius over 60 m of road, widened for short sharp bends a car can cut within its lane) and the map radius |
 | `len`, `turn`, `dir` | curve length (m), total turn (deg), L/R when travelling a → b |
 | `speed`, `adv` | speed limit (m/s; road-type default if OSM has none), OSM advisory speed (m/s, 0 = none) |
 | `cls`, `name`, `oneway`, `ways` | road class, name or ref, one-way, OSM way ids |

@@ -14,7 +14,8 @@ limit and acts on it when the setting is On (MazdaMapCurves: 0 off, 1 test, 2 on
     curve on the road ahead, in order, also on later ways of the same road. Distances are straight lines from
     the GPS position (a little short on a winding road, i.e. on the early side).
   * Which curve: of the curves within LOOKAHEAD ahead (and the one we are in), the one that needs the
-    lowest speed now with a gentle slowdown (PLAN_DECEL) to reach its speed PLAN_MARGIN before its entry.
+    lowest speed now with a gentle slowdown (PLAN_DECEL, after the cruise reacts) to reach its speed
+    PLAN_LEAD_TIME before its entry.
   * Ramps: when the road is a ramp (exit / entrance / interchange) we know where it leads: the road class,
     its speed limit and the distance to the end of the ramp.
   * Navigation: when the route says an exit ("off ramp" / "fork") is coming, the exit ramp is matched by
@@ -35,9 +36,10 @@ MPH = 0.44704
 EARTH_R = 6371008.8
 
 LOOKAHEAD = 1000.0        # m along the road
-PLAN_LAT = 3.0            # m/s^2: only to choose the governing curve; the car uses its own limit
-PLAN_DECEL = 0.6          # m/s^2: the slowdown the stock cruise gives after a set speed drop (0.6-0.7 measured)
-PLAN_MARGIN = 30.0        # m before the entry where the curve speed should be reached
+PLAN_LAT = 2.2            # m/s^2: as the car side (curve_target.MAP_LATERAL_ACCEL)
+PLAN_DECEL = 0.5          # m/s^2: as the car side (curve_target.MAP_DECEL)
+PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry
+PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET- press
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
 AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our heading
 NEAR = 15.0               # m
@@ -101,10 +103,12 @@ def curve_speed_limit(radius, advisory=0.0, lat_limit=PLAN_LAT):
   return min(v, advisory + ADVISORY_OVER) if advisory > 0 else v
 
 
-def plan_speed(radius, distance, advisory=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL, margin=PLAN_MARGIN):
-  """Highest speed (m/s) from which a `decel` slowdown reaches the curve speed `margin` m before its entry."""
+def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL):
+  """Highest speed (m/s) from which the stock cruise (reacting for PLAN_REACTION_TIME at `reaction_speed`, then
+  slowing at `decel`) reaches the curve speed PLAN_LEAD_TIME before its entry (the car side's map_curve_speed)."""
   v_curve = curve_speed_limit(radius, advisory, lat_limit)
-  return math.sqrt(v_curve ** 2 + 2 * decel * max(distance - margin, 0.0))
+  room = distance - v_curve * PLAN_LEAD_TIME - PLAN_REACTION_TIME * max(reaction_speed, v_curve)
+  return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
 
 
 def cell_key(cla, clo):
@@ -520,7 +524,7 @@ class MapCurvesPlanner:
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
-      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory) < set_speed - 2 * MPH and \
+      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory, set_speed) < set_speed - 2 * MPH and \
          curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"

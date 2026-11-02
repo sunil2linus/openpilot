@@ -254,7 +254,7 @@ def _map_distance(meters: float, metric: bool) -> str:
 
 
 def _map_curve_needs(radius: float, advisory: float) -> float:
-  needs = math.sqrt(3.0 * radius) if radius > 0 else 0.0
+  needs = math.sqrt(2.2 * radius) if radius > 0 else 0.0   # curve_target.MAP_LATERAL_ACCEL
   if advisory > 0:
     needs = min(needs, advisory + 10 * CV.MPH_TO_MS)   # never more than 10 mph over the yellow sign
   return needs

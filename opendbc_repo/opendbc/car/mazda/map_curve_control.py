@@ -3,7 +3,8 @@ Map curves on the Mazda set speed controller: turns the map curve fields of star
 starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
 
   * Curve ahead (or the one we are in): the set speed allowed now so that a gentle cruise slowdown
-    (MAP_DECEL) reaches the curve's speed (this car's lateral limit) MAP_MARGIN before its entry. Same
+    (MAP_DECEL, after the cruise's MAP_REACTION_TIME) reaches the curve's speed (MAP_LATERAL_ACCEL, or the car's
+    lateral limit if lower) MAP_LEAD_TIME before its entry. Same
     2 mph start gap / 1 mph end gap as the camera curve target.
   * Ramps (we are on an exit / entrance / interchange ramp and the curve is on it): may go past the
     driver's Max Drop, down to 25 mph, with a bigger SET- budget.
@@ -26,9 +27,9 @@ Pure logic (no openpilot imports) so it can be unit tested; the wrapper in curve
 from dataclasses import dataclass
 
 try:
-  from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP
+  from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL
 except ImportError:          # offline tests load this file directly
-  from curve_target import MapCurveTarget, NO_CURVE, START_GAP
+  from curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL
 
 MPH = 0.44704
 OFF, TEST, ON = 0, 1, 2
@@ -88,6 +89,7 @@ class MapOutput:
 
 class MapCurveControl:
   def __init__(self, lat_accel):
+    lat_accel = min(lat_accel, MAP_LATERAL_ACCEL)
     self.curve = MapCurveTarget(lat_accel)
     self.nav = MapCurveTarget(lat_accel)
     self.on_street_exit = False

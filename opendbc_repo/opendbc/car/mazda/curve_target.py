@@ -114,24 +114,34 @@ class CurveTarget:
 
 # ---------------- map curves (from starpilotPlan, see starpilot/controls/lib/map_curves.py) ----------------
 
-MAP_DECEL = 0.6               # m/s^2: the stock cruise's slowdown after a set speed drop (0.6-0.7 measured)
-MAP_MARGIN = 30.0             # m before the curve's entry where its speed should be reached
+MAP_LATERAL_ACCEL = 2.2       # m/s^2: map curves are planned at most at this (route 35/36: the 30 mph curve on West
+                              # Utica at 45 mph = 3.2 m/s^2 with the steering at 100 % for 3.5-4.5 s, out of the lane once)
+MAP_DECEL = 0.5               # m/s^2: planned slowdown, a little gentler than the stock cruise's own (0.6-0.7 measured), so
+                              # the set speed comes down 1 mph about every second and the car follows it smoothly
+MAP_LEAD_TIME = 1.0           # s: be at the curve's speed this long before its entry (slow before the curve, not in it)
+MAP_REACTION_TIME = 1.5       # s: the stock cruise starts slowing about this long after a SET- press
 ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advisory sign the map has for the curve
+MAP_START_GAP = 1.0 * MS_PER_MPH  # m/s: map curves start at the first 1 mph step (the map does not flicker, and a later
+                                  # start would need a bigger, quicker drop to catch up)
 
 
-def map_curve_speed(radius, distance, lat_accel, advisory=0.0, decel=MAP_DECEL, margin=MAP_MARGIN):
+def map_curve_speed(radius, distance, lat_accel, advisory=0.0, reaction_speed=0.0, decel=MAP_DECEL,
+                    lead_time=MAP_LEAD_TIME, reaction_time=MAP_REACTION_TIME):
   """Set speed allowed now (m/s, true speed) for a map curve of `radius` m starting `distance` m ahead
-  (`advisory`: its yellow sign speed in m/s, 0 if the map has none)."""
+  (`advisory`: its yellow sign speed in m/s, 0 if the map has none; `reaction_speed`: the speed driven while the
+  cruise reacts, the driver's set speed). The cruise reacts, then slows at `decel` and reaches the curve's speed
+  `lead_time` before the entry."""
   if radius <= 0:
     return NO_CURVE
   v_curve = math.sqrt(lat_accel * radius)
   if advisory > 0:
     v_curve = min(v_curve, advisory + ADVISORY_OVER)
-  return math.sqrt(v_curve ** 2 + 2 * decel * max(distance - margin, 0.0))
+  room = distance - v_curve * lead_time - reaction_time * max(reaction_speed, v_curve)
+  return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
 
 
 class MapCurveTarget:
-  """Same gap and hysteresis as CurveTarget, without the 1 s confirmation (the map does not flicker)."""
+  """Like CurveTarget, without the 1 s confirmation and starting at the first 1 mph step (the map does not flicker)."""
 
   def __init__(self, lat_accel):
     self.lat_accel = lat_accel
@@ -139,9 +149,9 @@ class MapCurveTarget:
     self.speed = NO_CURVE
 
   def update(self, radius, distance, driver_speed, advisory=0.0):
-    self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory)
+    self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory, reaction_speed=driver_speed)
     if not self.active:
-      self.active = radius > 0 and self.speed <= driver_speed - START_GAP
+      self.active = radius > 0 and self.speed <= driver_speed - MAP_START_GAP
     else:
       self.active = radius > 0 and self.speed < driver_speed - END_GAP
     return self.active, self.speed

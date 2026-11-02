@@ -149,9 +149,9 @@ def test_curve_far_away_waits_then_acts():
   c = CTL.MapCurveControl(3.0)
   out = c.update(F(status=1, radius=115, distance=900), 45 * MPH, False)
   assert not out.active
-  out = c.update(F(status=1, radius=115, distance=60), 50 * MPH, False)
+  out = c.update(F(status=1, radius=115, distance=40), 50 * MPH, False)
   assert out.active and out.why == "curve" and out.floor == 0
-  assert abs(out.speed - math.sqrt(3.0 * 115 + 2 * 0.6 * 30)) < 1e-6
+  assert abs(out.speed - math.sqrt(2.2 * 115)) < 1e-6      # 40 m out: already the curve's own speed (2.2 m/s^2)
 
 
 HOLD = int(CTL.RAMP_HOLD / CTL.DT_CTRL)
@@ -210,7 +210,7 @@ def test_early_signal_is_remembered_after_it_goes_off():
   acted = [c.update(nav(d), 70 * MPH, 0).active for d in range(900, 0, -10)]
   assert any(acted) and c.exit_intent
   first = 900 - 10 * acted.index(True)
-  assert 400 <= first <= 700, first                        # starts only as early as the 45 m curve needs
+  assert 400 <= first <= 850, first                        # starts only as early as the 45 m curve needs
 
 
 def test_signal_the_wrong_way_or_passing_the_exit_forgets_it():
@@ -314,22 +314,26 @@ def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
 # ---------------- yellow advisory signs ----------------
 
 def test_advisory_sign_caps_the_curve_speed():
-  # West Utica Road: 117 m radius, 45 mph limit, yellow 30 mph sign. Shape alone at 3.0 m/s^2 allows ~42 mph.
+  # West Utica Road: 117 m radius, 45 mph limit, yellow 30 mph sign. Shape alone at 2.2 m/s^2 allows ~36 mph,
+  # below the sign + 10 mph, so the sign changes nothing there; a 20 mph sign would cap it at 30 mph.
   c = CTL.MapCurveControl(3.0)
   out = c.update(F(status=1, radius=116.6, distance=0), 45 * MPH, 0)
-  assert out.active and 41.5 <= out.speed / MPH <= 42.5, out.speed / MPH
+  assert out.active and 35.5 <= out.speed / MPH <= 36.2, out.speed / MPH
   c = CTL.MapCurveControl(3.0)
   out = c.update(F(status=1, radius=116.6, distance=0, advisory=30 * MPH), 45 * MPH, 0)
-  assert out.active and abs(out.speed / MPH - 40) < 0.01           # 30 + 10 mph
+  assert out.active and 35.5 <= out.speed / MPH <= 36.2
+  c = CTL.MapCurveControl(3.0)
+  out = c.update(F(status=1, radius=116.6, distance=0, advisory=20 * MPH), 45 * MPH, 0)
+  assert out.active and abs(out.speed / MPH - 30) < 0.01           # 20 + 10 mph
   # a sign above what the shape allows changes nothing (the shape is lower)
   c = CTL.MapCurveControl(3.0)
   out = on_ramp_for(c, HOLD, 70 * MPH, status=2, radius=45, distance=0, on_ramp=True, ramp_type=1, advisory=35 * MPH)
-  assert abs(out.speed - math.sqrt(3.0 * 45)) < 1e-6
+  assert abs(out.speed - math.sqrt(2.2 * 45)) < 1e-6
 
 
 def test_planner_uses_the_advisory_to_choose_and_announce():
-  assert abs(MC.curve_speed_limit(116.6, 30 * MPH) / MPH - 40) < 0.01
-  assert MC.curve_speed_limit(116.6) > MC.curve_speed_limit(116.6, 30 * MPH)
+  assert abs(MC.curve_speed_limit(116.6, 20 * MPH) / MPH - 30) < 0.01
+  assert MC.curve_speed_limit(116.6) > MC.curve_speed_limit(116.6, 20 * MPH)
   # an easy-looking curve with a 25 mph sign governs over a sharper unsigned one at the same distance
   assert MC.plan_speed(300, 200, 25 * MPH) < MC.plan_speed(150, 200)
 
@@ -393,12 +397,12 @@ def test_planner_uses_its_own_matching_when_the_map_program_gives_none():
 
   la, lo = pos(0, -250)
   gps = {"latitude": la, "longitude": lo, "bearing": 0.0}
-  mp.update(SM(), gps, 20.0, 22.0)        # loads the files, then matches way 1
-  mp.update(SM(), gps, 20.0, 22.0)
+  mp.update(SM(), gps, 20.0, 20.0)        # loads the files, then matches way 1
+  mp.update(SM(), gps, 20.0, 20.0)
   assert mp.mc.curve is not None and abs(mp.mc.radius - curves[0]["r"]) < 1e-6
-  assert mp.notice is None                 # 250 m out at 49 mph the curve does not need slowing yet
+  assert mp.notice is None                 # 250 m out at 45 mph the curve does not need slowing yet
   la, lo = pos(0, -90)
-  mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 20.0, 22.0)
+  mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 20.0, 20.0)
   assert mp.notice == "curve"
 
 
@@ -416,3 +420,34 @@ def test_never_keeps_a_lowered_speed_when_the_next_road_is_a_freeway():
   for k in range(HOLD * 3):
     c.update(F(ramp_end_distance=300 - k * 0.5, **ramp), 70 * MPH, 0)
   assert not c.update(F(on_ramp=False, road_class=1), 70 * MPH, 0).adopt
+
+
+def test_west_utica_slows_before_the_curve_not_in_it():
+  # route 36: 45 mph, the 117 m curve. Start early enough that the stock cruise (1.5 s to react, then the planned
+  # 0.5 m/s^2) is at the curve's speed (~36 mph) just before the curve starts (1 s), coming down ~1 mph a second.
+  c = CTL.MapCurveControl(3.0)
+  start = None
+  for d in range(400, -1, -2):
+    if c.update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).active:
+      start = d
+      break
+  assert start is not None and 165 <= start <= 195, start
+  # the cruise from 45 mph, reacting then slowing at its measured 0.6 m/s^2, starting at `start`
+  v, x, t = 45 * MPH, float(start), 0.0
+  v_curve = math.sqrt(2.2 * 116.6)
+  while x > 0:
+    if t >= 1.5:
+      v = max(v - 0.6 * 0.01, v_curve)
+    x -= v * 0.01
+    t += 0.01
+    if v <= v_curve + 1e-6:
+      break
+  assert x >= v_curve * 1.0 - 1.0, x                          # at the curve's speed ~1 s before the curve
+  # gradual: the planned speed comes down by about 1 mph per second, never in jumps
+  prev, steps = None, []
+  for d in range(start, -1, -1):
+    sp = CTL.MapCurveControl(3.0).update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).speed
+    if prev is not None:
+      steps.append((prev - sp) / MPH / (1.0 / 18.0))          # mph per second at ~40 mph (18 m/s)
+    prev = sp
+  assert max(steps) < 1.3, max(steps)

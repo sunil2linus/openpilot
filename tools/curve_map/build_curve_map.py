@@ -46,7 +46,8 @@ STEP = 2.0                  # m: resampling step along a chain
 HALF_WINDOW = 30.0          # m: heading change measured between chords of this length on each side (checked
                             # against radii measured on the road: 117 / 131 / 216 m vs 104-116 / 138-164 / 231 m)
 JOIN_MAX_TURN = 50.0        # deg: ways only join into one road when they continue this straight
-KEEP_LAT = 3.0              # m/s^2: a curve is kept if sqrt(KEEP_LAT * R) < road speed + KEEP_OVER
+KEEP_LAT = 2.2              # m/s^2: a curve is kept if sqrt(KEEP_LAT * R) < road speed + KEEP_OVER (the car plans at 2.2)
+KINK_SLACK = 1.5            # m: a car can cut a short sharp bend this far inside its lane (see effective_radius)
 KEEP_OVER = 15 * MPH
 ADVISORY_OVER = 10 * MPH     # the car never plans a curve faster than its yellow advisory sign + this
 LAT_LEVELS = (2.5, 3.0, 3.5)
@@ -274,6 +275,15 @@ def chain_geometry(chain):
   return np.concatenate(lats), np.concatenate(lons), np.concatenate(wid)
 
 
+def effective_radius(r_map, turn_deg, slack=KINK_SLACK):
+  """Radius a car actually needs for a bend: a short sharp bend (two map pieces meeting at an angle, e.g. Dobry
+  Drive: 17 deg over 34 m reads as 99 m, the car measured ~370 m) can be cut within the lane. A circle tangent to
+  both sides of a corner of `turn_deg` that cuts it by `slack` m has radius slack / (1/cos(turn/2) - 1); a real
+  curve (long arc) is already wider than that and keeps its own radius."""
+  half = math.radians(min(max(turn_deg, 0.1), 170.0)) / 2
+  return max(r_map, slack / (1.0 / math.cos(half) - 1.0))
+
+
 def find_curves(chain, ways_by_id, ramp=None):
   """Curves along one chain. `ramp`: the chain's ramp record (link roads), added to each curve with the
   distance from the curve's end to the end of the ramp in the direction of travel."""
@@ -314,7 +324,8 @@ def find_curves(chain, ways_by_id, ramp=None):
       turn = max(turn, abs(math.degrees(float(np.sum(k[seg]) * STEP))))
     if length >= MIN_LENGTH and turn >= MIN_TURN_DEG:
       apex = i + int(np.argmax(np.abs(k[seg])))
-      r_min = 1.0 / abs(k[apex])
+      r_map = 1.0 / abs(k[apex])
+      r_min = effective_radius(r_map, turn)
       # the ways the curve lies on
       wset = sorted({int(wids[min(np.searchsorted(s_pts, rs[m]), len(wids) - 1)]) for m in range(i, j + 1, 5)} |
                     {int(wids[min(np.searchsorted(s_pts, rs[j]), len(wids) - 1)])})
@@ -335,7 +346,7 @@ def find_curves(chain, ways_by_id, ramp=None):
         c = {
           "a": pt(i), "a_hdg": round(h_in, 1),            # entry when travelling a -> b
           "b": pt(j), "b_hdg": round((h_out + 180) % 360, 1),  # entry when travelling b -> a
-          "apex": pt(apex), "r": round(r_min, 1), "len": round(length, 1), "turn": round(turn, 1),
+          "apex": pt(apex), "r": round(r_min, 1), "r_map": round(r_map, 1), "len": round(length, 1), "turn": round(turn, 1),
           "dir": "L" if sign > 0 else "R",                 # turning direction when travelling a -> b
           "speed": round(speed, 2), "adv": round(adv, 2), "cls": cls, "name": name,
           "oneway": any(w.oneway for w in wl), "ways": wset,

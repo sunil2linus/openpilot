@@ -147,8 +147,8 @@ def test_curve_on_an_exit_carries_the_ramp_and_distance_to_its_end():
     rec = B.ramp_record(ch, nidx, ways)
     if rec and rec["wdir"][0][0] == 11:
       cs = B.find_curves(ch, ways, rec)
-      assert len(cs) == 1
-      c = cs[0]
+      assert len(cs) >= 1
+      c = min(cs, key=lambda c: c["r"])                      # the loop (the bend off the motorway is wide)
       assert abs(c["r"] - 50) / 50 < 0.15, c["r"]
       assert c["ramp"]["type"] == "exit" and c["ramp"]["to"]["name"] == "Main Street"
       assert 60 <= c["ramp"]["end_dist"] <= 130, c["ramp"]["end_dist"]
@@ -206,3 +206,11 @@ def test_simplify_keeps_corners_and_drops_straight_points():
   y = [0, 0, 0, 0, 10, 20]
   assert B.simplify(x, y, 2.0) == [0, 3, 5]
   assert B.simplify([0, 1], [0, 0], 2.0) == [0, 1]
+
+
+def test_short_sharp_bends_are_widened_real_curves_are_not():
+  # Dobry Drive: 17.4 deg over 34 m reads as 99 m; a car cuts it within its lane (measured ~370 m)
+  assert B.effective_radius(98.7, 17.4) > 120
+  # West Utica Road: 40 deg over 112 m, 117 m (measured 104-116 m): unchanged
+  assert B.effective_radius(116.6, 39.9) == 116.6
+  assert B.effective_radius(50.0, 90.0) == 50.0
