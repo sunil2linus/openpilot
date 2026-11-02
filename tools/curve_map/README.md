@@ -51,8 +51,10 @@ Repeat 4–6 for each 2° folder you drive in.
    ```
    A city near a 2° line needs 2–4 folders; each takes about 10–40 s to build.
 3. Run the printed commands in PowerShell, from the folder with the script, with the car parked and the device on
-   the same Wi-Fi (or hotspot). Add `--device <ip>` to the step-2 command if the device's address changed. The device already has every US folder under
-`/data/media/0/osm/offline` (from FrogPilot's map download), so no new download is needed.
+   the same Wi-Fi (or hotspot). Add `--device <ip>` to the step-2 command if the device's address changed.
+
+The device already has every US folder under `/data/media/0/osm/offline` (from FrogPilot's map download), so no new
+download is needed.
 
 ## Output
 
