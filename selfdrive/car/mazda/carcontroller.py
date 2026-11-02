@@ -46,8 +46,10 @@ class CarController(CarControllerBase):
         except (TypeError, ValueError):
           stop_mode = 0
         stop_mode = stop_mode if stop_mode in (0, 1, 2) else 0
-        if curve_enabled or stop_mode:
-          self.curve_slowdown = CurveSlowdown(CP, self.params, curve_enabled=curve_enabled, stop_mode=stop_mode)
+        learning = self.params.get_bool("MazdaCurveLearning")
+        if curve_enabled or stop_mode or learning:
+          self.curve_slowdown = CurveSlowdown(CP, self.params, curve_enabled=curve_enabled, stop_mode=stop_mode,
+                                              learning=learning)
       except Exception:
         cloudlog.exception("mazda set speed slowdown init failed, disabled")
         self.curve_slowdown = None

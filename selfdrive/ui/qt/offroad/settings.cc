@@ -63,9 +63,11 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "MazdaCurveSlowdown",
       tr("Curve Slowdown (Experimental)"),
       tr("Gen1 Mazda with stock radar cruise only. Lowers the stock cruise set speed before curves by pressing SET- for you, "
-         "as much as the Curve Speed Controller says the curve needs (up to the maximum drop below, never below 25 mph), then "
-         "raises it back with SET+ while you exit the curve, never above your own set speed. Needs the Curve Speed Controller "
-         "turned on. If you brake and resume at the lowered speed, it still restores your speed. If you change the set speed "
+         "as much as the curve ahead needs (up to the maximum drop below, never below 25 mph), then "
+         "raises it back with SET+ while you exit the curve, never above your own set speed. The curve speed is worked out from "
+         "the road curvature the driving model sees: with a Torque Interceptor it plans curves at 3.0 m/s^2, without one at the "
+         "car's own steering limit (the same as FrogPilot's Curve Speed Controller). A curve must be seen for a second and need "
+         "at least 2 mph less than your set speed. If you brake and resume at the lowered speed, it still restores your speed. If you change the set speed "
          "yourself, it uses your new speed. The stock cruise still does all braking. Takes effect on the next drive."),
       "../assets/offroad/icon_openpilot.png",
     },
@@ -173,6 +175,18 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
                                         "curve needs, up to this limit. Larger drops take a few seconds of button presses. "
                                         "In km/h: 8, 16 or 24 km/h. Takes effect on the next drive."),
                                      "../assets/offroad/icon_speed_limit.png", drop_texts, 150));
+
+      // Curve learning (log only for now)
+      auto learning = new ParamControl("MazdaCurveLearning", tr("Curve Learning (Log Only)"),
+                                       tr("Records every curve and learns how much curve openpilot can steer on this car without "
+                                          "help, and how fast you like to take curves (from curves where you chose the speed: "
+                                          "cruise off, or your foot on the gas). Curves where Curve Slowdown lowered the speed are "
+                                          "not used for your preference. For now it only writes what it learned to "
+                                          "curve_learning.csv and curve_learning_state.json; it does not change the curve speed. "
+                                          "Takes effect on the next drive."),
+                                       "../assets/offroad/icon_speed_limit.png", this);
+      addItem(learning);
+      toggles["MazdaCurveLearning"] = learning;
 
       // Stopped car slowdown: Off / Test (log only, no presses) / On
       std::vector<QString> stop_texts{tr("Off"), tr("Test"), tr("On")};

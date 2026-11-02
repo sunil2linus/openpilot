@@ -53,7 +53,10 @@ MIN_SET_SPEED = 25.0 * MS_PER_MPH     # never set cruise below 25 mph
 START_SPEED = 25.0 * MS_PER_MPH       # only start a slowdown at 25 mph or more (true speed)
 KEEP_SPEED = 12.0 * MS_PER_MPH        # keep managing (incl. restoring) down to 12 mph (a 20 mph set speed reads ~18 true)
 RESTORE_MOVING_SPEED = 5.0            # m/s: after stopping behind a car, the driver's speed comes back once we are
-                                      # clearly rolling again (not while creeping in a queue)
+                                      # clearly rolling again (not while creeping in a queue) ...
+STANDSTILL_RESTORE_DELAY = 1.0        # s: ... or once we have been stopped this long. Checked on the owner's car
+                                      # (2018 CX-5): SET+ at a stop behind a car only raises the set speed, the
+                                      # MRCC keeps holding behind the car ahead.
 CURVE_MARGIN = 0.3                    # m/s: stay this far above the curve target
 CRUISE_SETTLE = 0.3                   # s: cruise must be engaged this long before we press
 RESTORE_DELAY = 0.5                   # s of FrogPilot saying the curve no longer limits us before raising
@@ -182,6 +185,7 @@ class CurveSlowdownLogic:
     self.hold_bound = None           # set speed the current hold must not cross
     self.stop_episode = False        # we lowered for a stopped car: the restore may use SET+ holds
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
+    self.standstill_frames = 0
     self.last_action = None          # "tap" / "hold" / "restore" of the last frame sent (for logs)
 
   @property
@@ -499,10 +503,14 @@ class CurveSlowdownLogic:
     if self.offset == 0 and not self.inflight or i.stop_active:
       self.restore_pending = False
     speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED)
-    # Never press at standstill (SET at standstill is unverified on the car); after stopping behind a car the
-    # driver's speed comes back once we are clearly rolling again.
-    can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and not i.standstill and
-               (speed_ok or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED)) and
+    self.standstill_frames = self.standstill_frames + 1 if i.standstill else 0
+    # At a standstill only the restore after stopping behind the car is sent (SET+ there only raises the set
+    # speed; the MRCC keeps holding behind the car ahead), once we have been stopped STANDSTILL_RESTORE_DELAY.
+    # While creeping in a queue nothing is sent until we are clearly rolling again.
+    stopped_restore = self.restore_pending and self.standstill_frames >= _frames(STANDSTILL_RESTORE_DELAY)
+    can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and
+               (not i.standstill or stopped_restore) and
+               (speed_ok or stopped_restore or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED)) and
                self.cruise_on_frames >= _frames(CRUISE_SETTLE))
     if not can_act:
       self.hold = None
@@ -633,13 +641,17 @@ class CurveSlowdownLogic:
 class CurveSlowdown:
   """Card-side wrapper: reads frogpilotPlan and radarState, runs the stopped car trigger and the
   shared set speed controller, builds the CAN messages and writes the per-event logs."""
+  # csc_active / csc_mph: our own curve target (curve_target.py); fp_csc_mph: FrogPilot's, for comparison
   EVENT_COLUMNS = ["t_wall", "vEgo_mph", "aEgo", "brake", "gas", "cruise", "op", "set_mph", "csc_active", "csc_mph",
+                   "road_curv", "fp_csc_active", "fp_csc_mph",
                    "lead_status", "lead_prob", "lead_d", "lead_v", "lead_y", "radar_has_lead", "radar_dist_bucket",
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring"]
 
-  def __init__(self, CP, params, curve_enabled=True, stop_mode=0):
+  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False):
     import cereal.messaging as messaging
+    from openpilot.selfdrive.car.mazda.values import MazdaFlags
+    from openpilot.selfdrive.car.mazda.curve_target import CurveTarget, lateral_limit
     try:
       choice = int(params.get("MazdaCurveSlowdownMaxDrop", encoding="utf8") or 1)
     except (TypeError, ValueError):
@@ -648,7 +660,19 @@ class CurveSlowdown:
     self.logic = CurveSlowdownLogic(params.get_bool("IsMetric"), max_drop)
     self.curve_enabled = curve_enabled
     self.stop_mode = stop_mode
-    self.sm = messaging.SubMaster(['frogpilotPlan', 'radarState'])
+    self.has_ti = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
+    self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
+    self.curve_target = CurveTarget(self.lat_limit)
+    self.learner = None
+    services = ['frogpilotPlan', 'radarState']
+    if learning:
+      try:
+        from openpilot.selfdrive.car.mazda.curve_learner import CurveLearner
+        self.learner = CurveLearner(self.lat_limit, self._load_learning_state())
+        services.append('liveLocationKalman')
+      except Exception:
+        self.learner = None
+    self.sm = messaging.SubMaster(services)
     from openpilot.selfdrive.car.mazda.stopped_car_slowdown import StoppedCarTrigger
     self.trigger = StoppedCarTrigger()
     self.frame = 0
@@ -687,6 +711,14 @@ class CurveSlowdown:
       radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)))
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
+    # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
+    lg = self.logic
+    plan_alive = self._alive('frogpilotPlan')
+    blinker = bool(CS.out.leftBlinker or CS.out.rightBlinker)
+    set_speed = float(CS.out.cruiseState.speed)
+    driver_speed = set_speed + lg.offset * lg.step if (cruise_enabled and set_speed > 0) else 0.0
+    curve_active, curve_speed = self.curve_target.update(float(plan.roadCurvature), driver_speed, plan_alive, blinker)
+
     inputs = SlowdownInputs(
       enabled=bool(CC.enabled),
       cruise_enabled=cruise_enabled,
@@ -695,9 +727,9 @@ class CurveSlowdown:
       gas_pressed=bool(CS.out.gasPressed),
       brake_pressed=bool(CS.out.brakePressed),
       standstill=bool(CS.out.standstill),
-      plan_alive=self._alive('frogpilotPlan'),
-      csc_active=bool(plan.cscActive) and self.curve_enabled,
-      csc_speed=float(plan.cscSpeed),
+      plan_alive=plan_alive,
+      csc_active=curve_active and self.curve_enabled,
+      csc_speed=min(float(curve_speed), 100.0),
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
       stop_active=stop_active and self.stop_mode == ON,
@@ -707,16 +739,84 @@ class CurveSlowdown:
     )
     button, offset = self.logic.update(inputs)
     try:
-      self._log(inputs, stop_inputs, stop_active, button, float(CS.out.aEgo))
+      self._log(inputs, stop_inputs, stop_active, button, float(CS.out.aEgo), plan)
     except Exception:
       pass
+    if self.learner is not None:
+      try:
+        self._learn(CC, CS, v_ego, cruise_enabled, blinker)
+      except Exception:
+        self.learner = None   # never let the learner affect anything else
     if button is None:
       return []
     btn = Buttons.SET_MINUS if button == SET_MINUS else Buttons.SET_PLUS
     return [mazdacan.create_button_cmd(packer, CP, CS.crz_btns_counter + offset, btn)]
 
+  # ---- curve learner (log only; called inside try/except) ----
+  LEARNING_CSV = "curve_learning.csv"
+  LEARNING_STATE = "curve_learning_state.json"
+  LEARNING_CSV_MAX_BYTES = 2_000_000
+  LEARNING_CSV_COLUMNS = ["t_wall", "duration_s", "lat_p90", "lat_peak", "speed_at_peak_mph", "mean_speed_mph",
+                          "engaged_share", "cruise_off_share", "gas_s", "blinker", "our_slowdown", "driver_help_lat",
+                          "saturated_lat", "too_fast_lat", "capability_before", "preference_before", "used",
+                          "capability", "preference", "preference_confidence", "suggested", "lat_limit_used", "ti"]
+
+  @classmethod
+  def _learning_dir(cls):
+    from openpilot.frogpilot.common.feature_events import EVENTS_ROOT
+    return EVENTS_ROOT
+
+  def _load_learning_state(self):
+    import json
+    import os
+    try:
+      with open(os.path.join(self._learning_dir(), self.LEARNING_STATE)) as f:
+        return json.load(f)
+    except Exception:
+      return None
+
+  def _learn(self, CC, CS, v_ego, cruise_enabled, blinker):
+    from openpilot.selfdrive.car.mazda.curve_learner import LearnerInputs
+    lat = None
+    if self._alive('liveLocationKalman'):
+      av = self.sm['liveLocationKalman'].angularVelocityCalibrated
+      if av.valid and len(av.value) > 2:
+        lat = float(av.value[2]) * v_ego
+    rec = self.learner.update(LearnerInputs(
+      v_ego=v_ego, lat_accel=lat, lat_active=bool(CC.latActive), steering_pressed=bool(CS.out.steeringPressed),
+      steer_cmd=abs(float(CC.actuators.steer)), cruise_enabled=cruise_enabled, gas_pressed=bool(CS.out.gasPressed),
+      brake_pressed=bool(CS.out.brakePressed), blinker=blinker, our_offset=self.logic.offset,
+      driver_set_minus=bool(CS.crz_set_minus)))
+    if rec is not None:
+      import threading
+      rec.update(lat_limit_used=self.lat_limit, ti=self.has_ti)
+      threading.Thread(target=self._write_learning, args=(rec, self.learner.state()), daemon=True).start()
+
+  def _write_learning(self, rec, state):
+    import json
+    import os
+    import time
+    try:
+      root = self._learning_dir()
+      os.makedirs(root, exist_ok=True)
+      path = os.path.join(root, self.LEARNING_CSV)
+      if os.path.exists(path) and os.path.getsize(path) > self.LEARNING_CSV_MAX_BYTES:
+        os.replace(path, path + ".1")
+      new = not os.path.exists(path)
+      rec = dict(rec, t_wall=f"{time.time():.1f}")
+      with open(path, "a") as f:
+        if new:
+          f.write(",".join(self.LEARNING_CSV_COLUMNS) + "\n")
+        f.write(",".join(str(rec.get(k, "")).replace(",", ";") for k in self.LEARNING_CSV_COLUMNS) + "\n")
+      tmp = os.path.join(root, self.LEARNING_STATE + ".tmp")
+      with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+      os.replace(tmp, os.path.join(root, self.LEARNING_STATE))
+    except Exception:
+      pass
+
   # ---- per-event logs (never raises into the car controller: called inside try/except) ----
-  def _log(self, i, si, stop_active, button, a_ego):
+  def _log(self, i, si, stop_active, button, a_ego, plan=None):
     if self.recorder is None:
       return
     import time
@@ -726,6 +826,8 @@ class CurveSlowdown:
       self.recorder.add_row(t, (
         f"{time.time():.2f}", i.v_ego / MS_PER_MPH, a_ego, i.brake_pressed, i.gas_pressed, i.cruise_enabled, i.enabled,
         i.set_speed / MS_PER_MPH, i.csc_active, i.csc_speed / MS_PER_MPH,
+        float(plan.roadCurvature) if plan is not None else 0.0, bool(plan.cscActive) if plan is not None else False,
+        float(plan.cscSpeed) / MS_PER_MPH if plan is not None else 0.0,
         si.lead_status, si.lead_prob, si.lead_d, si.lead_v, si.lead_y, si.radar_has_lead, si.radar_lead_distance,
         stop_active, self.trigger.target / MS_PER_MPH,
         self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), lg.offset, len(lg.inflight),

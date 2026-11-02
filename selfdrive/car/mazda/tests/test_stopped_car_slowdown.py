@@ -317,10 +317,35 @@ def _plus_frames(r):
                 [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS])
 
 
-def test_ego_stops_behind_lead_no_press_at_standstill_restore_once_moving():
-  # S4 / R3-2: we stop behind the stopped car; nothing is pressed while stopped or creeping; when the lead
-  # drives off and we are clearly rolling again (> 5 m/s), the driver's speed comes back.
+def test_ego_stops_behind_lead_restores_after_1_s_at_standstill():
+  # We stop behind the stopped car; once we have been stopped STANDSTILL_RESTORE_DELAY the driver's speed comes
+  # back while still stopped (owner, 2018 CX-5: SET+ at a stop behind a car only raises the set speed, the MRCC
+  # keeps holding). Nothing is pressed while still rolling to the stop.
   lead = StoppedLead(60, moves_at=2500, drive_off_mph=25)
+  car = Car(45, dash_offset_mph=0.0, decel=2.5)
+  speeds, gaps, sets = {}, {}, {}
+  orig_tick = lead.tick
+
+  def tick(c):
+    orig_tick(c)
+    speeds[lead.frame] = c.v_ego
+    gaps[lead.frame] = lead.d
+    sets[lead.frame] = c.set_speed
+  lead.tick = tick
+  r = run(car, NO_CURVE, 7000, lead=lead, max_drop=10)
+  tr = r["trigger"]
+  assert tr.release_reason == "ego stopped behind the lead", tr.release_reason
+  stopped = min(f for f, v in speeds.items() if v < 0.3)
+  plus = _plus_frames(r)
+  assert plus and stopped + 100 <= plus[0] < 2500, (stopped, plus[:1])    # 1 s into the stop, before the lead moves
+  assert all(speeds[f] < 0.3 for f in range(plus[0], 2500)), "the car stays stopped behind the lead"
+  assert near(sets[2499] / MPH, 45), sets[2499] / MPH                     # back to 45 before the lead moves
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, r["final"]
+
+
+def test_creeping_in_a_queue_no_restore_until_rolling_or_stopped():
+  # Rolling slowly behind the car (between a stop and 5 m/s) never raises the set speed.
+  lead = StoppedLead(60, v_mph=0.0, moves_at=2000, drive_off_mph=6)     # the lead creeps off at 6 mph
   car = Car(45, dash_offset_mph=0.0, decel=2.5)
   speeds = {}
   orig_tick = lead.tick
@@ -329,13 +354,10 @@ def test_ego_stops_behind_lead_no_press_at_standstill_restore_once_moving():
     orig_tick(c)
     speeds[lead.frame] = c.v_ego
   lead.tick = tick
-  r = run(car, NO_CURVE, 7000, lead=lead, max_drop=10)
-  tr = r["trigger"]
-  assert tr.release_reason in ("ego stopped behind the lead", "lead moved away (vision)"), tr.release_reason
-  plus = _plus_frames(r)
-  assert plus and plus[0] >= 2500, plus[:1]                                # only after the lead moved and we rolled
-  assert speeds[plus[0] - 1] > cs.RESTORE_MOVING_SPEED, speeds[plus[0] - 1]   # and only above 5 m/s
-  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, r["final"]
+  r = run(car, NO_CURVE, 6000, lead=lead, max_drop=10)
+  for f in _plus_frames(r):
+    v = speeds.get(f - 1, 0.0)
+    assert v < 0.3 or v > cs.RESTORE_MOVING_SPEED, (f, v)
 
 
 def test_lost_release_restores_gently_and_the_retrigger_wins():
@@ -352,8 +374,10 @@ def test_lost_release_restores_gently_and_the_retrigger_wins():
   plus_before = [f for f in _plus_frames(r) if f < stop_f]
   assert 1 <= len(plus_before) <= 2, plus_before
   assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] < stop_f], "no SET+ hold"
-  assert near(r["min"], 20) and r["final"] <= 20 + 1e-6, (r["min"], r["final"])
-  assert r["max"] <= 45 + 1e-6
+  assert near(r["min"], 20), r["min"]
+  plus_after = [f for f in _plus_frames(r) if f >= stop_f]
+  assert plus_after and plus_after[0] >= stop_f + 100 - 5, (stop_f, plus_after[:1])   # ~1 s into the stop
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
 
 
 def test_left_lane_release_restores_by_taps_only():

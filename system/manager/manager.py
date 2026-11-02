@@ -51,6 +51,7 @@ def manager_init() -> None:
     ("BlendedACC", "1"),
     ("MazdaCurveSlowdown", "0"),
     ("MazdaCurveSlowdownMaxDrop", "1"),
+    ("MazdaCurveLearning", "0"),
     ("MazdaStoppedCarSlowdown", "0"),
     ("StopWarningRedLight", "0"),
     ("StopWarningStoppedCar", "0"),
