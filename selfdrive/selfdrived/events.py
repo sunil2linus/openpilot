@@ -269,7 +269,7 @@ def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster
     f"{what} {where} · {action} {get_display_speed(_map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory), metric)}",
     "",
     StarPilotAlertStatus.starpilot, AlertSize.small,
-    Priority.LOW, VisualAlert.none, AudibleAlert.none, 3.)
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 6.)   # 3 s was easy to miss (drive 37)
 
 
 def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
