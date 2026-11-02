@@ -120,7 +120,8 @@ class MainLayout(Widget):
     gui_app.request_high_fps()
 
   def _on_settings_clicked(self):
-    self.open_settings(PanelType.STARPILOT)
+    # open on the Device page (Power Off is there); StarPilot settings are one tap away in the sidebar
+    self.open_settings(PanelType.DEVICE)
 
   def _on_bookmark_clicked(self):
     user_bookmark = messaging.new_message('bookmarkButton')
