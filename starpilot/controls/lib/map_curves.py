@@ -29,6 +29,7 @@ import json
 import math
 import os
 import threading
+import time
 from array import array
 
 CURVE_DIR = "/data/media/0/curve_map"
@@ -43,6 +44,8 @@ PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET-
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
 AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our heading
 NEAR = 15.0               # m
+APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
+                          # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 TILE_KEEP = 25            # squares kept in memory
 MATCH_DIST = 20.0         # m: the car is on a road shape within this distance (GPS error + road width)
 MATCH_HEADING = 35.0      # deg: and heading along it (either direction) within this
@@ -330,11 +333,119 @@ class MapCurveStore:
     self.ramps_all = list(ramps.values())
 
 
+MEMORY_PATH = "/data/media/0/curve_memory.json"
+MEMORY_MATCH = 20.0        # m between a curve's apex and a remembered one to be the same curve (curve files rebuilt)
+MEMORY_SAME_PASS = 60.0    # s: passes this close in time are one pass (a divided road is two curve records ~20 m apart)
+MEMORY_MIN_PASSES = 2      # clean passes before the measured radius is used
+MEMORY_AGREE = 1.35        # ... and the last ones must agree within this factor
+MEMORY_KEEP = 6            # passes kept per curve
+MEMORY_RANGE = (0.7, 5.0)  # measured radius used within this factor of the map's (a bad pass cannot do much)
+MEMORY_MAX_R = 2000.0      # m: a pass that never really turned counts as this
+PASS_MIN_SPEED = 8.0       # m/s
+PASS_MIN_TIME = 2.0        # s of samples in the curve
+PASS_SATURATED = 0.98      # |steer command|: the car could not follow (it goes wide): the pass does not count
+PASS_FILTER = 1.0          # s moving average of the measured curvature
+
+
+def curve_pass_radius(samples, dt=0.05, max_r=MEMORY_MAX_R):
+  """Radius (m) a clean pass through a curve measured: the tightest PASS_FILTER moving average of the car's own path
+  curvature, or None when the pass does not count. samples: (v m/s, curvature 1/m, lat active, driver steering,
+  |steer command|) per planner cycle while in the curve."""
+  if not samples or len(samples) * dt < PASS_MIN_TIME:
+    return None
+  if any((not lat) or driver or cmd >= PASS_SATURATED for _, _, lat, driver, cmd in samples):
+    return None
+  ks = [abs(k) for v, k, _, _, _ in samples if v >= PASS_MIN_SPEED]
+  n = max(int(round(PASS_FILTER / dt)), 1)
+  if len(ks) < n:
+    return None
+  best = max(sum(ks[j:j + n]) / n for j in range(len(ks) - n + 1))
+  return max_r if best <= 1.0 / max_r else min(1.0 / best, max_r)
+
+
+class CurveMemory:
+  """The radius the car actually drove, per map curve (by its apex position, so it survives rebuilt curve files):
+  used instead of the map's once MEMORY_MIN_PASSES clean passes agree. Kept in MEMORY_PATH (a small JSON list)."""
+
+  def __init__(self, path=MEMORY_PATH):
+    self.path = path
+    self.entries = []
+    try:
+      with open(path) as f:
+        data = json.load(f)
+      self.entries = [e for e in data.get("curves", []) if "lat" in e and "lon" in e]
+    except (OSError, ValueError, AttributeError):
+      self.entries = []
+    self.saving = False
+    self.dirty = False
+
+  def _find(self, lat, lon):
+    best, best_d = None, MEMORY_MATCH
+    for e in self.entries:
+      d = dist_m(lat, lon, e["lat"], e["lon"])
+      if d <= best_d:
+        best, best_d = e, d
+    return best
+
+  def radius(self, c):
+    """Learned radius for curve dict `c`, or None."""
+    try:
+      e = self._find(*c["apex"])
+      if e is None or len(e["passes"]) < MEMORY_MIN_PASSES:
+        return None
+      last = sorted(p[0] for p in e["passes"][-3:])
+      if last[-1] > last[0] * MEMORY_AGREE:
+        return None
+      r = last[len(last) // 2]
+      lo, hi = MEMORY_RANGE
+      return min(max(r, c["r"] * lo), c["r"] * hi)
+    except (KeyError, TypeError, IndexError):
+      return None
+
+  def add_pass(self, c, r, t=None):
+    """A clean pass through curve `c` that measured radius r (m), at wall time t (s)."""
+    t = time.time() if t is None else t   # noqa: TID251  wall time: passes are compared across drives and reboots
+    e = self._find(*c["apex"])
+    if e is None:
+      e = {"lat": round(c["apex"][0], 6), "lon": round(c["apex"][1], 6), "r_map": c.get("r"),
+           "name": c.get("name", ""), "passes": []}
+      self.entries.append(e)
+    passes = [p for p in e["passes"] if isinstance(p, list) and len(p) == 2]
+    if passes and abs(t - passes[-1][1]) < MEMORY_SAME_PASS:
+      passes = passes[:-1]                    # the same pass again (the other carriageway's record): keep the newest
+    e["passes"] = (passes + [[round(float(r), 1), round(t, 1)]])[-MEMORY_KEEP:]
+    self.save()
+
+  def save(self):
+    """Write the file in the background; a pass added while writing is written right after."""
+    self.dirty = True
+    if self.saving:
+      return
+    self.saving = True
+
+    def write():
+      try:
+        while self.dirty:
+          self.dirty = False
+          data = {"version": 1, "curves": [dict(e) for e in self.entries]}
+          tmp = self.path + ".tmp"
+          with open(tmp, "w") as f:
+            json.dump(data, f)
+          os.replace(tmp, self.path)
+      except OSError:
+        pass
+      finally:
+        self.saving = False
+    threading.Thread(target=write, daemon=True).start()
+
+
 class MapCurves:
   """The governing curve ahead, the ramp we are on, and the matched navigation exit."""
 
-  def __init__(self, store=None):
+  def __init__(self, store=None, release_after_apex=False, memory=None):
     self.store = store if store is not None else MapCurveStore()
+    self.release_after_apex = release_after_apex
+    self.memory = memory
     self.reset()
 
   def reset(self):
@@ -354,6 +465,7 @@ class MapCurves:
     self.nav_side = 0
     self.data_here = False
     self.chain_id = 0
+    self.inside = None           # the road curve we are driving through (also after its apex), for curve memory
 
   # ---- the road ahead ----
   def _road(self, way_id, is_forward):
@@ -386,8 +498,22 @@ class MapCurves:
         if d_entry <= LOOKAHEAD:
           out.append((c, d_entry))
       elif ex_ahead and d_exit > NEAR and d_exit <= c["len"] + 60:
+        if not c.get("ramp"):
+          self.inside = c
+        if self.release_after_apex and not c.get("ramp") and "apex" in c:
+          ap_ahead, d_apex = ahead(lat, lon, bearing, *c["apex"])
+          if not ap_ahead and d_apex > APEX_PASSED:
+            continue              # past the apex: the next curve (if any) governs, or none (the speed comes back)
         out.append((c, 0.0))      # in the curve
     return out
+
+  def _radius(self, c):
+    """The curve's radius: what the car measured on clean passes (curve memory) if known, else the map's."""
+    if self.memory is not None and not c.get("ramp"):
+      r = self.memory.radius(c)
+      if r is not None:
+        return r
+    return c["r"]
 
   def update(self, lat, lon, bearing, way_id, is_forward, nav=None):
     """nav: (maneuver type, modifier, distance m) of the next maneuver, or None."""
@@ -402,8 +528,8 @@ class MapCurves:
       self.chain_id = cid
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
-        c, d = min(cands, key=lambda cd: plan_speed(cd[0]["r"], cd[1], cd[0].get("adv", 0.0)))
-        self.curve, self.distance, self.radius = c, d, c["r"]
+        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0)))
+        self.curve, self.distance, self.radius = c, d, self._radius(c)
         self.advisory = float(c.get("adv", 0.0) or 0.0)
         self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
       ramp = self.store.ramps.get(cid)
@@ -492,7 +618,10 @@ class MapCurvesPlanner:
         self.mc.reset()
       return
     if self.mc is None:
-      self.mc = MapCurves()
+      # the speed comes back from a road curve's apex only with the camera curve slowdown on (it keeps the speed
+      # for whatever is left of the curve, and the next curve keeps governing when it is close)
+      self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory())
+      self.pass_curve, self.pass_samples = None, []
       self.matcher = RoadMatcher(self.mc.store)
     if gps_position is None:
       self.mc.reset()
@@ -521,6 +650,7 @@ class MapCurvesPlanner:
       nav = None
     self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav)
     mc = self.mc
+    self._measure_pass(sm, mc.inside)
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
@@ -535,6 +665,23 @@ class MapCurvesPlanner:
         self.notice = "exit_data" if mc.nav_exit in (NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES) else "exit_no_data"
     elif not mc.on_ramp:
       self.announced_exit = None
+
+  def _measure_pass(self, sm, inside):
+    """Curve memory: collect the car's own path through the road curve we are in; when we leave it, a clean pass
+    adds its measured radius (never raises into the planner)."""
+    try:
+      if inside is not self.pass_curve:
+        if self.pass_curve is not None and self.mc.memory is not None:
+          r = curve_pass_radius(self.pass_samples)
+          if r is not None:
+            self.mc.memory.add_pass(self.pass_curve, r)
+        self.pass_curve, self.pass_samples = inside, []
+      if inside is not None and len(self.pass_samples) < 2400:
+        cs, cc = sm["carState"], sm["carControl"]
+        self.pass_samples.append((float(cs.vEgo), float(sm["controlsState"].curvature), bool(cc.latActive),
+                                  bool(cs.steeringPressed), abs(float(cc.actuators.torque))))
+    except Exception:
+      self.pass_curve, self.pass_samples = None, []
 
   def publish(self, plan):
     mc = self.mc

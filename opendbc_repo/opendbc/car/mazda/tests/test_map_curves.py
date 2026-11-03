@@ -457,3 +457,82 @@ def test_west_utica_slows_before_the_curve_not_in_it():
       steps.append((prev - sp) / MPH / (1.0 / 18.0))          # mph per second at ~40 mph (18 m/s)
     prev = sp
   assert max(steps) < 0.7, max(steps)
+
+
+def test_a_road_curve_stops_governing_after_its_apex_when_the_camera_slowdown_is_on():
+  # slow in, speed up from the apex: past the apex the camera curve slowdown holds the speed for what is left
+  root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
+  c = curves[0]
+
+  def on_arc(deg):
+    a = math.radians(deg)
+    return pos(-115 + 115 * math.cos(a), 115 * math.sin(a)), 360.0 - deg
+
+  for release in (False, True):
+    m = MC.MapCurves(MC.MapCurveStore(root, background=False), release_after_apex=release)
+    (la, lo), brg = on_arc(8)                 # before the apex (the middle of the arc, ~20 deg)
+    m.update(la, lo, brg, 2, True)
+    assert m.curve is not None and m.distance == 0.0
+    (la, lo), brg = on_arc(34)                # ~28 m past the apex, still on the arc
+    m.update(la, lo, brg, 2, True)
+    assert (m.curve is None) == release, (release, m.curve)
+  assert "apex" in c
+
+
+# ---------------- curve memory ----------------
+
+def _pass(r, seconds=6.0, v=18.0, lat=True, driver=False, cmd=0.5):
+  return [(v, 1.0 / r if r else 0.0, lat, driver, cmd)] * int(seconds / 0.05)
+
+
+def test_a_clean_pass_measures_the_radius_the_car_drove():
+  assert abs(MC.curve_pass_radius(_pass(150)) - 150) < 0.5
+  assert MC.curve_pass_radius(_pass(0)) == MC.MEMORY_MAX_R          # did not really turn
+  assert MC.curve_pass_radius(_pass(150, seconds=1.0)) is None        # too short
+  # passes that do not count: the steering at its limit (the car goes wide), the driver steering, lateral off
+  assert MC.curve_pass_radius(_pass(150)[:60] + _pass(150, cmd=1.0)[:5] + _pass(150)[:60]) is None
+  assert MC.curve_pass_radius(_pass(150, driver=True)) is None
+  assert MC.curve_pass_radius(_pass(150, lat=False)) is None
+
+
+def test_curve_memory_needs_two_agreeing_passes_and_survives_a_reload(tmp_path):
+  path = str(tmp_path / "mem.json")
+  mem = MC.CurveMemory(path)
+  c = {"apex": (42.6, -83.1), "r": 129.0, "name": "Test Road"}
+  mem.add_pass(c, 390.0, t=1000.0)
+  assert mem.radius(c) is None                                         # one pass is not enough
+  mem.add_pass(c, 425.0, t=1010.0)
+  assert mem.radius(c) is None                                         # 10 s later: the same pass (divided road)
+  mem.add_pass(c, 420.0, t=5000.0)
+  assert mem.radius(c) in (420.0, 425.0), mem.radius(c)               # the 390 pass was replaced by its repeat
+  moved = {"apex": (42.6 + 10 / 111320, -83.1), "r": 131.0}            # the same curve after a rebuild (10 m off)
+  assert mem.radius(moved) is not None
+  other = {"apex": (42.6 + 60 / 111320, -83.1), "r": 131.0}
+  assert mem.radius(other) is None                                     # 60 m away: another curve
+  import time as _t
+  for _ in range(100):
+    if not mem.saving:
+      break
+    _t.sleep(0.01)
+  again = MC.CurveMemory(path)
+  assert again.radius(c) is not None
+  # passes that disagree are not used; the result is clamped to a range around the map's radius
+  c2 = {"apex": (42.7, -83.2), "r": 100.0}
+  mem.add_pass(c2, 150.0, t=1.0)
+  mem.add_pass(c2, 300.0, t=500.0)
+  assert mem.radius(c2) is None
+  c3 = {"apex": (42.8, -83.3), "r": 100.0}
+  mem.add_pass(c3, 2000.0, t=1.0)
+  mem.add_pass(c3, 2000.0, t=500.0)
+  assert mem.radius(c3) == 500.0                                       # at most 5x the map's
+
+
+def test_the_planner_uses_the_learned_radius(tmp_path):
+  root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  for k, r in enumerate((160.0, 165.0)):
+    mem.add_pass(curves[0], r, t=1000.0 * (k + 1))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
+  la, lo = pos(0, -250)
+  m.update(la, lo, 0.0, 1, True)
+  assert m.curve is not None and m.radius in (160.0, 165.0), m.radius
