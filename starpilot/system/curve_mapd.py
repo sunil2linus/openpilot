@@ -41,7 +41,7 @@ on the device, so a new city only needs the map download in the settings:
     in scope again. Position, range and both selections are read again on every pass, so parking somewhere else,
     changing the range or ticking a state takes effect on the next pass without a reboot.
   * Progress and timings go to /data/media/0/curve_map/build_log.txt (appended, size capped) and to cloudlog; a one
-    line status with a time estimate ("Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per
+    line status with a time estimate ("Building area 4 of 9 (now Illinois), about 8 min left (avg 1.4 min per
     area)") goes to the memory param CurveMapBuildStatus for the UI. The log may be shared, so the position in it
     is rounded to 0.1 degree.
 
@@ -518,8 +518,10 @@ def time_left_text(done, total, seconds_so_far, guess=FOLDER_SECONDS_GUESS):
 
 
 def progress_text(label, done, total, seconds_so_far, detail=""):
-  """'Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)' (+ ': <detail>')."""
-  s = f"Building {label}: area {done + 1} of {total} this pass, {time_left_text(done, total, seconds_so_far)}"
+  """'Building area 4 of 9 (now Illinois), about 8 min left (avg 1.4 min per area)' (+ ' — <detail>'). The count is
+  this build session's queue (every ticked state and the range together); the state is the one the current area is
+  for, so it is never read as "Illinois: 4 of 9"."""
+  s = f"Building area {done + 1} of {total} (now {label}), {time_left_text(done, total, seconds_so_far)}"
   return s + (f" — {detail}" if detail else "")
 
 

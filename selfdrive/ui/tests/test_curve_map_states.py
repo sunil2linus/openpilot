@@ -91,7 +91,7 @@ def test_texts(C):
   assert C.region_line(0, 0, False, True).startswith("Not on the device's map")
   assert C.tile_value([], "") == "None" and C.tile_value(["us_state.MI"], "") == "Michigan"
   assert C.tile_value(["us_state.MI", "us_state.IL", "us_state.WA"], "Curve files up to date: ...") == "Michigan + 2"
-  assert C.tile_value(["us_state.MI"], "Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)") == "Building Illinois 4/9"
+  assert C.tile_value(["us_state.MI"], "Building area 4 of 9 (now Illinois), about 8 min left (avg 1.4 min per area)") == "Area 4 of 9 (now Illinois)"
   assert C.token_label("nation.US") == "Whole U.S." and C.token_label("us_state.ZZ") == "ZZ" and C.token_label("nation.CA") == "Canada"
   assert C.listed_tokens(["us_state.IL", "us_state.MI"], ["us_state.WA", "us_state.MI"]) == ["us_state.IL", "us_state.MI", "us_state.WA"]
   assert C.tick_summary([], ["us_state.IL"]).startswith("No state ticked")
@@ -118,7 +118,7 @@ def test_dialog_ticks_save_at_once_in_the_selection_order(C):
 
 def test_dialog_scans_in_the_background_and_reads_the_status(C):
   params = FakeParams({C.SELECTED_PARAM: "us_state.IL,us_state.MI"})
-  mem = FakeParams({C.STATUS_PARAM: "Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)"})
+  mem = FakeParams({C.STATUS_PARAM: "Building area 4 of 9 (now Illinois), about 8 min left (avg 1.4 min per area)"})
   seen = []
 
   def scan(tokens):
@@ -128,6 +128,6 @@ def test_dialog_scans_in_the_background_and_reads_the_status(C):
   d._refresh()
   d._scan_thread.join(2.0)
   assert seen == [["us_state.IL", "us_state.MI"]] and d._region_info["us_state.MI"] == (9, 3, True)
-  assert d._status_text.startswith("Building Illinois")
+  assert d._status_text.startswith("Building area 4 of 9 (now Illinois)")
   d._refresh()                                                                 # too soon for another scan
   assert len(seen) == 1

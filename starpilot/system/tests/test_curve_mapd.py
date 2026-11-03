@@ -638,8 +638,8 @@ def test_ticked_state_is_built_in_full_whatever_the_range(tmp_path, monkeypatch)
   assert D.run_once(osm, cm, near=HOME, range_miles=30, log=log.append, status=status.append, regions=rg, memo=memo) == (2, 4)
   assert D.square_files(os.path.join(cm, "44", "-88")) and D.square_files(os.path.join(cm, "42", "-84"))
   assert not os.path.exists(os.path.join(cm, "36", "-90")) and not os.path.exists(os.path.join(cm, "38", "-84"))
-  assert status[0] == "Building Michigan: area 1 of 2 this pass, about 3 min left (guessing 1.5 min per area)"
-  assert any(s.startswith("Building Michigan: area 2 of 2 this pass, ") and s.endswith("squares, 0 s") and " — 44/-88: " in s for s in status)
+  assert status[0] == "Building area 1 of 2 (now Michigan), about 3 min left (guessing 1.5 min per area)"
+  assert any(s.startswith("Building area 2 of 2 (now Michigan), ") and s.endswith("squares, 0 s") and " — 44/-88: " in s for s in status)
   assert status[-1].startswith("Built 2 folders in") and "in Michigan" in status[-1] and "2 out of range or outside your selected maps" in status[-1]
   assert sum("outside your selected maps: leftovers" in line for line in log) == 1
   # the next pass: up to date, the leftover note is not repeated
@@ -771,7 +771,7 @@ def test_progress_and_time_left_text():
   assert D.time_left_text(8, 9, 8 * 84.0) == "about 80 s left (avg 1.4 min per area)"
   assert D.time_left_text(9, 9, 9 * 84.0) == "almost done (avg 1.4 min per area)"
   assert D.time_left_text(2, 66, 2 * 90.0) == "about 1.6 h left (avg 1.5 min per area)"
-  assert D.progress_text("Illinois", 3, 9, 3 * 84.0) == "Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)"
+  assert D.progress_text("Illinois", 3, 9, 3 * 84.0) == "Building area 4 of 9 (now Illinois), about 8 min left (avg 1.4 min per area)"
   assert D.progress_text("map folder 40/-90", 0, 1, 0.0, "40/-90: 3 squares, 40 s").endswith("(guessing 1.5 min per area) — 40/-90: 3 squares, 40 s")
   p = D.Plan([], 4, 2, HOME, 30, full={"42/-84": [MI, IL]})
   assert p.folder_label("42/-84") in ("Michigan", "MI") and p.folder_label("38/-84") == "map folder 38/-84"

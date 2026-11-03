@@ -88,9 +88,9 @@ def region_line(downloaded: int, built: int, placeable: bool, ticked: bool) -> s
 
 def tile_value(ticked: list[str], status: str) -> str:
   """What the tile shows: the build in progress when there is one, else the ticked states."""
-  m = re.match(r"Building (.+?): area (\d+) of (\d+)", status or "")
+  m = re.match(r"Building area (\d+) of (\d+) \(now (.+?)\)", status or "")
   if m:
-    return tr("Building {} {}/{}").format(m.group(1), m.group(2), m.group(3))
+    return tr("Area {} of {} (now {})").format(m.group(1), m.group(2), m.group(3))
   if not ticked:
     return tr("None")
   first = token_label(ticked[0])
