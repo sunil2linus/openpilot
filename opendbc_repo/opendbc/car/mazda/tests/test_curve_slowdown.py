@@ -151,7 +151,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   csc = CSC()
   trigger = scs.StoppedCarTrigger()
   st = dict(enabled=True, cruise=True, gas=False, brake=False, plan_alive=True)
-  hist, presses, holds = [], [], []
+  hist, presses, holds, sets = [], [], [], []
   ever_active = False
   start = car.set_speed
   min_set = max_set = car.set_speed
@@ -192,7 +192,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
     if lead is not None:
       lead.tick(car)
     min_set, max_set = min(min_set, car.set_speed), max(max_set, car.set_speed)
-  return dict(presses=presses, holds=holds, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
+    sets.append(car.set_speed)
+  return dict(presses=presses, holds=holds, sets=sets, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
               start=start / MPH, logic=logic, trigger=trigger, ever_active=ever_active)
 
 
@@ -838,6 +839,11 @@ def _measured_clean(logic):
   logic.hold_measured, logic.hold_overrun = True, 0     # a hold has shown the car stops cleanly on release
 
 
+def _back_at(r, mph, after):
+  """First frame from `after` on where the set speed is at `mph`."""
+  return next(f for f in range(after, len(r["sets"])) if near(r["sets"][f] / MPH, mph))
+
+
 def _restore_presses(r, after):
   return [f for f, b in r["presses"] if b == cs.SET_PLUS and f >= after], [f for f in r["holds"] if f >= after]
 
@@ -851,8 +857,15 @@ def test_big_gap_after_a_curve_holds_to_a_multiple_of_5_below_then_taps():
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
   plain = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 30), 4000, max_drop=15)
   p_taps, p_holds = _restore_presses(plain, 1500)
-  assert not p_holds and len(p_taps) >= 14                 # until measured: taps only (the cautious overrun)
+  assert p_holds and len(p_taps) < len(taps) + 10          # until measured: a shorter hold (two quanta of margin)
   assert near(plain["final"], 45) and plain["max"] <= 45 + 1e-6
+  # and it is quick: the hold must not end after one frame and wait for its settle (review: 31 -> 45 took 7 s)
+  for res in (r, plain):
+    first_plus = min([f for f, b in res["presses"] if f >= 1500 and b == cs.SET_PLUS] + [f for f in res["holds"] if f >= 1500])
+    assert (_back_at(res, 45, first_plus) - first_plus) * DT < 5.0
+  # a car that lands one more quantum after the release (slower than any seen in the logs) still never passes 45
+  late = run(Car(45, dash_offset_mph=0.0, hold_latency=0.6), between(100, 1500, 30), 4000, max_drop=15)
+  assert near(late["final"], 45) and late["max"] <= 45 + 1e-6, (late["final"], late["max"])
 
 
 def test_small_gap_after_a_curve_is_restored_by_taps():

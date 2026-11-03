@@ -575,3 +575,29 @@ def test_approach_45_mph_to_a_slow_car_at_a_red_light_drops_at_once_never_below_
   lead = StoppedLead(95, v_mph=13.0, prob=0.7, y=1.0)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 800, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0)
   assert not r["ever_active"] and r["presses"] == [] and r["holds"] == []
+
+
+def test_restore_at_a_stop_holds_most_of_the_way_up():
+  # drive 3c: a relaxed approach lowered to 22 by taps (no hold had measured the car yet), we stopped behind the car,
+  # and the SET+ hold was released at 26 (an assumed overrun of 3 quanta): the last 19 mph took 12 s of taps.
+  # Now the unmeasured margin is what a measured clean hold gives, so the hold goes most of the way; never above 45.
+  lead = StoppedLead(200, moves_at=4500, drive_off_mph=25)
+  car = Car(45, dash_offset_mph=0.0, decel=2.5)
+  sets = {}
+  orig_tick = lead.tick
+
+  def tick(c):
+    orig_tick(c)
+    sets[lead.frame] = c.set_speed
+  lead.tick = tick
+  r = run(car, NO_CURVE, 8000, lead=lead, max_drop=10)
+  plus = _plus_frames(r)
+  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]   # lowered by taps, as in drive 3c
+  low = min(sets.values()) / MPH
+  holds_up = [f for f in r["holds"] if f >= plus[0]]
+  assert holds_up, "a SET+ hold"
+  after_hold = sets[max(holds_up) + 60] / MPH
+  assert after_hold - low >= 10, (low, after_hold)            # the hold did at least 10 mph of the way
+  back = min(f for f in sets if f > plus[0] and near(sets[f] / MPH, 45))
+  assert (back - plus[0]) * T.DT < 7.0, (back - plus[0]) * T.DT
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6

@@ -63,7 +63,9 @@ RESTORE_DELAY = 0.5                   # s of FrogPilot saying the curve no longe
 FLICKER_RESTORE_DELAY = 2.0           # used instead while the curve flag has just flickered back on
 FLICKER_WINDOW = 3.0                  # s: flag coming back on this soon after going off = flicker
 MIN_DWELL = 1.0                       # s at least between the last SET- and a SET+
-PENDING_TIMEOUT = 0.5                 # s to wait for a press to show on the set speed (the car answers in < 0.2 s)
+# PENDING_TIMEOUT: the feature logs of drives 33-3d (806 taps): the car answered in 0.10 s typically, 0.22 s for 99 %,
+# so an ignored tap (about 1 in 4) now costs 0.3 s instead of 0.5 s; later answers are still ours (LATE_WINDOW).
+PENDING_TIMEOUT = 0.3                 # s to wait for a press to show on the set speed
 LATE_WINDOW = 3.0                     # s after the timeout during which a late change is still ours (car speed unknown)
 LATE_FACTOR = 4                       # once the car's answer time is known, a press is lost after this many times it
 MIN_IN_FLIGHT_WINDOW = 1.0            # s: a press is never forgotten sooner than this
@@ -91,7 +93,10 @@ HOLD_NO_EFFECT_SECONDS = 1.0             # a hold with no set speed change by th
 HOLD_QUANTUM_MPH = 5                     # the car's long-press step
 HOLD_SETTLE = 1.5                        # s after the last frame or landing during which changes are still the hold's
 HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after a SET- release, until measured
-HOLD_UP_OVERRUN_DEFAULT = 3              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
+# HOLD_UP_OVERRUN_DEFAULT 2 = what a measured clean hold gives: every hold in the feature logs of drives 33-3d (9 holds)
+# had nothing land after its release. With 3, the restore from a stop at 22 mph released its hold at 26 and tapped
+# the last 19 mph (drive 3c).
+HOLD_UP_OVERRUN_DEFAULT = 2              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
 HOLD_MISS_LIMIT = 2                      # holds with no effect before holds are off for the drive
 HOLD_GOALS_MPH = (15, 10)                # stopped car: first hold aims 15 mph down, the second 10 more, then taps
 # Restoring a big gap after a curve (the owner's suggestion): one SET+ hold up to a multiple of 5 below the driver's
@@ -362,10 +367,16 @@ class CurveSlowdownLogic:
         # Unambiguous landing with cruise on throughout: learn how fast this car answers.
         self.latencies = (self.latencies + [self.frame - self.inflight[0].frame])[-9:]
       if hold_open and n > n_ours:
-        # More than the hold had reserved: the car kept stepping after release. Still ours (the
-        # driver's speed reference must not move), but no more holds this drive.
-        self.hold_misses = HOLD_MISS_LIMIT
-        self.holds_ok = False
+        if self.hold is not None and self.hold.direction == direction:
+          # Still holding: the car steps for as long as we hold (a SET+ restore hold may run more quanta than the
+          # reserve, which is sized for a release). Grow the reserve with what landed.
+          self.hold.remaining += n - n_ours
+          self.hold.reserve += n - n_ours
+        else:
+          # More than the hold had reserved: the car kept stepping after release. Still ours (the
+          # driver's speed reference must not move), but no more holds this drive.
+          self.hold_misses = HOLD_MISS_LIMIT
+          self.holds_ok = False
       self._consume_ours(direction, n)
     elif one_step and expired_k is not None and not driver_recent and not after_gap:
       # A press we had given up on landed late. Counting it as ours keeps the driver's speed
@@ -557,10 +568,15 @@ class CurveSlowdownLogic:
       d = self.hold.direction
       # the quantum still to come while holding plus the overrun after the release must fit the bound
       # (a restore hold keeps a quantum of margin below the driver's speed instead of the assumed overrun)
-      up_overrun = 0 if self.hold_margin else self._up_overrun()
-      overrun = (1 + (self.hold_overrun if d == SET_MINUS else up_overrun)) * q * self.step
-      crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
-                 (i.set_speed + overrun > self.hold_bound + self.half_step))
+      if d == SET_PLUS and self.hold_margin:
+        # a restore hold keeps its margin in the bound: release once the next landing (the next multiple of the
+        # quantum above the set speed) would pass it
+        next_land = (int(round(i.set_speed / self.step)) // q + 1) * q * self.step
+        crosses = next_land > self.hold_bound + self.half_step
+      else:
+        overrun = (1 + (self.hold_overrun if d == SET_MINUS else self._up_overrun())) * q * self.step
+        crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
+                   (i.set_speed + overrun > self.hold_bound + self.half_step))
       reason_gone = (reason != "stop") if d == SET_MINUS else (reason is not None or offset <= 0)
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
