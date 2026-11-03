@@ -514,6 +514,27 @@ CAP_FLOOR = 25 * MPH       # never below this (the stock cruise's lowest set spe
 CAP_RISE = 0.5 * MPH       # a clean pass at (or within CAP_NEAR of) the cap raises it this much ...
 CAP_NEAR = 2.5 * MPH       # (true speed: the dash reads ~2 mph above it, and the car side keeps a margin above the cap)
 CAP_JUMP = 5 * MPH         # ... a clean pass well above the cap raises it to that pass's speed, at most this much
+# One trusted gentle pass: a map curve much sharper than the road really is (a kink where two map ways join) is
+# corrected after a single clean pass, when that pass was full, fast enough and right through the curve's apex.
+MEMORY_ONE_PASS = 1.6      # the newest pass measured at least this many times the map's radius ...
+PASS_TRUST_MIN_SPEED = 10.0  # m/s ... at this median speed or more ...
+PASS_APEX_NEAR = 15.0      # m ... the car came this close to the curve's apex (else: another road, the pass counts for nothing)
+PASS_EXIT_NEAR = 30.0      # m ... and the pass ended at the curve's exit (not by losing the road match)
+
+# Camera check of map curves (CurveVeto): the driving model's path ahead is compared with the map curve's radius.
+VETO_FACTOR = 2.0          # the camera sees the curve at least this many times gentler than planned ...
+VETO_CONFIRM = 20          # ... on this many frames in a row where it can see the curve (1 s at 20 Hz): ignored
+REARM_FACTOR = 1.3         # an ignored curve governs again when the camera sees it within this factor ...
+REARM_CONFIRM = 10         # ... on this many seeing frames in a row (0.5 s)
+VETO_MAX_FLIPS = 2         # after this many take-backs a curve is never ignored again this drive
+VETO_FORGET = 40           # planner frames a curve may be missing (road match flicker) before its check starts over
+VETO_CHORD = 30.0          # m: heading change over +-this along the path (the curve builder's HALF_WINDOW)
+VETO_PAD = 20.0            # m added around the curve's span
+VETO_STEP = 5.0            # m between curvature samples
+VETO_SEE_MAX = 110.0       # m: the camera judges a curve only when its apex + VETO_PAD is this close ...
+VETO_PATH_MARGIN = 10.0    # ... and this far inside the end of the model's path
+VETO_YSTD_MAX = 1.5        # m: the path's sideways uncertainty at the apex
+VETO_MIN_SPEED = 8.0       # m/s (at low speed the model's path is short)
 
 
 def curve_pass_radius(samples, dt=0.05, max_r=MEMORY_MAX_R):
@@ -587,19 +608,37 @@ class CurveMemory:
     return best
 
   def radius(self, c):
-    """Learned radius for curve dict `c`, or None."""
+    """Learned radius for curve dict `c`, or None: the middle of the last passes when MEMORY_MIN_PASSES or more
+    agree; else the newest pass alone when it was a trusted gentle pass (one_pass_ok). A sharper newest pass
+    therefore goes back to the map's radius by itself, and a later gentle pass earns it again."""
     try:
       e = self._find(*c["apex"])
-      if e is None or len(e["passes"]) < MEMORY_MIN_PASSES:
+      if e is None:
         return None
-      last = sorted(p[0] for p in e["passes"][-3:])
-      if last[-1] > last[0] * MEMORY_AGREE:
-        return None
-      r = last[len(last) // 2]
+      passes = [p for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 2]
       lo, hi = MEMORY_RANGE
-      return min(max(r, c["r"] * lo), c["r"] * hi)
-    except (KeyError, TypeError, IndexError):
+      if len(passes) >= MEMORY_MIN_PASSES:
+        last = sorted(float(p[0]) for p in passes[-3:])
+        if last[-1] <= last[0] * MEMORY_AGREE:
+          return min(max(last[len(last) // 2], c["r"] * lo), c["r"] * hi)
+      if passes and self.one_pass_ok(c, passes[-1]):
+        return min(max(float(passes[-1][0]), c["r"] * lo), c["r"] * hi)
       return None
+    except (KeyError, TypeError, IndexError, ValueError):
+      return None
+
+  @staticmethod
+  def one_pass_ok(c, p):
+    """Pass p ([r, t, v, flags]) alone shows the curve is much gentler than the map says: a full pass through the
+    apex, fast enough, MEMORY_ONE_PASS x the map's radius or more, and a real turn (MEMORY_MAX_R means it never
+    turned: another road, not a gentle curve). Old 2-value passes never qualify."""
+    try:
+      if len(p) < 4 or p[2] is None or "full" not in (p[3] or []):
+        return False
+      r = float(p[0])
+      return float(p[2]) >= PASS_TRUST_MIN_SPEED and MEMORY_ONE_PASS * float(c["r"]) <= r < MEMORY_MAX_R
+    except (TypeError, ValueError, KeyError):
+      return False
 
   def speed_cap(self, c):
     """Speed cap (m/s) for curve dict `c` from passes where the steering maxed out, or None."""
@@ -631,8 +670,9 @@ class CurveMemory:
     e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
     self.save()
 
-  def add_pass(self, c, r, t=None, v=None):
-    """A clean pass through curve `c` that measured radius r (m), at wall time t (s) and median speed v (m/s)."""
+  def add_pass(self, c, r, t=None, v=None, flags=None):
+    """A clean pass through curve `c` that measured radius r (m), at wall time t (s) and median speed v (m/s).
+    flags: "full" (through the apex to the exit), "vetoed" (the camera check ignored the curve: audit only)."""
     t = time.time() if t is None else t   # noqa: TID251  wall time: passes are compared across drives and reboots
     e = self._entry(c)
     if v is not None and e.get("cap") and v >= float(e["cap"]) - CAP_NEAR and \
@@ -641,10 +681,17 @@ class CurveMemory:
       cap = float(e["cap"])
       e["cap"] = round(max(cap + CAP_RISE, min(v, cap + CAP_JUMP)), 2)
       e["cap_t"] = round(t, 1)
-    passes = [p for p in e["passes"] if isinstance(p, list) and len(p) == 2]
+    passes = [p for p in e["passes"] if isinstance(p, list) and len(p) >= 2]
     if passes and abs(t - passes[-1][1]) < MEMORY_SAME_PASS:
       passes = passes[:-1]                    # the same pass again (the other carriageway's record): keep the newest
-    e["passes"] = (passes + [[round(float(r), 1), round(t, 1)]])[-MEMORY_KEEP:]
+    new = [round(float(r), 1), round(t, 1), None if v is None else round(float(v), 2), sorted(set(flags or []))]
+    e["passes"] = (passes + [new])[-MEMORY_KEEP:]
+    self.save()
+
+  def note_veto(self, c):
+    """The camera check ignored curve `c` (counted for the record only, never read)."""
+    e = self._entry(c)
+    e["veto_hits"] = int(e.get("veto_hits", 0)) + 1
     self.save()
 
   def save(self):
@@ -671,6 +718,197 @@ class CurveMemory:
     threading.Thread(target=write, daemon=True).start()
 
 
+class CameraView:
+  """What the driving model sees ahead in one frame (camera_view() builds it from modelV2, radarState, carState):
+  per path point s (m along the path), psi (heading, rad, relative to the car) and ystd (m, sideways uncertainty);
+  red (model confidence red), lane_change, blinker, lead_d (m to the lead, None without one), v_ego (m/s)."""
+
+  def __init__(self, s, psi, ystd, red=False, lane_change=False, blinker=False, lead_d=None, v_ego=0.0):
+    self.s, self.psi, self.ystd = list(s), list(psi), list(ystd)
+    self.red, self.lane_change, self.blinker = bool(red), bool(lane_change), bool(blinker)
+    self.lead_d, self.v_ego = lead_d, float(v_ego)
+
+  @property
+  def end(self):
+    return self.s[-1] if self.s else 0.0
+
+  def _at(self, values, x):
+    s = self.s
+    if x <= s[0]:
+      return values[0]
+    for i in range(1, len(s)):
+      if x <= s[i]:
+        w = (x - s[i - 1]) / max(s[i] - s[i - 1], 1e-6)
+        return values[i - 1] + w * (values[i] - values[i - 1])
+    return values[-1]
+
+  def radius(self, lo, hi):
+    """Tightest radius (m) of the path between lo and hi m along it: heading change over +-VETO_CHORD (shorter at
+    the ends of the path, never under VETO_CHORD in all). inf when straight."""
+    end = self.end
+    hi = min(hi, end)
+    worst = 0.0
+    x = max(lo, 0.0)
+    while x <= hi + 1e-6:
+      a, b = max(x - VETO_CHORD, 0.0), min(x + VETO_CHORD, end)
+      if b - a >= VETO_CHORD:
+        worst = max(worst, abs(self._at(self.psi, b) - self._at(self.psi, a)) / (b - a))
+      x += VETO_STEP
+    return 1.0 / worst if worst > 1e-6 else float("inf")
+
+  def blind(self, s_apex):
+    """Why the camera cannot judge a curve whose apex is s_apex m ahead now (None: it can)."""
+    if self.v_ego < VETO_MIN_SPEED:
+      return "slow"
+    if self.red:
+      return "red"
+    if self.lane_change or self.blinker:
+      return "signal"
+    if len(self.s) < 2 or s_apex + VETO_PAD > min(VETO_SEE_MAX, self.end - VETO_PATH_MARGIN):
+      return "far"
+    if self._at(self.ystd, s_apex) > VETO_YSTD_MAX:
+      return "ystd"
+    if self.lead_d is not None and self.lead_d < s_apex + VETO_PAD:
+      return "lead"
+    return None
+
+
+def _raw(v):
+  return int(getattr(v, "raw", v))
+
+
+def camera_view(sm):
+  """CameraView of this planner frame, or None when the model is not there (never raises)."""
+  try:
+    if not (sm.alive["modelV2"] and sm.valid["modelV2"]):
+      return None
+    md = sm["modelV2"]
+    xs, ys = list(md.position.x), list(md.position.y)
+    n = len(xs)
+    if n < 2 or len(ys) != n:
+      return None
+    s = [0.0]
+    for i in range(1, n):
+      s.append(s[-1] + math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+    psi = list(md.orientation.z)
+    if len(psi) != n:
+      psi = [0.0] + [math.atan2(ys[i] - ys[i - 1], xs[i] - xs[i - 1]) for i in range(1, n)]
+    ystd = list(md.position.yStd)
+    if len(ystd) != n:
+      ystd = [float("inf")] * n            # no uncertainty from the model: never judge
+    cs = sm["carState"]
+    lead = sm["radarState"].leadOne
+    lead_d = float(lead.dRel) if lead.status else None
+    return CameraView(s, psi, ystd, red=_raw(md.confidence) == 0, lane_change=_raw(md.meta.laneChangeState) != 0,
+                      blinker=bool(cs.leftBlinker or cs.rightBlinker), lead_d=lead_d, v_ego=float(cs.vEgo))
+  except Exception:
+    return None
+
+
+class CurveVeto:
+  """Camera check of map curves. A map curve the driving model sees as at least VETO_FACTOR x gentler, on
+  VETO_CONFIRM frames in a row where it can see the curve's apex well (CameraView.blind), stops governing: the
+  next curve governs, or none (the speed comes back as for any curve). While ignored it is still watched: seen
+  sharp again (REARM_FACTOR) it governs again; after VETO_MAX_FLIPS take-backs it is never ignored again this drive.
+  Never ignored: ramp curves, curves with a yellow sign, curves the curve memory knows (a cap or a learned radius:
+  the car has driven them). Frames where the camera cannot judge leave the counters as they are.
+  The car side only sees the curve gone; the camera curve slowdown keeps running as the safety net.
+  Honest limit: the map slows early (~290 m before the curve at 45 mph), the camera judges at ~110 m, so this saves
+  about the second half of a false slowdown; the curve memory then corrects the curve after one clean pass."""
+
+  def __init__(self):
+    self.reset_drive()
+
+  def reset_drive(self):
+    self.state = {}           # (chain, s_a) -> {"vetoed", "n", "flips", "r_cam", "seen"}
+    self.given_up = set()     # keys never ignored again this drive
+    self.frame = 0
+    self.events = []          # for the planner's log (it empties the list)
+    self.hidden = None        # (key, r_cam) of an ignored curve this frame, or None
+
+  def tick(self):
+    self.frame += 1
+    self.hidden = None
+    for key in [k for k, st in self.state.items() if self.frame - st["seen"] > VETO_FORGET]:
+      del self.state[key]
+
+  def is_vetoed(self, key):
+    st = self.state.get(key)
+    return bool(st and st["vetoed"])
+
+  def flips(self, key):
+    st = self.state.get(key)
+    return st["flips"] if st else (VETO_MAX_FLIPS if key in self.given_up else 0)
+
+  @staticmethod
+  def vetoable(mc, c):
+    if c.get("ramp") or float(c.get("adv", 0.0) or 0.0) > 0 or "apex" not in c:
+      return False
+    if mc.memory is not None and (mc.memory.speed_cap(c) is not None or mc.memory.radius(c) is not None):
+      return False
+    return True
+
+  def filter(self, mc, cid, cands, camera):
+    """cands: [(curve, m to its entry)] -> the same without the ignored curves."""
+    out = []
+    for c, d in cands:
+      key = (cid, c["s_a"])
+      if key in self.given_up or not self.vetoable(mc, c):
+        self.state.pop(key, None)
+        out.append((c, d))
+        continue
+      st = self.state.get(key)
+      if st is None:
+        st = self.state[key] = {"vetoed": False, "n": 0, "flips": 0, "r_cam": 0.0}
+      st["seen"] = self.frame
+      self._check(mc, key, st, c, d, camera)
+      if st["vetoed"]:
+        if self.hidden is None:
+          self.hidden = (key, st["r_cam"])
+      else:
+        out.append((c, d))
+    return out
+
+  def _check(self, mc, key, st, c, d_entry, camera):
+    g = mc.geom.get(id(c))
+    if camera is None or g is None:
+      return
+    d_apex, d_exit = g
+    s_apex = max(d_apex, 0.0)               # behind the apex: what is left of the curve
+    if camera.blind(s_apex) is not None:
+      return
+    r_eff = mc._radius(c)
+    s_exit = d_exit if d_entry <= 0.0 else d_entry + float(c.get("len", 0.0))
+    lo = max(d_entry - VETO_PAD, 0.0)
+    hi = min(s_exit + VETO_PAD, VETO_SEE_MAX, camera.end - VETO_PATH_MARGIN)
+    r_cam = camera.radius(lo, hi)
+    st["r_cam"] = r_cam
+    if not st["vetoed"]:
+      st["n"] = st["n"] + 1 if r_cam >= VETO_FACTOR * r_eff else 0
+      if st["n"] >= VETO_CONFIRM:
+        st["vetoed"], st["n"] = True, 0
+        self._event("veto", c, key, st, d_entry, d_apex, r_eff, camera)
+    else:
+      st["n"] = st["n"] + 1 if r_cam <= REARM_FACTOR * r_eff else 0
+      if st["n"] >= REARM_CONFIRM:
+        st["vetoed"], st["n"] = False, 0
+        st["flips"] += 1
+        self._event("rearm", c, key, st, d_entry, d_apex, r_eff, camera)
+        if st["flips"] >= VETO_MAX_FLIPS:
+          self.given_up.add(key)
+          self._event("give_up", c, key, st, d_entry, d_apex, r_eff, camera)
+
+  def _event(self, what, c, key, st, d_entry, d_apex, r_eff, camera):
+    r_cam = st["r_cam"]
+    self.events.append({
+      "what": what, "curve": c, "name": c.get("name", "") or "", "chain": key[0], "s_a": key[1],
+      "r_map": float(c.get("r", 0.0)), "r_eff": round(r_eff, 1), "turn": float(c.get("turn", 0.0) or 0.0),
+      "len": float(c.get("len", 0.0) or 0.0), "d_entry": round(d_entry, 1), "d_apex": round(d_apex, 1),
+      "r_cam": round(r_cam, 1) if r_cam != float("inf") else -1.0,
+      "ystd_apex": round(camera._at(camera.ystd, max(d_apex, 0.0)), 2), "lead_d": camera.lead_d,
+      "v_ego": round(camera.v_ego, 2), "frames": VETO_CONFIRM if what == "veto" else REARM_CONFIRM, "flips": st["flips"]})
+
+
 class MapCurves:
   """The governing curve ahead, the ramp we are on, and the matched navigation exit."""
 
@@ -679,6 +917,7 @@ class MapCurves:
     self.release_after_apex = release_after_apex
     self.memory = memory
     self.decel = decel           # the cruise's slowdown for the plan (PLAN_DECEL, or the car profile's measured value)
+    self.veto = CurveVeto()      # camera check (acts only when update() gets a camera view)
     self.reset()
 
   def reset(self):
@@ -699,6 +938,11 @@ class MapCurves:
     self.data_here = False
     self.chain_id = 0
     self.inside = None           # the road curve we are driving through (also after its apex), for curve memory
+    self.inside_exit = float("inf")  # m to its exit
+    self.geom = {}               # id(curve) -> (m to its apex, negative when behind; m to its exit) this frame
+    self.veto_status = 0         # starpilotPlan.mapCurveVeto
+    self.veto_radius = 0.0
+    self.source = 0              # starpilotPlan.mapCurveSource
 
   # ---- the road ahead ----
   def _road(self, way_id, is_forward):
@@ -727,6 +971,9 @@ class MapCurves:
       on_this_way = (s0 <= s_entry <= s1)
       ent_ahead, d_entry = ahead(lat, lon, bearing, *entry)
       ex_ahead, d_exit = ahead(lat, lon, bearing, *exit_)
+      if "apex" in c:
+        ap_ok, ap_d = ahead(lat, lon, bearing, *c["apex"])
+        self.geom[id(c)] = (ap_d if ap_ok else -ap_d, d_exit)
       later_way = (s_entry > s1) if increasing else (s_entry < s0)
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
@@ -735,6 +982,7 @@ class MapCurves:
         if not c.get("ramp") and d_exit < inside_exit:
           # the curve we are in is the one we leave first (the next one may already match up to 60 m before it)
           self.inside, inside_exit = c, d_exit
+          self.inside_exit = d_exit
         if self.release_after_apex and not c.get("ramp") and "apex" in c:
           ap_ahead, d_apex = ahead(lat, lon, bearing, *c["apex"])
           if not ap_ahead and d_apex > APEX_PASSED:
@@ -756,9 +1004,22 @@ class MapCurves:
         r = min(r, cap * cap / PLAN_LAT)
     return r
 
-  def update(self, lat, lon, bearing, way_id, is_forward, nav=None):
-    """nav: (maneuver type, modifier, distance m) of the next maneuver, or None."""
+  def _source(self, c):
+    """Where the curve's radius comes from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap."""
+    if self.memory is None or c.get("ramp"):
+      return 0
+    learned = self.memory.radius(c)
+    cap = self.memory.speed_cap(c)
+    r = learned if learned is not None else c["r"]
+    if cap is not None and cap * cap / PLAN_LAT < r:
+      return 2
+    return 1 if learned is not None else 0
+
+  def update(self, lat, lon, bearing, way_id, is_forward, nav=None, camera=None):
+    """nav: (maneuver type, modifier, distance m) of the next maneuver, or None. camera: CameraView or None
+    (no camera check)."""
     self.reset()
+    self.veto.tick()
     if lat is None:
       return
     self.store.update(lat, lon)
@@ -769,10 +1030,19 @@ class MapCurves:
       self.chain_id = cid
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
+        cands = self.veto.filter(self, cid, cands, camera)
+      if cands:
         c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel))
         self.curve, self.distance, self.radius = c, d, self._radius(c)
         self.advisory = float(c.get("adv", 0.0) or 0.0)
         self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
+        self.source = self._source(c)
+      if self.veto.hidden is not None:
+        self.veto_status = 1
+        r_cam = self.veto.hidden[1]
+        self.veto_radius = r_cam if r_cam != float("inf") else MEMORY_MAX_R
+      elif self.curve is not None and self.veto.flips((cid, self.curve["s_a"])) > 0:
+        self.veto_status = 2
       ramp = self.store.ramps.get(cid)
       if ramp is not None and (ramp["travel"] == "both" or (ramp["travel"] == "ab") == increasing):
         self.on_ramp, self.ramp = True, ramp
@@ -835,6 +1105,8 @@ class MapCurvesPlanner:
     self.notice = None          # "curve" / "exit_data" / "exit_no_data" for one planner cycle
     self.profile_path = PROFILE_PATH
     self.decel = PLAN_DECEL     # read with the mode at the start of every drive (the car side reads the same file then)
+    self.recorder = None        # camera check events (feature logs), started on first use
+    self.recorder_failed = False
 
   def _read_mode(self):
     try:
@@ -858,6 +1130,8 @@ class MapCurvesPlanner:
     drive_start = self.counter == 0 or now - getattr(self, "last_call", now) > 5.0 or (started and not getattr(self, "prev_started", False))
     if drive_start or (not started and self.counter % 20 == 0):
       self._read_mode()
+    if drive_start and self.mc is not None:
+      self.mc.veto.reset_drive()  # a curve ignored or taken back last drive is checked afresh
     self.prev_started = started
     self.last_call = now
     self.counter += 1
@@ -900,9 +1174,12 @@ class MapCurvesPlanner:
           nav = (str(ni.maneuverType), str(ni.maneuverModifier), float(ni.maneuverDistance))
     except Exception:
       nav = None
-    self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav)
+    camera = camera_view(sm)
+    self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav,
+                   camera=camera)
     mc = self.mc
-    self._measure_pass(sm, mc.inside)
+    self._veto_log(mc, v_ego, set_speed, now)
+    self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"])
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
@@ -918,26 +1195,67 @@ class MapCurvesPlanner:
     elif not mc.on_ramp:
       self.announced_exit = None
 
-  def _measure_pass(self, sm, inside):
+  VETO_COLUMNS = ["t_wall", "vEgo_mph", "set_mph", "map_status", "map_dist", "map_r", "veto", "veto_r"]
+
+  def _veto_log(self, mc, v_ego, set_speed, now):
+    """Feature log of the camera check: a row per frame, an event when a curve is ignored, taken back or given up
+    on (never raises into the planner)."""
+    try:
+      events, mc.veto.events = mc.veto.events, []
+      if self.recorder is None and not self.recorder_failed:
+        try:
+          from openpilot.starpilot.common.feature_events import EventRecorder
+          self.recorder = EventRecorder(self.VETO_COLUMNS, hz=20, params=self.params)
+        except Exception:
+          self.recorder_failed = True
+      for ev in events:
+        if ev["what"] == "veto" and mc.memory is not None:
+          mc.memory.note_veto(ev["curve"])
+      rec = self.recorder
+      if rec is None:
+        return
+      rec.add_row(now, (f"{time.time():.2f}", v_ego / MPH, set_speed / MPH, mc.status if mc.curve is not None else 0,  # noqa: TID251
+                        mc.distance, mc.radius, mc.veto_status, mc.veto_radius))
+      for ev in events:
+        rec.record("mapCurveVeto", now, {**{k: v for k, v in ev.items() if k != "curve"}, "set_mph": set_speed / MPH})
+      rec.tick(now)
+    except Exception:
+      pass
+
+  def _measure_pass(self, sm, inside, lat=None, lon=None):
     """Curve memory: collect the car's own path through the road curve we are in; when we leave it, a clean pass
-    adds its measured radius (never raises into the planner)."""
+    adds its measured radius (never raises into the planner). A pass counts for nothing when the turn signal was
+    on in it (a lane change) or the car never came within PASS_APEX_NEAR of the apex (another road)."""
     try:
       if inside is not self.pass_curve:
         if self.pass_curve is not None and self.mc.memory is not None:
-          v_sat = curve_pass_saturation(self.pass_samples)
-          if v_sat is not None:
-            self.mc.memory.add_saturated_pass(self.pass_curve, v_sat)
-          else:
-            r = curve_pass_radius(self.pass_samples)
-            if r is not None:
-              self.mc.memory.add_pass(self.pass_curve, r, v=curve_pass_speed(self.pass_samples))
+          self._finish_pass()
         self.pass_curve, self.pass_samples = inside, []
+        self.pass_blinker, self.pass_apex, self.pass_exit, self.pass_vetoed = False, float("inf"), float("inf"), False
       if inside is not None and len(self.pass_samples) < 2400:
         cs, cc = sm["carState"], sm["carControl"]
         self.pass_samples.append((float(cs.vEgo), float(sm["controlsState"].curvature), bool(cc.latActive),
                                   bool(cs.steeringPressed), abs(float(cc.actuators.torque))))
+        self.pass_blinker |= bool(cs.leftBlinker or cs.rightBlinker)
+        if lat is not None and "apex" in inside:
+          self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *inside["apex"]))
+        self.pass_exit = self.mc.inside_exit
+        self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, inside["s_a"]))
     except Exception:
       self.pass_curve, self.pass_samples = None, []
+
+  def _finish_pass(self):
+    c, samples = self.pass_curve, self.pass_samples
+    if self.pass_blinker or self.pass_apex > PASS_APEX_NEAR:
+      return
+    v_sat = curve_pass_saturation(samples)
+    if v_sat is not None:
+      self.mc.memory.add_saturated_pass(c, v_sat)
+      return
+    r = curve_pass_radius(samples)
+    if r is not None:
+      flags = (["full"] if self.pass_exit <= PASS_EXIT_NEAR else []) + (["vetoed"] if self.pass_vetoed else [])
+      self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags)
 
   def publish(self, plan):
     mc = self.mc
@@ -958,6 +1276,9 @@ class MapCurvesPlanner:
       plan.mapRampToHighway = to.get("cls") in HIGHWAY_CLASSES
       plan.mapRampEndDistance = float(mc.ramp_end_dist)
     plan.mapRoadClass = int(getattr(self, "road_class", 0))
+    plan.mapCurveVeto = int(mc.veto_status)
+    plan.mapCurveVetoRadius = float(mc.veto_radius)
+    plan.mapCurveSource = int(mc.source)
     plan.mapNavExit = mc.nav_exit
     plan.mapNavExitDistance = float(mc.nav_exit_dist)
     plan.mapNavExitSide = int(mc.nav_side)

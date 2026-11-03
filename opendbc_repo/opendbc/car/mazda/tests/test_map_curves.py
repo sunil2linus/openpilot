@@ -627,3 +627,243 @@ def test_the_background_loader_uses_the_stepped_parser(tmp_path):
   finally:
     MC.load_json_in_steps = orig
   assert calls and store.loaded
+
+
+# ---------------- camera check of map curves (CurveVeto) and one trusted gentle pass ----------------
+
+def _view(straight_m, r_cam, length=160.0, ystd=0.3, **kw):
+  """The model's path: straight for straight_m, then an arc of r_cam to the left (None: straight on)."""
+  s = [5.0 * i for i in range(int(length / 5.0) + 1)]
+  psi = [0.0 if (r_cam is None or x <= straight_m) else (x - straight_m) / r_cam for x in s]
+  kw.setdefault("v_ego", 18.0)
+  return MC.CameraView(s, psi, [ystd] * len(s), **kw)
+
+
+def _false_kink(memory=None):
+  """A 130 m map curve (the map's radius), 40 m ahead of the car, apex ~85 m ahead."""
+  root, curves, _ = write_files(G.curve_road(r=130, turn=40, split=True))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=memory)
+  la, lo = pos(0, -40)
+  return m, curves, (la, lo, 0.0, 1, True)
+
+
+def _frames(m, where, view, n):
+  for _ in range(n):
+    m.update(*where, camera=view)
+
+
+def test_the_camera_ignores_a_map_curve_it_sees_much_gentler_after_one_second():
+  m, curves, where = _false_kink()
+  gentle = _view(40.0, 400.0)
+  _frames(m, where, gentle, MC.VETO_CONFIRM - 1)
+  assert m.curve is not None and m.veto_status == 0                   # 19 frames: still slowing for it
+  _frames(m, where, gentle, 1)
+  assert m.curve is None and m.status == MC.STATUS_NONE and m.veto_status == 1
+  assert 300 <= m.veto_radius <= 500, m.veto_radius
+  ev = m.veto.events[-1]
+  assert ev["what"] == "veto" and 300 <= ev["r_cam"] <= 500 and abs(ev["r_map"] - curves[0]["r"]) < 1e-6
+  # the car side sees the curve gone: the map reason ends
+  f = CTL.MapFields(mode=CTL.ON, status=m.status, distance=m.distance, radius=m.radius)
+  assert f.status == 0
+  # without a camera view nothing is ignored (and the old call still works)
+  m2, _, where2 = _false_kink()
+  for _ in range(40):
+    m2.update(*where2)
+  assert m2.curve is not None and m2.veto_status == 0
+
+
+def test_the_camera_check_waits_when_it_cannot_see_well():
+  m, _, _ = _false_kink()
+  far = (*pos(0, -150), 0.0, 1, True)                                  # apex ~195 m ahead
+  _frames(m, far, _view(150.0, 400.0, length=250.0), 100)
+  assert m.curve is not None and m.veto_status == 0
+  for blind in (_view(40.0, 400.0, ystd=2.0), _view(40.0, 400.0, red=True), _view(40.0, 400.0, lead_d=60.0),
+                _view(40.0, 400.0, blinker=True), _view(40.0, 400.0, lane_change=True), _view(40.0, 400.0, v_ego=6.0),
+                _view(40.0, 400.0, length=80.0)):                      # a short path (a hill crest)
+    m, _, where = _false_kink()
+    _frames(m, where, blind, 100)
+    assert m.curve is not None and m.veto_status == 0
+    assert all(st["n"] == 0 for st in m.veto.state.values())          # blind frames neither count nor reset
+  # blind frames in between hold the count: 10 seeing + 50 blind + 10 seeing = ignored
+  m, _, where = _false_kink()
+  _frames(m, where, _view(40.0, 400.0), 10)
+  _frames(m, where, _view(40.0, 400.0, red=True), 50)
+  _frames(m, where, _view(40.0, 400.0), 10)
+  assert m.curve is None and m.veto_status == 1
+
+
+def test_no_veto_when_the_camera_agrees_or_is_not_sure_enough():
+  for r_cam in (130.0, 1.8 * 130.0):
+    m, _, where = _false_kink()
+    _frames(m, where, _view(40.0, r_cam), 60)
+    assert m.curve is not None and m.veto_status == 0, r_cam
+  # one frame that disagrees starts the count again
+  m, _, where = _false_kink()
+  _frames(m, where, _view(40.0, 400.0), 15)
+  _frames(m, where, _view(40.0, 130.0), 1)
+  _frames(m, where, _view(40.0, 400.0), 15)
+  assert m.curve is not None
+
+
+def test_an_ignored_curve_seen_sharp_again_governs_again_and_two_flips_end_it():
+  m, _, where = _false_kink()
+  gentle, sharp = _view(40.0, 400.0), _view(40.0, 130.0)
+  _frames(m, where, gentle, MC.VETO_CONFIRM)
+  assert m.curve is None
+  _frames(m, where, _view(40.0, 200.0), 30)                           # between the two factors: stays ignored
+  assert m.curve is None
+  _frames(m, where, sharp, MC.REARM_CONFIRM - 1)
+  assert m.curve is None
+  _frames(m, where, sharp, 1)
+  assert m.curve is not None and m.veto_status == 2 and m.veto.events[-1]["what"] == "rearm"
+  _frames(m, where, gentle, MC.VETO_CONFIRM)
+  assert m.curve is None
+  _frames(m, where, sharp, MC.REARM_CONFIRM)
+  assert m.curve is not None and [e["what"] for e in m.veto.events[-2:]] == ["rearm", "give_up"]
+  _frames(m, where, gentle, 100)                                       # never ignored again this drive
+  assert m.curve is not None and m.veto_status == 2
+  m.veto.reset_drive()                                                 # the next drive checks it afresh
+  _frames(m, where, gentle, MC.VETO_CONFIRM)
+  assert m.curve is None
+
+
+def test_ramps_signed_capped_and_learned_curves_are_never_ignored(tmp_path):
+  gentle = _view(40.0, 400.0)
+  for change in ("ramp", "adv"):
+    m, _, where = _false_kink()
+    m.update(*where)
+    m.curve[change] = True if change == "ramp" else 35 * MPH
+    _frames(m, where, gentle, 60)
+    assert m.curve is not None and m.veto_status == 0, change
+  mem = MC.CurveMemory(str(tmp_path / "cap.json"))
+  m, curves, where = _false_kink(memory=mem)
+  mem.add_saturated_pass(curves[0], 13.0, t=1.0)                     # capped below the map's speed
+  _frames(m, where, gentle, 60)
+  assert m.curve is not None and m.source == 2
+  mem2 = MC.CurveMemory(str(tmp_path / "learned.json"))
+  m, curves, where = _false_kink(memory=mem2)
+  mem2.add_pass(curves[0], 150.0, t=1.0, v=15.0)
+  mem2.add_pass(curves[0], 155.0, t=500.0, v=15.0)
+  _frames(m, where, gentle, 60)
+  assert m.curve is not None and m.source == 1
+
+
+def _two_curves():
+  """Straight north, a 110 m left curve (35 deg), 200 m straight, a 150 m right curve (40 deg), straight."""
+  pts = G.straight(0, -300, 0, 300)
+  a = G.arc(-110, 0, 110, 0, 35)
+  pts += a[1:]
+  b = G.straight(*a[-1], -35, 200)[1:]
+  pts += b
+  bx, by = b[-1]
+  cx, cy = bx + 150 * math.sin(math.radians(55)), by + 150 * math.cos(math.radians(55))
+  a0 = math.degrees(math.atan2(by - cy, bx - cx))
+  c = G.arc(cx, cy, 150, a0, a0 - 40)
+  pts += c[1:]
+  pts += G.straight(*c[-1], 5, 300)[1:]
+  return {1: G.way(1, pts)}
+
+
+def test_when_the_first_curve_is_ignored_the_next_one_governs_and_the_pass_is_still_measured():
+  root, curves, _ = write_files(_two_curves())
+  assert len(curves) == 2, curves
+  first = min(curves, key=lambda c: c["s_a"])
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False))
+  where = (*pos(0, -40), 0.0, 1, True)
+  _frames(m, where, _view(40.0, 400.0), MC.VETO_CONFIRM)
+  assert m.curve is not None and m.curve["s_a"] > first["s_a"] and m.veto_status == 1   # the real one after it governs
+  # inside the ignored curve: still the curve being driven (curve memory measures the pass)
+  ang = math.radians(15)
+  la, lo = pos(-110 + 110 * math.cos(ang), 110 * math.sin(ang))
+  m.update(la, lo, 345.0, 1, True, camera=_view(0.0, 400.0))
+  assert m.inside is not None and m.inside["s_a"] == first["s_a"] and m.veto.is_vetoed((m.chain_id, first["s_a"]))
+
+
+def test_a_curve_that_starts_gentle_and_tightens_is_not_judged_before_its_apex_is_seen():
+  root, curves, _ = write_files(G.curve_road(r=130, turn=80, split=True))    # apex ~90 m into the curve
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False))
+  where = (*pos(0, -20), 0.0, 1, True)
+  _frames(m, where, _view(20.0, 400.0), 60)                           # the model sees only the gentle start
+  assert m.curve is not None and m.veto_status == 0
+
+
+def test_camera_view_from_the_model_message():
+  from types import SimpleNamespace as N
+
+  class Enum(int):
+    @property
+    def raw(self):
+      return int(self)
+
+  xs = [5.0 * i for i in range(33)]
+  md = N(position=N(x=xs, y=[0.0] * 33, yStd=[0.2] * 33), orientation=N(z=[0.0] * 33), confidence=Enum(2),
+         meta=N(laneChangeState=Enum(0)))
+
+  class SM(dict):
+    alive = {"modelV2": True}
+    valid = {"modelV2": True}
+
+  sm = SM(modelV2=md, carState=N(leftBlinker=False, rightBlinker=False, vEgo=20.0),
+          radarState=N(leadOne=N(status=True, dRel=55.0)))
+  v = MC.camera_view(sm)
+  assert v is not None and v.end == 160.0 and not v.red and v.lead_d == 55.0 and v.radius(0, 150) == float("inf")
+  md.confidence = Enum(0)
+  assert MC.camera_view(sm).red
+  sm.alive = {"modelV2": False}
+  assert MC.camera_view(sm) is None
+  assert MC.camera_view(None) is None
+
+
+def test_one_trusted_gentle_pass_corrects_a_map_curve(tmp_path):
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = {"apex": (42.6, -83.1), "r": 129.0}
+  mem.add_pass(c, 400.0, t=1000.0, v=18.0, flags=["full"])
+  assert mem.radius(c) == 400.0                                        # one full, fast pass well over the map's
+  for name, kw in (("gentler but close", dict(r=180.0)), ("slow", dict(v=8.0)), ("never turned", dict(r=2000.0)),
+                   ("not full", dict(flags=[]))):
+    m2 = MC.CurveMemory(str(tmp_path / f"{name}.json"))
+    args = dict(r=400.0, v=18.0, flags=["full"])
+    args.update(kw)
+    m2.add_pass(c, args["r"], t=1000.0, v=args["v"], flags=args["flags"])
+    assert m2.radius(c) is None, name
+  mem.add_pass(c, 150.0, t=5000.0, v=18.0, flags=["full"])
+  assert mem.radius(c) is None                                         # a sharper pass: back to the map's radius
+  mem.add_pass(c, 390.0, t=9000.0, v=18.0, flags=["full"])
+  assert mem.radius(c) == 390.0                                        # a gentle one again: trusted again
+  far = {"apex": (42.7, -83.1), "r": 60.0}
+  mem.add_pass(far, 1000.0, t=1.0, v=18.0, flags=["full"])
+  assert mem.radius(far) == 300.0                                      # still at most 5x the map's
+
+
+def test_an_old_memory_file_still_loads(tmp_path):
+  path = tmp_path / "old.json"
+  c = {"apex": (42.6, -83.1), "r": 129.0}
+  path.write_text(json.dumps({"version": 1, "curves": [{"lat": 42.6, "lon": -83.1, "r_map": 129.0, "name": "",
+                                                         "passes": [[160.0, 1000.0], [165.0, 5000.0]]}]}))
+  mem = MC.CurveMemory(str(path))
+  assert mem.radius(c) in (160.0, 165.0)
+  mem.add_pass(c, 170.0, t=9000.0, v=15.0, flags=["full"])
+  assert len(mem._find(42.6, -83.1)["passes"]) == 3 and mem.radius(c) in (165.0, 170.0)
+
+
+def test_a_pass_with_the_turn_signal_or_off_the_apex_counts_for_nothing(tmp_path):
+  class P:
+    def get(self, key, encoding=None):
+      return None
+
+  def run(blinker=False, apex=5.0, exit_=16.0):
+    mp = MC.MapCurvesPlanner(P(), P())
+    mp.mc = MC.MapCurves(MC.MapCurveStore(tempfile.mkdtemp(), background=False),
+                         memory=MC.CurveMemory(str(tmp_path / f"m{blinker}{apex}{exit_}.json")))
+    c = {"apex": (42.6, -83.1), "r": 129.0, "s_a": 0.0}
+    mp.pass_curve, mp.pass_samples = c, _pass(400.0)
+    mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed = blinker, apex, exit_, True
+    mp._finish_pass()
+    e = mp.mc.memory._find(*c["apex"])
+    return e["passes"] if e else []
+
+  ps = run()
+  assert len(ps) == 1 and ps[0][3] == ["full", "vetoed"]
+  assert run(blinker=True) == []                                       # a lane change in the curve
+  assert run(apex=30.0) == []                                          # never near the apex: another road
+  assert run(exit_=200.0)[0][3] == ["vetoed"]                          # lost the road before the exit: not full

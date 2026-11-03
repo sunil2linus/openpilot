@@ -64,6 +64,9 @@ class MapFields:
   advisory: float = 0.0           # m/s, yellow sign speed of the curve (0 none)
   nav_curve_advisory: float = 0.0
   road_class: int = 0             # matched road (0 unknown); a freeway never takes the street rules
+  veto: int = 0                   # planner's camera check (logged only): 1 a map curve is ignored, 2 taken back
+  veto_radius: float = 0.0        # m, the camera's radius of that curve
+  source: int = 0                 # governing curve's radius: 0 map, 1 curve memory, 2 memory speed cap
 
   @staticmethod
   def from_plan(plan):
@@ -73,7 +76,8 @@ class MapFields:
                      int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
                      float(plan.mapNavCurveDistance), int(getattr(plan, "mapNavExitSide", 0)),
                      float(getattr(plan, "mapCurveAdvisory", 0.0)), float(getattr(plan, "mapNavCurveAdvisory", 0.0)),
-                     int(getattr(plan, "mapRoadClass", 0)))
+                     int(getattr(plan, "mapRoadClass", 0)), int(getattr(plan, "mapCurveVeto", 0)),
+                     float(getattr(plan, "mapCurveVetoRadius", 0.0)), int(getattr(plan, "mapCurveSource", 0)))
 
 
 @dataclass

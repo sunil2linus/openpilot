@@ -276,6 +276,9 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveAdvisory @60 :Float32;     # m/s, yellow advisory sign speed of the governing curve from the map (0 none)
   mapNavCurveAdvisory @61 :Float32;  # m/s, same for the announced exit's curve
   mapRoadClass @62 :UInt8;           # highwayClass of the road the car is matched to (0 unknown; 1 motorway, 3 trunk)
+  mapCurveVeto @63 :UInt8;           # camera check of map curves: 0 none, 1 a map curve the camera sees as much gentler is ignored, 2 the governing curve was ignored and taken back this drive
+  mapCurveVetoRadius @64 :Float32;   # m, the camera's radius of that curve (0 none)
+  mapCurveSource @65 :UInt8;         # governing curve's radius from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {
