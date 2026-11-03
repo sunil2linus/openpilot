@@ -496,7 +496,8 @@ class VehicleSettingsManagerView(PanelManagerView):
         ("MazdaMapCurveChime", tr_noop("Exit Chime"), (tr_noop("Off"), tr_noop("5%"), tr_noop("10%"), tr_noop("20%")), 1),
         ("MazdaStoppedCarSlowdown", tr_noop("Stopped Car Slowdown"), modes, 0),
         ("StopWarningRedLight", tr_noop("Stop Ahead Warning"), modes, 0),
-        ("StopWarningStoppedCar", tr_noop("Stopped Car Warning"), modes, 0)):
+        ("StopWarningStoppedCar", tr_noop("Stopped Car Warning"), modes, 0),
+        ("MazdaStopWarningChime", tr_noop("Stop Warning Chime"), (tr_noop("5%"), tr_noop("10%"), tr_noop("20%"), tr_noop("30%")), 0)):
       get_value, on_click = choice(key, labels, default)
       tiles.append({"title": tr(title), "get_value": get_value, "on_click": on_click})
     tiles.append({

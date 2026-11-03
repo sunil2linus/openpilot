@@ -52,6 +52,10 @@ struct StarPilotCarControl @0x81c2f05a394cf4af {
       # Mazda map curves: soft exit chimes (own fixed volume)
       curveChime @23;
       curveNoData @24;
+
+      # Mazda stop warnings: soft chimes at their own fixed volume (MazdaStopWarningChime)
+      stopChime @25;
+      stoppedCarChime @26;
     }
   }
 

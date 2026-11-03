@@ -81,6 +81,7 @@ def should_mute_turn_steering_limit_alert(alert_type: str, v_ego: float, mute_be
 
 
 MAP_CURVE_CHIME_VOLUMES = (0, 5, 10, 20)   # MazdaMapCurveChime index -> % (0 = off)
+STOP_CHIME_VOLUMES = (5, 10, 20, 30)       # MazdaStopWarningChime index -> % (a stop warning is never silent: use Test for that)
 
 
 def read_volume_settings(params):
@@ -95,8 +96,13 @@ def read_volume_settings(params):
     chime = int(params.get_int("MazdaMapCurveChime", return_default=True, default=1))
   except (TypeError, ValueError, OSError):
     chime = 1
+  try:
+    stop_chime = int(params.get_int("MazdaStopWarningChime", return_default=True, default=0))
+  except (TypeError, ValueError, OSError):
+    stop_chime = 0
   return {
     "map_curve_chime": MAP_CURVE_CHIME_VOLUMES[chime] / 100.0 if 0 <= chime < len(MAP_CURVE_CHIME_VOLUMES) else 0.05,
+    "stop_chime": STOP_CHIME_VOLUMES[stop_chime] / 100.0 if 0 <= stop_chime < len(STOP_CHIME_VOLUMES) else 0.05,
     "alert_volume_controller": params.get_bool("AlertVolumeControl"),
     **{
       key: read_int(key, minimum=25 if key in ("WarningImmediateVolume", "WarningSoftVolume") else 0)
@@ -139,9 +145,15 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   # Map curves: soft chimes at their own fixed volume (MazdaMapCurveChime), never raised for road noise
   starpilot_alert_key(StarPilotAudibleAlert.curveChime): ("curve_chime.wav", 1, MAX_VOLUME),
   starpilot_alert_key(StarPilotAudibleAlert.curveNoData): ("curve_no_data.wav", 1, MAX_VOLUME),
+
+  # Mazda stop warnings: one soft chime at its own fixed volume (MazdaStopWarningChime)
+  starpilot_alert_key(StarPilotAudibleAlert.stopChime): ("stop_chime.wav", 1, MAX_VOLUME),
+  starpilot_alert_key(StarPilotAudibleAlert.stoppedCarChime): ("stopped_car_chime.wav", 1, MAX_VOLUME),
 }
 MAP_CURVE_CHIME_ALERTS = (starpilot_alert_key(StarPilotAudibleAlert.curveChime),
                           starpilot_alert_key(StarPilotAudibleAlert.curveNoData))
+STOP_CHIME_ALERTS = (starpilot_alert_key(StarPilotAudibleAlert.stopChime),
+                     starpilot_alert_key(StarPilotAudibleAlert.stoppedCarChime))
 if HARDWARE.get_device_type() in ("tici", "tizi"):
   sound_list.update({
     AudibleAlert.engage: ("engage_tizi.wav", 1, MAX_VOLUME),
@@ -477,6 +489,8 @@ class Soundd:
 
           if self.current_alert in MAP_CURVE_CHIME_ALERTS:
             self.current_volume = self.volume_settings.get("map_curve_chime", 0.05)
+          elif self.current_alert in STOP_CHIME_ALERTS:
+            self.current_volume = self.volume_settings.get("stop_chime", 0.05)
           elif self.current_alert != AudibleAlert.none:
             v_ego = max(float(getattr(sm["starpilotSelfdriveState"], "vEgo", 0.0)), 0.0)
             if should_mute_turn_steering_limit_alert(

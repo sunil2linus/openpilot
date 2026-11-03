@@ -825,6 +825,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaCurveLearning", {PERSISTENT, BOOL, "0", "0"}},
     {"MazdaMapCurves", {PERSISTENT, INT, "0", "0"}},
     {"MazdaMapCurveChime", {PERSISTENT, INT, "1", "1"}},
+    {"MazdaStopWarningChime", {PERSISTENT, INT, "0", "0"}},
     {"MazdaStoppedCarSlowdown", {PERSISTENT, INT, "0", "0"}},
     {"StopWarningRedLight", {PERSISTENT, INT, "0", "0"}},
     {"StopWarningStoppedCar", {PERSISTENT, INT, "0", "0"}},

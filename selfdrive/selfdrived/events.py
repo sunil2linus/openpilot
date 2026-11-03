@@ -1230,13 +1230,14 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.MID, VisualAlert.none, AudibleAlert.prompt, 3.),
   },
 
-  # Mazda stop warnings (StopWarningRedLight / StopWarningStoppedCar: On only; Test is silent and only logs)
+  # Mazda stop warnings (StopWarningRedLight / StopWarningStoppedCar: On only; Test is silent and only logs).
+  # A soft chime played once at its own volume (MazdaStopWarningChime), not the repeating warning sound.
   StarPilotEventName.stopAheadWarning: {
     ET.PERMANENT: Alert(
       "STOP AHEAD - SLOW DOWN",
       "Cruise may not stop for this",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+      Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stopChime, 3.),
   },
 
   StarPilotEventName.stoppedLeadWarning: {
@@ -1244,7 +1245,7 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "STOPPED CAR AHEAD - BRAKE",
       "Cruise may not stop for this",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 2.),
+      Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stoppedCarChime, 3.),
   },
 
   # Mazda map curves (MazdaMapCurves: Test or On)

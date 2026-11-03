@@ -1,5 +1,6 @@
 from cereal import custom, log
 from cereal import messaging
+from openpilot.common.basedir import BASEDIR
 from cereal.messaging import SubMaster, PubMaster
 from openpilot.selfdrive.ui.soundd import (
   SELFDRIVE_STATE_TIMEOUT,
@@ -8,11 +9,14 @@ from openpilot.selfdrive.ui.soundd import (
   check_selfdrive_timeout_alert,
   is_turn_steering_limit_alert,
   read_volume_settings,
+  sound_list,
+  STOP_CHIME_ALERTS,
   should_mute_turn_steering_limit_alert,
   starpilot_alert_key,
 )
 
 import numpy as np
+import os
 import time
 import wave
 
@@ -53,6 +57,29 @@ class TestSoundd:
     params.values["PromptVolume"] = 35
     assert soundd.refresh_volume_settings(now=1.0)
     assert soundd.volume_map[AudibleAlert.promptRepeat] == 0.35
+
+  def test_stop_warning_chimes_are_soft_one_shots_at_their_own_volume(self):
+    class FakeParams:
+      values = {}
+
+      def get_bool(self, key):
+        return False
+
+      def get_int(self, key, return_default=False, default=101):
+        return self.values.get(key, default)
+
+    params = FakeParams()
+    assert read_volume_settings(params)["stop_chime"] == 0.05          # default 5 %
+    params.values["MazdaStopWarningChime"] = 2
+    assert read_volume_settings(params)["stop_chime"] == 0.20
+    for alert in (StarPilotAudibleAlert.stopChime, StarPilotAudibleAlert.stoppedCarChime):
+      key = starpilot_alert_key(alert)
+      assert key in STOP_CHIME_ALERTS
+      filename, play_count, _ = sound_list[key]
+      assert play_count == 1, filename                                   # one chime, not a repeating warning
+      with wave.open(os.path.join(BASEDIR, "selfdrive", "assets", "sounds", filename)) as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 48000)
+        assert w.getnframes() / 48000 <= 1.2
 
   def test_does_not_consume_car_state_reader(self):
     assert "carState" not in SOUNDD_SERVICES
