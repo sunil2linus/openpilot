@@ -361,6 +361,21 @@ class Plan:
       s = (s + " or " if s else "") + "in " + _names(ticked)
     return s
 
+  def status_scope(self):
+    """For the status line on the screen: '27 areas (near you within 300 mi, plus ticked: Illinois, Michigan); 66
+    others not needed yet'. Plain words, no position (the log line has it)."""
+    parts = []
+    if self.range_miles is not None:
+      parts.append(f"near you within {self.range_miles:g} mi" if self.near is not None else
+                   f"within {self.range_miles:g} mi once the car has a GPS position")
+    ticked = self.ticked_labels()
+    if ticked:
+      parts.append("plus ticked: " + ", ".join(ticked) if parts else "ticked: " + ", ".join(ticked))
+    s = _plural(self.in_range, "area") + (f" ({', '.join(parts)})" if parts else "")
+    if self.skipped:
+      s += f"; {self.skipped} {'other' if self.skipped == 1 else 'others'} not needed yet"
+    return s
+
   def skipped_why(self):
     return "out of range or outside your selected maps" if self.restricted else "out of range"
 
@@ -621,9 +636,7 @@ def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, sta
     return 0, p.total
   if idle is not None:
     idle.clear()
-  scope = f"{_plural(p.in_range, 'map folder')} {p.where()}".replace("  ", " ").strip()
-  if p.skipped:
-    scope += f", {p.skipped} {p.skipped_why()}"
+  scope = p.status_scope()
   if notes:
     scope += f"; {notes}"
   if not p.todo:
@@ -658,7 +671,7 @@ def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, sta
   if built:
     log(f"all done: {_plural(built)} in {time.monotonic() - t0:.0f} s")
   if status is not None:
-    status(f"Built {_plural(built)} in {time.monotonic() - t0:.0f} s ({scope})")
+    status(f"Built {_plural(built, 'area')} in {time.monotonic() - t0:.0f} s: {scope}")
   return built, p.total
 
 

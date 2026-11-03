@@ -380,10 +380,10 @@ def test_plan_builds_only_the_folders_in_range_nearest_first(tmp_path):
   assert os.path.isdir(os.path.join(cm, "42", "-84")) and os.path.isdir(os.path.join(cm, "40", "-84"))
   assert not os.path.exists(os.path.join(cm, "40", "-90"))                 # out of range: not built
   assert log[0] == p.summary() and "42.6,-83.1" in log[0] and "-83.0" not in log[0]
-  assert "1 out of range" in status[-1] and "100 mi" in status[-1]
+  assert "1 other not needed yet" in status[-1] and "near you within 100 mi" in status[-1]
   # the next pass: up to date within range, the far folder still not built
   assert D.run_once(osm, cm, near=here, range_miles=100, log=log.append, status=status.append) == (0, 3)
-  assert status[-1].startswith("Curve files up to date: 2 map folders within 100 mi") and "1 out of range" in status[-1]
+  assert status[-1] == "Curve files up to date: 2 areas (near you within 100 mi); 1 other not needed yet"
   assert not os.path.exists(os.path.join(cm, "40", "-90"))
 
 
@@ -650,11 +650,11 @@ def test_ticked_state_is_built_in_full_whatever_the_range(tmp_path, monkeypatch)
   assert not os.path.exists(os.path.join(cm, "36", "-90")) and not os.path.exists(os.path.join(cm, "38", "-84"))
   assert status[0] == "Building area 1 of 2 (now Michigan), about 3 min left (guessing 1.5 min per area)"
   assert any(s.startswith("Building area 2 of 2 (now Michigan), ") and s.endswith("squares, 0 s") and " - 44/-88: " in s for s in status)
-  assert status[-1].startswith("Built 2 folders in") and "in Michigan" in status[-1] and "2 out of range or outside your selected maps" in status[-1]
+  assert status[-1].startswith("Built 2 areas in") and status[-1].endswith(": 2 areas (near you within 30 mi, plus ticked: Michigan); 2 others not needed yet")
   assert sum("outside your selected maps: leftovers" in line for line in log) == 1
   # the next pass: up to date, the leftover note is not repeated
   assert D.run_once(osm, cm, near=HOME, range_miles=30, log=log.append, status=status.append, regions=rg, memo=memo) == (0, 4)
-  assert status[-1].startswith("Curve files up to date: 2 map folders within 30 mi of 42.6,-83.1 or in Michigan")
+  assert status[-1].startswith("Curve files up to date: 2 areas (near you within 30 mi, plus ticked: Michigan)")
   assert sum("leftovers" in line for line in log) == 1
   # a map update of the far Michigan folder: rebuilt because the state stays ticked
   tile = os.listdir(os.path.join(osm, "44", "-88"))[0]
@@ -769,10 +769,10 @@ def test_ticked_state_without_downloaded_maps(tmp_path, monkeypatch):
   log, status, idle, memo = [], [], {}, {}
   assert D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo) == (1, 1)
   assert log[0] == "no map tiles for Washington: download them in StarPilot's map settings"
-  assert status[-1].startswith("Built 1 folder") and "Washington not downloaded" in status[-1] and "in Michigan" in status[-1]
+  assert status[-1].startswith("Built 1 area") and "Washington not downloaded" in status[-1] and "plus ticked: Michigan" in status[-1]
   D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo)
   assert sum("no map tiles" in line for line in log) == 1
-  assert status[-1].startswith("Curve files up to date: 1 map folder within 100 mi (no position yet) or in Michigan")
+  assert status[-1].startswith("Curve files up to date: 1 area (within 100 mi once the car has a GPS position, plus ticked: Michigan)")
 
 
 def test_progress_and_time_left_text():
