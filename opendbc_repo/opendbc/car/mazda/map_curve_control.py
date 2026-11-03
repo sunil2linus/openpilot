@@ -29,7 +29,7 @@ from dataclasses import dataclass
 try:
   from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL
 except ImportError:          # offline tests load this file directly
-  from curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL
+  from curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL
 
 MPH = 0.44704
 OFF, TEST, ON = 0, 1, 2
@@ -88,9 +88,12 @@ class MapOutput:
 
 
 class MapCurveControl:
-  def __init__(self, lat_accel):
+  def __init__(self, lat_accel, decel=MAP_DECEL):
+    """decel: the cruise's slowdown for road curves, m/s^2 (MAP_DECEL, or what the car profile learned on this
+    car; the planner reads the same value, see car_profile.py). Ramp curves and exits keep MAP_RAMP_DECEL."""
     lat_accel = min(lat_accel, MAP_LATERAL_ACCEL)
-    self.curve = MapCurveTarget(lat_accel)
+    self.decel = decel
+    self.curve = MapCurveTarget(lat_accel, decel)
     self.nav = MapCurveTarget(lat_accel, MAP_RAMP_DECEL)
     self.on_street_exit = False
     self.exit_intent = False      # the driver signalled for the announced exit
@@ -135,7 +138,7 @@ class MapCurveControl:
       return out
     radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory,
-                              MAP_RAMP_DECEL if (f.status == STATUS_RAMP_CURVE or f.on_ramp) else MAP_DECEL)
+                              MAP_RAMP_DECEL if (f.status == STATUS_RAMP_CURVE or f.on_ramp) else self.decel)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
     nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held)
     na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)

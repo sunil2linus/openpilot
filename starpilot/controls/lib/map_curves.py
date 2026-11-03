@@ -38,7 +38,12 @@ EARTH_R = 6371008.8
 
 LOOKAHEAD = 1000.0        # m along the road
 PLAN_LAT = 2.2            # m/s^2: as the car side (curve_target.MAP_LATERAL_ACCEL)
-PLAN_DECEL = 0.25         # m/s^2: as the car side for road curves (curve_target.MAP_DECEL)
+PLAN_DECEL = 0.25         # m/s^2: as the car side for road curves (curve_target.MAP_DECEL), until the car profile has measured it
+# The car profile (opendbc/car/mazda/car_profile.py, written by the car controller in card) holds the cruise decel
+# measured on this car as decel.use; both sides read it once per drive and clamp it the same way, so the planner's
+# "Slowing to" notices and the car side's set speed target agree.
+PROFILE_PATH = "/data/media/0/mazda_car_profile.json"
+PROFILE_DECEL_RANGE = (0.15, 0.40)
 PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry
 PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET- press
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
@@ -113,6 +118,20 @@ def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLA
   v_curve = curve_speed_limit(radius, advisory, lat_limit)
   room = distance - v_curve * PLAN_LEAD_TIME - PLAN_REACTION_TIME * max(reaction_speed, v_curve)
   return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
+
+
+def read_profile_decel(path=PROFILE_PATH, default=PLAN_DECEL):
+  """The decel to plan with: the car profile's measured value (clamped to PROFILE_DECEL_RANGE), else the default.
+  A few KB once per drive; never raises. Mirrors car_profile.read_profile_decel (this module stays dependency free)."""
+  try:
+    with open(path) as f:
+      use = json.load(f).get("decel", {}).get("use")
+    v = float(use)
+  except (OSError, ValueError, TypeError, AttributeError):
+    return default
+  if v != v:
+    return default
+  return min(max(v, PROFILE_DECEL_RANGE[0]), PROFILE_DECEL_RANGE[1])
 
 
 def leave_caller_priority():
@@ -655,10 +674,11 @@ class CurveMemory:
 class MapCurves:
   """The governing curve ahead, the ramp we are on, and the matched navigation exit."""
 
-  def __init__(self, store=None, release_after_apex=False, memory=None):
+  def __init__(self, store=None, release_after_apex=False, memory=None, decel=PLAN_DECEL):
     self.store = store if store is not None else MapCurveStore()
     self.release_after_apex = release_after_apex
     self.memory = memory
+    self.decel = decel           # the cruise's slowdown for the plan (PLAN_DECEL, or the car profile's measured value)
     self.reset()
 
   def reset(self):
@@ -749,7 +769,7 @@ class MapCurves:
       self.chain_id = cid
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
-        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0)))
+        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel))
         self.curve, self.distance, self.radius = c, d, self._radius(c)
         self.advisory = float(c.get("adv", 0.0) or 0.0)
         self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
@@ -792,7 +812,7 @@ class MapCurves:
       chain_len = self.store.chains.get(best["chain"], {}).get("len", 0.0)
       def to_entry(c):
         return c["s_a"] if best["travel"] == "ab" else chain_len - c["s_b"]
-      c = min(curves, key=lambda c: plan_speed(c["r"], distance + to_entry(c), c.get("adv", 0.0)))
+      c = min(curves, key=lambda c: plan_speed(c["r"], distance + to_entry(c), c.get("adv", 0.0), decel=self.decel))
       self.nav_curve, self.nav_curve_dist = c, distance + to_entry(c)
       self.nav_exit = NAV_EXIT_CURVES
     else:
@@ -813,12 +833,17 @@ class MapCurvesPlanner:
     self.announced_curve = None
     self.announced_exit = None
     self.notice = None          # "curve" / "exit_data" / "exit_no_data" for one planner cycle
+    self.profile_path = PROFILE_PATH
+    self.decel = PLAN_DECEL     # read with the mode at the start of every drive (the car side reads the same file then)
 
   def _read_mode(self):
     try:
       self.mode = int(self.params.get(self.PARAM, encoding="utf8") or 0)
     except (TypeError, ValueError):
       self.mode = 0
+    self.decel = read_profile_decel(self.profile_path)
+    if self.mc is not None:
+      self.mc.decel = self.decel
 
   def update(self, sm, gps_position, v_ego, set_speed):
     self.notice = None
@@ -843,7 +868,7 @@ class MapCurvesPlanner:
     if self.mc is None:
       # the speed comes back from a road curve's apex only with the camera curve slowdown on (it keeps the speed
       # for whatever is left of the curve, and the next curve keeps governing when it is close)
-      self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory())
+      self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory(), decel=self.decel)
       self.pass_curve, self.pass_samples = None, []
       self.matcher = RoadMatcher(self.mc.store)
     elif started:
@@ -881,7 +906,7 @@ class MapCurvesPlanner:
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
-      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory, set_speed) < set_speed - 2 * MPH and \
+      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel) < set_speed - 2 * MPH and \
          curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"

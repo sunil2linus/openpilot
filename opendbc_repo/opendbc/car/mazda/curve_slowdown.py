@@ -201,6 +201,12 @@ class CurveSlowdownLogic:
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
     self.standstill_frames = 0
     self.last_action = None          # "tap" / "hold" / "restore" of the last frame sent (for logs)
+    # What the car profile (car_profile.py) remembers across drives: every hold whose landing after the release was
+    # measured, ours (_finish_hold) and the driver's own (a held SET-/SET+ on the stock switch, watched below, so
+    # Test mode learns the car too), is counted here with its quanta after the release.
+    self.holds_learned = 0
+    self.last_hold_learned = None    # (quanta after release, "ours" / "driver")
+    self.driver_hold = None          # the driver's hold being watched: dict(dir, down, release, landed, after, last)
 
   @property
   def managing(self):
@@ -289,6 +295,8 @@ class CurveSlowdownLogic:
       # should still land; more than that means the car keeps stepping, which we then assume).
       self.hold_overrun = max(1, self.hold_overrun if self.hold_measured else 0, quanta_after)
       self.hold_measured = True
+      self.holds_learned += 1
+      self.last_hold_learned = (quanta_after, "ours")
     elif p.landed == 0:
       self.hold_misses += 1
       self.holds_ok = False
@@ -300,6 +308,48 @@ class CurveSlowdownLogic:
       self.inflight.remove(p)
     if p in self.expired:
       self.expired.remove(p)
+
+  # ---- the driver's own holds: the car's landing after a release is the same whoever held the button ----
+  def _watch_driver_hold_landing(self, direction, steps):
+    dh = self.driver_hold
+    if dh is None or dh["dir"] != direction or abs(steps - round(steps)) > 0.25:
+      return
+    n = int(round(steps))
+    dh["landed"] += n
+    if dh["release"] is not None and self.frame > dh["release"] + HOLD_FRAME_GAP + _frames(0.2):
+      dh["after"] += n
+    dh["last"] = self.frame
+
+  def _watch_driver_hold(self, button):
+    """Called every frame with the stock switch's SET-/SET+ state (None when not pressed)."""
+    dh = self.driver_hold
+    if button in (SET_MINUS, SET_PLUS):
+      if dh is None or dh["release"] is not None:
+        if dh is not None:
+          self._finish_driver_hold()     # a new press settles the previous one
+        self.driver_hold = {"dir": button, "down": self.frame, "release": None, "landed": 0, "after": 0, "last": self.frame}
+      elif dh["dir"] != button:
+        self.driver_hold = None
+      return
+    if dh is None:
+      return
+    if dh["release"] is None:
+      dh["release"] = self.frame
+    elif self.frame - max(dh["release"], dh["last"]) > _frames(HOLD_SETTLE):
+      self._finish_driver_hold()
+
+  def _finish_driver_hold(self):
+    dh, self.driver_hold = self.driver_hold, None
+    if dh is None or dh["release"] is None:
+      return
+    q = self._quantum_steps()
+    if dh["landed"] > q:
+      # a real staircase (a hold, not a tap): learned exactly like one of ours (see _finish_hold)
+      quanta_after = -(-dh["after"] // q)
+      self.hold_overrun = max(1, self.hold_overrun if self.hold_measured else 0, quanta_after)
+      self.hold_measured = True
+      self.holds_learned += 1
+      self.last_hold_learned = (quanta_after, "driver")
 
   def _consume_ours(self, direction, n):
     """Account n steps in `direction` to our presses in flight, oldest first. A hold takes
@@ -331,6 +381,7 @@ class CurveSlowdownLogic:
     self.last_set_speed = i.set_speed
     direction = SET_PLUS if delta > 0 else SET_MINUS
     steps = abs(delta) / self.step
+    self._watch_driver_hold_landing(direction, steps)
     match = self._matching_press(direction)
     ours_k = match[1] if match is not None and match[0] == "ours" else None
     driver_k = match[1] if match is not None and match[0] == "driver" else None
@@ -466,6 +517,7 @@ class CurveSlowdownLogic:
       self.last_driver_edge[i.driver_button] = self.frame     # kept fresh while held
     self.prev_driver_button = i.driver_button
     self.driver_taps = [(d, f) for d, f in self.driver_taps if self.frame - f <= self._in_flight_window()]
+    self._watch_driver_hold(i.driver_button if cruise_ok else None)
 
     if cruise_ok:
       self._observe_set_speed(i)
@@ -693,7 +745,8 @@ class CurveSlowdown:
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
-                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph"]
+                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph",
+                   "decel_learn", "answer_frames"]
 
   def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
     import cereal.messaging as messaging
@@ -711,13 +764,27 @@ class CurveSlowdown:
     self.has_ti = bool(CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
+    # The car profile: what earlier drives learned about this car (answer time, hold overrun, cruise decel), see
+    # car_profile.py. Loaded here (a few KB), applied to the logic, saved in the background as it learns.
+    from opendbc.car.mazda.curve_target import MAP_DECEL
+    self.profile = None
+    self.decel_learner = None
+    self.decel_used = MAP_DECEL
+    self.profile_holds_seen = 0
+    self.prev_cruise = False
+    try:
+      self.profile = self._load_profile(CP, params)
+      if self.profile is not None:
+        self.decel_used = self.profile.decel(MAP_DECEL)
+    except Exception:
+      self.profile = None
     self.map_mode = map_mode
     self.map_control = None
     self.map_out = None
     self.map_event = None
     if map_mode:
       from opendbc.car.mazda.map_curve_control import MapCurveControl
-      self.map_control = MapCurveControl(self.lat_limit)
+      self.map_control = MapCurveControl(self.lat_limit, self.decel_used)
     self.learner = None
     services = ['starpilotPlan', 'radarState', 'modelV2']
     if learning:
@@ -745,6 +812,62 @@ class CurveSlowdown:
 
   def _alive(self, service):
     return bool(self.sm.alive[service] and self.sm.recv_frame[service] > 0)
+
+  # ---- car profile (never raises into the car controller: called inside try/except) ----
+  def _load_profile(self, CP, params):
+    from opendbc.car.mazda.car_profile import CarProfile, DecelLearner
+    profile = CarProfile(fingerprint=str(CP.carFingerprint), ti=self.has_ti)
+    try:
+      if params.get_bool("MazdaResetCarProfile"):
+        profile.delete()
+        params.put_bool("MazdaResetCarProfile", False)
+    except Exception:
+      pass
+    lg = self.logic
+    lg.latencies = profile.latencies                     # the timeout logic is tuned from the first press
+    lg.hold_overrun, lg.hold_measured = profile.hold_start(HOLD_OVERRUN_DEFAULT)
+    profile.note_drive()
+    self.decel_learner = DecelLearner(DT_CTRL)
+    return profile
+
+  def _learn_profile(self, i, si, lead_status, lead_d, t):
+    """Feed the profile what this frame taught: new answer times, a hold's landing after its release (ours or the
+    driver's), a clean cruise slowdown's decel; save in the background now and then."""
+    p, lg = self.profile, self.logic
+    if lg.latencies != p.data["latencies"]:
+      p.set_latencies(lg.latencies)
+    while self.profile_holds_seen < lg.holds_learned:
+      self.profile_holds_seen += 1
+      after, who = lg.last_hold_learned or (lg.hold_overrun, "ours")
+      p.add_hold(after, driver=(who == "driver"))
+      if self.recorder is not None:
+        self.recorder.record("carProfileHold", t, {"after_release_quanta": after, "by": who, "hold_overrun_now": lg.hold_overrun,
+                                                   "profile_holds": p.holds, "profile_worst": p.data["hold"]["worst_after_release"],
+                                                   "profile": p.summary()})
+    from opendbc.car.mazda.car_profile import DecelInputs
+    d = self.decel_learner.update(DecelInputs(v_ego=i.v_ego, set_speed=i.set_speed, cruise_enabled=i.cruise_enabled,
+                                              brake_pressed=i.brake_pressed, gas_pressed=i.gas_pressed, lead_status=lead_status,
+                                              lead_d=lead_d, csc_active=i.csc_active))
+    if d is not None:
+      use = p.add_decel_episode(d)
+      if self.recorder is not None:
+        self.recorder.record("carProfileDecel", t, {"decel_measured": d, "decel_episodes": p.decel_episodes, "decel_use_next_drive": use,
+                                                    "decel_used_this_drive": self.decel_used, "profile": p.summary()}, min_gap=30.0)
+    cruise_off = self.prev_cruise and not i.cruise_enabled
+    self.prev_cruise = i.cruise_enabled
+    p.save_if_due(t, force=cruise_off)
+
+  def _profile_summary(self):
+    """The learned values in use, for every event's summary (so a drive can be audited)."""
+    lg = self.logic
+    out = {"answer_frames": lg.latency, "hold_overrun": lg.hold_overrun, "hold_measured": lg.hold_measured,
+           "decel_used": self.decel_used}
+    if self.profile is not None:
+      out["profile"] = self.profile.summary()
+      out["profile_loaded"] = self.profile.loaded
+      if self.profile.discarded:
+        out["profile_discarded"] = self.profile.discarded
+    return out
 
   def update(self, CC, CS, packer, CP, other_button_active):
     from opendbc.car.mazda import mazdacan
@@ -824,6 +947,12 @@ class CurveSlowdown:
       stop_restore_now=bool(self.trigger.restore_now) and self.stop_mode == ON,
     )
     button, offset = self.logic.update(inputs)
+    if self.profile is not None:
+      try:
+        import time
+        self._learn_profile(inputs, stop_inputs, bool(lead.status) and self._alive('radarState'), float(lead.dRel), time.monotonic())
+      except Exception:
+        self.profile = None   # never let the profile affect anything else
     try:
       self._log(inputs, stop_inputs, stop_active, button, float(CS.out.aEgo), plan)
     except Exception:
@@ -929,7 +1058,7 @@ class CurveSlowdown:
         "target_mph": mo.speed / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
         "lat_limit": self.lat_limit, "on_ramp": bool(plan.mapOnRamp), "ramp_type": int(plan.mapRampType),
         "ramp_to_mph": float(plan.mapRampToSpeed) / MS_PER_MPH, "ramp_to_highway": bool(plan.mapRampToHighway),
-        "nav_exit": int(plan.mapNavExit), "nav_exit_m": float(plan.mapNavExitDistance)})
+        "nav_exit": int(plan.mapNavExit), "nav_exit_m": float(plan.mapNavExitDistance), **self._profile_summary()})
       self.map_min_speed = i.v_ego
       self.map_min_set = i.set_speed
       self.map_brake = False
@@ -961,13 +1090,13 @@ class CurveSlowdown:
         stop_active, self.trigger.target / MS_PER_MPH,
         self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), lg.offset, len(lg.inflight),
         lg.hold is not None, {SET_MINUS: "M", SET_PLUS: "P"}.get(button, ""), i.driver_button or "", lg.blocked, lg.restoring,
-        *self._map_row(plan)))
+        *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0))
     self._map_episode(t, i, plan)
     # curve slowdown episode: from the first SET- for a curve to the restore being complete
     if self.curve_event is None and button == SET_MINUS and lg.last_action in ("tap", "hold") and not stop_active and i.csc_active:
       self.curve_event = self.recorder.open("curveSlowdown", t, {
         "mode": "on", "set_mph_before": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
-        "csc_mph": i.csc_speed / MS_PER_MPH, "max_drop_steps": lg.max_drop_steps})
+        "csc_mph": i.csc_speed / MS_PER_MPH, "max_drop_steps": lg.max_drop_steps, **self._profile_summary()})
       self.curve_presses = 0
     if self.curve_event is not None:
       if button is not None:
@@ -983,7 +1112,7 @@ class CurveSlowdown:
         "set_mph_before": i.set_speed / MS_PER_MPH,
         "vEgo_mph": i.v_ego / MS_PER_MPH, "lead_d": si.lead_d, "lead_v": si.lead_v, "lead_prob": si.lead_prob,
         "lead_y": si.lead_y, "target_mph": self.trigger.target / MS_PER_MPH, "required_decel": self.trigger.required,
-        "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent})
+        "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent, **self._profile_summary()})
       self.stop_presses_at_start = lg.stop_presses
       self.stop_holds_at_start = len(lg.hold_log)
       self.stop_min_set = i.set_speed
@@ -999,7 +1128,8 @@ class CurveSlowdown:
           "holds_detail": "; ".join(f"frames_sent {h.get('frames_sent')} landed {h.get('landed')} after_release {h.get('landed_after_release', 0)} "
                                     f"landings {[(round((f - h['frame']) * DT_CTRL, 2), n) for f, n in h.get('landings', [])]}"
                                     for h in holds),
-          "hold_overrun_learned": lg.hold_overrun, "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
+          "hold_overrun_learned": lg.hold_overrun, "hold_measured": lg.hold_measured, "holds_learned_all_drives": self.profile.holds if self.profile else 0,
+          "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
           "radar_lead_rises_s": [round((f - self.trigger.start_frame) * DT_CTRL, 2) for f in self.trigger.radar_rises
                                  if f >= self.trigger.start_frame - 1500]})
         self.stop_event = None

@@ -506,7 +506,54 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_state": lambda: params.get_bool("MazdaCurveLearning"),
       "set_state": lambda s: self._controller._on_toggle("MazdaCurveLearning"),
     })
+    tiles.append({
+      "title": tr("Car Profile (tap to reset)"),
+      "subtitle": tr("What the first drives learned about this car: button answer time, hold overrun, cruise decel. Tap to forget it."),
+      "get_value": self._car_profile_status,
+      "on_click": self._reset_car_profile,
+    })
     return tiles
+
+  # ---- the learned car profile (opendbc/car/mazda/car_profile.py) ----
+  CAR_PROFILE_PATH = "/data/media/0/mazda_car_profile.json"
+  _profile_status = ("", 0.0)
+
+  def _car_profile_status(self) -> str:
+    """One short line from the profile file, re-read at most every 5 s (this is called every frame)."""
+    now = time.monotonic()
+    text, at = self._profile_status
+    if now - at < 5.0 and text:
+      return text
+    try:
+      import json
+      with open(self.CAR_PROFILE_PATH) as f:
+        d = json.load(f)
+      hold, decel = d.get("hold", {}), d.get("decel", {})
+      lat = sorted(int(x) for x in d.get("latencies", []))
+      parts = [f"{int(d.get('drives', 0))} drives"]
+      if lat:
+        parts.append(f"{lat[len(lat) // 2] * 10} ms")
+      parts.append(f"{int(hold.get('holds', 0))} holds")
+      use = decel.get("use")
+      parts.append(f"decel {float(use):.2f}" if use is not None else f"decel {int(decel.get('count', 0))}/10")
+      text = " · ".join(parts)
+    except Exception:
+      text = tr("Nothing learned yet")
+    self._profile_status = (text, now)
+    return text
+
+  def _reset_car_profile(self):
+    """Delete the profile now (the car controller is not running while parked) and tell it too, in case it is."""
+    try:
+      self._controller._params.put_bool("MazdaResetCarProfile", True)
+    except Exception:
+      pass
+    try:
+      import os
+      os.remove(self.CAR_PROFILE_PATH)
+    except OSError:
+      pass
+    self._profile_status = (tr("Reset"), time.monotonic())
 
   def _rebuild_toggle_grid(self):
     defs = self._build_driving_toggles()
