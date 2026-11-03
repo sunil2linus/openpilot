@@ -114,6 +114,89 @@ def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLA
   return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
 
 
+def leave_caller_priority():
+  """Background threads here inherit starpilot_process's real-time priority and core (SCHED_FIFO 51 on core 5, the
+  same as plannerd and radard, which cannot preempt it: drive 3e). Give this thread normal priority and the other
+  cores (as starpilot/common/feature_events.py does; a copy so this module stays dependency free)."""
+  try:
+    os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+  except (AttributeError, OSError, PermissionError):
+    pass
+  try:
+    cores = os.sched_getaffinity(0)
+    others = set(range(os.cpu_count() or 1)) - cores
+    if others:
+      os.sched_setaffinity(0, others)
+  except (AttributeError, OSError):
+    pass
+  try:
+    os.nice(10)
+  except OSError:
+    pass
+
+
+_DECODER = json.JSONDecoder()
+_SPACE = " \t\n\r"
+JSON_STEP = 200            # list items parsed between two yields of the GIL
+
+
+def _skip(text, i):
+  while i < len(text) and text[i] in _SPACE:
+    i += 1
+  return i
+
+
+def load_json_in_steps(text):
+  """json.loads for a curve tile, one top-level list item at a time, letting other threads run in between.
+  json.load of a big tile (3 MB, 17k road shapes) holds the GIL for 0.3 s on a PC and longer on the device: the
+  planner loop then stalls and selfdrived raises "Communication Issue" (drive 3e, first GPS fix). Same result."""
+  i = _skip(text, 0)
+  if i >= len(text) or text[i] != "{":
+    return _DECODER.decode(text)
+  out = {}
+  i = _skip(text, i + 1)
+  if i < len(text) and text[i] == "}":
+    return out
+  count = 0
+  while True:
+    key, i = _DECODER.raw_decode(text, _skip(text, i))
+    i = _skip(text, i)
+    if text[i] != ":":
+      raise ValueError("expected ':'")
+    i = _skip(text, i + 1)
+    if text[i] == "[":
+      items = []
+      i = _skip(text, i + 1)
+      if text[i] == "]":
+        i += 1
+      else:
+        while True:
+          item, i = _DECODER.raw_decode(text, i)
+          items.append(item)
+          count += 1
+          if count % JSON_STEP == 0:
+            time.sleep(0)
+          i = _skip(text, i)
+          if text[i] == ",":
+            i = _skip(text, i + 1)
+          elif text[i] == "]":
+            i += 1
+            break
+          else:
+            raise ValueError("expected ',' or ']'")
+      value = items
+    else:
+      value, i = _DECODER.raw_decode(text, i)
+    out[key] = value
+    i = _skip(text, i)
+    if text[i] == ",":
+      i += 1
+    elif text[i] == "}":
+      return out
+    else:
+      raise ValueError("expected ',' or '}'")
+
+
 def cell_key(cla, clo):
   return cla * 10_000_000 + clo     # one int per grid cell (|clo| < 180 * MATCH_CELL)
 
@@ -278,6 +361,8 @@ class MapCurveStore:
       self._load(missing, want)
 
   def _load(self, names, want):
+    if self.background:
+      leave_caller_priority()
     try:
       new = {}
       for n in names:
@@ -285,7 +370,8 @@ class MapCurveStore:
         for p in self.index.get(n, []):
           try:
             with open(p) as f:
-              d = json.load(f)
+              text = f.read()
+            d = load_json_in_steps(text) if self.background else json.loads(text)
           except (OSError, ValueError):
             continue
           if d.get("version", 0) < 3:
@@ -497,6 +583,7 @@ class CurveMemory:
     self.saving = True
 
     def write():
+      leave_caller_priority()
       try:
         while self.dirty:
           self.dirty = False

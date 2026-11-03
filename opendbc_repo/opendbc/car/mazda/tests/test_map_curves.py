@@ -582,3 +582,48 @@ def test_the_planner_slows_more_for_a_capped_curve(tmp_path):
   mem.add_saturated_pass(curves[0], before, t=1.0)
   m.update(la, lo, 0.0, 1, True)
   assert abs(MC.curve_speed_limit(m.radius, m.advisory) - 0.9 * before) < 0.01, (m.radius, before)
+
+
+def test_tiles_are_parsed_in_steps_with_the_same_result():
+  import json
+  import threading
+  import time as _t
+  tile = {"version": 3, "curves": [{"apex": [42.6, -83.1], "r": 120.5, "name": "A, [b] ]}", "adv": 0.0}] * 900,
+          "ramps": [], "chains": [{"w": [[1, True, 0.0]], "len": 12.5}] * 700,
+          "roads": [{"w": 1, "c": 2, "k": 9, "p": [1, -2, 3, 4]}] * 3000, "meta": {"built": "x"}, "n": None}
+  for text in (json.dumps(tile), json.dumps(tile, indent=1), json.dumps({}), json.dumps({"curves": []})):
+    assert MC.load_json_in_steps(text) == json.loads(text)
+  # other threads get to run while a big tile is parsed (the planner loop must never stall for the whole parse)
+  text, ticks, done = json.dumps(tile), [], threading.Event()
+
+  def other():
+    while not done.is_set():
+      ticks.append(_t.perf_counter())
+      _t.sleep(0.001)
+  th = threading.Thread(target=other)
+  th.start()
+  for _ in range(20):
+    MC.load_json_in_steps(text)
+  done.set()
+  th.join()
+  gaps = [b - a for a, b in zip(ticks, ticks[1:], strict=False)]
+  assert max(gaps) < 0.05, max(gaps)
+
+
+def test_the_background_loader_uses_the_stepped_parser(tmp_path):
+  root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
+  calls = []
+  orig = MC.load_json_in_steps
+  MC.load_json_in_steps = lambda text: calls.append(1) or orig(text)
+  try:
+    store = MC.MapCurveStore(root, background=True)
+    la, lo = pos(0, -250)
+    store.update(la, lo)
+    import time as _t
+    for _ in range(200):
+      if not store.loading:
+        break
+      _t.sleep(0.01)
+  finally:
+    MC.load_json_in_steps = orig
+  assert calls and store.loaded
