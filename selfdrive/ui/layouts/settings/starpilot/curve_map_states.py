@@ -80,10 +80,10 @@ def region_line(downloaded: int, built: int, placeable: bool, ticked: bool) -> s
   if downloaded == 0:
     return tr("Map not downloaded")
   if built >= downloaded:
-    base = tr("Built — {} areas").format(downloaded) if downloaded != 1 else tr("Built — 1 area")
+    base = tr("Built, {} areas").format(downloaded) if downloaded != 1 else tr("Built, 1 area")
   else:
     base = tr("{} of {} areas built").format(built, downloaded)
-  return base + (tr(" · whole state, always") if ticked else tr(" · only within range"))
+  return base + (tr(" - whole state, always") if ticked else tr(" - only within range"))
 
 
 def tile_value(ticked: list[str], status: str) -> str:
@@ -258,7 +258,7 @@ class CurveMapStatesDialog(Widget):
       downloaded, built, placeable = info.get(token, (0, 0, True))
       subtitle = region_line(downloaded, built, placeable, ticked) if info else tr("Checking the map folders...")
       if token not in self._selected:
-        subtitle += tr(" · not in the map selection any more")
+        subtitle += tr(" - not in the map selection any more")
       hovered = rl.check_collision_point_rec(mouse, row) and rl.check_collision_point_rec(mouse, self._list_rect)
       draw_selection_list_row(
         row,

@@ -84,9 +84,9 @@ def C():
 
 
 def test_texts(C):
-  assert C.region_line(9, 3, True, True) == "3 of 9 areas built · whole state, always"
-  assert C.region_line(9, 9, True, False) == "Built — 9 areas · only within range"
-  assert C.region_line(1, 1, True, False) == "Built — 1 area · only within range"
+  assert C.region_line(9, 3, True, True) == "3 of 9 areas built - whole state, always"
+  assert C.region_line(9, 9, True, False) == "Built, 9 areas - only within range"
+  assert C.region_line(1, 1, True, False) == "Built, 1 area - only within range"
   assert C.region_line(0, 0, True, True) == "Map not downloaded"
   assert C.region_line(0, 0, False, True).startswith("Not on the device's map")
   assert C.tile_value([], "") == "None" and C.tile_value(["us_state.MI"], "") == "Michigan"
@@ -131,3 +131,14 @@ def test_dialog_scans_in_the_background_and_reads_the_status(C):
   assert d._status_text.startswith("Building area 4 of 9 (now Illinois)")
   d._refresh()                                                                 # too soon for another scan
   assert len(seen) == 1
+
+
+def test_texts_on_screen_are_ascii(C):
+  # the UI font has no "·" or "—": they were drawn as "?" on the device
+  import os
+  import re
+  for path in ("selfdrive/ui/layouts/settings/starpilot/curve_map_states.py",):
+    src = open(os.path.join(os.path.dirname(__file__), "..", "..", "..", path)).read()
+    for m in re.finditer(r'tr\("([^"]*)"\)', src):
+      assert all(ord(ch) < 128 for ch in m.group(1)), m.group(1)
+  assert all(ord(ch) < 128 for ch in C.region_line(9, 3, True, True) + C.region_line(9, 9, True, False))

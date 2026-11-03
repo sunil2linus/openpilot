@@ -572,7 +572,7 @@ class VehicleSettingsManagerView(PanelManagerView):
       parts.append(f"{int(hold.get('holds', 0))} holds")
       use = decel.get("use")
       parts.append(f"decel {float(use):.2f}" if use is not None else f"decel {int(decel.get('count', 0))}/10")
-      text = " · ".join(parts)
+      text = ", ".join(parts)   # ASCII only: the UI font has no "·" (it showed as "?")
     except Exception:
       text = tr("Nothing learned yet")
     self._profile_status = (text, now)

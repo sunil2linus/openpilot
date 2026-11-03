@@ -522,7 +522,7 @@ def progress_text(label, done, total, seconds_so_far, detail=""):
   this build session's queue (every ticked state and the range together); the state is the one the current area is
   for, so it is never read as "Illinois: 4 of 9"."""
   s = f"Building area {done + 1} of {total} (now {label}), {time_left_text(done, total, seconds_so_far)}"
-  return s + (f" — {detail}" if detail else "")
+  return s + (f" - {detail}" if detail else "")
 
 
 def idle_notice(p):
