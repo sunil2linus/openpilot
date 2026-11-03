@@ -1962,3 +1962,45 @@ def test_favorite_traffic_mode_action_is_consumed_when_not_active(monkeypatch, t
 
   assert card.traffic_mode_enabled is False
   assert card._favorite_traffic_mode_counter == 1
+
+
+def _mazda_card(monkeypatch, tmp_path):
+  monkeypatch.setattr(spc, "Params", FakeParams)
+  monkeypatch.setattr(spc, "ERROR_LOGS_PATH", tmp_path)
+  return spc.StarPilotCard(SimpleNamespace(brand="mazda"),
+                           SimpleNamespace(alternativeExperience=spc.ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL))
+
+
+def test_mazda_aol_waits_for_the_first_engagement_then_stays_until_main_off(monkeypatch, tmp_path):
+  # drive 3a: AOL steered from a standstill with cruise off and the camera faulted its LKAS 5 s later
+  card = _mazda_card(monkeypatch, tmp_path)
+  toggles = make_toggles(always_on_lateral=True, always_on_lateral_main=True)
+  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # main on, never engaged: no steering
+  ret = card.update(make_car_state(available=True, enabled=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is True                      # first SET (>= ~19 mph on the MRCC)
+  ret = card.update(make_car_state(available=True, brake_pressed=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is True                      # braked, cruise off: still steering, down to 0
+  ret = card.update(make_car_state(available=False), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # main off resets the latch
+  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # main on again: waits for the next SET
+
+
+def test_mazda_aol_latch_resets_in_park_or_reverse(monkeypatch, tmp_path):
+  card = _mazda_card(monkeypatch, tmp_path)
+  toggles = make_toggles(always_on_lateral=True, always_on_lateral_main=True)
+  card.update(make_car_state(available=True, enabled=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  cs = make_car_state(available=True)
+  cs.gearShifter = spc.GearShifter.park
+  card.update(cs, SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # parked once: leaving the spot does not steer
+
+
+def test_other_brands_are_not_affected_by_the_mazda_latch(monkeypatch, tmp_path):
+  monkeypatch.setattr(spc, "Params", FakeParams)
+  monkeypatch.setattr(spc, "ERROR_LOGS_PATH", tmp_path)
+  card = spc.StarPilotCard(SimpleNamespace(brand="toyota"),
+                           SimpleNamespace(alternativeExperience=spc.ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL))
+  assert card.mazda_aol_needs_engagement is False

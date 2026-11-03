@@ -74,6 +74,12 @@ class StarPilotCard:
       self.CP.brand == "hyundai" and not (hyundai_flags & HyundaiFlags.CANFD) and not hyundai_aol_before_engagement
     )
     self.hyundai_aol_ready = False
+    # Mazda (mazda-frogpilot-dev behaviour): always-on lateral only after cruise was engaged once while main is on
+    # (the MRCC cannot be set below ~19 mph), then down to 0 until main goes off or the car is put in P/R. Steering
+    # with cruise off from a standstill (leaving a parking spot) made the camera fault its LKAS 5 s later for the
+    # rest of the drive (drive 3a), leaving only the Torque Interceptor to steer.
+    self.mazda_aol_needs_engagement = getattr(self.CP, "brand", None) == "mazda"
+    self.mazda_aol_ready = False
     self.ev6_aol_needs_arming = (
       getattr(self.CP, "carFingerprint", None) == HYUNDAI_CAR.KIA_EV6 and
       getattr(self.CP, "openpilotLongitudinalControl", False) and not getattr(self.CP, "pcmCruise", False)
@@ -541,6 +547,12 @@ class StarPilotCard:
       self.always_on_lateral_enabled &= preap_authorized
     self.always_on_lateral_enabled &= carState.gearShifter not in NON_DRIVING_GEARS
     self.always_on_lateral_enabled &= not hyundai_aol_needs_engagement or self.hyundai_aol_ready
+    if self.mazda_aol_needs_engagement:
+      if carState.gearShifter in NON_DRIVING_GEARS or not carState.cruiseState.available:
+        self.mazda_aol_ready = False
+      elif sm["selfdriveState"].active or carState.cruiseState.enabled:
+        self.mazda_aol_ready = True
+      self.always_on_lateral_enabled &= self.mazda_aol_ready
     self.always_on_lateral_enabled &= sm["starpilotPlan"].lateralCheck
     self.always_on_lateral_enabled &= sm["liveCalibration"].calPerc >= 1
     self.always_on_lateral_enabled &= not aol_blocked_by_immediate_disable(
