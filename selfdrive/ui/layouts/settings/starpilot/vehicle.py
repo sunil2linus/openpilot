@@ -464,7 +464,8 @@ class VehicleSettingsManagerView(PanelManagerView):
 
   def _mazda_cruise_helper_tiles(self) -> list[dict]:
     """Gen1 Mazda with stock radar cruise: curve / map curve / stopped car slowdowns (SET-/SET+ presses) and
-    the stop warnings. Choices cycle on each tap. All take effect on the next drive."""
+    the stop warnings. Choices cycle on each tap. All take effect on the next drive (Map Build Range: on the next
+    pass of the parked map build, within a minute)."""
     params = self._controller._params
 
     def choice(key, labels, default=0):
@@ -494,6 +495,8 @@ class VehicleSettingsManagerView(PanelManagerView):
         ("MazdaCurveSlowdownMaxDrop", tr_noop("Curve Max Drop"), (tr_noop("5 mph"), tr_noop("10 mph"), tr_noop("15 mph")), 1),
         ("MazdaMapCurves", tr_noop("Map Curves"), modes, 0),
         ("MazdaMapCurveChime", tr_noop("Exit Chime"), (tr_noop("Off"), tr_noop("5%"), tr_noop("10%"), tr_noop("20%")), 1),
+        ("MazdaCurveMapRange", tr_noop("Map Build Range"),
+         (tr_noop("30 mi"), tr_noop("50 mi"), tr_noop("100 mi"), tr_noop("200 mi"), tr_noop("300 mi")), 2),
         ("MazdaStoppedCarSlowdown", tr_noop("Stopped Car Slowdown"), modes, 0),
         ("StopWarningRedLight", tr_noop("Stop Ahead Warning"), modes, 0),
         ("StopWarningStoppedCar", tr_noop("Stopped Car Warning"), modes, 0),

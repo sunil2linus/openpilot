@@ -825,6 +825,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaCurveLearning", {PERSISTENT, BOOL, "0", "0"}},
     {"MazdaMapCurves", {PERSISTENT, INT, "0", "0"}},
     {"MazdaMapCurveChime", {PERSISTENT, INT, "1", "1"}},
+    {"MazdaCurveMapRange", {PERSISTENT, INT, "2", "2"}},             // curve_mapd: build map folders within 30/50/100/200/300 mi (index) of the car
     {"MazdaStopWarningChime", {PERSISTENT, INT, "0", "0"}},
     {"MazdaStoppedCarSlowdown", {PERSISTENT, INT, "0", "0"}},
     {"MazdaResetCarProfile", {PERSISTENT, BOOL, "0", "0"}},          // set by the settings tile: the car controller deletes the learned car profile

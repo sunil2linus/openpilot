@@ -19,8 +19,17 @@ on the device, so a new city only needs the map download in the settings:
     The folder's record (build_state.meta: which tiles it was built from, by which builder) is written last; a
     folder killed half way is built again on the next run, finished folders are skipped (that is the resume).
   * Memory: see build_curve_map.load_ways (about 170 MB peak for the Detroit folder, the biggest the owner has).
+  * Range: a folder takes 1.5 to 2 minutes whatever its density (loading the tiles ~25 s, the curve search ~50 s),
+    and the owner's offline maps cover the whole lower 48 (390 folders: 6 to 10 hours). So only the folders whose
+    2 x 2 degree box comes within MazdaCurveMapRange miles (30/50/100/200/300, default 100) of the last known position
+    are built, nearest first. The position is LastGPSPosition: the memory copy (fresh, written while driving and
+    while parked with a fix) first, the persistent copy (written when a drive ends, survives a reboot) as fallback.
+    Folders out of range are left alone: not built, never deleted; built ones are refreshed only once in range
+    again. Both the position and the setting are read again on every pass, so parking somewhere else or changing the
+    range takes effect on the next pass without a reboot. No position known yet (a new install): nothing is built.
   * Progress and timings go to /data/media/0/curve_map/build_log.txt (appended, size capped) and to cloudlog; a one
-    line status goes to the memory param CurveMapBuildStatus for the UI.
+    line status goes to the memory param CurveMapBuildStatus for the UI. The log may be shared, so the position in
+    it is rounded to 0.1 degree.
 
 The pure parts (folder state, planning) have no openpilot imports so they can be unit tested; main() has them.
 """
@@ -39,10 +48,18 @@ LOG_NAME = "build_log.txt"
 LOG_MAX_BYTES = 300_000
 STATE_NAME = "build_state.meta"        # not .json: the car side indexes every *.json in the folder as a square
 STATUS_PARAM = "CurveMapBuildStatus"
+RANGE_PARAM = "MazdaCurveMapRange"
+RANGE_MILES = (30, 50, 100, 200, 300)  # MazdaCurveMapRange index -> miles
+RANGE_DEFAULT = 2                      # 100 miles
+POSITION_PARAM = "LastGPSPosition"
 CHECK_INTERVAL = 60.0                  # s between two looks at the map folders while parked
 NOT_MAZDA_INTERVAL = 300.0
 LEGACY_BUILDER = 1                     # curve files without a "builder" field were made by this builder (the laptop)
 HEAD_BYTES = 200                       # a curve file starts with {"version":4,"builder":1,... : enough to read both
+LOG_NAMES = 10                         # folder names listed in the summary line, the rest is "..."
+IDLE_MOVE_MILES = 5.0                  # "no maps here" is said again only after the car moved this far (not GPS jitter)
+MILE_M = 1609.344
+DEG_M = 111_195.0                      # metres per degree of latitude
 
 
 def _load_builder():
@@ -152,25 +169,79 @@ def check_folder(folder, tiles, curve_root=CURVE_ROOT):
   return None
 
 
-def plan(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None):
-  """[(folder, reason)] to build, the folder around `near` (lat, lon) first, then by distance."""
+def folder_box(folder):
+  """(lat0, lat1, lon0, lon1) of a map folder: '42/-84' is the box lat 42..44, lon -84..-82 (as build_curve_map.
+  folders_for names them: the lower corner, floored to an even degree). None for a name that is not a folder."""
+  try:
+    la, lo = (int(x) for x in folder.split("/"))
+  except ValueError:
+    return None
+  return la, la + 2, lo, lo + 2
+
+
+def box_distance_miles(near, folder):
+  """Miles from the position `near` (lat, lon) to the nearest point of the folder's box: 0 inside it. A flat-earth
+  distance with the longitude scaled at the latitude half way to that point: good to a percent at these sizes."""
+  box = folder_box(folder)
+  if box is None:
+    return float("inf")
+  lat, lon = near
+  la = min(max(lat, box[0]), box[1])              # the nearest point of the box
+  lo = min(max(lon, box[2]), box[3])
+  dlat = (la - lat) * DEG_M
+  dlon = (lo - lon) * DEG_M * math.cos(math.radians((la + lat) / 2.0))
+  return math.hypot(dlat, dlon) / MILE_M
+
+
+def in_range(folders, near, range_miles):
+  """The folders (names) whose box comes within range_miles of `near`, nearest first; the one around the position
+  always first. No range: all of them, nearest first. No position: none when there is a range, all otherwise."""
+  names = list(folders)
+  if near is None:
+    return [] if range_miles is not None else names
+  if range_miles is not None:
+    names = [f for f in names if box_distance_miles(near, f) <= range_miles]
+  names.sort(key=lambda f: (box_distance_miles(near, f), f))
+  return names
+
+
+class Plan:
+  """What one pass found: todo = [(folder, reason)] to build, nearest first; total = map folders downloaded;
+  in_range = how many of them are within range (all when there is no range); skipped = out of range (untouched)."""
+
+  def __init__(self, todo, total, in_range, near, range_miles):
+    self.todo, self.total, self.in_range = todo, total, in_range
+    self.near, self.range_miles = near, range_miles
+    self.skipped = total - in_range
+
+  def where(self):
+    """'within 100 mi of 42.6,-83.1': the position rounded to 0.1 degree, this may be shared in a log."""
+    if self.near is None:
+      return "" if self.range_miles is None else f"within {self.range_miles:g} mi (no position yet)"
+    where = f"of {self.near[0]:.1f},{self.near[1]:.1f}"
+    return f"within {self.range_miles:g} mi {where}" if self.range_miles is not None else f"nearest first {where}"
+
+  def summary(self):
+    """One short line: '3 of 12 map folders within 100 mi of 42.6,-83.1 need building (378 of 390 out of range):
+    42/-84, 42/-86, ...' (at most LOG_NAMES names)."""
+    names = [f for f, _ in self.todo[:LOG_NAMES]] + (["..."] if len(self.todo) > LOG_NAMES else [])
+    s = f"{len(self.todo)} of {self.in_range} map folders {self.where()} need building".replace("  ", " ")
+    if self.skipped:
+      s += f" ({self.skipped} of {self.total} out of range)"
+    return s + ": " + ", ".join(names)
+
+
+def plan(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, range_miles=None):
+  """The folders to build: those within range_miles of `near` (lat, lon) whose curve files are missing or stale,
+  nearest first. Folders out of range are not even checked (checking a laptop-built folder writes its record)."""
   folders = map_folders(osm_root)
+  wanted = in_range(folders, near, range_miles)
   todo = []
-  for folder, tiles in folders.items():
-    reason = check_folder(folder, tiles, curve_root)
+  for folder in wanted:
+    reason = check_folder(folder, folders[folder], curve_root)
     if reason is not None:
       todo.append((folder, reason))
-
-  def dist(item):
-    if near is None:
-      return 0.0
-    try:
-      la, lo = (float(x) for x in item[0].split("/"))
-    except ValueError:
-      return 1e9
-    return math.hypot(la + 1.0 - near[0], (lo + 1.0 - near[1]) * math.cos(math.radians(near[0])))
-  todo.sort(key=dist)
-  return todo, len(folders)
+  return Plan(todo, len(folders), len(wanted), near, range_miles)
 
 
 class BuildLog:
@@ -240,17 +311,72 @@ def build_folder(folder, tiles, osm_root=OSM_ROOT, curve_root=CURVE_ROOT, log=pr
   return stats
 
 
-def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, status=None, should_stop=lambda: False):
-  """Build every folder that needs it. Returns (folders built, folders checked)."""
-  todo, total = plan(osm_root, curve_root, near)
-  if not todo:
+def _plural(n, word="folder"):
+  return f"{n} {word}{'s' if n != 1 else ''}"
+
+
+def idle_notice(p):
+  """Why nothing can be built this pass, as (kind, log line, status line), or None when there is work or everything
+  is up to date."""
+  if p.near is None and p.range_miles is not None:
+    return ("no position", "no GPS position yet: drive once, the map folders around the car are built after that",
+            "Curve files: no GPS position yet, drive once")
+  if p.in_range == 0 and p.range_miles is not None:
+    where = p.where()
+    if p.total == 0:
+      line = f"no offline maps downloaded ({where}): download this area in StarPilot's map settings"
+    else:
+      line = f"no downloaded maps {where} ({_plural(p.total, 'map folder')} elsewhere): download this area in StarPilot's map settings"
+    return ("no maps", line, f"No downloaded maps within {p.range_miles:g} mi of here: download this area in StarPilot's map settings")
+  return None
+
+
+def _miles_between(a, b):
+  dlat = (a[0] - b[0]) * DEG_M
+  dlon = (a[1] - b[1]) * DEG_M * math.cos(math.radians((a[0] + b[0]) / 2.0))
+  return math.hypot(dlat, dlon) / MILE_M
+
+
+def same_situation(idle, kind, p):
+  """True when the idle notice `kind` was already logged for this range and (within IDLE_MOVE_MILES, GPS jitter
+  while parked must not count) this position."""
+  if idle.get("kind") != kind or idle.get("range") != p.range_miles:
+    return False
+  prev = idle.get("near")
+  if prev is None or p.near is None:
+    return prev is None and p.near is None
+  return _miles_between(prev, p.near) <= IDLE_MOVE_MILES
+
+
+def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, status=None, should_stop=lambda: False,
+             range_miles=None, idle=None):
+  """Build every folder within range that needs it. Returns (folders built, folders downloaded). `idle`, a dict the
+  caller keeps between passes, rate-limits the "nothing to do here" notices to once per situation (position, range)
+  instead of once a minute; the status line is refreshed every pass."""
+  p = plan(osm_root, curve_root, near, range_miles)
+  notice = idle_notice(p)
+  if notice is not None:
+    kind, line, text = notice
+    if idle is None or not same_situation(idle, kind, p):
+      log(line)
+    if idle is not None:
+      idle.update(kind=kind, near=p.near, range=p.range_miles)
     if status is not None:
-      status(f"Curve files up to date ({total} map folder{'s' if total != 1 else ''})")
-    return 0, total
-  log(f"{len(todo)} of {total} map folders to build: " + ", ".join(f"{f} ({why})" for f, why in todo))
+      status(text)
+    return 0, p.total
+  if idle is not None:
+    idle.clear()
+  scope = f"{_plural(p.in_range, 'map folder')} {p.where()}".replace("  ", " ").strip()
+  if p.skipped:
+    scope += f", {p.skipped} out of range"
+  if not p.todo:
+    if status is not None:
+      status(f"Curve files up to date: {scope}")
+    return 0, p.total
+  log(p.summary())
   t0 = time.monotonic()
   built = 0
-  for folder, why in todo:
+  for folder, why in p.todo:
     if should_stop():
       break
     log(f"{folder}: building ({why})")
@@ -266,10 +392,10 @@ def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, sta
       log(f"{folder}: out of memory, giving up on this folder for now")
       break
   if built:
-    log(f"all done: {built} folder{'s' if built != 1 else ''} in {time.monotonic() - t0:.0f} s")
+    log(f"all done: {_plural(built)} in {time.monotonic() - t0:.0f} s")
   if status is not None:
-    status(f"Built {built} folder{'s' if built != 1 else ''} in {time.monotonic() - t0:.0f} s")
-  return built, total
+    status(f"Built {_plural(built)} in {time.monotonic() - t0:.0f} s ({scope})")
+  return built, p.total
 
 
 # ---------------- the daemon ----------------
@@ -298,12 +424,40 @@ def _is_mazda(params):
     return None
 
 
-def _last_position(params):
+def parse_position(raw):
+  """(lat, lon) from a LastGPSPosition JSON string, or None when there is none or it is not a fix."""
   try:
-    gps = json.loads(params.get("LastGPSPosition", encoding="utf8") or "null")
-    return float(gps["latitude"]), float(gps["longitude"])
+    gps = json.loads(raw or "null")
+    lat, lon = float(gps["latitude"]), float(gps["longitude"])
   except (TypeError, ValueError, KeyError):
     return None
+  if not (math.isfinite(lat) and math.isfinite(lon)) or (lat == 0.0 and lon == 0.0) or abs(lat) > 90 or abs(lon) > 180:
+    return None
+  if isinstance(gps, dict) and gps.get("hasFix") is False:
+    return None
+  return lat, lon
+
+
+def last_position(*stores):
+  """The last known position from the first param store that has one: the memory copy (fresh, lost at a reboot) is
+  given first, the persistent copy (written when a drive ends) second."""
+  for store in stores:
+    try:
+      pos = parse_position(store.get(POSITION_PARAM, encoding="utf8"))
+    except Exception:
+      pos = None
+    if pos is not None:
+      return pos
+  return None
+
+
+def range_miles(params):
+  """The MazdaCurveMapRange setting in miles (read every pass: a change needs no reboot)."""
+  try:
+    idx = int(params.get_int(RANGE_PARAM, return_default=True, default=RANGE_DEFAULT))
+  except Exception:
+    idx = RANGE_DEFAULT
+  return RANGE_MILES[idx] if 0 <= idx < len(RANGE_MILES) else RANGE_MILES[RANGE_DEFAULT]
 
 
 def main():
@@ -313,6 +467,7 @@ def main():
   params = Params()
   params_memory = Params(memory=True)
   log = BuildLog(mirror=cloudlog.info)
+  idle = {}
 
   def status(text):
     try:
@@ -327,7 +482,9 @@ def main():
       time.sleep(NOT_MAZDA_INTERVAL)
       continue
     try:
-      run_once(near=_last_position(params), log=log, status=status)
+      # position and range are read every pass: a car parked somewhere new, a GPS fix that arrived while parked, or a
+      # changed setting all take effect on the next pass
+      run_once(near=last_position(params_memory, params), range_miles=range_miles(params), log=log, status=status, idle=idle)
     except Exception:
       cloudlog.exception("curve_mapd failed")
       log("failed, see the system log")
