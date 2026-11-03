@@ -94,6 +94,11 @@ HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after a SE
 HOLD_UP_OVERRUN_DEFAULT = 3              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
 HOLD_MISS_LIMIT = 2                      # holds with no effect before holds are off for the drive
 HOLD_GOALS_MPH = (15, 10)                # stopped car: first hold aims 15 mph down, the second 10 more, then taps
+# Restoring a big gap after a curve (the owner's suggestion): one SET+ hold up to a multiple of 5 below the driver's
+# speed, then taps. The margin below the driver's speed is the quanta that may still land after a SET+ release
+# (_up_overrun: one once a hold has measured that the car stops cleanly, cautious until then), so the hold can never
+# take the set speed past the driver's speed.
+RESTORE_HOLD_MIN_QUANTA = 2              # gap (in quanta, i.e. 10 mph) from which a restore uses the hold
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -186,6 +191,7 @@ class CurveSlowdownLogic:
     self.hold_log = []               # [dict] one per hold, for the per-event log
     self.holds_this_episode = 0      # SET- holds for the current stopped car (HOLD_GOALS_MPH)
     self.hold_bound = None           # set speed the current hold must not cross
+    self.hold_margin = False         # the current hold is a restore hold (keeps a quantum of margin, see RESTORE_HOLD_*)
     self.stop_episode = False        # we lowered for a stopped car: the restore may use SET+ holds
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
     self.standstill_frames = 0
@@ -550,7 +556,9 @@ class CurveSlowdownLogic:
       q = self._quantum_steps()
       d = self.hold.direction
       # the quantum still to come while holding plus the overrun after the release must fit the bound
-      overrun = (1 + (self.hold_overrun if d == SET_MINUS else self._up_overrun())) * q * self.step
+      # (a restore hold keeps a quantum of margin below the driver's speed instead of the assumed overrun)
+      up_overrun = 0 if self.hold_margin else self._up_overrun()
+      overrun = (1 + (self.hold_overrun if d == SET_MINUS else up_overrun)) * q * self.step
       crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
                  (i.set_speed + overrun > self.hold_bound + self.half_step))
       reason_gone = (reason != "stop") if d == SET_MINUS else (reason is not None or offset <= 0)
@@ -615,6 +623,7 @@ class CurveSlowdownLogic:
     q = self._quantum_steps()
     worst = (q + self._hold_reserve()) * self.step      # tap + first quantum + pending quantum + measured overrun
     hold = False
+    self.hold_margin = False
     if self.holds_allowed and not self.inflight:
       if want_lower and reason == "stop" and self.holds_this_episode < len(HOLD_GOALS_MPH):
         goal = HOLD_GOALS_MPH[self.holds_this_episode] * (1.609344 if self.step < MS_PER_MPH else 1.0) * self.step
@@ -623,6 +632,17 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
+      elif (button == SET_PLUS and not want_lower and all_over and not self.restore_pending and not i.csc_active and
+            not self.stop_episode and offset >= RESTORE_HOLD_MIN_QUANTA * q):
+        driver_steps = int(round(driver_speed / self.step))
+        set_steps = int(round(set_speed / self.step))
+        margin = self._up_overrun() * q                      # what may still land after the release
+        bound_steps = ((driver_steps - margin) // q) * q     # a multiple of the quantum, that far below
+        first = ((set_steps + 1 + q) // q) * q               # where the hold's first jump lands (after its tap)
+        hold = first <= bound_steps
+        if hold:
+          self.hold_bound = bound_steps * self.step
+          self.hold_margin = True
       elif button == SET_PLUS and (self.stop_episode or i.fast_restore) and self.restore_pending and not want_lower:
         # only when the lead has clearly gone (moved away, or we stopped behind it); a lost or left-lane
         # release restores by taps so a re-trigger wins if the car is still there.

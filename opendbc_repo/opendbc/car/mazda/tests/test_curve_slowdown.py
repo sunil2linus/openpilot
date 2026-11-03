@@ -143,9 +143,11 @@ class CSC:
 
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
-        model=lambda f: None):
+        model=lambda f: None, setup=None):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
+  if setup is not None:
+    setup(logic)
   csc = CSC()
   trigger = scs.StoppedCarTrigger()
   st = dict(enabled=True, cruise=True, gas=False, brake=False, plan_alive=True)
@@ -828,3 +830,40 @@ if __name__ == "__main__":
         print("FAIL", name, e)
   print(f"{failed} failed")
   sys.exit(1 if failed else 0)
+
+
+# ---------------- restoring a big gap after a curve: one SET+ hold, then taps ----------------
+
+def _measured_clean(logic):
+  logic.hold_measured, logic.hold_overrun = True, 0     # a hold has shown the car stops cleanly on release
+
+
+def _restore_presses(r, after):
+  return [f for f, b in r["presses"] if b == cs.SET_PLUS and f >= after], [f for f in r["holds"] if f >= after]
+
+
+def test_big_gap_after_a_curve_holds_to_a_multiple_of_5_below_then_taps():
+  # 45 mph, a curve that needs ~30: the set speed comes down 15. Once the car is known to stop cleanly after a
+  # SET+ release, the restore holds up to 40 (one quantum below 45) and taps the rest; never above 45.
+  r = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 30), 4000, max_drop=15, setup=_measured_clean)
+  taps, holds = _restore_presses(r, 1500)
+  assert holds, "a SET+ hold for the 15 mph gap"
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
+  plain = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 30), 4000, max_drop=15)
+  p_taps, p_holds = _restore_presses(plain, 1500)
+  assert not p_holds and len(p_taps) >= 14                 # until measured: taps only (the cautious overrun)
+  assert near(plain["final"], 45) and plain["max"] <= 45 + 1e-6
+
+
+def test_small_gap_after_a_curve_is_restored_by_taps():
+  r = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 38), 4000, max_drop=10, setup=_measured_clean)
+  taps, holds = _restore_presses(r, 1500)
+  assert not holds and taps and near(r["final"], 45)
+
+
+def test_restore_hold_never_passes_the_driver_speed_whatever_lands_after_the_release():
+  # the margin is what the car was measured to add after a release: clean (0 extra) -> one quantum margin
+  for latency in (0.0, 0.3):
+    r = run(Car(47, dash_offset_mph=0.0, hold_latency=latency), between(100, 1500, 30), 4000, max_drop=15,
+            setup=_measured_clean)
+    assert r["max"] <= 47 + 1e-6 and near(r["final"], 47), (latency, r["max"], r["final"])
