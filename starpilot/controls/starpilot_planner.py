@@ -6,6 +6,7 @@ import time
 import cereal.messaging as messaging
 import numpy as np
 
+from openpilot.common.swaglog import cloudlog
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.gps import get_gps_location_service
@@ -264,6 +265,7 @@ class StarPilotPlanner:
           set_speed = cs.cruiseState.speed + max(sm["starpilotCarState"].curveSlowdownOffset, 0) * step
         self.map_curves.update(sm, self.gps_position if self.gps_valid else None, v_ego, set_speed)
       except Exception:
+        cloudlog.exception("map curves failed, disabled for this drive")
         self.map_curves = None
 
     self.starpilot_events.update(controls_enabled, v_cruise, sm, starpilot_toggles)

@@ -9,6 +9,9 @@ from opendbc.car.mazda.values import DBC, LKAS_LIMITS, MazdaSafetyFlags, TI_STAT
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
+STOCK_LKAS_OFF_SPEED = 35 * CV.MPH_TO_MS   # m/s
+STOCK_LKAS_OFF_TIME = 5.0                  # s
+
 class CarState(CarStateBase):
   def __init__(self, CP, FPCP):
     super().__init__(CP, FPCP)
@@ -27,6 +30,8 @@ class CarState(CarStateBase):
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
     self.lkas_disabled = False
+    self.stock_lkas_off_frames = 0
+    self.stock_lkas_off = False
     self.cam_lkas = 0
     self.params = CarControllerParams(CP)
 
@@ -168,6 +173,13 @@ class CarState(CarStateBase):
       # does not matter (mazda-frogpilot-dev ignores it, and steering works down to 0 mph), and this
       # alert was seen below ~28 mph on StarPilot-dev, so only raise "Invalid LKAS setting" without a TI.
       self.lkas_disabled = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
+      # With a TI that state is ignored, so a camera LKAS fault (it latches for the drive, e.g. after steering at
+      # parking-lot speed with cruise off, drive 3a) would only show as weaker steering: flag it once it has
+      # lasted STOCK_LKAS_OFF_TIME above STOCK_LKAS_OFF_SPEED (the stock LKAS is on there when healthy).
+      if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
+        off_at_speed = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 and ret.vEgo > STOCK_LKAS_OFF_SPEED
+        self.stock_lkas_off_frames = self.stock_lkas_off_frames + 1 if off_at_speed else 0
+        self.stock_lkas_off = self.stock_lkas_off_frames >= STOCK_LKAS_OFF_TIME * 100
       ret.invalidLkasSetting = self.lkas_disabled
       self.cam_lkas = cp_cam.vl["CAM_LKAS"]
       self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]

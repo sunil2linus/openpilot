@@ -461,6 +461,7 @@ class CarInterfaceBase(ABC):
     if slowdown is not None:
       fp_ret.curveSlowdownOffset = max(-127, min(127, int(slowdown.logic.offset)))
       fp_ret.curveSlowdownInFlight = max(0, min(127, len(slowdown.logic.inflight)))
+    fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
 
     return ret, fp_ret
 

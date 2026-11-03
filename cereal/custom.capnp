@@ -116,6 +116,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   pulseAndGlide @30 :Bool;  # developer-only wheel-button pulse-and-glide mode is enabled
   curveSlowdownOffset @31 :Int8;     # Mazda set speed slowdown: steps below the driver's set speed
   curveSlowdownInFlight @32 :Int8;   # our SET presses not yet seen on the set speed
+  mazdaStockLkasOff @33 :Bool;       # Mazda + TI: the camera reports its LKAS off at speed (only the TI steers)
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -201,6 +202,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mapCurveAhead @43;
     mapExitCurveData @44;
     mapExitNoCurveData @45;
+    mazdaStockLkasOff @46;
   }
 }
 

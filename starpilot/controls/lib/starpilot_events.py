@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import random
 
+from openpilot.common.swaglog import cloudlog
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.desire_helper import TurnDirection
@@ -87,8 +88,13 @@ class StarPilotEvents:
           elif kind == STOPPED_LEAD:
             self.events.add(StarPilotEventName.stoppedLeadWarning)
       except Exception:
-        # Never let the optional warning break the planner: turn it off for this drive.
+        # Never let the optional warning break the planner: turn it off for this drive (and say why in the log).
+        cloudlog.exception("stop warning failed, disabled for this drive")
         self.stop_warning = None
+
+    if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
+      self.mazda_lkas_off_shown = True
+      self.events.add(StarPilotEventName.mazdaStockLkasOff)
 
     map_curves = getattr(self.starpilot_planner, "map_curves", None)
     if map_curves is not None and map_curves.notice:

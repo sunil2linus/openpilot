@@ -1264,6 +1264,14 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, StarPilotAudibleAlert.curveNoData, 4.),
   },
 
+  StarPilotEventName.mazdaStockLkasOff: {
+    ET.PERMANENT: Alert(
+      "Car's Lane Keep Assist is off",
+      "Steering is weaker in curves. Restart the car to reset it",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.),
+  },
+
   StarPilotEventName.holidayActive: {
     ET.PERMANENT: holiday_alert,
   },
