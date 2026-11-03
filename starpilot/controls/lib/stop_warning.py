@@ -44,6 +44,8 @@ STOP_BUFFER = 2.0               # m subtracted from the planned distance
 STOP_DEBOUNCE = 1.0             # s
 STOP_DROPOUT = 0.25             # s: the plan may miss the condition this long without restarting the debounce
 STOP_HOLD_POINTS = 2            # the slowdown must hold for this many consecutive plan points (single dips are noise)
+LANE_CHANGE_HOLD = 2.0          # s after a lane change with no stop ahead warning: the model's plan dips while the
+                                # car changes lanes (drive 3b: 2 of 6 warnings right after a lane change began)
 
 # Stopped car ahead
 LEAD_MIN_SPEED = 20 * MS_PER_MPH
@@ -104,6 +106,7 @@ class StopWarningInputs:
   lead_prob: float = 0.0
   lead_y: float = 0.0
   lead_relevant: bool = False
+  lane_change: bool = False     # modelV2.meta.laneChangeState is laneChangeStarting / laneChangeFinishing
 
 
 @dataclass
@@ -170,6 +173,7 @@ class StopWarningLogic:
     self.frame = 0
     self.gates = {STOP_AHEAD: _Gate(STOP_DEBOUNCE, STOP_DROPOUT), STOPPED_LEAD: _Gate(LEAD_DEBOUNCE)}
     self.a_filtered = None
+    self.since_lane_change = _frames(LANE_CHANGE_HOLD)
 
   def not_slowing(self, i):
     alpha = DT / (ACCEL_FILTER_TAU + DT)
@@ -199,7 +203,7 @@ class StopWarningLogic:
     return t_min, v_min, d_min, required
 
   def stop_ahead(self, i):
-    if i.lead_relevant or i.v_ego < STOP_MIN_SPEED:
+    if i.lead_relevant or i.v_ego < STOP_MIN_SPEED or self.since_lane_change < _frames(LANE_CHANGE_HOLD):
       return None
     plan = self.plan_slowdown(i)
     if plan is None or plan[3] < STOP_DECEL:
@@ -248,6 +252,8 @@ class StopWarningLogic:
       out.append(f"lead relevant d {i.lead_d:.0f} m vLead {i.lead_v / MS_PER_MPH:.0f} mph")
     if i.v_ego < STOP_MIN_SPEED:
       out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {STOP_MIN_SPEED / MS_PER_MPH:.0f} mph")
+    if self.since_lane_change < _frames(LANE_CHANGE_HOLD):
+      out.append("lane change")
     plan = self.plan_slowdown(i)
     if plan is None:
       loose = self.plan_slowdown(i, 1.0)
@@ -288,6 +294,7 @@ class StopWarningLogic:
   def update(self, i: StopWarningInputs, modes: dict):
     """Returns a list of (Detection, mode) that fired this frame (mode TEST or ON)."""
     self.frame += 1
+    self.since_lane_change = 0 if i.lane_change else self.since_lane_change + 1
     not_slowing = self.not_slowing(i)   # always update the filter
     active = i.cruise_enabled and not i.standstill and not_slowing
     fired = []
@@ -479,6 +486,7 @@ class StopWarning:
       lead_prob=float(lead.modelProb),
       lead_y=float(lead.yRel),
       lead_relevant=self._lead_relevant(planner, lead, cs),
+      lane_change=self._lane_change(model),
     )
     alerts = []
     fired = self.logic.update(inputs, self.modes)
@@ -496,6 +504,13 @@ class StopWarning:
     except Exception:
       pass
     return alerts
+
+  @staticmethod
+  def _lane_change(model):
+    try:
+      return str(model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
+    except Exception:
+      return False
 
   @staticmethod
   def _lead_relevant(planner, lead, cs):

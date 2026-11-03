@@ -384,3 +384,15 @@ def test_lead_relevance_matches_frogpilot():
   assert not sw.lead_is_relevant(False, 50.0, 0.0, 0.0, False, 25.0, 200.0)
   assert sw.lead_is_relevant(True, 8.0, 0.0, 0.0, True, 0.0, 0.0)
   assert not sw.lead_is_relevant(True, 12.0, 0.0, 0.0, True, 0.0, 0.0)
+
+
+def test_no_stop_ahead_during_a_lane_change_or_2_s_after():
+  # drive 3b: the model's plan dips while the car changes lanes; 2 of 6 warnings came right after one began
+  stop = inputs(40, model=model_stop(40 * MPH, 60))
+  changing = inputs(40, model=model_stop(40 * MPH, 60))
+  changing.lane_change = True
+  assert run(repeat(changing, 4)) == []                           # during the lane change: nothing
+  out = run(repeat(changing, 2) + repeat(stop, 5))
+  assert [k for _, k, _ in out] == [sw.STOP_AHEAD], out           # still warns once the lane change is over ...
+  first = out[0][0] - sw._frames(2.0)
+  assert first >= sw._frames(sw.LANE_CHANGE_HOLD) + sw._frames(sw.STOP_DEBOUNCE) - 2, first   # ... 2 s + debounce later

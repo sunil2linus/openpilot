@@ -111,11 +111,15 @@ class AlertRenderer(Widget):
             return ALERT_CRITICAL_TIMEOUT
           return ALERT_CRITICAL_REBOOT
 
-    if ss.alertSize != AlertSize.none:
+    starpilot_ss = sm["starpilotSelfdriveState"]
+    # soundd plays the StarPilot sound when the main alert has none: show that banner too, so a StarPilot warning
+    # (e.g. Stop Ahead) is never heard while a silent main banner ("Changing Lanes") is on screen (drive 3b)
+    starpilot_sound_over_silent_main = (str(ss.alertSound) == "none" and str(starpilot_ss.alertSound) != "none" and
+                                        starpilot_ss.alertSize != custom.StarPilotSelfdriveState.AlertSize.none)
+    if ss.alertSize != AlertSize.none and not starpilot_sound_over_silent_main:
       ret = Alert(text1=ss.alertText1, text2=ss.alertText2, size=ss.alertSize.raw, status=ss.alertStatus.raw,
                   alert_type=ss.alertType)
     else:
-      starpilot_ss = sm["starpilotSelfdriveState"]
       if starpilot_ss.alertSize == custom.StarPilotSelfdriveState.AlertSize.none:
         return None
       ret = Alert(text1=starpilot_ss.alertText1, text2=starpilot_ss.alertText2,
