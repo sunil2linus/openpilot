@@ -345,6 +345,17 @@ PASS_MIN_SPEED = 8.0       # m/s
 PASS_MIN_TIME = 2.0        # s of samples in the curve
 PASS_SATURATED = 0.98      # |steer command|: the car could not follow (it goes wide): the pass does not count
 PASS_FILTER = 1.0          # s moving average of the measured curvature
+# Steering at its limit: the Torque Interceptor could not steer this curve at that speed (drive 3d: the 30 mph West
+# Utica curve maxed the steering at 37 mph on every pass, FrogPilot's too). Such a pass caps the curve's speed.
+SAT_MIN_TIME = 1.0         # s with the steering command at PASS_SATURATED or more for a pass to count as maxed out
+SAT_LAT_SHARE = 0.9        # share of the pass with openpilot steering
+# Saturated samples with the driver's hands on the wheel do not count: the command also saturates when the driver
+# steers against openpilot's path (another line through the curve), which says nothing about the curve.
+SAT_FACTOR = 0.9           # a maxed-out pass caps the curve at this share of the speed the steering maxed out at
+CAP_FLOOR = 25 * MPH       # never below this (the stock cruise's lowest set speed) ...
+CAP_RISE = 0.5 * MPH       # a clean pass at (or within CAP_NEAR of) the cap raises it this much ...
+CAP_NEAR = 2.5 * MPH       # (true speed: the dash reads ~2 mph above it, and the car side keeps a margin above the cap)
+CAP_JUMP = 5 * MPH         # ... a clean pass well above the cap raises it to that pass's speed, at most this much
 
 
 def curve_pass_radius(samples, dt=0.05, max_r=MEMORY_MAX_R):
@@ -363,9 +374,39 @@ def curve_pass_radius(samples, dt=0.05, max_r=MEMORY_MAX_R):
   return max_r if best <= 1.0 / max_r else min(1.0 / best, max_r)
 
 
+def curve_pass_saturation(samples, dt=0.05):
+  """Speed (m/s) at which the steering first stayed at its limit through the curve (SAT_MIN_TIME in all), or None.
+  samples as for curve_pass_radius."""
+  if not samples or len(samples) * dt < PASS_MIN_TIME:
+    return None
+  if sum(1 for _, _, lat, _, _ in samples if lat) < SAT_LAT_SHARE * len(samples):
+    return None
+  sat = [lat and not driver and cmd >= PASS_SATURATED and v >= PASS_MIN_SPEED for v, _, lat, driver, cmd in samples]
+  if sum(sat) * dt < SAT_MIN_TIME:
+    return None
+  # the speed at the start of the longest run at the limit (a short blip on entry does not set the speed)
+  best_len, best_start, run_start = 0, 0, None
+  for k, s in enumerate(sat + [False]):
+    if s and run_start is None:
+      run_start = k
+    elif not s and run_start is not None:
+      if k - run_start > best_len:
+        best_len, best_start = k - run_start, run_start
+      run_start = None
+  return samples[best_start][0]
+
+
+def curve_pass_speed(samples):
+  """Median speed (m/s) of a pass."""
+  vs = sorted(v for v, _, _, _, _ in samples)
+  return vs[len(vs) // 2] if vs else 0.0
+
+
 class CurveMemory:
-  """The radius the car actually drove, per map curve (by its apex position, so it survives rebuilt curve files):
-  used instead of the map's once MEMORY_MIN_PASSES clean passes agree. Kept in MEMORY_PATH (a small JSON list)."""
+  """Per map curve (by its apex position, so it survives rebuilt curve files), kept in MEMORY_PATH (a small JSON list):
+    * the radius the car actually drove: used instead of the map's once MEMORY_MIN_PASSES clean passes agree;
+    * a speed cap ("cap", m/s) after a pass where the steering maxed out: SAT_FACTOR of that speed, never below the
+      curve's yellow sign or CAP_FLOOR. Each clean pass near the cap raises it by CAP_RISE (searching back up)."""
 
   def __init__(self, path=MEMORY_PATH):
     self.path = path
@@ -402,14 +443,46 @@ class CurveMemory:
     except (KeyError, TypeError, IndexError):
       return None
 
-  def add_pass(self, c, r, t=None):
-    """A clean pass through curve `c` that measured radius r (m), at wall time t (s)."""
-    t = time.time() if t is None else t   # noqa: TID251  wall time: passes are compared across drives and reboots
+  def speed_cap(self, c):
+    """Speed cap (m/s) for curve dict `c` from passes where the steering maxed out, or None."""
+    try:
+      e = self._find(*c["apex"])
+      cap = None if e is None else e.get("cap")
+      return float(cap) if cap else None
+    except (KeyError, TypeError, ValueError):
+      return None
+
+  def _entry(self, c):
     e = self._find(*c["apex"])
     if e is None:
       e = {"lat": round(c["apex"][0], 6), "lon": round(c["apex"][1], 6), "r_map": c.get("r"),
            "name": c.get("name", ""), "passes": []}
       self.entries.append(e)
+    return e
+
+  def add_saturated_pass(self, c, v, t=None):
+    """A pass through curve `c` where the steering maxed out at speed v (m/s): cap the curve's speed."""
+    t = time.time() if t is None else t   # noqa: TID251  wall time, as add_pass
+    e = self._entry(c)
+    if abs(t - float(e.get("cap_t", -1e12))) < MEMORY_SAME_PASS:
+      return                                  # the same pass again (the other carriageway's record)
+    floor = max(CAP_FLOOR, float(c.get("adv", 0.0) or 0.0))
+    old = float(e["cap"]) if e.get("cap") else float("inf")
+    e["cap"] = round(max(floor, min(old, SAT_FACTOR * v)), 2)
+    e["cap_t"] = round(t, 1)
+    e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
+    self.save()
+
+  def add_pass(self, c, r, t=None, v=None):
+    """A clean pass through curve `c` that measured radius r (m), at wall time t (s) and median speed v (m/s)."""
+    t = time.time() if t is None else t   # noqa: TID251  wall time: passes are compared across drives and reboots
+    e = self._entry(c)
+    if v is not None and e.get("cap") and v >= float(e["cap"]) - CAP_NEAR and \
+       abs(t - float(e.get("cap_t", -1e12))) >= MEMORY_SAME_PASS:
+      # it took the curve cleanly near the cap (try a bit faster), or well above it (up to that speed)
+      cap = float(e["cap"])
+      e["cap"] = round(max(cap + CAP_RISE, min(v, cap + CAP_JUMP)), 2)
+      e["cap_t"] = round(t, 1)
     passes = [p for p in e["passes"] if isinstance(p, list) and len(p) == 2]
     if passes and abs(t - passes[-1][1]) < MEMORY_SAME_PASS:
       passes = passes[:-1]                    # the same pass again (the other carriageway's record): keep the newest
@@ -483,6 +556,7 @@ class MapCurves:
 
   def _curves_ahead(self, cid, increasing, s0, s1, lat, lon, bearing):
     out = []
+    inside_exit = float("inf")
     for c in self.store.curves.get(cid, []):
       entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
       s_entry, s_exit = (c["s_a"], c["s_b"]) if increasing else (c["s_b"], c["s_a"])
@@ -498,8 +572,9 @@ class MapCurves:
         if d_entry <= LOOKAHEAD:
           out.append((c, d_entry))
       elif ex_ahead and d_exit > NEAR and d_exit <= c["len"] + 60:
-        if not c.get("ramp"):
-          self.inside = c
+        if not c.get("ramp") and d_exit < inside_exit:
+          # the curve we are in is the one we leave first (the next one may already match up to 60 m before it)
+          self.inside, inside_exit = c, d_exit
         if self.release_after_apex and not c.get("ramp") and "apex" in c:
           ap_ahead, d_apex = ahead(lat, lon, bearing, *c["apex"])
           if not ap_ahead and d_apex > APEX_PASSED:
@@ -508,12 +583,18 @@ class MapCurves:
     return out
 
   def _radius(self, c):
-    """The curve's radius: what the car measured on clean passes (curve memory) if known, else the map's."""
+    """The curve's radius: what the car measured on clean passes (curve memory) if known, else the map's; made
+    tighter when the memory caps the curve's speed (steering maxed out there), so that the curve's speed at PLAN_LAT
+    is the cap. The car side plans at PLAN_LAT or less, so it never goes faster than the cap."""
+    r = c["r"]
     if self.memory is not None and not c.get("ramp"):
-      r = self.memory.radius(c)
-      if r is not None:
-        return r
-    return c["r"]
+      learned = self.memory.radius(c)
+      if learned is not None:
+        r = learned
+      cap = self.memory.speed_cap(c)
+      if cap is not None:
+        r = min(r, cap * cap / PLAN_LAT)
+    return r
 
   def update(self, lat, lon, bearing, way_id, is_forward, nav=None):
     """nav: (maneuver type, modifier, distance m) of the next maneuver, or None."""
@@ -672,9 +753,13 @@ class MapCurvesPlanner:
     try:
       if inside is not self.pass_curve:
         if self.pass_curve is not None and self.mc.memory is not None:
-          r = curve_pass_radius(self.pass_samples)
-          if r is not None:
-            self.mc.memory.add_pass(self.pass_curve, r)
+          v_sat = curve_pass_saturation(self.pass_samples)
+          if v_sat is not None:
+            self.mc.memory.add_saturated_pass(self.pass_curve, v_sat)
+          else:
+            r = curve_pass_radius(self.pass_samples)
+            if r is not None:
+              self.mc.memory.add_pass(self.pass_curve, r, v=curve_pass_speed(self.pass_samples))
         self.pass_curve, self.pass_samples = inside, []
       if inside is not None and len(self.pass_samples) < 2400:
         cs, cc = sm["carState"], sm["carControl"]

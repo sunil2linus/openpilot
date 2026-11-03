@@ -536,3 +536,49 @@ def test_the_planner_uses_the_learned_radius(tmp_path):
   la, lo = pos(0, -250)
   m.update(la, lo, 0.0, 1, True)
   assert m.curve is not None and m.radius in (160.0, 165.0), m.radius
+
+
+def test_a_pass_with_the_steering_maxed_out_caps_the_curve_speed(tmp_path):
+  # drive 3d, the 30 mph West Utica curve: the steering stayed at its limit for ~5 s at 37.5 mph
+  maxed = _pass(133, seconds=3.0, v=16.7) + _pass(133, seconds=2.0, v=16.7, cmd=1.0) + _pass(133, seconds=2.0, v=16.7)
+  assert abs(MC.curve_pass_saturation(maxed) - 16.7) < 1e-6
+  # the driver steering against openpilot's line also maxes the command: that says nothing about the curve
+  assert MC.curve_pass_saturation(_pass(133, seconds=3.0) + _pass(133, seconds=2.0, cmd=1.0, driver=True)) is None
+  # the speed comes from the longest run at the limit, not from a short blip on entry
+  blip = _pass(133, seconds=1.0, v=18.8) + _pass(133, seconds=0.2, v=18.8, cmd=1.0) + _pass(133, seconds=1.0, v=15.2) + \
+    _pass(133, seconds=1.5, v=15.2, cmd=1.0)
+  assert abs(MC.curve_pass_saturation(blip) - 15.2) < 1e-6
+  assert MC.curve_pass_saturation(_pass(133)) is None                                   # never maxed out
+  assert MC.curve_pass_saturation(_pass(133)[:60] + _pass(133, cmd=1.0)[:5] + _pass(133)[:60]) is None   # a blip
+  assert MC.curve_pass_saturation(_pass(133, cmd=1.0, lat=False)) is None              # openpilot not steering
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = {"apex": (42.6, -83.1), "r": 117.0, "adv": 30 * MC.MPH}
+  assert mem.speed_cap(c) is None
+  mem.add_saturated_pass(c, 37.5 * MC.MPH, t=1000.0)
+  assert abs(mem.speed_cap(c) - 0.9 * 37.5 * MC.MPH) < 0.01                           # ~33.8 mph next time
+  mem.add_saturated_pass(c, 37.5 * MC.MPH, t=1010.0)
+  assert abs(mem.speed_cap(c) - 0.9 * 37.5 * MC.MPH) < 0.01                           # same pass (other carriageway)
+  mem.add_saturated_pass(c, 32.0 * MC.MPH, t=5000.0)
+  assert abs(mem.speed_cap(c) - 30 * MC.MPH) < 0.01                                     # never below the yellow sign
+  mem.add_pass(c, 140.0, t=9000.0, v=28.2 * MC.MPH)
+  assert abs(mem.speed_cap(c) - 30.5 * MC.MPH) < 0.01         # clean at the cap (true speed ~2 mph under the dash): up
+  mem.add_pass(c, 140.0, t=13000.0, v=25.0 * MC.MPH)
+  assert abs(mem.speed_cap(c) - 30.5 * MC.MPH) < 0.01                                   # clean but much slower: no news
+  mem.add_pass(c, 140.0, t=17000.0, v=40.0 * MC.MPH)
+  assert abs(mem.speed_cap(c) - 35.5 * MC.MPH) < 0.01         # clean well above the cap (no slowdown): up to 5 mph
+  unsigned = {"apex": (42.7, -83.2), "r": 60.0}
+  mem.add_saturated_pass(unsigned, 26.0 * MC.MPH, t=1.0)
+  assert abs(mem.speed_cap(unsigned) - 25 * MC.MPH) < 0.01                              # floor: 25 mph
+
+
+def test_the_planner_slows_more_for_a_capped_curve(tmp_path):
+  root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
+  la, lo = pos(0, -250)
+  m.update(la, lo, 0.0, 1, True)
+  assert m.curve is not None and abs(m.radius - curves[0]["r"]) < 1e-6
+  before = MC.curve_speed_limit(m.radius, m.advisory)
+  mem.add_saturated_pass(curves[0], before, t=1.0)
+  m.update(la, lo, 0.0, 1, True)
+  assert abs(MC.curve_speed_limit(m.radius, m.advisory) - 0.9 * before) < 0.01, (m.radius, before)
