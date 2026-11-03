@@ -114,7 +114,9 @@ class AlertRenderer(Widget):
     starpilot_ss = sm["starpilotSelfdriveState"]
     # soundd plays the StarPilot sound when the main alert has none: show that banner too, so a StarPilot warning
     # (e.g. Stop Ahead) is never heard while a silent main banner ("Changing Lanes") is on screen (drive 3b)
-    starpilot_sound_over_silent_main = (str(ss.alertSound) == "none" and str(starpilot_ss.alertSound) != "none" and
+    # .raw, never str(): StarPilot's own sounds (chimes, random events) are outside the stock enum this field is typed
+    # with, and str() raises on them (drive 3e: the screen crashed and restarted on every Stop Ahead chime)
+    starpilot_sound_over_silent_main = (ss.alertSound.raw == 0 and starpilot_ss.alertSound.raw != 0 and
                                         starpilot_ss.alertSize != custom.StarPilotSelfdriveState.AlertSize.none)
     if ss.alertSize != AlertSize.none and not starpilot_sound_over_silent_main:
       ret = Alert(text1=ss.alertText1, text2=ss.alertText2, size=ss.alertSize.raw, status=ss.alertStatus.raw,
