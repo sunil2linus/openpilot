@@ -464,8 +464,8 @@ class VehicleSettingsManagerView(PanelManagerView):
 
   def _mazda_cruise_helper_tiles(self) -> list[dict]:
     """Gen1 Mazda with stock radar cruise: curve / map curve / stopped car slowdowns (SET-/SET+ presses) and
-    the stop warnings. Choices cycle on each tap. All take effect on the next drive (Map Build Range: on the next
-    pass of the parked map build, within a minute)."""
+    the stop warnings. Choices cycle on each tap. All take effect on the next drive (Map Build Range and Map Build
+    States: on the next pass of the parked map build, within a minute)."""
     params = self._controller._params
 
     def choice(key, labels, default=0):
@@ -504,6 +504,12 @@ class VehicleSettingsManagerView(PanelManagerView):
       get_value, on_click = choice(key, labels, default)
       tiles.append({"title": tr(title), "get_value": get_value, "on_click": on_click})
     tiles.append({
+      "title": tr("Map Build States"),
+      "subtitle": tr("Tick states to build their curve files in full while parked, wherever the car is (a trip); the rest only within range."),
+      "get_value": self._curve_map_states_value,
+      "on_click": self._open_curve_map_states,
+    })
+    tiles.append({
       "title": tr("Curve Learning (Log Only)"),
       "subtitle": tr("Records every curve and learns this car's steering limit and your curve speed. Changes nothing yet."),
       "get_state": lambda: params.get_bool("MazdaCurveLearning"),
@@ -516,6 +522,33 @@ class VehicleSettingsManagerView(PanelManagerView):
       "on_click": self._reset_car_profile,
     })
     return tiles
+
+  # ---- the states to build curve files for in full (curve_map_states.py, starpilot/system/curve_mapd.py) ----
+  _states_value = ("", 0.0)
+  _params_memory = None
+
+  def _curve_map_states_value(self) -> str:
+    """The ticked states, or the build in progress; re-read at most every 2 s (this is called every frame)."""
+    now = time.monotonic()
+    text, at = self._states_value
+    if now - at < 2.0 and text:
+      return text
+    try:
+      from openpilot.selfdrive.ui.layouts.settings.starpilot.curve_map_states import STATUS_PARAM, TICKED_PARAM, parse_tokens, tile_value
+      if self._params_memory is None:
+        from openpilot.common.params import Params
+        self._params_memory = Params(memory=True)
+      ticked = parse_tokens(self._controller._params.get(TICKED_PARAM, encoding="utf-8"))
+      text = tile_value(ticked, self._params_memory.get(STATUS_PARAM, encoding="utf-8") or "")
+    except Exception:
+      text = tr("None")
+    self._states_value = (text, now)
+    return text
+
+  def _open_curve_map_states(self):
+    from openpilot.selfdrive.ui.layouts.settings.starpilot.curve_map_states import CurveMapStatesDialog
+    self._states_value = ("", 0.0)
+    gui_app.push_widget(CurveMapStatesDialog(self._controller._params))
 
   # ---- the learned car profile (opendbc/car/mazda/car_profile.py) ----
   CAR_PROFILE_PATH = "/data/media/0/mazda_car_profile.json"

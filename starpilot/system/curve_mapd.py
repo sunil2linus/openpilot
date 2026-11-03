@@ -19,17 +19,31 @@ on the device, so a new city only needs the map download in the settings:
     The folder's record (build_state.meta: which tiles it was built from, by which builder) is written last; a
     folder killed half way is built again on the next run, finished folders are skipped (that is the resume).
   * Memory: see build_curve_map.load_ways (about 170 MB peak for the Detroit folder, the biggest the owner has).
-  * Range: a folder takes 1.5 to 2 minutes whatever its density (loading the tiles ~25 s, the curve search ~50 s),
-    and the owner's offline maps cover the whole lower 48 (390 folders: 6 to 10 hours). So only the folders whose
-    2 x 2 degree box comes within MazdaCurveMapRange miles (30/50/100/200/300, default 100) of the last known position
-    are built, nearest first. The position is LastGPSPosition: the memory copy (fresh, written while driving and
-    while parked with a fix) first, the persistent copy (written when a drive ends, survives a reboot) as fallback.
-    Folders out of range are left alone: not built, never deleted; built ones are refreshed only once in range
-    again. Both the position and the setting are read again on every pass, so parking somewhere else or changing the
-    range takes effect on the next pass without a reboot. No position known yet (a new install): nothing is built.
+  * Which folders (a folder takes 1.5 to 2 minutes whatever its density; the owner's offline maps cover the whole
+    lower 48, 390 folders, 6 to 10 hours):
+      - Ticked states (MazdaCurveMapStates, the "Map Build States" tile: a tick per state of the map selection) are
+        built in full: every downloaded folder overlapping the state's box, wherever the car is, and kept up to date
+        when a map update makes a folder stale. The owner ticks the states of a trip while parked at home, unticks
+        them after.
+      - Everything else: only the folders whose box comes within MazdaCurveMapRange miles (30/50/100/200/300,
+        default 100) of the last known position, measured to the nearest point of the box (the folder around the
+        car always qualifies). The position is LastGPSPosition: the memory copy (fresh, written while driving and
+        while parked with a fix) first, the persistent copy (written when a drive ends, survives a reboot) as
+        fallback. No position known yet (a new install): only ticked states are built.
+      - Both are restricted to the regions selected in StarPilot's map settings (MapsSelected) when there is a
+        selection: the owner's osm folder holds the whole lower 48 from an older download, but only 8 states are
+        selected, so Kentucky (within 300 mi of Detroit) is never built. The leftovers are counted and their size
+        logged once; nothing is ever deleted here. No selection: everything downloaded within range, as before.
+      - Where a region is comes from starpilot/common/map_region_boxes.py (a bounding box per US state, US/CA/MX).
+        A token it cannot place is skipped and said so, unless it is the only kind of region selected: then every
+        downloaded folder is taken to be its own.
+    Nearest first. Folders out of scope are left alone: not built, never deleted; built ones are refreshed only once
+    in scope again. Position, range and both selections are read again on every pass, so parking somewhere else,
+    changing the range or ticking a state takes effect on the next pass without a reboot.
   * Progress and timings go to /data/media/0/curve_map/build_log.txt (appended, size capped) and to cloudlog; a one
-    line status goes to the memory param CurveMapBuildStatus for the UI. The log may be shared, so the position in
-    it is rounded to 0.1 degree.
+    line status with a time estimate ("Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per
+    area)") goes to the memory param CurveMapBuildStatus for the UI. The log may be shared, so the position in it
+    is rounded to 0.1 degree.
 
 The pure parts (folder state, planning) have no openpilot imports so they can be unit tested; main() has them.
 """
@@ -52,6 +66,8 @@ RANGE_PARAM = "MazdaCurveMapRange"
 RANGE_MILES = (30, 50, 100, 200, 300)  # MazdaCurveMapRange index -> miles
 RANGE_DEFAULT = 2                      # 100 miles
 POSITION_PARAM = "LastGPSPosition"
+SELECTED_PARAM = "MapsSelected"        # StarPilot's map settings: the regions downloaded (CSV of tokens)
+TICKED_PARAM = "MazdaCurveMapStates"   # the states to build in full, whatever the range (CSV of the same tokens)
 CHECK_INTERVAL = 60.0                  # s between two looks at the map folders while parked
 NOT_MAZDA_INTERVAL = 300.0
 LEGACY_BUILDER = 1                     # curve files without a "builder" field were made by this builder (the laptop)
@@ -60,18 +76,20 @@ LOG_NAMES = 10                         # folder names listed in the summary line
 IDLE_MOVE_MILES = 5.0                  # "no maps here" is said again only after the car moved this far (not GPS jitter)
 MILE_M = 1609.344
 DEG_M = 111_195.0                      # metres per degree of latitude
+FOLDER_SECONDS_GUESS = 90.0            # time per folder assumed before the first one of a pass is timed
 
 
-def _load_builder():
+def _load_by_path(name, *parts):
   here = os.path.dirname(os.path.abspath(__file__))
-  path = os.path.join(here, "..", "..", "tools", "curve_map", "build_curve_map.py")
-  spec = importlib.util.spec_from_file_location("build_curve_map", path)
+  path = os.path.join(here, "..", "..", *parts)
+  spec = importlib.util.spec_from_file_location(name, path)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
   return mod
 
 
-B = _load_builder()
+B = _load_by_path("build_curve_map", "tools", "curve_map", "build_curve_map.py")
+R = _load_by_path("map_region_boxes", "starpilot", "common", "map_region_boxes.py")
 BUILDER_VERSION = B.BUILDER_VERSION
 FORMAT_VERSION = B.FORMAT_VERSION
 
@@ -169,14 +187,25 @@ def check_folder(folder, tiles, curve_root=CURVE_ROOT):
   return None
 
 
+def folder_is_built(folder, tiles, curve_root=CURVE_ROOT):
+  """Read-only: True when the folder has a finished record for exactly these tiles by the current builder (for the
+  UI; check_folder, which may write an adopted record, is for the daemon)."""
+  state = read_state(os.path.join(curve_root, folder))
+  if state is None or state.get("building"):
+    return False
+  try:
+    return (int(state.get("builder", 0)) >= BUILDER_VERSION and int(state.get("format", 0)) >= FORMAT_VERSION
+            and state.get("tiles") == tiles)
+  except (TypeError, ValueError):
+    return False
+
+
+# ---------------- where the folders are: range, regions ----------------
+
 def folder_box(folder):
   """(lat0, lat1, lon0, lon1) of a map folder: '42/-84' is the box lat 42..44, lon -84..-82 (as build_curve_map.
   folders_for names them: the lower corner, floored to an even degree). None for a name that is not a folder."""
-  try:
-    la, lo = (int(x) for x in folder.split("/"))
-  except ValueError:
-    return None
-  return la, la + 2, lo, lo + 2
+  return R.folder_box(folder)
 
 
 def box_distance_miles(near, folder):
@@ -205,21 +234,135 @@ def in_range(folders, near, range_miles):
   return names
 
 
+def parse_tokens(raw):
+  """The region tokens of a MapsSelected / MazdaCurveMapStates CSV ('us_state.MI,us_state.IL'), in order, once each.
+  A bare state code (an old selection) counts as a state. Anything else is dropped."""
+  if isinstance(raw, bytes):
+    raw = raw.decode("utf-8", "ignore")
+  out = []
+  for t in (raw or "").split(","):
+    t = t.strip()
+    if not t:
+      continue
+    if not t.startswith((R.STATE_PREFIX, R.COUNTRY_PREFIX)):
+      if len(t) == 2 and t.isalpha() and t.isupper():
+        t = R.STATE_PREFIX + t
+      else:
+        continue
+    if t not in out:
+      out.append(t)
+  return out
+
+
+_LABELS = None
+
+
+def token_label(token):
+  """'Michigan' for 'us_state.MI': from StarPilot's map catalog when it imports, else the code."""
+  global _LABELS
+  if _LABELS is None:
+    try:
+      from openpilot.starpilot.common.maps_catalog import MAP_TOKEN_LABELS
+      _LABELS = dict(MAP_TOKEN_LABELS)
+    except Exception:
+      _LABELS = {}
+  return _LABELS.get(token) or token.split(".", 1)[-1]
+
+
+class Regions:
+  """The selected (MapsSelected) and ticked (MazdaCurveMapStates) regions placed on the map.
+  placed: {token: boxes}; unknown: tokens without a box; ticked: the ticked tokens (a subset of placed or unknown).
+  own_everything: no token could be placed but some were given: every downloaded folder is taken to be theirs."""
+
+  def __init__(self, selected=(), ticked=()):
+    self.selected = list(selected)
+    self.ticked = list(ticked)
+    all_tokens = self.selected + [t for t in self.ticked if t not in self.selected]
+    self.placed, self.unknown = R.place_tokens(all_tokens)
+    self.own_everything = bool(all_tokens) and not self.placed
+
+  @property
+  def empty(self):
+    return not self.selected and not self.ticked
+
+  def restricts(self):
+    """True when range mode must be limited to the selected regions' folders: a selection exists and at least one of
+    its regions could be placed. A selection of only unplaceable regions keeps the old behaviour (everything
+    downloaded within range): nothing can be told apart from it."""
+    return any(t in self.placed for t in self.selected)
+
+  def folders_of(self, folders, tokens):
+    """{folder: [token...]} of the downloaded folders belonging to these tokens (placed ones; or all folders when
+    nothing at all could be placed)."""
+    boxes = {t: self.placed[t] for t in tokens if t in self.placed}
+    if boxes:
+      return R.folders_in_regions(folders, boxes)
+    if self.own_everything and any(t in self.unknown for t in tokens):
+      return {f: [t for t in tokens if t in self.unknown] for f in folders}
+    return {}
+
+  def ticked_placed(self):
+    return [t for t in self.ticked if t in self.placed]
+
+  def ticked_unknown(self):
+    return [t for t in self.ticked if t in self.unknown]
+
+
+def _names(tokens, limit=4):
+  labels = [token_label(t) for t in tokens]
+  return ", ".join(labels[:limit]) + (f" + {len(labels) - limit} more" if len(labels) > limit else "")
+
+
+def _size(nbytes):
+  return f"{nbytes / 1e9:.1f} GB" if nbytes >= 1e9 else f"{nbytes / 1e6:.0f} MB"
+
+
 class Plan:
   """What one pass found: todo = [(folder, reason)] to build, nearest first; total = map folders downloaded;
-  in_range = how many of them are within range (all when there is no range); skipped = out of range (untouched)."""
+  in_range = how many of them are within scope (range and ticked states; all when there is no range);
+  skipped = out of scope (untouched). With regions: full = {folder: [ticked tokens]} of the ticked states' folders,
+  leftovers = (count, bytes) of downloaded folders outside every selected or ticked region, missing = ticked tokens
+  with no downloaded folder, unknown = tokens that could not be placed (skipped)."""
 
-  def __init__(self, todo, total, in_range, near, range_miles):
+  def __init__(self, todo, total, in_range, near, range_miles, regions=None, full=None, leftovers=None, missing=(),
+               unknown=(), restricted=False):
     self.todo, self.total, self.in_range = todo, total, in_range
     self.near, self.range_miles = near, range_miles
     self.skipped = total - in_range
+    self.regions = regions
+    self.full = dict(full or {})
+    self.leftovers = leftovers
+    self.missing = list(missing)
+    self.unknown = list(unknown)
+    self.restricted = restricted
+
+  def ticked_labels(self):
+    seen = []
+    for toks in self.full.values():
+      for t in toks:
+        if t not in seen:
+          seen.append(t)
+    if self.regions is not None:
+      for t in self.regions.ticked:
+        if t not in seen and t not in self.missing and t not in self.unknown:
+          seen.append(t)
+    return [token_label(t) for t in seen]
 
   def where(self):
-    """'within 100 mi of 42.6,-83.1': the position rounded to 0.1 degree, this may be shared in a log."""
+    """'within 100 mi of 42.6,-83.1' (+ ' or in Michigan, Illinois' for ticked states): the position rounded to 0.1
+    degree, this may be shared in a log."""
     if self.near is None:
-      return "" if self.range_miles is None else f"within {self.range_miles:g} mi (no position yet)"
-    where = f"of {self.near[0]:.1f},{self.near[1]:.1f}"
-    return f"within {self.range_miles:g} mi {where}" if self.range_miles is not None else f"nearest first {where}"
+      s = "" if self.range_miles is None else f"within {self.range_miles:g} mi (no position yet)"
+    else:
+      where = f"of {self.near[0]:.1f},{self.near[1]:.1f}"
+      s = f"within {self.range_miles:g} mi {where}" if self.range_miles is not None else f"nearest first {where}"
+    ticked = self.ticked_labels()
+    if ticked:
+      s = (s + " or " if s else "") + "in " + _names(ticked)
+    return s
+
+  def skipped_why(self):
+    return "out of range or outside your selected maps" if self.restricted else "out of range"
 
   def summary(self):
     """One short line: '3 of 12 map folders within 100 mi of 42.6,-83.1 need building (378 of 390 out of range):
@@ -227,22 +370,61 @@ class Plan:
     names = [f for f, _ in self.todo[:LOG_NAMES]] + (["..."] if len(self.todo) > LOG_NAMES else [])
     s = f"{len(self.todo)} of {self.in_range} map folders {self.where()} need building".replace("  ", " ")
     if self.skipped:
-      s += f" ({self.skipped} of {self.total} out of range)"
+      s += f" ({self.skipped} of {self.total} {self.skipped_why()})"
     return s + ": " + ", ".join(names)
 
+  def folder_label(self, folder):
+    """'Illinois' for a folder of a ticked state (the first one it overlaps), 'map folder 40/-90' otherwise."""
+    toks = self.full.get(folder)
+    return token_label(toks[0]) if toks else f"map folder {folder}"
 
-def plan(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, range_miles=None):
-  """The folders to build: those within range_miles of `near` (lat, lon) whose curve files are missing or stale,
-  nearest first. Folders out of range are not even checked (checking a laptop-built folder writes its record)."""
+
+def plan(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, range_miles=None, regions=None):
+  """The folders to build: every downloaded folder of a ticked state, plus those within range_miles of `near`
+  (lat, lon), both limited to the selected regions when there is a selection; only the ones whose curve files are
+  missing or stale; nearest first. Folders out of scope are not even checked (checking a laptop-built folder writes
+  its record)."""
   folders = map_folders(osm_root)
-  wanted = in_range(folders, near, range_miles)
+  if regions is None or regions.empty:
+    wanted = in_range(folders, near, range_miles)
+    todo = [(f, r) for f in wanted for r in [check_folder(f, folders[f], curve_root)] if r is not None]
+    return Plan(todo, len(folders), len(wanted), near, range_miles, regions)
+  full = regions.folders_of(folders, regions.ticked)
+  restricted = regions.restricts()
+  if restricted:
+    # range mode only builds folders of the selected regions (or of a ticked state); the rest are leftovers
+    in_selection = set(regions.folders_of(folders, regions.selected)) | set(full)
+    wanted = [f for f in in_range(folders, near, range_miles) if f in in_selection]
+    outside = [f for f in folders if f not in in_selection]
+    leftovers = (len(outside), sum(s for f in outside for s, _m in folders[f].values()))
+  else:
+    wanted = in_range(folders, near, range_miles)
+    leftovers = None
+  missing = [t for t in regions.ticked if t not in regions.unknown or regions.own_everything]
+  missing = [t for t in missing if not any(t in toks for toks in full.values())]
+  for f in full:
+    if f not in wanted:
+      wanted.append(f)
+  if near is not None:
+    wanted.sort(key=lambda f: (box_distance_miles(near, f), f))
   todo = []
   for folder in wanted:
     reason = check_folder(folder, folders[folder], curve_root)
     if reason is not None:
       todo.append((folder, reason))
-  return Plan(todo, len(folders), len(wanted), near, range_miles)
+  unknown = [] if regions.own_everything else list(regions.unknown)
+  return Plan(todo, len(folders), len(wanted), near, range_miles, regions, full, leftovers, missing, unknown, restricted)
 
+
+def region_status(token, folders, curve_root=CURVE_ROOT, regions=None):
+  """For the UI: (downloaded folders of the region, built ones, placeable) — read-only."""
+  rg = regions or Regions(selected=[token])
+  mine = rg.folders_of(folders, [token])
+  built = sum(1 for f in mine if folder_is_built(f, folders[f], curve_root))
+  return len(mine), built, token in rg.placed or rg.own_everything
+
+
+# ---------------- the build log, building ----------------
 
 class BuildLog:
   """Appends to build_log.txt (size capped: the file is rotated to .1) and mirrors to a callback (cloudlog)."""
@@ -289,7 +471,7 @@ def build_folder(folder, tiles, osm_root=OSM_ROOT, curve_root=CURVE_ROOT, log=pr
     n["files"] += 1
     log(f"  {folder}: square {name} written, {nbytes / 1e3:.0f} kB, {seconds:.0f} s into the folder")
     if status is not None:
-      status(f"Building {folder}: {n['files']} squares, {seconds:.0f} s")
+      status(f"{folder}: {n['files']} squares, {seconds:.0f} s")
 
   built = datetime.datetime.now().isoformat(timespec="seconds")
   stats = B.build(osm_dir, curve_dir, quiet=True, progress=progress, extra={"built": built, "source": "device"})
@@ -315,16 +497,50 @@ def _plural(n, word="folder"):
   return f"{n} {word}{'s' if n != 1 else ''}"
 
 
+def time_left_text(done, total, seconds_so_far, guess=FOLDER_SECONDS_GUESS):
+  """'about 12 min left (avg 1.4 min per area)' from the folders finished this pass; before the first one is timed
+  the guess per folder is used and said so."""
+  left = max(0, total - done)
+  if done > 0 and seconds_so_far > 0:
+    per = seconds_so_far / done
+    avg = f"avg {per / 60:.1f} min per area"
+  else:
+    per = guess
+    avg = f"guessing {per / 60:.1f} min per area"
+  secs = left * per
+  if secs < 90:
+    when = f"about {max(1, round(secs / 10) * 10)} s left" if secs >= 10 else "almost done"
+  elif secs < 3600 * 1.5:
+    when = f"about {round(secs / 60)} min left"
+  else:
+    when = f"about {secs / 3600:.1f} h left"
+  return f"{when} ({avg})"
+
+
+def progress_text(label, done, total, seconds_so_far, detail=""):
+  """'Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)' (+ ': <detail>')."""
+  s = f"Building {label}: area {done + 1} of {total} this pass, {time_left_text(done, total, seconds_so_far)}"
+  return s + (f" — {detail}" if detail else "")
+
+
 def idle_notice(p):
   """Why nothing can be built this pass, as (kind, log line, status line), or None when there is work or everything
   is up to date."""
+  if p.in_range > 0:
+    return None
+  if p.missing:
+    names = _names(p.missing)
+    return ("not downloaded", f"no map tiles for {names}: download them in StarPilot's map settings",
+            f"Map not downloaded for {names}: download it in StarPilot's map settings")
   if p.near is None and p.range_miles is not None:
     return ("no position", "no GPS position yet: drive once, the map folders around the car are built after that",
             "Curve files: no GPS position yet, drive once")
-  if p.in_range == 0 and p.range_miles is not None:
+  if p.range_miles is not None:
     where = p.where()
     if p.total == 0:
       line = f"no offline maps downloaded ({where}): download this area in StarPilot's map settings"
+    elif p.restricted:
+      line = f"no downloaded maps of your selected regions {where} ({_plural(p.total, 'map folder')} elsewhere): download this area in StarPilot's map settings"
     else:
       line = f"no downloaded maps {where} ({_plural(p.total, 'map folder')} elsewhere): download this area in StarPilot's map settings"
     return ("no maps", line, f"No downloaded maps within {p.range_miles:g} mi of here: download this area in StarPilot's map settings")
@@ -348,12 +564,49 @@ def same_situation(idle, kind, p):
   return _miles_between(prev, p.near) <= IDLE_MOVE_MILES
 
 
+def region_notices(p, memo, log):
+  """Log, once per situation (`memo` is kept between passes), what the regions tell: tokens that cannot be placed,
+  ticked states without map tiles, downloaded folders outside every selected region (the leftovers, never
+  deleted here). Returns a short status prefix for the unknown/missing ones, or ''."""
+  notes = []
+  if p.unknown:
+    key = ("unknown", tuple(p.unknown))
+    if memo is not None and memo.get("unknown") != key:
+      log(f"cannot place {_names(p.unknown)} on the map (no bounding box here): skipped, its folders cannot be told from leftovers")
+    if memo is not None:
+      memo["unknown"] = key
+    notes.append(f"can't place {_names(p.unknown, 2)}")
+  elif memo is not None:
+    memo.pop("unknown", None)
+  if p.missing and p.in_range > 0:
+    key = ("missing", tuple(p.missing))
+    if memo is not None and memo.get("missing") != key:
+      log(f"no map tiles for {_names(p.missing)}: download them in StarPilot's map settings")
+    if memo is not None:
+      memo["missing"] = key
+    notes.append(f"{_names(p.missing, 2)} not downloaded")
+  elif memo is not None:
+    memo.pop("missing", None)
+  if p.leftovers and p.leftovers[0]:
+    key = ("leftovers", p.leftovers[0])
+    if memo is not None and memo.get("leftovers") != key:
+      n, nbytes = p.leftovers
+      log(f"{_plural(n, 'map folder')} ({_size(nbytes)}) are outside your selected maps: leftovers from an older download, left alone")
+    if memo is not None:
+      memo["leftovers"] = key
+  elif memo is not None:
+    memo.pop("leftovers", None)
+  return "; ".join(notes)
+
+
 def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, status=None, should_stop=lambda: False,
-             range_miles=None, idle=None):
-  """Build every folder within range that needs it. Returns (folders built, folders downloaded). `idle`, a dict the
-  caller keeps between passes, rate-limits the "nothing to do here" notices to once per situation (position, range)
-  instead of once a minute; the status line is refreshed every pass."""
-  p = plan(osm_root, curve_root, near, range_miles)
+             range_miles=None, idle=None, regions=None, memo=None):
+  """Build every folder in scope (ticked states in full, the rest within range) that needs it. Returns (folders
+  built, folders downloaded). `idle`, a dict the caller keeps between passes, rate-limits the "nothing to do here"
+  notices to once per situation (position, range) instead of once a minute; `memo` does the same for the region
+  notices; the status line is refreshed every pass."""
+  p = plan(osm_root, curve_root, near, range_miles, regions)
+  notes = region_notices(p, memo, log)
   notice = idle_notice(p)
   if notice is not None:
     kind, line, text = notice
@@ -368,7 +621,9 @@ def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, sta
     idle.clear()
   scope = f"{_plural(p.in_range, 'map folder')} {p.where()}".replace("  ", " ").strip()
   if p.skipped:
-    scope += f", {p.skipped} out of range"
+    scope += f", {p.skipped} {p.skipped_why()}"
+  if notes:
+    scope += f"; {notes}"
   if not p.todo:
     if status is not None:
       status(f"Curve files up to date: {scope}")
@@ -376,15 +631,22 @@ def run_once(osm_root=OSM_ROOT, curve_root=CURVE_ROOT, near=None, log=print, sta
   log(p.summary())
   t0 = time.monotonic()
   built = 0
+  total = len(p.todo)
   for folder, why in p.todo:
     if should_stop():
       break
     log(f"{folder}: building ({why})")
+    label = p.folder_label(folder)
+    if status is not None:
+      status(progress_text(label, built, total, time.monotonic() - t0))
+
+    def folder_status(detail, _label=label, _built=built):
+      status(progress_text(_label, _built, total, time.monotonic() - t0, detail))
     try:
       tiles = map_folders(osm_root).get(folder)
       if not tiles:
         continue
-      build_folder(folder, tiles, osm_root, curve_root, log, status)
+      build_folder(folder, tiles, osm_root, curve_root, log, folder_status if status is not None else None)
       built += 1
     except FileNotFoundError as e:
       log(f"{folder}: skipped: {e}")
@@ -460,6 +722,16 @@ def range_miles(params):
   return RANGE_MILES[idx] if 0 <= idx < len(RANGE_MILES) else RANGE_MILES[RANGE_DEFAULT]
 
 
+def read_regions(params):
+  """The selected (MapsSelected) and ticked (MazdaCurveMapStates) regions, read every pass."""
+  def tokens(key):
+    try:
+      return parse_tokens(params.get(key, encoding="utf8"))
+    except Exception:
+      return []
+  return Regions(selected=tokens(SELECTED_PARAM), ticked=tokens(TICKED_PARAM))
+
+
 def main():
   from openpilot.common.params import Params
   from openpilot.common.swaglog import cloudlog
@@ -467,7 +739,7 @@ def main():
   params = Params()
   params_memory = Params(memory=True)
   log = BuildLog(mirror=cloudlog.info)
-  idle = {}
+  idle, memo = {}, {}
 
   def status(text):
     try:
@@ -482,9 +754,10 @@ def main():
       time.sleep(NOT_MAZDA_INTERVAL)
       continue
     try:
-      # position and range are read every pass: a car parked somewhere new, a GPS fix that arrived while parked, or a
-      # changed setting all take effect on the next pass
-      run_once(near=last_position(params_memory, params), range_miles=range_miles(params), log=log, status=status, idle=idle)
+      # position, range and the selections are read every pass: a car parked somewhere new, a GPS fix that arrived
+      # while parked, a changed setting or a newly ticked state all take effect on the next pass
+      run_once(near=last_position(params_memory, params), range_miles=range_miles(params), log=log, status=status,
+               idle=idle, regions=read_regions(params), memo=memo)
     except Exception:
       cloudlog.exception("curve_mapd failed")
       log("failed, see the system log")

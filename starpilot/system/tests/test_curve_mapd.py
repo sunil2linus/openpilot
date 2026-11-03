@@ -551,3 +551,273 @@ def test_owner_example_folder_counts_per_range_choice():
   assert counts[30] == 1 and counts[50] == 3
   assert counts[100] < counts[200] < counts[300] <= 40
   assert all(D.in_range(folders, (42.6, -83.1), r)[0] == "42/-84" for r in D.RANGE_MILES)
+
+
+# ---------------- the map selection and the ticked states (MapsSelected, MazdaCurveMapStates) ----------------
+
+R = D.R
+MI, IL, IN, KY, WA, DE = "us_state.MI", "us_state.IL", "us_state.IN", "us_state.KY", "us_state.WA", "nation.DE"
+LABELS = {MI: "Michigan", IL: "Illinois", IN: "Indiana", KY: "Kentucky", WA: "Washington", DE: "Germany", "nation.US": "United States"}
+HOME = (42.6, -83.1)                 # parked near Detroit: the 42/-84 folder
+
+
+def regions(selected=(), ticked=(), monkeypatch=None):
+  if monkeypatch is not None:
+    monkeypatch.setattr(D, "_LABELS", dict(LABELS))
+  return D.Regions(selected=list(selected), ticked=list(ticked))
+
+
+def test_token_to_boxes():
+  """A state token has a box, the US is the union of its states, Alaska crosses 180 (two boxes), a country or a
+  token this file does not know has none; the CSV parser takes prefixed tokens and bare state codes only."""
+  assert R.region_boxes(MI) == ((41.69, 48.31, -90.42, -82.41),)
+  assert len(R.region_boxes("us_state.AK")) == 2 and R.region_boxes("us_state.AK")[1][2] > 170
+  assert len(R.region_boxes("nation.US")) == 52 and R.region_boxes("nation.CA")[0][1] > 80
+  assert R.region_boxes(DE) is None and R.region_boxes("us_state.XX") is None and R.region_boxes("pkg:midwest") is None
+  assert R.region_boxes(None) is None and R.region_boxes("") is None
+  for code, boxes in R.US_STATE_BOXES.items():
+    for lat_min, lat_max, lon_min, lon_max in boxes:
+      assert -90 < lat_min < lat_max < 90 and -180 <= lon_min < lon_max <= 180, code
+      assert lat_max - lat_min < 21 and lon_max - lon_min < 51, code
+  assert len(R.US_STATE_BOXES) == 56                                       # 50 states, DC, 5 territories
+  placed, unknown = R.place_tokens([MI, DE, IL])
+  assert list(placed) == [MI, IL] and unknown == [DE]
+  assert D.parse_tokens("us_state.MI,us_state.IL,,nation.DE") == [MI, IL, DE]
+  assert D.parse_tokens(b"us_state.MI, MI ,IL,junk,pkg:midwest,us_state.MI") == [MI, IL]   # bytes, bare codes, once each
+  assert D.parse_tokens("") == [] and D.parse_tokens(None) == []
+  assert D.token_label("us_state.ZZ") == "ZZ"
+
+
+def test_folder_overlap_with_the_region_boxes():
+  mi = R.region_boxes(MI)
+  assert R.box_overlaps("42/-84", mi) and R.box_overlaps("46/-90", mi) and R.box_overlaps("40/-90", mi)   # SW corner, with the margin
+  assert not R.box_overlaps("38/-84", mi) and not R.box_overlaps("42/-82", mi)                           # Kentucky, Lake Huron / Ontario
+  assert not R.box_overlaps("build_log.txt", mi) and not R.box_overlaps("42/-84", None) and not R.box_overlaps("42/-84", ())
+  # the margin: Michigan's east edge is -82.41; without a margin the -84 folder still overlaps, the -82 folder never
+  assert R.box_overlaps("42/-84", mi, margin=0.0) and not R.box_overlaps("42/-82", mi, margin=0.3)
+  # Indiana's west edge (-88.1) is just past the -88 line: the -90 folder is Indiana's too, margin or not
+  assert R.box_overlaps("38/-90", R.region_boxes(IN), margin=0.0)
+  hits = R.folders_in_regions(["42/-84", "38/-84", "40/-88", "36/-90"], {MI: mi, IL: R.region_boxes(IL)})
+  assert hits == {"42/-84": [MI], "40/-88": [MI, IL], "36/-90": [IL]}
+  assert set(R.folders_of_box(((41.69, 48.31, -90.42, -82.41),))) == {f"{la}/{lo}" for la in (40, 42, 44, 46, 48) for lo in (-92, -90, -88, -86, -84)}
+  assert R.folders_of_box(R.region_boxes("us_state.DC")) == ["38/-78"]
+  assert D.folder_box("42/-84") == R.folder_box("42/-84") == (42, 44, -84, -82)
+
+
+def test_regions_placement_and_fallbacks(monkeypatch):
+  folders = ["42/-84", "38/-84", "36/-90"]
+  rg = regions([MI, IL], [MI], monkeypatch)
+  assert not rg.empty and rg.restricts() and rg.unknown == [] and not rg.own_everything
+  assert rg.folders_of(folders, [MI]) == {"42/-84": [MI]}
+  assert rg.folders_of(folders, [MI, IL]) == {"42/-84": [MI], "36/-90": [IL]}
+  # a token without a box among placed ones: skipped (its folders cannot be told from leftovers)
+  rg = regions([MI, DE], [DE], monkeypatch)
+  assert rg.unknown == [DE] and rg.restricts() and not rg.own_everything and rg.folders_of(folders, [DE]) == {}
+  assert rg.ticked_unknown() == [DE] and rg.ticked_placed() == []
+  # only unplaceable tokens: every downloaded folder is theirs (the old behaviour), range mode is not restricted
+  rg = regions([DE], [DE], monkeypatch)
+  assert rg.own_everything and not rg.restricts() and set(rg.folders_of(folders, [DE])) == set(folders)
+  assert D.Regions().empty and not D.Regions().restricts()
+
+
+def test_ticked_state_is_built_in_full_whatever_the_range(tmp_path, monkeypatch):
+  """Michigan ticked, parked in Detroit with a 30 mi range: every downloaded Michigan folder is built, the Illinois
+  folder (selected, out of range) and the Kentucky folder (a leftover) are not. A stale Michigan folder is rebuilt
+  on a later pass while it stays ticked; unticked, it is left alone again."""
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  for f in ("42/-84", "44/-88", "36/-90", "38/-84"):
+    make_osm(osm, folder=f, mtime=1_600_000_000)
+  rg = regions([MI, IL], [MI], monkeypatch)
+  p = D.plan(osm, cm, near=HOME, range_miles=30, regions=rg)
+  assert [f for f, _ in p.todo] == ["42/-84", "44/-88"] and p.full == {"42/-84": [MI], "44/-88": [MI]}
+  assert (p.total, p.in_range, p.skipped) == (4, 2, 2) and p.leftovers == (1, sum(s for s, _ in D.map_folders(osm)["38/-84"].values()))
+  assert p.where() == "within 30 mi of 42.6,-83.1 or in Michigan"
+  expect = "2 of 2 map folders within 30 mi of 42.6,-83.1 or in Michigan need building (2 of 4 out of range or outside your selected maps)"
+  assert p.summary() == expect + ": 42/-84, 44/-88"
+  log, status, memo = [], [], {}
+  assert D.run_once(osm, cm, near=HOME, range_miles=30, log=log.append, status=status.append, regions=rg, memo=memo) == (2, 4)
+  assert D.square_files(os.path.join(cm, "44", "-88")) and D.square_files(os.path.join(cm, "42", "-84"))
+  assert not os.path.exists(os.path.join(cm, "36", "-90")) and not os.path.exists(os.path.join(cm, "38", "-84"))
+  assert status[0] == "Building Michigan: area 1 of 2 this pass, about 3 min left (guessing 1.5 min per area)"
+  assert any(s.startswith("Building Michigan: area 2 of 2 this pass, ") and s.endswith("squares, 0 s") and " — 44/-88: " in s for s in status)
+  assert status[-1].startswith("Built 2 folders in") and "in Michigan" in status[-1] and "2 out of range or outside your selected maps" in status[-1]
+  assert sum("outside your selected maps: leftovers" in line for line in log) == 1
+  # the next pass: up to date, the leftover note is not repeated
+  assert D.run_once(osm, cm, near=HOME, range_miles=30, log=log.append, status=status.append, regions=rg, memo=memo) == (0, 4)
+  assert status[-1].startswith("Curve files up to date: 2 map folders within 30 mi of 42.6,-83.1 or in Michigan")
+  assert sum("leftovers" in line for line in log) == 1
+  # a map update of the far Michigan folder: rebuilt because the state stays ticked
+  tile = os.listdir(os.path.join(osm, "44", "-88"))[0]
+  os.utime(os.path.join(osm, "44", "-88", tile), (1_700_000_000, 1_700_000_000))
+  assert D.plan(osm, cm, near=HOME, range_miles=30, regions=rg).todo == [("44/-88", "map data changed")]
+  time.sleep(0.01)
+  assert D.run_once(osm, cm, near=HOME, range_miles=30, log=log.append, regions=rg, memo=memo) == (1, 4)
+  # unticked after the trip: the far folder is out of range again, left alone even when stale
+  os.utime(os.path.join(osm, "44", "-88", tile), (1_700_000_100, 1_700_000_100))
+  p = D.plan(osm, cm, near=HOME, range_miles=30, regions=regions([MI, IL], [], monkeypatch))
+  assert p.todo == [] and p.in_range == 1 and p.full == {} and p.where() == "within 30 mi of 42.6,-83.1"
+
+
+def test_ticked_state_is_built_without_a_gps_position(tmp_path, monkeypatch):
+  """A new install, never driven: no position, but the ticked state is built; range mode waits for a drive."""
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  make_osm(osm, folder="36/-90")
+  rg = regions([MI, IL], [MI], monkeypatch)
+  log, status, idle = [], [], {}
+  assert D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg) == (1, 2)
+  assert D.square_files(os.path.join(cm, "42", "-84")) and not os.path.exists(os.path.join(cm, "36", "-90"))
+  assert not any("no GPS position" in line for line in log) and idle == {}
+  # nothing ticked and no position: the old notice
+  rg = regions([MI, IL], [], monkeypatch)
+  assert D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg) == (0, 2)
+  assert "no GPS position yet" in log[-1] and idle["kind"] == "no position"
+
+
+def test_range_mode_skips_folders_outside_the_selected_regions(tmp_path, monkeypatch):
+  """Kentucky is within 300 mi of Detroit but the owner never selected it: its folder is a leftover of the old
+  whole-US download and is not built (nor deleted). The leftover count and size are logged once."""
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  make_osm(osm, folder="38/-84")
+  assert D.box_distance_miles(HOME, "38/-84") < 300
+  rg = regions([MI, IL], [], monkeypatch)
+  p = D.plan(osm, cm, near=HOME, range_miles=300, regions=rg)
+  assert [f for f, _ in p.todo] == ["42/-84"] and (p.total, p.in_range, p.skipped) == (2, 1, 1) and p.full == {}
+  log, memo = [], {}
+  assert D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, regions=rg, memo=memo) == (1, 2)
+  assert not os.path.exists(os.path.join(cm, "38", "-84"))
+  leftover_lines = [line for line in log if "leftovers" in line]
+  assert len(leftover_lines) == 1 and leftover_lines[0].startswith("1 map folder (") and "MB) are outside your selected maps" in leftover_lines[0]
+  assert sorted(os.listdir(os.path.join(osm, "38", "-84")))                    # nothing under osm touched
+  D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, regions=rg, memo=memo)
+  assert sum("leftovers" in line for line in log) == 1
+  # a selected state with no downloaded maps within range: said so, once
+  log, status, idle = [], [], {}
+  assert D.run_once(osm, cm, near=(37.0, -95.0), range_miles=30, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo) == (0, 2)
+  assert log[-1].startswith("no downloaded maps of your selected regions within 30 mi of 37.0,-95.0 (2 map folders elsewhere)")
+
+
+def test_empty_selection_keeps_the_old_behaviour(tmp_path):
+  """No MapsSelected (or no regions passed at all): everything downloaded within range is built, Kentucky included."""
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  make_osm(osm, folder="38/-84")
+  for rg in (None, D.Regions()):
+    p = D.plan(osm, cm, near=HOME, range_miles=300, regions=rg)
+    assert [f for f, _ in p.todo] == ["42/-84", "38/-84"] and p.leftovers is None and not p.restricted
+    assert p.summary().startswith("2 of 2 map folders within 300 mi of 42.6,-83.1 need building: 42/-84, 38/-84")
+  log = []
+  assert D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, regions=D.Regions(), memo={}) == (2, 2)
+  assert os.path.isdir(os.path.join(cm, "38", "-84")) and not any("leftovers" in line for line in log)
+
+
+def test_unknown_token_handling(tmp_path, monkeypatch):
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  make_osm(osm, folder="38/-84")
+  # only Germany selected: nothing can be placed, so every downloaded folder is taken to be its own (old behaviour)
+  log, status, memo = [], [], {}
+  rg = regions([DE], [], monkeypatch)
+  p = D.plan(osm, cm, near=HOME, range_miles=300, regions=rg)
+  assert len(p.todo) == 2 and p.unknown == [] and p.leftovers is None
+  assert D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, status=status.append, regions=rg, memo=memo) == (2, 2)
+  assert not any("cannot place" in line for line in log)
+  # ... and ticked: all of it is built in full, no position needed
+  p = D.plan(osm, cm, near=None, range_miles=30, regions=regions([DE], [DE], monkeypatch))
+  assert p.in_range == 2 and set(p.full) == {"42/-84", "38/-84"} and p.where() == "within 30 mi (no position yet) or in Germany"
+  # Germany next to Michigan: cannot be told from the leftovers, skipped and said once; Michigan still restricts
+  import shutil
+  shutil.rmtree(cm)
+  log, status, memo = [], [], {}
+  rg = regions([MI, DE], [DE], monkeypatch)
+  p = D.plan(osm, cm, near=HOME, range_miles=300, regions=rg)
+  assert [f for f, _ in p.todo] == ["42/-84"] and p.unknown == [DE] and p.full == {} and p.leftovers[0] == 1
+  assert D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, status=status.append, regions=rg, memo=memo) == (1, 2)
+  assert sum(line.startswith("cannot place Germany on the map") for line in log) == 1
+  assert "can't place Germany" in status[-1] and not os.path.exists(os.path.join(cm, "38", "-84"))
+  D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, status=status.append, regions=rg, memo=memo)
+  assert sum("cannot place" in line for line in log) == 1 and "can't place Germany" in status[-1]
+  # the selection changes to one that places: the note is forgotten, so a later Germany is said again
+  D.run_once(osm, cm, near=HOME, range_miles=300, log=log.append, status=status.append, regions=regions([MI], [], monkeypatch), memo=memo)
+  assert "unknown" not in memo and "can't place" not in status[-1]
+
+
+def test_ticked_state_without_downloaded_maps(tmp_path, monkeypatch):
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  # Washington ticked, nothing of it downloaded, nothing else in scope: the status says what to do, logged once
+  rg = regions([MI, WA], [WA], monkeypatch)
+  log, status, idle, memo = [], [], {}, {}
+  assert D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo) == (0, 1)
+  assert log == ["no map tiles for Washington: download them in StarPilot's map settings"]
+  assert status[-1] == "Map not downloaded for Washington: download it in StarPilot's map settings"
+  D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo)
+  assert len(log) == 1 and len(status) == 2
+  # Michigan ticked too: Michigan is built, Washington is noted once in the log and in the status
+  rg = regions([MI, WA], [MI, WA], monkeypatch)
+  log, status, idle, memo = [], [], {}, {}
+  assert D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo) == (1, 1)
+  assert log[0] == "no map tiles for Washington: download them in StarPilot's map settings"
+  assert status[-1].startswith("Built 1 folder") and "Washington not downloaded" in status[-1] and "in Michigan" in status[-1]
+  D.run_once(osm, cm, near=None, range_miles=100, log=log.append, status=status.append, idle=idle, regions=rg, memo=memo)
+  assert sum("no map tiles" in line for line in log) == 1
+  assert status[-1].startswith("Curve files up to date: 1 map folder within 100 mi (no position yet) or in Michigan")
+
+
+def test_progress_and_time_left_text():
+  assert D.time_left_text(0, 9, 0.0) == "about 14 min left (guessing 1.5 min per area)"
+  assert D.time_left_text(3, 9, 3 * 84.0) == "about 8 min left (avg 1.4 min per area)"
+  assert D.time_left_text(8, 9, 8 * 84.0) == "about 80 s left (avg 1.4 min per area)"
+  assert D.time_left_text(9, 9, 9 * 84.0) == "almost done (avg 1.4 min per area)"
+  assert D.time_left_text(2, 66, 2 * 90.0) == "about 1.6 h left (avg 1.5 min per area)"
+  assert D.progress_text("Illinois", 3, 9, 3 * 84.0) == "Building Illinois: area 4 of 9 this pass, about 8 min left (avg 1.4 min per area)"
+  assert D.progress_text("map folder 40/-90", 0, 1, 0.0, "40/-90: 3 squares, 40 s").endswith("(guessing 1.5 min per area) — 40/-90: 3 squares, 40 s")
+  p = D.Plan([], 4, 2, HOME, 30, full={"42/-84": [MI, IL]})
+  assert p.folder_label("42/-84") in ("Michigan", "MI") and p.folder_label("38/-84") == "map folder 38/-84"
+
+
+def test_region_status_for_the_ui(tmp_path, monkeypatch):
+  osm, cm = str(tmp_path / "osm"), str(tmp_path / "curve_map")
+  make_osm(osm, folder="42/-84")
+  make_osm(osm, folder="44/-88")
+  make_osm(osm, folder="36/-90")
+  folders = D.map_folders(osm)
+  rg = regions([MI, IL, WA, DE], [], monkeypatch)
+  assert D.region_status(MI, folders, cm, rg) == (2, 0, True)
+  assert D.region_status(WA, folders, cm, rg) == (0, 0, True)
+  assert D.region_status(DE, folders, cm, rg) == (0, 0, False)
+  D.run_once(osm, cm, near=HOME, range_miles=30, log=lambda m: None, regions=rg)
+  assert D.region_status(MI, folders, cm, rg) == (2, 1, True) and D.region_status(IL, folders, cm, rg) == (1, 0, True)
+  assert D.folder_is_built("42/-84", folders["42/-84"], cm) and not D.folder_is_built("44/-88", folders["44/-88"], cm)
+  assert not D.folder_is_built("42/-84", dict(folders["42/-84"], extra=[1, 2]), cm)       # a new tile: stale
+  assert not os.path.exists(os.path.join(cm, "36", "-90", D.STATE_NAME))                 # read-only: nothing written
+  assert D.region_status(MI, folders, cm) == (2, 1, True)                                 # without a Regions object
+
+
+def test_regions_are_read_from_params(monkeypatch):
+  monkeypatch.setattr(D, "_LABELS", dict(LABELS))
+  rg = D.read_regions(FakeParams({D.SELECTED_PARAM: "us_state.IL,us_state.MI", D.TICKED_PARAM: b"us_state.MI"}))
+  assert rg.selected == [IL, MI] and rg.ticked == [MI]
+  assert D.read_regions(FakeParams()).empty
+  # a ticked state no longer in the map selection still counts (the UI lists it so it can be unticked)
+  rg = D.read_regions(FakeParams({D.SELECTED_PARAM: "us_state.IL", D.TICKED_PARAM: "us_state.MI"}))
+  assert rg.ticked == [MI] and MI in rg.placed and rg.restricts()
+
+
+def test_owner_example_eight_states():
+  """The owner's selection (MI, IL, IN, MO, ND, SD, WA, WI) on a 2 deg grid of the lower 48 (lat 24..48, lon
+  -126..-68, 348 folders): all eight ticked is 66 folders; Kentucky never qualifies; range mode at 300 mi from
+  Detroit builds fewer folders than without the selection."""
+  grid = [f"{la}/{lo}" for la in range(24, 48, 2) for lo in range(-126, -68, 2)]
+  toks = [f"us_state.{c}" for c in ("MI", "IL", "IN", "MO", "ND", "SD", "WA", "WI")]
+  rg = D.Regions(selected=toks, ticked=toks)
+  full = rg.folders_of(grid, toks)
+  assert len(full) == 66
+  assert all(f not in full for f in R.folders_in_regions(grid, {KY: R.region_boxes(KY)}) if "38/" in f and f not in ("38/-88", "38/-90", "38/-92", "38/-86"))
+  per_state = {t: sum(1 for toks_ in full.values() if t in toks_) for t in toks}
+  assert per_state["us_state.MI"] == 20 and per_state["us_state.IN"] == 9 and per_state["us_state.WA"] == 10
+  near, r300 = (42.6, -83.1), D.in_range(grid, (42.6, -83.1), 300)
+  restricted = [f for f in r300 if f in rg.folders_of(grid, toks)]
+  assert len(restricted) == 17 < len(r300) and "38/-84" in r300 and "38/-84" not in restricted
+  assert restricted[0] == "42/-84" and D.box_distance_miles(near, restricted[-1]) <= 300

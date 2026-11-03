@@ -20,6 +20,18 @@ are. A new city: download its map in the StarPilot map settings, park, and wait.
 `/data/media/0/curve_map/build_log.txt` (a metro folder takes a few minutes on the device). The car side picks the
 new files up at the start of the next drive (and every 2 minutes while driving).
 
+Which folders get built (the Mazda tiles in the vehicle settings):
+
+* **Map Build Range** (30–300 mi): folders within that distance of where the car is parked, nearest first.
+* **Map Build States**: a tick per state of the map selection. A ticked state is built in full, wherever the car is
+  parked and whatever the range says, and kept up to date after map updates. For a trip, tick its states while parked
+  at home (on Wi-Fi, after downloading them in the map settings), untick them after. The dialog shows what each state
+  has ("3 of 9 areas built", "Map not downloaded") and the build's progress with a time estimate.
+* Both only build folders of the regions selected in StarPilot's map settings. Folders from an older whole-US download
+  that are outside the selection are counted in the log ("378 map folders (4.1 GB) are outside your selected maps")
+  and left alone; nothing under `osm/` is ever deleted here. Where a state is comes from
+  `starpilot/common/map_region_boxes.py` (a bounding box per US state; US, Canada and Mexico as countries).
+
 ## Run it on a Windows laptop
 
 1. Install Python 3.12 from https://www.python.org/downloads/ (tick "Add python.exe to PATH").
