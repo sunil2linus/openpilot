@@ -216,3 +216,41 @@ if __name__ == "__main__":
         print("FAIL", name, repr(e))
   print(f"{failed} failed")
   sys.exit(1 if failed else 0)
+
+
+def test_long_events_are_thinned_evenly():
+  rows = [(i * 0.05, (i,)) for i in range(5000)]
+  thin = fe.EventRecorder._thin(rows, 1200)
+  assert len(thin) == 1200 and thin[0] == rows[0] and thin[-1] == rows[-1]
+  gaps = {round(thin[i + 1][0] - thin[i][0], 2) for i in range(len(thin) - 1)}
+  assert max(gaps) <= 0.25                      # evenly spread, no big holes
+
+
+def test_threaded_writer_never_blocks_the_caller(tmp_path):
+  # drive 3b: a 2,000-row map curve event written in one go froze card for 0.1-0.3 s. The caller now only
+  # hands the event to one writer thread; tick() returns at once and the file still appears.
+  import time as _t
+  cols = [f"c{i}" for i in range(50)]
+  rec = fe.EventRecorder(cols, hz=20, root=str(tmp_path), write_in_thread=True)
+  t = 0.0
+  ev = rec.open("mapCurve", t, {"a": 1})
+  for k in range(2400):
+    t = k * 0.05
+    rec.add_row(t, [float(k)] * 50)
+  rec.close(ev, t)
+  worst = 0.0
+  for _ in range(200):
+    t += 0.05
+    s = _t.perf_counter()
+    rec.tick(t)
+    worst = max(worst, _t.perf_counter() - s)
+  assert worst < 0.01, worst
+  for _ in range(400):
+    if rec.written:
+      break
+    _t.sleep(0.05)
+  assert rec.written == 1
+  folder = os.listdir(tmp_path)[0]
+  with open(os.path.join(tmp_path, folder, "signals.csv")) as f:
+    n = sum(1 for _ in f) - 1
+  assert n == fe.MAX_ROWS

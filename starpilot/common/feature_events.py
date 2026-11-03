@@ -9,7 +9,12 @@ Each event becomes a folder /data/media/0/feature_events/<YYYY-MM-DD_HH-MM-SS>_<
 
 Rules:
   * Nothing is written while the event is going on: the folder is written once, after the
-    post window, from a background thread. The calling process only appends to a deque.
+    post window, by one background writer thread per recorder. The calling process only appends
+    to a deque. The writer must never slow the caller (drive 3b: writing a 2,000-row map curve
+    event in one go froze card, which runs at real-time priority on one core, for 0.1-0.3 s ->
+    "Communication Issue" alerts). So the writer leaves the caller's real-time priority and core,
+    writes WRITE_CHUNK_ROWS rows at a time with a pause in between (letting the caller have the
+    GIL), events are capped at MAX_ROWS rows (evenly thinned), and pruning runs rarely.
   * Every public method swallows its own exceptions: this must never break the planner or
     the car controller. The worst case is a missing event folder.
   * The folder is outside realdata, so the log deleter never touches it; it is capped at
@@ -25,6 +30,7 @@ script can re-derive the segment from file mtimes if that lookup failed.
 """
 import datetime
 import os
+import queue
 import shutil
 import threading
 import time
@@ -36,7 +42,11 @@ MAX_BYTES = 50_000_000
 MAX_EVENTS = 300
 PRE_SECONDS = 15.0
 POST_SECONDS = 5.0
-MAX_OPEN_SECONDS = 300.0        # an episode still open after this is written as it is
+MAX_OPEN_SECONDS = 180.0        # an episode still open after this is written as it is
+MAX_ROWS = 1200                 # rows per event file at most (longer events are evenly thinned)
+WRITE_CHUNK_ROWS = 20           # rows formatted per step in the writer ...
+WRITE_PAUSE = 0.005             # ... then the writer pauses this long (s), so the caller always gets the GIL
+PRUNE_EVERY = 600.0             # s between two prunes of the event folder
 NEAR_MISS_SUFFIX = "_nearMiss"  # events of this kind are rate limited and pruned first
 NEAR_MISS_MIN_GAP = 20.0        # s between two near-miss events of the same kind
 
@@ -95,6 +105,9 @@ class EventRecorder:
     self.written = 0
     self.failed = 0
     self.skipped = 0
+    self.write_pause = WRITE_PAUSE if write_in_thread else 0.0
+    self.queue = None              # writer thread input (started on the first event)
+    self.last_prune = None
 
   # ---- collecting ----
   def add_row(self, t, values):
@@ -160,13 +173,54 @@ class EventRecorder:
         # rows after t_end + post are not of interest (the buffer may already hold a few)
         ev["rows"] = [r for r in ev["rows"] if r[0] <= ev["t_end"] + self.post]
         if self.write_in_thread:
-          threading.Thread(target=self._write, args=(ev,), daemon=True).start()
+          self._start_writer()
+          self.queue.put(ev)
         else:
           self._write(ev)
     except Exception:
       pass
 
   # ---- writing (background) ----
+  def _start_writer(self):
+    if self.queue is None:
+      self.queue = queue.Queue()
+      threading.Thread(target=self._writer_loop, daemon=True).start()
+
+  @staticmethod
+  def _leave_caller_priority():
+    """The writer thread inherits the caller's real-time priority and core (card: SCHED_FIFO on one core).
+    On Linux pid 0 = the calling thread: give this thread normal priority and the other cores."""
+    try:
+      os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+    except (AttributeError, OSError, PermissionError):
+      pass
+    try:
+      cores = os.sched_getaffinity(0)
+      others = set(range(os.cpu_count() or 1)) - cores
+      if others:
+        os.sched_setaffinity(0, others)
+    except (AttributeError, OSError):
+      pass
+    try:
+      os.nice(10)
+    except OSError:
+      pass
+
+  def _writer_loop(self):
+    self._leave_caller_priority()
+    while True:
+      ev = self.queue.get()
+      self._write(ev)
+
+  @staticmethod
+  def _thin(rows, max_rows=MAX_ROWS):
+    """At most max_rows rows, evenly spread over the event (first and last kept)."""
+    n = len(rows)
+    if n <= max_rows:
+      return rows
+    step = (n - 1) / (max_rows - 1)
+    return [rows[round(i * step)] for i in range(max_rows)]
+
   def _write(self, ev):
     try:
       wall = ev["wall"]
@@ -202,12 +256,21 @@ class EventRecorder:
       os.makedirs(folder, exist_ok=True)
       with open(os.path.join(folder, "summary.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
+      rows = self._thin(ev["rows"])
+      t0 = ev["t_start"]
       with open(os.path.join(folder, "signals.csv"), "w") as f:
         f.write("t_rel," + ",".join(self.columns) + "\n")
-        for t, vals in ev["rows"]:
-          f.write(f"{t - ev['t_start']:.2f}," + ",".join(_fmt(v) for v in vals) + "\n")
+        for i in range(0, len(rows), WRITE_CHUNK_ROWS):
+          f.write("".join(f"{t - t0:.2f}," + ",".join(_fmt(v) for v in vals) + "\n"
+                          for t, vals in rows[i:i + WRITE_CHUNK_ROWS]))
+          if self.write_pause:
+            time.sleep(self.write_pause)
+      ev["rows"] = []
       self.written += 1
-      prune(self.root, self.max_bytes, self.max_events)
+      now = time.monotonic()
+      if self.last_prune is None or now - self.last_prune > PRUNE_EVERY:
+        self.last_prune = now
+        prune(self.root, self.max_bytes, self.max_events)
     except Exception:
       self.failed += 1
 
