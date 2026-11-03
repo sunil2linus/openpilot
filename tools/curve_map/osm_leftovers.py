@@ -8,7 +8,8 @@ StarPilot's map settings: leftovers of an older download (FrogPilot and StarPilo
 
 Safety: nothing is removed when the selection is empty or holds a region this tool cannot place on the map (it
 could not tell that region's folders from leftovers). A folder is kept when it overlaps any selected region, with a
-margin, so nothing near a state line goes. Only <lat>/<lon> folders under the offline root are ever touched.
+margin, using the states' real outlines (starpilot/common/map_region_shapes.json), so nothing
+near a state line goes. Only <lat>/<lon> folders under the offline root are ever touched.
 """
 import argparse
 import os
@@ -65,8 +66,7 @@ def find_leftovers(folders, tokens):
   placed, unknown = place_tokens(tokens)
   if unknown:
     return [], list(folders), f"cannot place {', '.join(unknown)} on the map: not removing anything"
-  boxes = [b for bs in placed.values() for b in bs]
-  keep = [f for f in folders if box_overlaps(f, boxes)]
+  keep = [f for f in folders if any(box_overlaps(f, region) for region in placed.values())]
   leftovers = [f for f in folders if f not in keep]
   return leftovers, keep, None
 

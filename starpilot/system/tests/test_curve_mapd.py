@@ -568,11 +568,15 @@ def regions(selected=(), ticked=(), monkeypatch=None):
 
 
 def test_token_to_boxes():
-  """A state token has a box, the US is the union of its states, Alaska crosses 180 (two boxes), a country or a
-  token this file does not know has none; the CSV parser takes prefixed tokens and bare state codes only."""
-  assert R.region_boxes(MI) == ((41.69, 48.31, -90.42, -82.41),)
-  assert len(R.region_boxes("us_state.AK")) == 2 and R.region_boxes("us_state.AK")[1][2] > 170
-  assert len(R.region_boxes("nation.US")) == 52 and R.region_boxes("nation.CA")[0][1] > 80
+  """A state token has its outline (Michigan: land, several parts), the US is the union of its states, Alaska has
+  parts on both sides of 180, a country or a token this file does not know has none; territories keep their box;
+  the CSV parser takes prefixed tokens and bare state codes only."""
+  mi = R.region_boxes(MI)
+  assert isinstance(mi, R.Region) and len(mi) >= 2 and mi.bbox[2] > -90.6 and mi.bbox[3] < -82.2   # land: no Lake Huron
+  ak = R.region_boxes("us_state.AK")
+  assert any(x > 170 for ring in ak.rings for x, _y in ring) and any(x < -170 for ring in ak.rings for x, _y in ring)
+  assert len(R.region_boxes("nation.US")) > 51 and R.region_boxes("nation.CA").bbox[1] > 80
+  assert R.region_boxes("us_state.PR").boxes == R.US_STATE_BOXES["PR"]
   assert R.region_boxes(DE) is None and R.region_boxes("us_state.XX") is None and R.region_boxes("pkg:midwest") is None
   assert R.region_boxes(None) is None and R.region_boxes("") is None
   for code, boxes in R.US_STATE_BOXES.items():
@@ -590,15 +594,21 @@ def test_token_to_boxes():
 
 def test_folder_overlap_with_the_region_boxes():
   mi = R.region_boxes(MI)
-  assert R.box_overlaps("42/-84", mi) and R.box_overlaps("46/-90", mi) and R.box_overlaps("40/-90", mi)   # SW corner, with the margin
+  assert R.box_overlaps("42/-84", mi) and R.box_overlaps("46/-90", mi) and R.box_overlaps("46/-92", mi)   # Ironwood: lon -90.4..-90
+  # the real outline, not the box: Michigan's box covered all of Wisconsin and parts of Minnesota and Iowa
+  assert not any(R.box_overlaps(f, mi) for f in ("42/-92", "44/-92", "48/-92", "40/-90"))
+  assert R.box_overlaps("42/-86", mi)                    # no outline point in the box: wholly inside (centre test)
   assert not R.box_overlaps("38/-84", mi) and not R.box_overlaps("42/-82", mi)                           # Kentucky, Lake Huron / Ontario
   assert not R.box_overlaps("build_log.txt", mi) and not R.box_overlaps("42/-84", None) and not R.box_overlaps("42/-84", ())
-  # the margin: Michigan's east edge is -82.41; without a margin the -84 folder still overlaps, the -82 folder never
+  # the margin: Michigan's land reaches about -82.4; the -84 folder overlaps without a margin, the -82 folder never
   assert R.box_overlaps("42/-84", mi, margin=0.0) and not R.box_overlaps("42/-82", mi, margin=0.3)
+  assert R.folders_of_box(mi) == sorted(["40/-84", "40/-86", "40/-88", "42/-84", "42/-86", "42/-88", "44/-84", "44/-86",
+                                         "44/-88", "44/-90", "46/-84", "46/-86", "46/-88", "46/-90", "46/-92", "48/-90"])
   # Indiana's west edge (-88.1) is just past the -88 line: the -90 folder is Indiana's too, margin or not
   assert R.box_overlaps("38/-90", R.region_boxes(IN), margin=0.0)
   hits = R.folders_in_regions(["42/-84", "38/-84", "40/-88", "36/-90"], {MI: mi, IL: R.region_boxes(IL)})
   assert hits == {"42/-84": [MI], "40/-88": [MI, IL], "36/-90": [IL]}
+  # a bare tuple of boxes still works (the old behaviour, the fallback)
   assert set(R.folders_of_box(((41.69, 48.31, -90.42, -82.41),))) == {f"{la}/{lo}" for la in (40, 42, 44, 46, 48) for lo in (-92, -90, -88, -86, -84)}
   assert R.folders_of_box(R.region_boxes("us_state.DC")) == ["38/-78"]
   assert D.folder_box("42/-84") == R.folder_box("42/-84") == (42, 44, -84, -82)
@@ -807,17 +817,38 @@ def test_regions_are_read_from_params(monkeypatch):
 
 def test_owner_example_eight_states():
   """The owner's selection (MI, IL, IN, MO, ND, SD, WA, WI) on a 2 deg grid of the lower 48 (lat 24..48, lon
-  -126..-68, 348 folders): all eight ticked is 66 folders; Kentucky never qualifies; range mode at 300 mi from
-  Detroit builds fewer folders than without the selection."""
+  -126..-68, 348 folders): all eight ticked is 62 folders (real outlines; 66 with boxes); Kentucky never qualifies;
+  range mode at 300 mi from Detroit builds fewer folders than without the selection."""
   grid = [f"{la}/{lo}" for la in range(24, 48, 2) for lo in range(-126, -68, 2)]
   toks = [f"us_state.{c}" for c in ("MI", "IL", "IN", "MO", "ND", "SD", "WA", "WI")]
   rg = D.Regions(selected=toks, ticked=toks)
   full = rg.folders_of(grid, toks)
-  assert len(full) == 66
+  assert len(full) == 62
   assert all(f not in full for f in R.folders_in_regions(grid, {KY: R.region_boxes(KY)}) if "38/" in f and f not in ("38/-88", "38/-90", "38/-92", "38/-86"))
   per_state = {t: sum(1 for toks_ in full.values() if t in toks_) for t in toks}
-  assert per_state["us_state.MI"] == 20 and per_state["us_state.IN"] == 9 and per_state["us_state.WA"] == 10
+  assert per_state["us_state.MI"] == 15 and per_state["us_state.IN"] == 8 and per_state["us_state.WA"] == 9
   near, r300 = (42.6, -83.1), D.in_range(grid, (42.6, -83.1), 300)
   restricted = [f for f in r300 if f in rg.folders_of(grid, toks)]
   assert len(restricted) == 17 < len(r300) and "38/-84" in r300 and "38/-84" not in restricted
   assert restricted[0] == "42/-84" and D.box_distance_miles(near, restricted[-1]) <= 300
+
+
+
+def test_outlines_cover_the_boxes_quick_check_and_every_state_has_folders():
+  """Each state's outline lies within its box (grown a little: the outline is buffered), and every state has at
+  least one folder; the quick bounding-box reject never drops a folder the full test accepts."""
+  grid = [f"{la}/{lo}" for la in range(16, 72, 2) for lo in range(-180, -64, 2)]
+  for code in R.US_MAIN_CODES:
+    region = R.region_boxes(f"us_state.{code}")
+    assert R.folders_of_box(region), code
+    for la0, la1, lo0, lo1 in [R.folder_box(f) for f in grid]:
+      if region._touches((la0, la1, lo0, lo1), R.MARGIN_DEG):
+        b = region.bbox
+        assert not (la0 - 0.1 > b[1] or la1 + 0.1 < b[0] or lo0 - 0.1 > b[3] or lo1 + 0.1 < b[2]), code
+
+
+def test_missing_shape_file_falls_back_to_boxes(monkeypatch, tmp_path):
+  monkeypatch.setattr(R, "SHAPES_PATH", str(tmp_path / "missing.json"))
+  monkeypatch.setattr(R, "_REGIONS", {})
+  mi = R.region_boxes(MI)
+  assert mi.boxes == R.US_STATE_BOXES["MI"] and len(R.folders_of_box(mi)) == 25   # the old, looser behaviour

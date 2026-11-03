@@ -1,12 +1,17 @@
 """
-Where a map region of StarPilot's map settings is on the globe: bounding boxes per MapsSelected token.
+Where a map region of StarPilot's map settings is on the globe: the real outline per MapsSelected token.
 
 The map download (the mapd binary) knows the real shape of every region, but it keeps that to itself: this repo
 only sends it the token CSV. The curve map builder (starpilot/system/curve_mapd.py) needs to know which 2 x 2 degree
 map folders belong to the states the owner selected, so the folders left over from an older whole-US download are
-never built, and so a ticked state is built in full. A bounding box per state is plenty for that: a folder is
-built when its box overlaps the region's box (with MARGIN_DEG around the region), so the worst a loose box can do is
-build a neighbouring folder too, never miss one.
+never built, and so a ticked state is built in full.
+
+A bounding box is far too coarse for that (Michigan's covers all of Wisconsin and parts of Minnesota and Iowa: ticking
+Michigan built 25 folders instead of 16). So the US states and Canada / Mexico use simplified land outlines from
+Natural Earth (map_region_shapes.json next to this file, made by tools/curve_map/build_region_shapes.py). Each
+simplified outline COVERS the original, and a folder counts when its box grown by MARGIN_DEG touches the outline: a
+folder holding any part of a region is never missed, one near the line may be counted too. The boxes below stay as
+the fallback (territories, or when the JSON cannot be read), and as each region's quick pre-check.
 
 Boxes are (lat_min, lat_max, lon_min, lon_max) in degrees, from the usual US state extents, rounded outwards to
 0.01. A region can have several boxes (Alaska crosses the antimeridian). Countries: only the ones a US driver can
@@ -88,16 +93,140 @@ COUNTRY_BOXES = {
 }
 
 
+import json
+import os
+
+SHAPES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map_region_shapes.json")
+
+
+class Region:
+  """A region's outline: rings of (lon, lat) points (no holes) and their bounding box. Built from boxes when there is
+  no outline (then the rings are the boxes' rectangles, which is the old behaviour)."""
+
+  def __init__(self, rings, boxes=None):
+    self.rings = [[(float(x), float(y)) for x, y in ring] for ring in rings if len(ring) >= 3]
+    self.boxes = tuple(boxes) if boxes else None
+    ys = [y for r in self.rings for _x, y in r]
+    xs = [x for r in self.rings for x, _y in r]
+    self.bbox = (min(ys), max(ys), min(xs), max(xs)) if xs else None
+    self._hits = {}
+
+  @classmethod
+  def from_boxes(cls, boxes):
+    rings = [[(lo0, la0), (lo1, la0), (lo1, la1), (lo0, la1), (lo0, la0)] for la0, la1, lo0, lo1 in boxes]
+    return cls(rings, boxes)
+
+  def __len__(self):
+    return len(self.rings)
+
+  def touches(self, fb, margin):
+    """True when the folder box fb = (lat0, lat1, lon0, lon1), grown by `margin`, touches the outline (cached)."""
+    key = (fb, margin)
+    hit = self._hits.get(key)
+    if hit is None:
+      hit = self._hits[key] = self._touches(fb, margin)
+    return hit
+
+  def _touches(self, fb, margin):
+    if self.bbox is None:
+      return False
+    la0, la1, lo0, lo1 = fb[0] - margin, fb[1] + margin, fb[2] - margin, fb[3] + margin
+    b_la0, b_la1, b_lo0, b_lo1 = self.bbox
+    if la0 > b_la1 or la1 < b_la0 or lo0 > b_lo1 or lo1 < b_lo0:
+      return False
+    cx, cy = (lo0 + lo1) / 2, (la0 + la1) / 2
+    for ring in self.rings:
+      for (x0, y0), (x1, y1) in zip(ring, ring[1:] + ring[:1], strict=False):
+        if _segment_hits_box(x0, y0, x1, y1, lo0, la0, lo1, la1):
+          return True
+      if _inside(cx, cy, ring):
+        return True          # no edge enters the box: it is wholly inside (or outside, then this is False)
+    return False
+
+
+def _segment_hits_box(x0, y0, x1, y1, xmin, ymin, xmax, ymax):
+  """Liang-Barsky: does the segment (x0, y0)-(x1, y1) touch the box?"""
+  t0, t1 = 0.0, 1.0
+  dx, dy = x1 - x0, y1 - y0
+  for p, q in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin), (dy, ymax - y0)):
+    if p == 0:
+      if q < 0:
+        return False
+    else:
+      t = q / p
+      if p < 0:
+        if t > t1:
+          return False
+        t0 = max(t0, t)
+      else:
+        if t < t0:
+          return False
+        t1 = min(t1, t)
+  return t0 <= t1
+
+
+def _inside(x, y, ring):
+  """Even-odd ray cast: is (x, y) inside the ring?"""
+  inside = False
+  n = len(ring)
+  for k in range(n):
+    xa, ya = ring[k]
+    xb, yb = ring[(k + 1) % n]
+    if (ya > y) != (yb > y) and x < xa + (y - ya) * (xb - xa) / (yb - ya):
+      inside = not inside
+  return inside
+
+
+_REGIONS = {}
+
+
+def _shapes():
+  """The outlines from map_region_shapes.json ({'states': {...}, 'nations': {...}}), {} when unreadable."""
+  if "_shapes" not in _REGIONS:
+    try:
+      with open(SHAPES_PATH) as f:
+        data = json.load(f)
+      _REGIONS["_shapes"] = data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+      _REGIONS["_shapes"] = {}
+  return _REGIONS["_shapes"]
+
+
+def _state(code):
+  rings = _shapes().get("states", {}).get(code)
+  if rings:
+    return Region(rings, US_STATE_BOXES.get(code))
+  boxes = US_STATE_BOXES.get(code)
+  return Region.from_boxes(boxes) if boxes else None
+
+
+def _nation(code):
+  if code == "US":
+    parts = [_state(c) for c in US_MAIN_CODES]
+    return Region([r for p in parts if p is not None for r in p.rings], COUNTRY_BOXES["US"])
+  rings = _shapes().get("nations", {}).get(code)
+  if rings:
+    return Region(rings, COUNTRY_BOXES.get(code))
+  boxes = COUNTRY_BOXES.get(code)
+  return Region.from_boxes(boxes) if boxes else None
+
+
 def region_boxes(token):
-  """The boxes of a MapsSelected token ('us_state.MI', 'nation.CA'), or None when this file cannot place it."""
+  """The Region (outline) of a MapsSelected token ('us_state.MI', 'nation.CA'), or None when this file cannot place
+  it. Cached: the folder checks of a region are remembered."""
   if not isinstance(token, str):
     return None
   token = token.strip()
+  if token in _REGIONS:
+    return _REGIONS[token]
+  region = None
   if token.startswith(STATE_PREFIX):
-    return US_STATE_BOXES.get(token[len(STATE_PREFIX):])
-  if token.startswith(COUNTRY_PREFIX):
-    return COUNTRY_BOXES.get(token[len(COUNTRY_PREFIX):])
-  return None
+    region = _state(token[len(STATE_PREFIX):])
+  elif token.startswith(COUNTRY_PREFIX):
+    region = _nation(token[len(COUNTRY_PREFIX):])
+  if region is not None:
+    _REGIONS[token] = region
+  return region
 
 
 def folder_box(folder):
@@ -109,50 +238,55 @@ def folder_box(folder):
   return la, la + 2, lo, lo + 2
 
 
-def box_overlaps(folder, boxes, margin=MARGIN_DEG):
-  """True when the map folder's box overlaps any of the region boxes, each grown by `margin` degrees."""
+def box_overlaps(folder, region, margin=MARGIN_DEG):
+  """True when the map folder's box, grown by `margin` degrees, touches the region (a Region, or a tuple of boxes)."""
   fb = folder_box(folder)
-  if fb is None or not boxes:
+  if fb is None or not region:
     return False
-  la0, la1, lo0, lo1 = fb
-  for lat_min, lat_max, lon_min, lon_max in boxes:
-    if la0 < lat_max + margin and la1 > lat_min - margin and lo0 < lon_max + margin and lo1 > lon_min - margin:
-      return True
-  return False
+  if not isinstance(region, Region):
+    region = Region.from_boxes(region)
+  return region.touches(fb, margin)
 
 
 def place_tokens(tokens):
-  """Split tokens into {token: boxes} for the ones this file can place and [tokens] it cannot."""
+  """Split tokens into {token: Region} for the ones this file can place and [tokens] it cannot."""
   placed, unknown = {}, []
   for t in tokens:
-    boxes = region_boxes(t)
-    if boxes:
-      placed[t] = boxes
+    region = region_boxes(t)
+    if region:
+      placed[t] = region
     else:
       unknown.append(t)
   return placed, unknown
 
 
-def folders_in_regions(folders, boxes_by_token, margin=MARGIN_DEG):
-  """{folder: [token, ...]} for the folders (names) that overlap at least one region, tokens in the given order."""
+def folders_in_regions(folders, regions_by_token, margin=MARGIN_DEG):
+  """{folder: [token, ...]} for the folders (names) that touch at least one region, tokens in the given order."""
   out = {}
   for f in folders:
-    hits = [t for t, boxes in boxes_by_token.items() if box_overlaps(f, boxes, margin)]
+    hits = [t for t, region in regions_by_token.items() if box_overlaps(f, region, margin)]
     if hits:
       out[f] = hits
   return out
 
 
-def folders_of_box(boxes, margin=MARGIN_DEG):
-  """Every 2 x 2 degree folder name a region's boxes touch (downloaded or not): what a full build of it may need."""
-  names = set()
-  for lat_min, lat_max, lon_min, lon_max in boxes:
-    la = int((lat_min - margin) // 2) * 2
-    while la < lat_max + margin:
-      lo = int((lon_min - margin) // 2) * 2
-      while lo < lon_max + margin:
-        if -90 <= la < 90 and -180 <= lo < 180:
-          names.add(f"{la}/{lo}")
-        lo += 2
-      la += 2
+def folders_of_box(region, margin=MARGIN_DEG):
+  """Every 2 x 2 degree folder name a region touches (downloaded or not): what a full build of it may need."""
+  if not region:
+    return []
+  if not isinstance(region, Region):
+    region = Region.from_boxes(region)
+  if region.bbox is None:
+    return []
+  lat_min, lat_max, lon_min, lon_max = region.bbox
+  names = []
+  la = int((lat_min - margin) // 2) * 2
+  while la < lat_max + margin:
+    lo = int((lon_min - margin) // 2) * 2
+    while lo < lon_max + margin:
+      name = f"{la}/{lo}"
+      if -90 <= la < 90 and -180 <= lo < 180 and box_overlaps(name, region, margin):
+        names.append(name)
+      lo += 2
+    la += 2
   return sorted(names)

@@ -34,7 +34,7 @@ on the device, so a new city only needs the map download in the settings:
         selection: the owner's osm folder holds the whole lower 48 from an older download, but only 8 states are
         selected, so Kentucky (within 300 mi of Detroit) is never built. The leftovers are counted and their size
         logged once; nothing is ever deleted here. No selection: everything downloaded within range, as before.
-      - Where a region is comes from starpilot/common/map_region_boxes.py (a bounding box per US state, US/CA/MX).
+      - Where a region is comes from starpilot/common/map_region_boxes.py (real outlines of the US states, US/CA/MX).
         A token it cannot place is skipped and said so, unless it is the only kind of region selected: then every
         downloaded folder is taken to be its own.
     Nearest first. Folders out of scope are left alone: not built, never deleted; built ones are refreshed only once
@@ -271,7 +271,7 @@ def token_label(token):
 
 class Regions:
   """The selected (MapsSelected) and ticked (MazdaCurveMapStates) regions placed on the map.
-  placed: {token: boxes}; unknown: tokens without a box; ticked: the ticked tokens (a subset of placed or unknown).
+  placed: {token: Region (outline)}; unknown: tokens that cannot be placed; ticked: the ticked tokens (a subset of placed or unknown).
   own_everything: no token could be placed but some were given: every downloaded folder is taken to be theirs."""
 
   def __init__(self, selected=(), ticked=()):
