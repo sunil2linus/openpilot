@@ -148,7 +148,7 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
 
   # Mazda stop warnings: one soft chime at its own fixed volume (MazdaStopWarningChime)
   starpilot_alert_key(StarPilotAudibleAlert.stopChime): ("stop_chime.wav", 1, MAX_VOLUME),
-  starpilot_alert_key(StarPilotAudibleAlert.stoppedCarChime): ("stopped_car_chime.wav", 1, MAX_VOLUME),
+  starpilot_alert_key(StarPilotAudibleAlert.stoppedCarChime): ("stop_chime.wav", 1, MAX_VOLUME),   # owner: one ding for both
 }
 MAP_CURVE_CHIME_ALERTS = (starpilot_alert_key(StarPilotAudibleAlert.curveChime),
                           starpilot_alert_key(StarPilotAudibleAlert.curveNoData))
