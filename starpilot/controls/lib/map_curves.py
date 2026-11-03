@@ -47,6 +47,7 @@ NEAR = 15.0               # m
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 TILE_KEEP = 25            # squares kept in memory
+RESCAN_SECONDS = 120.0    # how often the curve_map folder is checked for new files (curve_mapd builds them while parked)
 MATCH_DIST = 20.0         # m: the car is on a road shape within this distance (GPS error + road width)
 MATCH_HEADING = 35.0      # deg: and heading along it (either direction) within this
 MATCH_STAY = 12.0         # m: the car stays on the road it is on until that road is this far away (or turns away)
@@ -317,8 +318,8 @@ class RoadMatcher:
 class MapCurveStore:
   """Curve files around the car, loaded in the background."""
 
-  def __init__(self, root=CURVE_DIR, background=True):
-    self.root = root
+  def __init__(self, root=None, background=True):
+    self.root = CURVE_DIR if root is None else root
     self.background = background
     self.index = {}            # square name -> [paths]
     self.loaded = {}           # square name -> (curves, ramps, chains)
@@ -332,12 +333,64 @@ class MapCurveStore:
     self.way_chain = {}        # way id -> (chain id, index in the chain)
     self.grid = []             # RoadIndex of every loaded square that has road shapes
     self.wanted = []
+    self.signature = None      # folder mtimes the index was made from
+    self.last_rescan = None
     self.scan()
 
-  def scan(self):
-    self.index = {}
+  def _signature(self):
+    """Modification times of the curve_map folder and its two levels of subfolders (a few stats): a file added,
+    replaced or removed changes its folder's mtime, so this says whether the index is stale without listing files."""
+    sig = []
+    for d in [self.root] + sorted(glob.glob(os.path.join(self.root, "*"))) + sorted(glob.glob(os.path.join(self.root, "*", "*"))):
+      try:
+        sig.append((d, os.stat(d).st_mtime_ns))
+      except OSError:
+        pass
+    return tuple(sig)
+
+  def _index(self):
+    index = {}
     for p in glob.glob(os.path.join(self.root, "*", "*", "*.json")):
-      self.index.setdefault(os.path.basename(p)[:-5], []).append(p)
+      index.setdefault(os.path.basename(p)[:-5], []).append(p)
+    return index
+
+  def scan(self):
+    self.signature = self._signature()
+    self.index = self._index()
+    self.last_rescan = time.monotonic()
+
+  def rescan_if_changed(self, now=None, force=False):
+    """Pick up curve files built since the index was made (curve_mapd, or files copied over): when the folder
+    signature changed, re-index and drop the loaded squares (they may have been rebuilt) in the background thread.
+    Checked at most every RESCAN_SECONDS (or when `force`), never while a load is running. Returns True when a
+    rescan was started."""
+    if self.loading:
+      return False
+    now = time.monotonic() if now is None else now
+    if not force and self.last_rescan is not None and now - self.last_rescan < RESCAN_SECONDS:
+      return False
+    self.last_rescan = now
+    if self._signature() == self.signature:
+      return False
+    if self.background:
+      self.loading = True
+      threading.Thread(target=self._rescan, daemon=True).start()
+    else:
+      self._rescan()
+    return True
+
+  def _rescan(self):
+    if self.background:
+      leave_caller_priority()
+    try:
+      sig = self._signature()
+      index = self._index()
+      with self.lock:
+        self.signature, self.index = sig, index
+        self.loaded, self.order, self.wanted = {}, [], []
+        self._rebuild()
+    finally:
+      self.loading = False
 
   @property
   def has_files(self):
@@ -777,8 +830,10 @@ class MapCurvesPlanner:
       started = bool(sm["deviceState"].started)
     except Exception:
       started = True
-    if self.counter == 0 or now - getattr(self, "last_call", now) > 5.0 or (not started and self.counter % 20 == 0):
+    drive_start = self.counter == 0 or now - getattr(self, "last_call", now) > 5.0 or (started and not getattr(self, "prev_started", False))
+    if drive_start or (not started and self.counter % 20 == 0):
       self._read_mode()
+    self.prev_started = started
     self.last_call = now
     self.counter += 1
     if self.mode == 0:
@@ -791,6 +846,10 @@ class MapCurvesPlanner:
       self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory())
       self.pass_curve, self.pass_samples = None, []
       self.matcher = RoadMatcher(self.mc.store)
+    elif started:
+      # curve files built while parked (curve_mapd) or copied over: re-index at the start of a drive, then every
+      # RESCAN_SECONDS (a few folder stats here; the file listing runs in the background)
+      self.mc.store.rescan_if_changed(now, force=drive_start)
     if gps_position is None:
       self.mc.reset()
       return

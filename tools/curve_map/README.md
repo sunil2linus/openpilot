@@ -10,6 +10,16 @@ Checked against curves the car measured: the map radius was within about 10 % (1
 131 m vs 138–164 m, 216 m vs 231 m). A 2° x 2° area (about 140 x 100 miles) takes about 10 s and gives about
 14,000 curves, about 14 MB with the road shapes.
 
+## Built on the device (no laptop needed)
+
+With Map Curves set to Test or On, the device builds the curve files itself while the car is parked
+(`starpilot/system/curve_mapd.py`, started by manager offroad, lowest priority): every map folder under
+`/data/media/0/osm/offline` that has no curve files, newer map tiles than its curve files were built from, or files
+from an older builder is built into `/data/media/0/curve_map/<lat>/<lon>/`. Files built on a laptop are kept as they
+are. A new city: download its map in the StarPilot map settings, park, and wait. Progress and timings are in
+`/data/media/0/curve_map/build_log.txt` (a metro folder takes a few minutes on the device). The car side picks the
+new files up at the start of the next drive (and every 2 minutes while driving).
+
 ## Run it on a Windows laptop
 
 1. Install Python 3.12 from https://www.python.org/downloads/ (tick "Add python.exe to PATH").

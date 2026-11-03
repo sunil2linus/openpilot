@@ -143,6 +143,17 @@ def run_v_asm(started: bool, params: Params, CP: car.CarParams, starpilot_toggle
   return started and getattr(starpilot_toggles, "v_asm_enabled", False)
 
 
+def run_curve_mapd(started: bool, params: Params, CP: car.CarParams, starpilot_toggles: SimpleNamespace) -> bool:
+  """Build the Mazda map curve files from the offline map tiles while parked (MazdaMapCurves Test or On; the process
+  itself checks that the car is a Mazda, CP is empty offroad)."""
+  if started:
+    return False
+  try:
+    return int(params.get("MazdaMapCurves") or 0) > 0
+  except (TypeError, ValueError):
+    return False
+
+
 def run_stinger_object_shadow(started: bool, params: Params, CP: car.CarParams, starpilot_toggles: SimpleNamespace) -> bool:
   return (started and not CP.notCar and CP.carFingerprint == "KIA_STINGER_2022" and
           params.get_bool("StingerObjectShadow") and not params.get_bool("DisableLogging") and
@@ -238,6 +249,7 @@ procs += [
   PythonProcess("speed_limit_vision", "starpilot.system.speed_limit_vision", run_speed_limit_vision, nice=19),
   PythonProcess("adj_spot_monitor_vision", "starpilot.system.adj_spot_monitor_vision", run_v_asm, nice=19),
   PythonProcess("stinger_object_shadow", "starpilot.system.stinger_object_shadow", run_stinger_object_shadow, nice=19),
+  PythonProcess("curve_mapd", "starpilot.system.curve_mapd", run_curve_mapd, nice=19),
 ]
 
 managed_processes = {p.name: p for p in procs}

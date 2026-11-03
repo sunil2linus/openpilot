@@ -23,6 +23,12 @@ Runs anywhere with Python 3.9+ and `pip install pycapnp numpy`, e.g. on a laptop
   python build_curve_map.py --tiles <folder with the 0.25 deg files> --out <output folder>
   python build_curve_map.py --tiles osm_offline/42/-84 --out curves/42/-84
 
+and on the device itself while parked (starpilot/system/curve_mapd.py builds every downloaded map folder that has no
+curve files yet, or whose map data or builder is newer). The device has little memory, so a folder is built with the
+nodes of each tile in one flat array (a Way is a view into it), residential streets are not kept (only the few a ramp
+ends on), the node index only holds the nodes ramps end on, and the squares are written one at a time (each file
+through a temporary name, so a kill leaves no half-written file).
+
 The schema (offline_maps.capnp) is read from FrogPilot's frogpilot/system/ next to this script's repo
 root, or from --schema.
 """
@@ -63,6 +69,11 @@ LINK_CLASSES = {2, 4, 6, 8, 10}
 SKIP_CLASSES = {12}         # residential streets: 25 mph, cul-de-sacs and courts; the slowdown works from 25 mph up
 SHAPE_TOLERANCE = 2.0       # m: road shapes for the car's own road matching are simplified to this
 FORMAT_VERSION = 4          # 3: curves, ramps, chains; 4: + road shapes ("roads") for matching without FrogPilot's map match
+# BUILDER_VERSION: how the curves are found. Written into every file ("builder"); the device rebuilds a folder whose
+# files were made by an older builder. Bump it when a change here should rebuild the existing curve files (files
+# without the field were made by builder 1: the same algorithm, before the field existed).
+BUILDER_VERSION = 1
+KEY_SCALE = 4_000_000_000   # node key = round(lat * 1e7) * KEY_SCALE + round(lon * 1e7) (one int, lon fits below the scale)
 
 
 def load_schema(path=None):
@@ -146,27 +157,103 @@ class Way:
 
 
 def key(lat, lon):
-  return (round(lat * 1e7), round(lon * 1e7))
+  """One int per node position (1e-7 deg, about 1 cm): ways that share a node share the key."""
+  return int(round(float(lat) * 1e7)) * KEY_SCALE + int(round(float(lon) * 1e7))
+
+
+def node_keys(lat, lon):
+  """key() of every node, as an int64 array (the same numbers: both round the same double, ties to even)."""
+  la = np.rint(np.asarray(lat, dtype=np.float64) * 1e7).astype(np.int64)
+  lo = np.rint(np.asarray(lon, dtype=np.float64) * 1e7).astype(np.int64)
+  return la * KEY_SCALE + lo
+
+
+def keys_in(keys, sorted_keys):
+  """Positions in `keys` (int64 array) whose value is in `sorted_keys` (sorted int64 array)."""
+  if len(sorted_keys) == 0 or len(keys) == 0:
+    return np.zeros(0, dtype=np.int64)
+  pos = np.searchsorted(sorted_keys, keys)
+  pos[pos >= len(sorted_keys)] = 0
+  return np.nonzero(sorted_keys[pos] == keys)[0]
+
+
+def _make_way(meta, lat, lon):
+  wy = Way()
+  wy.id, wy.name, wy.ref, wy.cls, speed, advisory, wy.oneway = meta
+  wy.speed = speed if speed > 0 else DEFAULT_SPEED_MPH[wy.cls] * MPH
+  wy.advisory = advisory if advisory > 0 else 0.0
+  wy.lat, wy.lon = lat, lon
+  wy.start, wy.end = key(lat[0], lon[0]), key(lat[-1], lon[-1])
+  return wy
+
+
+def link_end_keys(ways):
+  """The nodes ramps (link roads) start and end on: the only nodes the ramp records look up (connected())."""
+  out = set()
+  for w in ways.values():
+    if w.cls in LINK_CLASSES:
+      out.add(w.start)
+      out.add(w.end)
+  return out
 
 
 def load_ways(schema, files):
-  ways = {}
+  """Way objects for the roads the curves use. Roads of SKIP_CLASSES (residential streets) are only kept when a ramp
+  ends on one of their nodes (the ramp records need the road a ramp leads to); nothing else uses them. Memory: the
+  nodes of a tile are one flat array and each Way's lat/lon is a view into it. A metro folder (Detroit, 2 x 2 deg) has
+  204k roads with 2M nodes, 60 % residential: a Way object per road with its own arrays took 240 MB, this about 60."""
+  wanted = set()        # nodes ramps start or end on (first pass: cheap, the tiles are read lazily)
   for f in files:
     t = read_tile(schema, f)
     if t is None:
       continue
     for w in t.ways:
-      if w.id in ways or w.highwayClass not in CLASS_NAMES or len(w.nodes) < 2:
+      if w.highwayClass in LINK_CLASSES and len(w.nodes) >= 2:
+        nodes = w.nodes
+        wanted.add(key(nodes[0].latitude, nodes[0].longitude))
+        wanted.add(key(nodes[-1].latitude, nodes[-1].longitude))
+    del t
+  wanted_arr = np.array(sorted(wanted), dtype=np.int64)
+  ways, seen = {}, set()
+  for f in files:
+    t = read_tile(schema, f)
+    if t is None:
+      continue
+    la, lo, pend = [], [], []          # nodes of the ways kept, and (meta, start, count) per way
+    rla, rlo, rpend = [], [], []       # skipped classes: only to find the nodes a ramp ends on
+    for w in t.ways:
+      cls = w.highwayClass
+      if w.id in seen or cls not in CLASS_NAMES or len(w.nodes) < 2:
         continue
-      wy = Way()
-      wy.id, wy.name, wy.ref, wy.cls = w.id, w.name, w.ref, w.highwayClass
-      wy.speed = w.maxSpeed if w.maxSpeed > 0 else DEFAULT_SPEED_MPH[w.highwayClass] * MPH
-      wy.advisory = w.advisorySpeed if w.advisorySpeed > 0 else 0.0
-      wy.oneway = bool(w.oneWay)
-      wy.lat = np.array([n.latitude for n in w.nodes])
-      wy.lon = np.array([n.longitude for n in w.nodes])
-      wy.start, wy.end = key(wy.lat[0], wy.lon[0]), key(wy.lat[-1], wy.lon[-1])
-      ways[w.id] = wy
+      nodes = w.nodes
+      meta = (w.id, sys.intern(w.name), sys.intern(w.ref), cls, w.maxSpeed, w.advisorySpeed, bool(w.oneWay))
+      if cls in SKIP_CLASSES:
+        if len(wanted_arr):
+          rpend.append((meta, len(rla), len(nodes)))
+          rla.extend(n.latitude for n in nodes)
+          rlo.extend(n.longitude for n in nodes)
+      else:
+        seen.add(w.id)
+        pend.append((meta, len(la), len(nodes)))
+        la.extend(n.latitude for n in nodes)
+        lo.extend(n.longitude for n in nodes)
+    if rpend:
+      hits = keys_in(node_keys(rla, rlo), wanted_arr)
+      if len(hits):
+        starts = np.array([s for _, s, _ in rpend], dtype=np.int64)
+        for k in sorted(set((np.searchsorted(starts, hits, side="right") - 1).tolist())):
+          meta, s, n = rpend[k]
+          if meta[0] not in seen:
+            seen.add(meta[0])
+            pend.append((meta, len(la), n))
+            la.extend(rla[s:s + n])
+            lo.extend(rlo[s:s + n])
+    del rla, rlo, rpend
+    lat_arr, lon_arr = np.array(la, dtype=np.float64), np.array(lo, dtype=np.float64)
+    del la, lo
+    for meta, s, n in pend:
+      ways[meta[0]] = _make_way(meta, lat_arr[s:s + n], lon_arr[s:s + n])
+    del t
   return ways
 
 
@@ -372,13 +459,21 @@ HIGHWAY_CLASSES = {1, 3}
 LINK_FOLLOW_HOPS = 4
 
 
-def node_index(ways):
-  """Every node -> [(way, position)], for all classes (a ramp may end on a road's interior node)."""
+def node_index(ways, only=None):
+  """Node -> [(way, position)], for all classes (a ramp may end on a road's interior node). With `only` (a set of
+  node keys) just those nodes are indexed: the ramp records only ever look up link_end_keys(ways), and the full
+  index of a metro folder (2M nodes) took 500 MB."""
   idx = {}
+  if only is None:
+    for w in ways.values():
+      for m in range(len(w.lat)):
+        idx.setdefault(key(w.lat[m], w.lon[m]), []).append((w, m))
+    return idx
+  only_arr = np.array(sorted(only), dtype=np.int64)
   for w in ways.values():
-    n = len(w.lat)
-    for m in range(n):
-      idx.setdefault(key(w.lat[m], w.lon[m]), []).append((w, m))
+    ks = node_keys(w.lat, w.lon)
+    for m in keys_in(ks, only_arr).tolist():
+      idx.setdefault(int(ks[m]), []).append((w, m))
   return idx
 
 
@@ -520,15 +615,37 @@ def tile_of(lat, lon):
   return f"{la:.6f}_{lo:.6f}_{la + 0.25:.6f}_{lo + 0.25:.6f}"
 
 
-def build(tiles_dir, out_dir, schema_path=None, quiet=False):
+def tiles_of_way(w):
+  """The 0.25 deg squares a way's road shape can fall in (from its bounding box, in the micro-degrees the shape
+  is written in, so a point rounded across a square line still finds its square)."""
+  la = np.rint(w.lat * 1e6) / 1e6
+  lo = np.rint(w.lon * 1e6) / 1e6
+  la0, la1 = math.floor(float(la.min()) * 4), math.floor(float(la.max()) * 4)
+  lo0, lo1 = math.floor(float(lo.min()) * 4), math.floor(float(lo.max()) * 4)
+  return [tile_of(a / 4 + 0.001, o / 4 + 0.001) for a in range(la0, la1 + 1) for o in range(lo0, lo1 + 1)]
+
+
+def write_json_atomic(path, data):
+  """Write through a temporary name and rename: a reader (or a kill) never sees a half-written file."""
+  tmp = path + ".tmp"
+  with open(tmp, "w") as f:
+    json.dump(data, f, separators=(",", ":"))
+  os.replace(tmp, path)
+
+
+def build(tiles_dir, out_dir, schema_path=None, quiet=False, progress=None, extra=None):
+  """Build the curve files of one map folder into out_dir, one square at a time (each written atomically).
+  progress(square name, bytes written, seconds since the start) is called after each file. `extra`: more fields for
+  every file (the device adds when it built them). Returns the counts as a dict (see the end)."""
   schema = load_schema(schema_path)
   files = sorted(f for f in glob.glob(os.path.join(tiles_dir, "*")) if os.path.isfile(f))
   if not files:
-    sys.exit(f"no tile files in {tiles_dir}")
-  t0 = time.time()
+    raise FileNotFoundError(f"no tile files in {tiles_dir}")
+  t0 = time.monotonic()
   ways = load_ways(schema, files)
+  t_load = time.monotonic() - t0
   chains = build_chains(ways)
-  nidx = node_index(ways)
+  nidx = node_index(ways, link_end_keys(ways))
   curves, ramps, chain_recs = [], [], {}
   for ch in chains:
     ramp = ramp_record(ch, nidx, ways)
@@ -539,10 +656,12 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False):
     if found or ramp is not None:
       rec = chain_record(ch)
       chain_recs[rec["id"]] = rec
+  del nidx
+  t_curves = time.monotonic() - t0
   # one file per 0.25 deg square: curves by their apex, ramps by their start, road shapes where they lie
   by_tile = {}
   def tile(name):
-    return by_tile.setdefault(name, {"curves": [], "ramps": [], "chains": set(), "roads": []})
+    return by_tile.setdefault(name, {"curves": [], "ramps": [], "chains": set()})
   for c in curves:
     t = tile(tile_of(*c["apex"]))
     t["curves"].append(c)
@@ -552,22 +671,44 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False):
     t["ramps"].append(r)
     t["chains"].add(r["chain"])
   chain_of = {w.id: int(ch[0][0].id) for ch in chains for w, _rev in ch}
-  for name, shapes in road_shapes(ways, chain_of).items():
-    tile(name)["roads"] = shapes
+  n_chains = len(chains)
+  del chains
+  # the road shapes are made square by square (all at once they took more memory than the roads themselves)
+  ways_of_tile = {}
+  for w in ways.values():
+    if w.cls in SKIP_CLASSES or len(w.lat) < 2:
+      continue
+    for name in tiles_of_way(w):
+      ways_of_tile.setdefault(name, []).append(w.id)
   os.makedirs(out_dir, exist_ok=True)
-  for name, d in by_tile.items():
-    with open(os.path.join(out_dir, name + ".json"), "w") as f:
-      json.dump({"version": FORMAT_VERSION, "keep_lat": KEEP_LAT, "curves": d["curves"], "ramps": d["ramps"],
-                 "chains": [chain_recs[c] for c in sorted(d["chains"]) if c in chain_recs],
-                 "roads": d["roads"]}, f, separators=(",", ":"))
+  written, size = [], 0
+  for name in sorted(set(by_tile) | set(ways_of_tile)):
+    d = by_tile.get(name, {"curves": [], "ramps": [], "chains": set()})
+    roads = road_shapes({wid: ways[wid] for wid in ways_of_tile.get(name, [])}, chain_of).get(name, [])
+    if not (d["curves"] or d["ramps"] or roads):
+      continue
+    data = {"version": FORMAT_VERSION, "builder": BUILDER_VERSION, "keep_lat": KEEP_LAT, "curves": d["curves"], "ramps": d["ramps"],
+            "chains": [chain_recs[c] for c in sorted(d["chains"]) if c in chain_recs], "roads": roads}
+    if extra:
+      data.update(extra)
+    path = os.path.join(out_dir, name + ".json")
+    write_json_atomic(path, data)
+    n = os.path.getsize(path)
+    size += n
+    written.append(name)
+    if progress is not None:
+      progress(name, n, time.monotonic() - t0)
+  kinds = {}
+  for r in ramps:
+    kinds[r["type"]] = kinds.get(r["type"], 0) + 1
+  stats = {"tiles": len(files), "roads": len(ways), "chains": n_chains, "curves": len(curves), "ramps": len(ramps),
+           "kinds": kinds, "files": written, "bytes": size, "seconds": round(time.monotonic() - t0, 1),
+           "load_s": round(t_load, 1), "curves_s": round(t_curves - t_load, 1)}
   if not quiet:
-    size = sum(os.path.getsize(os.path.join(out_dir, n + ".json")) for n in by_tile)
-    kinds = {}
-    for r in ramps:
-      kinds[r["type"]] = kinds.get(r["type"], 0) + 1
-    print(f"{len(files)} tiles, {len(ways)} roads, {len(chains)} chains, {len(curves)} curves, {len(ramps)} ramps {kinds}, "
-          f"{len(by_tile)} output files, {size / 1e6:.2f} MB, {time.time() - t0:.0f} s")
-  return curves, ways
+    msg = f"{stats['tiles']} tiles, {stats['roads']} roads, {n_chains} chains, {stats['curves']} curves, {stats['ramps']} ramps {kinds}, "
+    msg += f"{len(written)} output files, {size / 1e6:.2f} MB, {stats['seconds']:.0f} s (load {stats['load_s']:.0f}, curves {stats['curves_s']:.0f})"
+    print(msg)
+  return stats
 
 
 def folders_for(lat, lon, miles):
@@ -607,7 +748,10 @@ def main():
     return
   if not a.tiles or not a.out:
     p.error("--tiles and --out are needed (or --which LAT LON MILES)")
-  build(a.tiles, a.out, a.schema)
+  try:
+    build(a.tiles, a.out, a.schema)
+  except FileNotFoundError as e:
+    sys.exit(str(e))
 
 
 if __name__ == "__main__":
