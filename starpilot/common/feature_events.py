@@ -9,12 +9,16 @@ Each event becomes a folder /data/media/0/feature_events/<YYYY-MM-DD_HH-MM-SS>_<
 
 Rules:
   * Nothing is written while the event is going on: the folder is written once, after the
-    post window, by one background writer thread per recorder. The calling process only appends
-    to a deque. The writer must never slow the caller (drive 3b: writing a 2,000-row map curve
-    event in one go froze card, which runs at real-time priority on one core, for 0.1-0.3 s ->
-    "Communication Issue" alerts). So the writer leaves the caller's real-time priority and core,
-    writes WRITE_CHUNK_ROWS rows at a time with a pause in between (letting the caller have the
-    GIL), events are capped at MAX_ROWS rows (evenly thinned), and pruning runs rarely.
+    post window, by a separate writer PROCESS (one per openpilot process, started once). The caller
+    never formats or writes a file: each tick it pickles at most PIPE_CHUNK_ROWS rows of one ready
+    event (C code, a fraction of a ms) into a non-blocking pipe. History: drive 3b, one 2,000-row
+    event written in one go froze card for 0.1-0.3 s ("Communication Issue"); the fix then was a
+    writer THREAD with chunks and pauses. Drive 44 (Nov 4): a burst of nine events written by that
+    thread still held card's GIL often enough to delay carState by 20-55 ms for seconds, and
+    selfdrived raised "System Lagging" (TAKE CONTROL IMMEDIATELY). A thread shares the GIL; a process
+    does not. The thread path is kept only as a fallback if the process cannot be started.
+  * Events are capped at MAX_ROWS rows (evenly thinned); pruning runs rarely, in the writer.
+  * Point events that do not need the signal ring (signals=False) write summary.txt only.
   * Every public method swallows its own exceptions: this must never break the planner or
     the car controller. The worst case is a missing event folder.
   * The folder is outside realdata, so the log deleter never touches it; it is capped at
@@ -30,8 +34,12 @@ script can re-derive the segment from file mtimes if that lookup failed.
 """
 import datetime
 import os
+import pickle
 import queue
 import shutil
+import struct
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -49,6 +57,11 @@ WRITE_PAUSE = 0.005             # ... then the writer pauses this long (s), so t
 PRUNE_EVERY = 600.0             # s between two prunes of the event folder
 NEAR_MISS_SUFFIX = "_nearMiss"  # events of this kind are rate limited and pruned first
 NEAR_MISS_MIN_GAP = 20.0        # s between two near-miss events of the same kind
+USE_WRITER_PROCESS = True       # write in a separate process (see Rules); False = the old writer thread
+PIPE_CHUNK_ROWS = 20            # rows pickled per tick by the caller
+PUMP_MIN_GAP = 0.004            # s: at most one pipe message per this, per process (several recorders share it)
+F_SETPIPE_SZ = 1031             # fcntl: ask for a bigger pipe buffer (Linux)
+PIPE_SIZE = 1 << 20
 
 
 def _fmt(v):
@@ -108,6 +121,12 @@ class EventRecorder:
     self.write_pause = WRITE_PAUSE if write_in_thread else 0.0
     self.queue = None              # writer thread input (started on the first event)
     self.last_prune = None
+    self.writer = None             # the shared writer process (USE_WRITER_PROCESS)
+    if write_in_thread and USE_WRITER_PROCESS:
+      try:
+        self.writer = get_writer()
+      except Exception:
+        self.writer = None
 
   # ---- collecting ----
   def add_row(self, t, values):
@@ -116,15 +135,16 @@ class EventRecorder:
       row = (t, tuple(values))
       self.buffer.append(row)
       for ev in self.open_events:
-        ev["rows"].append(row)
+        if ev["signals"]:
+          ev["rows"].append(row)
       for ev in self.pending:
-        if t <= ev["t_end"] + self.post:
+        if ev["signals"] and t <= ev["t_end"] + self.post:
           ev["rows"].append(row)
     except Exception:
       pass
 
-  def open(self, kind, t, summary, min_gap=None):
-    """Start an event at t: keeps the rows from t - pre on until close().
+  def open(self, kind, t, summary, min_gap=None, signals=True):
+    """Start an event at t: keeps the rows from t - pre on until close() (signals=False: summary only).
 
     Near-miss kinds (name ending in NEAR_MISS_SUFFIX) are rate limited to one per
     NEAR_MISS_MIN_GAP per kind, unless `min_gap` says otherwise; returns None when skipped."""
@@ -136,7 +156,7 @@ class EventRecorder:
         return None
       self.last_open[kind] = t
       ev = {"kind": kind, "t_start": t, "t_end": None, "wall": self.clock(), "summary": dict(summary),
-            "rows": [r for r in self.buffer if r[0] >= t - self.pre]}
+            "signals": bool(signals), "rows": [r for r in self.buffer if r[0] >= t - self.pre] if signals else []}
       self.open_events.append(ev)
       return ev
     except Exception:
@@ -155,9 +175,9 @@ class EventRecorder:
     except Exception:
       pass
 
-  def record(self, kind, t, summary, min_gap=None):
+  def record(self, kind, t, summary, min_gap=None, signals=True):
     """A point event: open and close at the same time. Returns False when rate limited."""
-    ev = self.open(kind, t, summary, min_gap)
+    ev = self.open(kind, t, summary, min_gap, signals)
     self.close(ev, t)
     return ev is not None
 
@@ -168,15 +188,24 @@ class EventRecorder:
         if t - ev["t_start"] > MAX_OPEN_SECONDS:
           self.close(ev, t, {"note": "still open after MAX_OPEN_SECONDS"})
       ready = [ev for ev in self.pending if t >= ev["t_end"] + self.post]
+      if self.writer is not None:
+        ready = ready[:1]          # one hand-off per tick: thinning a long event is the caller's biggest cost
       for ev in ready:
         self.pending.remove(ev)
         # rows after t_end + post are not of interest (the buffer may already hold a few)
         ev["rows"] = [r for r in ev["rows"] if r[0] <= ev["t_end"] + self.post]
-        if self.write_in_thread:
+        if self.writer is not None:
+          if self.writer.broken:
+            self.failed += 1
+          else:
+            self.writer.submit(self, self._header(ev), self._thin(ev["rows"]))
+        elif self.write_in_thread:
           self._start_writer()
           self.queue.put(ev)
         else:
           self._write(ev)
+      if self.writer is not None:
+        self.writer.pump(time.monotonic())
     except Exception:
       pass
 
@@ -188,23 +217,7 @@ class EventRecorder:
 
   @staticmethod
   def _leave_caller_priority():
-    """The writer thread inherits the caller's real-time priority and core (card: SCHED_FIFO on one core).
-    On Linux pid 0 = the calling thread: give this thread normal priority and the other cores."""
-    try:
-      os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
-    except (AttributeError, OSError, PermissionError):
-      pass
-    try:
-      cores = os.sched_getaffinity(0)
-      others = set(range(os.cpu_count() or 1)) - cores
-      if others:
-        os.sched_setaffinity(0, others)
-    except (AttributeError, OSError):
-      pass
-    try:
-      os.nice(10)
-    except OSError:
-      pass
+    _leave_caller_priority()
 
   def _writer_loop(self):
     self._leave_caller_priority()
@@ -221,58 +234,259 @@ class EventRecorder:
     step = (n - 1) / (max_rows - 1)
     return [rows[round(i * step)] for i in range(max_rows)]
 
-  def _write(self, ev):
+  def _route(self):
     try:
-      wall = ev["wall"]
-      stamp = datetime.datetime.fromtimestamp(wall).strftime("%Y-%m-%d_%H-%M-%S")
-      folder = os.path.join(self.root, f"{stamp}_{ev['kind']}")
-      n = 1
-      while os.path.exists(folder):
-        n += 1
-        folder = os.path.join(self.root, f"{stamp}_{ev['kind']}_{n}")
-      route = None
-      try:
-        if self.params is not None:
-          route = self.params.get("CurrentRoute", encoding="utf8")
-      except Exception:
-        route = None
-      segment, seconds, log_root = locate_segment(route, wall)
-      now_mono = time.monotonic()
-      lines = [
-        f"kind: {ev['kind']}",
-        f"time: {datetime.datetime.fromtimestamp(wall).isoformat(timespec='milliseconds')}",
-        f"time_unix: {wall:.3f}",
-        f"time_monotonic: {ev['t_start']:.3f}",
-        f"duration_s: {max(ev['t_end'] - ev['t_start'], 0.0):.2f}",
-        f"route: {route or ''}",
-        f"segment: {'' if segment is None else segment}",
-        f"segment_seconds: {'' if seconds is None else f'{seconds:.1f}'}",
-        f"segment_source: {log_root or ''}",
-        f"written_after_s: {time.time() - wall:.1f}",
-        f"monotonic_at_write: {now_mono:.3f}",
-      ]
-      for k, v in ev["summary"].items():
-        lines.append(f"{k}: {_fmt(v)}")
-      os.makedirs(folder, exist_ok=True)
-      with open(os.path.join(folder, "summary.txt"), "w") as f:
-        f.write("\n".join(lines) + "\n")
-      rows = self._thin(ev["rows"])
-      t0 = ev["t_start"]
+      if self.params is not None:
+        return self.params.get("CurrentRoute", encoding="utf8")
+    except Exception:
+      pass
+    return None
+
+  def _header(self, ev):
+    """Everything the writer needs except the rows, as plain picklable data."""
+    return {"kind": ev["kind"], "wall": ev["wall"], "t_start": ev["t_start"], "t_end": ev["t_end"],
+            "summary": [(k, _fmt(v)) for k, v in ev["summary"].items()], "route": self._route(),
+            "signals": ev.get("signals", True), "columns": self.columns, "root": self.root,
+            "max_bytes": self.max_bytes, "max_events": self.max_events}
+
+  def _write(self, ev):
+    """Thread / synchronous path."""
+    ok = _write_event(self._header(ev), self._thin(ev["rows"]), self.write_pause)
+    ev["rows"] = []
+    if ok:
+      self.written += 1
+    else:
+      self.failed += 1
+    now = time.monotonic()
+    if self.last_prune is None or now - self.last_prune > PRUNE_EVERY:
+      self.last_prune = now
+      prune(self.root, self.max_bytes, self.max_events)
+
+
+def _leave_caller_priority():
+  """A writer inherits the caller's real-time priority and core (card: SCHED_FIFO on one core).
+  On Linux pid 0 = the calling thread / process: normal priority, the other cores, nice 10."""
+  try:
+    os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+  except (AttributeError, OSError, PermissionError):
+    pass
+  try:
+    cores = os.sched_getaffinity(0)
+    others = set(range(os.cpu_count() or 1)) - cores
+    if others:
+      os.sched_setaffinity(0, others)
+  except (AttributeError, OSError):
+    pass
+  try:
+    os.nice(10)
+  except OSError:
+    pass
+
+
+def _write_event(h, rows, write_pause=0.0):
+  """Write one event folder from its header (EventRecorder._header) and thinned rows. True when written."""
+  try:
+    wall = h["wall"]
+    stamp = datetime.datetime.fromtimestamp(wall).strftime("%Y-%m-%d_%H-%M-%S")
+    folder = os.path.join(h["root"], f"{stamp}_{h['kind']}")
+    n = 1
+    while os.path.exists(folder):
+      n += 1
+      folder = os.path.join(h["root"], f"{stamp}_{h['kind']}_{n}")
+    route = h["route"]
+    segment, seconds, log_root = locate_segment(route, wall)
+    lines = [
+      f"kind: {h['kind']}",
+      f"time: {datetime.datetime.fromtimestamp(wall).isoformat(timespec='milliseconds')}",
+      f"time_unix: {wall:.3f}",
+      f"time_monotonic: {h['t_start']:.3f}",
+      f"duration_s: {max(h['t_end'] - h['t_start'], 0.0):.2f}",
+      f"route: {route or ''}",
+      f"segment: {'' if segment is None else segment}",
+      f"segment_seconds: {'' if seconds is None else f'{seconds:.1f}'}",
+      f"segment_source: {log_root or ''}",
+      f"written_after_s: {time.time() - wall:.1f}",
+      f"monotonic_at_write: {time.monotonic():.3f}",
+    ]
+    lines += [f"{k}: {v}" for k, v in h["summary"]]
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "summary.txt"), "w") as f:
+      f.write("\n".join(lines) + "\n")
+    if h.get("signals", True):
+      t0 = h["t_start"]
       with open(os.path.join(folder, "signals.csv"), "w") as f:
-        f.write("t_rel," + ",".join(self.columns) + "\n")
+        f.write("t_rel," + ",".join(h["columns"]) + "\n")
         for i in range(0, len(rows), WRITE_CHUNK_ROWS):
           f.write("".join(f"{t - t0:.2f}," + ",".join(_fmt(v) for v in vals) + "\n"
                           for t, vals in rows[i:i + WRITE_CHUNK_ROWS]))
-          if self.write_pause:
-            time.sleep(self.write_pause)
-      ev["rows"] = []
-      self.written += 1
-      now = time.monotonic()
-      if self.last_prune is None or now - self.last_prune > PRUNE_EVERY:
-        self.last_prune = now
-        prune(self.root, self.max_bytes, self.max_events)
+          if write_pause:
+            time.sleep(write_pause)
+    return True
+  except Exception:
+    return False
+
+
+# ---- the writer process ----
+class WriterProcess:
+  """One per openpilot process. The parent pickles small messages into a non-blocking pipe (stdin of
+  a fresh python running this file with --writer); the child formats and writes. Acks (event id,
+  ok) come back on its stdout. Nothing here may raise into the caller."""
+
+  def __init__(self, argv=None):
+    self.owners = {}               # event id -> EventRecorder (for written / failed)
+    self.outbox = deque()          # [id, header, rows, pos]
+    self.outbuf = b""
+    self.ackbuf = b""
+    self.next_id = 1
+    self.last_pump = -1.0
+    self.broken = False
+    self.pid_owner = os.getpid()
+    cmd = argv or [sys.executable, "-u", os.path.abspath(__file__), "--writer"]
+    self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 close_fds=True, start_new_session=True)
+    self.w = self.proc.stdin.fileno()
+    self.r = self.proc.stdout.fileno()
+    try:
+      import fcntl
+      fcntl.fcntl(self.w, F_SETPIPE_SZ, PIPE_SIZE)
     except Exception:
-      self.failed += 1
+      pass
+    os.set_blocking(self.w, False)
+    os.set_blocking(self.r, False)
+
+  def submit(self, rec, header, rows):
+    ev_id = self.next_id
+    self.next_id += 1
+    self.owners[ev_id] = rec
+    self.outbox.append([ev_id, header, rows, -1])
+
+  def pending(self):
+    return len(self.outbox) + (1 if self.outbuf else 0)
+
+  def _break(self):
+    self.broken = True
+    for item in self.outbox:
+      rec = self.owners.pop(item[0], None)
+      if rec is not None:
+        rec.failed += 1
+    self.outbox.clear()
+    self.outbuf = b""
+
+  def _read_acks(self):
+    try:
+      data = os.read(self.r, 4096)
+    except BlockingIOError:
+      return
+    except OSError:
+      self._break()
+      return
+    if not data:
+      if self.proc.poll() is not None:
+        self._break()
+      return
+    self.ackbuf += data
+    while len(self.ackbuf) >= 5:
+      ev_id, ok = struct.unpack_from("<IB", self.ackbuf)
+      self.ackbuf = self.ackbuf[5:]
+      rec = self.owners.pop(ev_id, None)
+      if rec is not None:
+        if ok:
+          rec.written += 1
+        else:
+          rec.failed += 1
+
+  def pump(self, now, force=False):
+    """At most one message per PUMP_MIN_GAP: pickle the next chunk, push what the pipe takes."""
+    try:
+      if self.broken or (not force and now - self.last_pump < PUMP_MIN_GAP):
+        return
+      self.last_pump = now
+      self._read_acks()
+      if not self.outbuf and self.outbox:
+        item = self.outbox[0]
+        ev_id, header, rows, pos = item
+        if pos < 0:
+          msg = ("open", ev_id, header)
+          item[3] = 0
+        elif pos < len(rows):
+          msg = ("rows", ev_id, rows[pos:pos + PIPE_CHUNK_ROWS])
+          item[3] = pos + PIPE_CHUNK_ROWS
+        else:
+          msg = ("end", ev_id)
+          self.outbox.popleft()
+        data = pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
+        self.outbuf = struct.pack("<I", len(data)) + data
+      if self.outbuf:
+        try:
+          n = os.write(self.w, self.outbuf)
+          self.outbuf = self.outbuf[n:]
+        except BlockingIOError:
+          pass
+        except OSError:
+          self._break()
+    except Exception:
+      self._break()
+
+  def close(self):
+    try:
+      self.proc.stdin.close()
+    except Exception:
+      pass
+
+
+_writer = None
+
+
+def get_writer():
+  """The process-wide writer (started on first use; a forked child never reuses its parent's)."""
+  global _writer
+  if _writer is None or _writer.pid_owner != os.getpid():
+    _writer = WriterProcess()
+  return _writer
+
+
+def _writer_main(fin=None, fout=None):
+  """The writer process: read length-prefixed pickles from stdin, write folders, ack on stdout."""
+  _leave_caller_priority()
+  try:
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+  except Exception:
+    pass
+  fin = fin if fin is not None else sys.stdin.buffer
+  fout = fout if fout is not None else sys.stdout.buffer
+  events = {}
+  last_prune = None
+  while True:
+    head = fin.read(4)
+    if len(head) < 4:
+      return
+    n = struct.unpack("<I", head)[0]
+    body = fin.read(n)
+    if len(body) < n:
+      return
+    try:
+      msg = pickle.loads(body)
+      kind, ev_id = msg[0], msg[1]
+      if kind == "open":
+        events[ev_id] = (msg[2], [])
+      elif kind == "rows":
+        events[ev_id][1].extend(msg[2])
+      elif kind == "end":
+        header, rows = events.pop(ev_id)
+        ok = _write_event(header, rows)
+        fout.write(struct.pack("<IB", ev_id, 1 if ok else 0))
+        fout.flush()
+        now = time.monotonic()
+        if ok and (last_prune is None or now - last_prune > PRUNE_EVERY):
+          last_prune = now
+          prune(header["root"], header["max_bytes"], header["max_events"])
+    except Exception:
+      try:
+        fout.write(struct.pack("<IB", int(msg[1]), 0))
+        fout.flush()
+      except Exception:
+        pass
 
 
 def _folder_size(path):
@@ -345,3 +559,7 @@ class NearMissTracker:
         self.start = None
     except Exception:
       self.start = None
+
+
+if __name__ == "__main__" and "--writer" in sys.argv:
+  _writer_main()

@@ -24,12 +24,14 @@ DT = 0.01
 
 class Car:
   def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
-               hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None):
+               hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None,
+               hold_phase_window=None):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.decel = decel
+    self.hold_phase_window = hold_phase_window   # frames: a hold frame later than this after the wheel's reads as a tap
     self.decel_fn = decel_fn          # decel_fn(gap_mph) -> m/s^2 the stock cruise slows at for that set speed gap
     self.min_set = min_set_mph * MPH if min_set_mph else None   # the car's own minimum set speed (clamp)
     self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
@@ -148,7 +150,7 @@ class CSC:
 
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
-        model=lambda f: None, setup=None, plan=lambda f: False):
+        model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
@@ -158,6 +160,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   trigger = scs.StoppedCarTrigger()
   st = dict(enabled=True, cruise=True, gas=False, brake=False, plan_alive=True)
   hist, presses, holds, sets = [], [], [], []
+  ctr = -1
   ever_active = False
   start = car.set_speed
   min_set = max_set = car.set_speed
@@ -182,17 +185,23 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
       restore_now = trigger.restore_now and stop_mode == 2
       hold_restore = trigger.hold_restore and stop_mode == 2
-    inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
+    if wheel_phase is not None and wheel_alive(f):
+      ctr = ((f - wheel_phase) // 10) % 16       # the wheel's CRZ_BTNS frame every 10 frames (10 Hz)
+    inp = cs.SlowdownInputs(btn_counter=ctr if wheel_phase is not None else -1, enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
                             v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=car.v_ego < 0.3,
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
                             stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore)
     btn, off = logic.update(inp)
     if btn is not None:
-      assert off in (0, 1)
+      assert 0 <= off < 16
       if logic.last_action == "hold":
         holds.append(f)
-        car.hold_frame(btn)
+        late = wheel_phase is not None and car.hold_phase_window is not None and (f - wheel_phase) % 10 > car.hold_phase_window
+        if late:
+          car.press(btn)                               # the wheel's "not pressed" frame wins: the car sees a tap
+        else:
+          car.hold_frame(btn)
       else:
         presses.append((f, btn))
         car.press(btn)

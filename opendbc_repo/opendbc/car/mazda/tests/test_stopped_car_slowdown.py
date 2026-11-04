@@ -905,3 +905,49 @@ def test_hold_onto_the_car_minimum_is_ours_not_a_disable():
   lg = r["logic"]
   assert not lg.disabled
   assert r["min"] >= 30 / 1.609344 - 1e-6
+
+
+# ---------------- phase-locked holds (drive 44: our holds mostly read as quick taps) ----------------
+
+def test_hold_frames_go_out_only_with_a_new_wheel_frame():
+  for phase in (0, 3, 7):
+    r = approach(45, 60, frames=1500, events=None) if phase == 0 else \
+        run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=T.StoppedLead(60), stop_mode=2, max_drop=10, wheel_phase=phase)
+    assert r["holds"], phase
+    assert all((f - phase) % 10 == 0 for f in r["holds"]), (phase, r["holds"][:10])
+    assert len({(f - phase) // 10 for f in r["holds"]}) == len(r["holds"])          # never two per wheel frame
+    for h in r["logic"].hold_log:
+      assert h["phase_lock"] and set(h["delays"]) <= {0}, h
+
+
+def test_hold_fallback_when_the_wheel_frames_stop():
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=T.StoppedLead(60), stop_mode=2, max_drop=10,
+          wheel_alive=lambda f: f < 110)
+  log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
+  assert log and sum(h["fallbacks"] for h in log) > 0, log
+  gaps = [b - a for a, b in zip(r["holds"], r["holds"][1:], strict=False) if b - a < 50 and a >= 120]
+  assert gaps and min(gaps) >= cs.HOLD_FALLBACK_FRAMES, gaps
+  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+
+
+def test_phase_strict_car_sees_a_long_press_only_when_locked():
+  r = run(Car(45, dash_offset_mph=0.0, hold_phase_window=1), NO_CURVE, 2500, lead=T.StoppedLead(70), stop_mode=2,
+          max_drop=10, wheel_phase=4)
+  log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS and h["done"]]
+  assert log and log[0]["pattern"] == "quantum", log[:1]
+  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  cs.HOLD_PHASE_LOCK = False
+  try:
+    r2 = run(Car(45, dash_offset_mph=0.0, hold_phase_window=1), NO_CURVE, 2500, lead=T.StoppedLead(70), stop_mode=2,
+             max_drop=10, wheel_phase=4)
+  finally:
+    cs.HOLD_PHASE_LOCK = True
+  log2 = [h for h in r2["logic"].hold_log if h["direction"] == cs.SET_MINUS and h["done"]]
+  assert r2["min"] >= 20 - 1e-6 and r2["max"] <= 45 + 1e-6       # taps answers keep the limits too
+  assert all(not h["phase_lock"] for h in log2)
+
+
+def test_taps_are_unchanged_by_the_wheel_counter():
+  a = run(Car(65), T.between(100, 1500, 61), 4000, wheel_phase=None)
+  b = run(Car(65), T.between(100, 1500, 61), 4000, wheel_phase=3)
+  assert a["presses"] == b["presses"] and a["holds"] == b["holds"] == []

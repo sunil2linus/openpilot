@@ -245,12 +245,114 @@ def test_threaded_writer_never_blocks_the_caller(tmp_path):
     rec.tick(t)
     worst = max(worst, _t.perf_counter() - s)
   assert worst < 0.01, worst
-  for _ in range(400):
+  for _ in range(800):
     if rec.written:
       break
-    _t.sleep(0.05)
+    _t.sleep(0.005)
+    t += 0.005
+    rec.tick(t)                                 # the caller keeps ticking (every frame), which feeds the writer
   assert rec.written == 1
   folder = os.listdir(tmp_path)[0]
   with open(os.path.join(tmp_path, folder, "signals.csv")) as f:
     n = sum(1 for _ in f) - 1
   assert n == fe.MAX_ROWS
+
+
+# ---- the writer process (drive 44: a writer THREAD still held card's GIL -> "System Lagging") ----
+
+def _feed(rec, kind, n_rows, cols, t0=0.0):
+  ev = rec.open(kind, t0, {"a": 1})
+  t = t0
+  for k in range(n_rows):
+    t = t0 + k * 0.05
+    rec.add_row(t, [float(k) + 0.123] * cols)
+  rec.close(ev, t)
+  return t
+
+
+def test_process_writer_keeps_the_caller_loop_smooth(tmp_path):
+  import time as _t
+  cols = 60
+  recs = [fe.EventRecorder([f"c{i}" for i in range(cols)], hz=20, root=str(tmp_path / f"r{j}"), write_in_thread=True,
+                           pre=100.0, post=0.0) for j in range(6)]
+  assert all(r.writer is not None for r in recs) and len({id(r.writer) for r in recs}) == 1   # one process, shared
+  t = max(_feed(r, f"big{j}", 1300, cols) for j, r in enumerate(recs))
+  ticks, gaps = [], []
+  last = _t.perf_counter()
+  deadline = _t.monotonic() + 20.0
+  while sum(r.written for r in recs) < 6 and _t.monotonic() < deadline:
+    _t.sleep(0.005)
+    t += 0.01
+    s = _t.perf_counter()
+    for r in recs:
+      r.tick(t)
+    e = _t.perf_counter()
+    ticks.append(e - s)
+    gaps.append(e - last)
+    last = e
+  assert sum(r.written for r in recs) == 6, [(r.written, r.failed) for r in recs]
+  ticks.sort()
+  # the caller only pickles one small chunk per tick (a test machine may stall a tick now and then)
+  assert ticks[int(len(ticks) * 0.99)] < 0.002, ticks[-10:]
+  assert sorted(gaps)[int(len(gaps) * 0.99)] < 0.02
+  for j in range(6):
+    folder = os.listdir(tmp_path / f"r{j}")[0]
+    with open(os.path.join(tmp_path, f"r{j}", folder, "signals.csv")) as f:
+      lines = f.read().splitlines()
+    assert lines[0].startswith("t_rel,c0,c1") and len(lines) - 1 == fe.MAX_ROWS
+    assert lines[1].split(",")[1] == "0.123"
+    with open(os.path.join(tmp_path, f"r{j}", folder, "summary.txt")) as f:
+      assert f"kind: big{j}" in f.read()
+
+
+def test_signals_false_writes_the_summary_only(tmp_path):
+  rec = make(str(tmp_path))
+  feed(rec, 0.0, 10.0)
+  assert rec.record("driverSetChange", 10.0, {"count": 2, "events": [{"dir": "SET_PLUS"}]}, min_gap=0.0, signals=False)
+  rec.tick(30.0)
+  folder = os.path.join(tmp_path, os.listdir(tmp_path)[0])
+  assert os.listdir(folder) == ["summary.txt"]
+  with open(os.path.join(folder, "summary.txt")) as f:
+    text = f.read()
+  assert "count: 2" in text and "SET_PLUS" in text
+
+
+def test_writer_process_exits_with_its_parent(tmp_path):
+  import subprocess
+  import sys
+  import time as _t
+  code = "; ".join(["import importlib.util, sys", "s = importlib.util.spec_from_file_location('fe', sys.argv[1])",
+                    "m = importlib.util.module_from_spec(s)", "s.loader.exec_module(m)",
+                    "r = m.EventRecorder(['a'], hz=20, root=sys.argv[2])", "print(r.writer.proc.pid, flush=True)"])
+  out = subprocess.run([sys.executable, "-c", code, fe.__file__, str(tmp_path)], capture_output=True, text=True, timeout=30)
+  pid = int(out.stdout.strip())
+  for _ in range(100):
+    try:
+      os.kill(pid, 0)
+    except ProcessLookupError:
+      break
+    try:
+      os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+      pass
+    _t.sleep(0.05)
+  else:
+    raise AssertionError("writer still running")
+
+
+def test_broken_writer_never_raises(tmp_path):
+  rec = fe.EventRecorder(["a"], hz=20, root=str(tmp_path), write_in_thread=True)
+  w = fe.WriterProcess()                     # a private one, so the shared writer stays usable for other tests
+  rec.writer = w
+  w.proc.kill()
+  w.proc.wait()
+  for k in range(3):
+    rec.record(f"x{k}", float(k), {"a": 1})
+  for k in range(400):
+    rec.tick(10.0 + k * 0.01)
+    if w.broken:
+      break
+  for k in range(3):
+    rec.record(f"y{k}", 20.0 + k, {"a": 1})
+    rec.tick(30.0 + k)
+  assert w.broken and rec.failed >= 3 and rec.written == 0

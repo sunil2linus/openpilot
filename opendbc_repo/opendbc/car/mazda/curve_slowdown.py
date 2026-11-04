@@ -93,6 +93,14 @@ RELAXED_GAP_FRAMES = 50                  # 0.5 s between taps when the stopped c
 # downward change during a hold and HOLD_SETTLE after it is ours.
 LONG_PRESS_ENABLED = True
 HOLD_FRAME_GAP = 10                      # frames between the hold's SET frames (stock 10 Hz cadence)
+# Phase-locked holds (drive 44): the wheel keeps sending "not pressed" frames at 10 Hz during our hold, so the car
+# mostly read our holds as quick taps (1 mph every 0.1-0.3 s). The one hold it took as a long press (2:05,
+# 34 -> 33 -> 30 -> 25) had our frames ~5 ms after each wheel frame; failed ones were 15-80 ms after. So a hold frame
+# now goes out on the cycle a new wheel frame is first seen (CTR = wheel + 1), one per wheel frame. Experimental: every
+# hold logs its delays and whether it landed as a long press ("quantum") or as taps.
+HOLD_PHASE_LOCK = True
+HOLD_COUNTER_OFFSET = 0                  # create_button_cmd adds 1: CTR = wheel CTR + 1
+HOLD_FALLBACK_FRAMES = 12                # no new wheel frame this long after our last hold frame: send anyway
 HOLD_MAX_SECONDS = 4.0                   # a hold is released after this at the latest
 HOLD_NO_EFFECT_SECONDS = 1.0             # a hold with no set speed change by then is released (the car ignores it)
 HOLD_QUANTUM_MPH = 5                     # the car's long-press step
@@ -143,6 +151,7 @@ class SlowdownInputs:
   curve_budget: int = 0           # SET- presses allowed for this curve when more than the usual budget (a ramp)
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
+  btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
 
 
 @dataclass
@@ -207,6 +216,10 @@ class CurveSlowdownLogic:
     # answers our frames the same way is checked on the road, so every hold is logged with what landed
     # and when, any landing size is handled, and holds stop after HOLD_MISS_LIMIT holds with no effect.
     self.hold = None                 # the Press of the hold being sent, while frames are still going out
+    self.prev_btn_counter = -1
+    self.wheel_frame = -10_000       # frame a new wheel CRZ_BTNS frame was last seen
+    self.new_wheel = False
+    self.phase_lock = False
     self.holds_ok = True             # allowed in the current episode
     self.hold_misses = 0
     self.hold_overrun = HOLD_OVERRUN_DEFAULT   # quanta seen to land after a release (max), starts conservative
@@ -352,6 +365,7 @@ class CurveSlowdownLogic:
       self.holds_ok = False
     for entry in self.hold_log:
       if entry["frame"] == p.frame:
+        entry.update(pattern="quantum" if any(n >= 2 for _, n in p.landings) else ("taps" if p.landed else "none"))
         entry.update(landed=p.landed, landed_after_release=after, landings=list(p.landings),
                      release_frame=p.release_frame, done=True)
     if p in self.inflight:
@@ -517,23 +531,32 @@ class CurveSlowdownLogic:
       self._forget()
       self.blocked = True
 
+  def _start_hold(self, button):
+    """The hold's bookkeeping, before (phase lock: possibly a few frames before) its first frame goes out."""
+    reserve = self._hold_reserve() + self._quantum_steps()   # first quantum + what may follow a release
+    p = Press(button, self.frame, reserve=reserve, remaining=reserve, hold=True)
+    self.hold = p
+    self.pending = p
+    self.inflight.append(p)
+    self.hold_log.append({"frame": self.frame, "direction": button, "frames_sent": 0, "landed": 0, "done": False,
+                          "overrun_assumed": self.hold_overrun, "bound_mph": (self.hold_bound or 0) / MS_PER_MPH,
+                          "phase_lock": self.phase_lock, "delays": [], "fallbacks": 0, "pattern": ""})
+
   def _send(self, button, hold=False):
     """Book-keeping for a frame going out now; returns the counter offset or None (skip frame)."""
-    offset = COUNTER_OFFSETS[self.button_frame % len(COUNTER_OFFSETS)]
-    self.button_frame += 1
+    if hold and self.phase_lock:
+      offset = HOLD_COUNTER_OFFSET
+    else:
+      offset = COUNTER_OFFSETS[self.button_frame % len(COUNTER_OFFSETS)]
+      self.button_frame += 1
     if offset is None:
       return None
     self.last_send_frame = self.frame
     if hold:
       if self.hold is None:
-        reserve = self._hold_reserve() + self._quantum_steps()   # first quantum + what may follow a release
-        p = Press(button, self.frame, reserve=reserve, remaining=reserve, hold=True)
-        self.hold = p
-        self.pending = p
-        self.inflight.append(p)
-        self.hold_log.append({"frame": self.frame, "direction": button, "frames_sent": 0, "landed": 0, "done": False,
-                              "overrun_assumed": self.hold_overrun, "bound_mph": (self.hold_bound or 0) / MS_PER_MPH})
+        self._start_hold(button)
       self.hold.frames_sent += 1
+      self.hold_log[-1]["delays"].append(self.frame - self.wheel_frame)
       self.hold.release_frame = self.frame
       self.hold_log[-1]["frames_sent"] = self.hold.frames_sent
     else:
@@ -547,6 +570,11 @@ class CurveSlowdownLogic:
     """Returns (button, counter_offset) to send this frame, or (None, None)."""
     self.frame += 1
     self.last_action = None
+    self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
+    if self.new_wheel:
+      self.wheel_frame = self.frame
+    self.prev_btn_counter = i.btn_counter
+    self.phase_lock = HOLD_PHASE_LOCK and i.btn_counter >= 0
     if self.disabled:
       return None, None
     cruise_ok = i.cruise_enabled and i.set_speed > 0
@@ -706,7 +734,16 @@ class CurveSlowdownLogic:
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
         self.hold = None
         return None, None
-      if self.frame - self.last_send_frame >= HOLD_FRAME_GAP:
+      if self.phase_lock:
+        ref = self.last_send_frame if self.hold.frames_sent else self.hold.frame
+        due = self.new_wheel                    # one frame per wheel frame, right after it
+        if (not due and self.frame - ref >= HOLD_FALLBACK_FRAMES and
+            self.frame - self.wheel_frame >= HOLD_FALLBACK_FRAMES):
+          due = True                            # the wheel's frames stopped coming: keep the hold alive anyway
+          self.hold_log[-1]["fallbacks"] += 1
+      else:
+        due = self.frame - self.last_send_frame >= HOLD_FRAME_GAP
+      if due:
         off = self._send(d, hold=True)
         if off is not None:
           self.last_action = "hold"
@@ -804,15 +841,21 @@ class CurveSlowdownLogic:
       self.stop_episode = True
     if button == SET_MINUS and self.anchor is None:
       self.anchor = i.set_speed      # the driver's speed, before our first press moves it
-    off = self._send(button, hold=hold)
-    if off is None:
-      return None, None
+    if hold and self.phase_lock and not self.new_wheel:
+      self._start_hold(button)        # its first frame goes out with the next wheel frame
+      off = None
+    else:
+      off = self._send(button, hold=hold)
+      if off is None:
+        return None, None
     if button == SET_MINUS and want_lower:
       if reason == "curve":
         self.lower_presses += 1
       else:
         self.stop_presses += 1
       self.last_minus_frame = self.frame
+    if off is None:
+      return None, None
     self.last_action = "hold" if hold else ("tap" if want_lower else "restore")
     return button, off
 
@@ -926,7 +969,7 @@ class CurveSlowdown:
       if self.recorder is not None:
         self.recorder.record("carProfileHold", t, {"after_release_quanta": after, "by": who, "hold_overrun_now": lg.hold_overrun,
                                                    "profile_holds": p.holds, "profile_worst": p.data["hold"]["worst_after_release"],
-                                                   "profile": p.summary()})
+                                                   "profile": p.summary()}, signals=False)
     from opendbc.car.mazda.car_profile import DecelInputs
     d = self.decel_learner.update(DecelInputs(v_ego=i.v_ego, set_speed=i.set_speed, cruise_enabled=i.cruise_enabled,
                                               brake_pressed=i.brake_pressed, gas_pressed=i.gas_pressed, lead_status=lead_status,
@@ -935,10 +978,18 @@ class CurveSlowdown:
       use = p.add_decel_episode(d)
       if self.recorder is not None:
         self.recorder.record("carProfileDecel", t, {"decel_measured": d, "decel_episodes": p.decel_episodes, "decel_use_next_drive": use,
-                                                    "decel_used_this_drive": self.decel_used, "profile": p.summary()}, min_gap=30.0)
+                                                    "decel_used_this_drive": self.decel_used, "profile": p.summary()}, min_gap=30.0,
+                             signals=False)
     cruise_off = self.prev_cruise and not i.cruise_enabled
     self.prev_cruise = i.cruise_enabled
     p.save_if_due(t, force=cruise_off)
+
+  @staticmethod
+  def _hold_text(h):
+    landings = [(round((f - h['frame']) * DT_CTRL, 2), n) for f, n in h.get('landings', [])]
+    return (f"frames_sent {h.get('frames_sent')} landed {h.get('landed')} after_release {h.get('landed_after_release', 0)} " +
+            f"landings {landings} pattern {h.get('pattern', '')} phase_lock {h.get('phase_lock')} " +
+            f"delays {h.get('delays', [])[:12]} fallbacks {h.get('fallbacks', 0)}")
 
   def _profile_summary(self):
     """The learned values in use, for every event's summary (so a drive can be audited)."""
@@ -1038,6 +1089,7 @@ class CurveSlowdown:
       stop_urgent=bool(self.trigger.urgent),
       stop_restore_now=bool(self.trigger.restore_now) and self.stop_mode == ON,
       hold_restore=bool(self.trigger.hold_restore) and self.stop_mode == ON,
+      btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
     )
     button, offset = self.logic.update(inputs)
     if self.profile is not None:
@@ -1193,10 +1245,14 @@ class CurveSlowdown:
         *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0,
         (lg.anchor or 0.0) / MS_PER_MPH, si.plan_stop, si.plan_ratio, self.trigger.latched,
         self.trigger.early and self.trigger.active))
-    for ev in lg.driver_events:
-      # a driver set speed change while we managed it (what happened to the restore)
-      self.recorder.record("driverSetChange", t, {k: (v / MS_PER_MPH if isinstance(v, float) and k != "steps" else v)
-                                                  for k, v in ev.items()}, min_gap=0.0)
+    if lg.driver_events:
+      # driver set speed changes while we managed it (what happened to the restore): one summary-only event per
+      # frame (drive 44: five 400-row events in a few seconds helped make card lag); the episode events have the rows
+      evs = [{k: (round(v / MS_PER_MPH, 2) if isinstance(v, float) and k != "steps" else v) for k, v in ev.items()}
+             for ev in lg.driver_events]
+      summary = dict(evs[-1])
+      summary.update({"count": len(evs), "events": evs})
+      self.recorder.record("driverSetChange", t, summary, min_gap=0.0, signals=False)
     lg.driver_events = []
     self._map_episode(t, i, plan)
     # curve slowdown episode: from the first SET- for a curve to the restore being complete
@@ -1237,9 +1293,7 @@ class CurveSlowdown:
           "release_reason": self.trigger.release_reason, "kind": self.trigger.kind,
           "set_mph_min": self.stop_min_set / MS_PER_MPH,
           "set_mph_after": i.set_speed / MS_PER_MPH, "holds": len(holds),
-          "holds_detail": "; ".join(f"frames_sent {h.get('frames_sent')} landed {h.get('landed')} after_release {h.get('landed_after_release', 0)} "
-                                    f"landings {[(round((f - h['frame']) * DT_CTRL, 2), n) for f, n in h.get('landings', [])]}"
-                                    for h in holds),
+          "holds_detail": "; ".join(self._hold_text(h) for h in holds),
           "hold_overrun_learned": lg.hold_overrun, "hold_measured": lg.hold_measured, "holds_learned_all_drives": self.profile.holds if self.profile else 0,
           "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
           "radar_lead_rises_s": [round((f - self.trigger.start_frame) * DT_CTRL, 2) for f in self.trigger.radar_rises
