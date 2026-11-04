@@ -42,7 +42,7 @@ class FakeSM:
                                        mapNavCurveRadius=0.0, mapNavCurveDistance=0.0, mapNavExitSide=0, mapCurveAdvisory=0.0,
                                        mapNavCurveAdvisory=0.0, mapRoadClass=0),
       "radarState": SimpleNamespace(leadOne=SimpleNamespace(status=False, modelProb=0.0, dRel=0.0, vLead=0.0, yRel=0.0)),
-      "modelV2": SimpleNamespace(action=SimpleNamespace(desiredAcceleration=0.0), velocity=SimpleNamespace(x=[]),
+      "modelV2": SimpleNamespace(action=SimpleNamespace(desiredAcceleration=0.0), velocity=SimpleNamespace(x=[], t=[]),
                                  orientationRate=SimpleNamespace(z=[]), position=SimpleNamespace(x=[], y=[])),
     }
     self.alive = dict.fromkeys(self.msgs, True)

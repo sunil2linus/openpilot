@@ -38,6 +38,7 @@ Design rules (each enforced by the logic itself, not by timing assumptions):
   * Button traffic is bounded: a SET- budget per curve (restoring is never cut short),
     and a back-off when the car ignores presses (give up after NO_EFFECT_TRIPS back-offs).
 """
+import math
 from dataclasses import dataclass, field
 
 DT_CTRL = 0.01                     # car controller runs at 100 Hz
@@ -99,7 +100,11 @@ HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after a SE
 # the last 19 mph (drive 3c).
 HOLD_UP_OVERRUN_DEFAULT = 2              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
 HOLD_MISS_LIMIT = 2                      # holds with no effect before holds are off for the drive
-HOLD_GOALS_MPH = (15, 10)                # stopped car: first hold aims 15 mph down, the second 10 more, then taps
+HOLD_GOALS_MPH = (15, 10)                # stopped car, car not measured yet: first hold 15 mph down, the second 10 more
+# SET- holds per stopped car; once the car's holds are measured, a hold aims straight at the floor (the release rule
+# keeps the overrun margin), then taps
+MAX_STOP_HOLDS = 2
+CAR_MIN_SET_SPEED = 30.0 * MS_PER_KPH    # the car's own minimum set speed (18.6 mph): SET- below it lands short
 # Restoring a big gap after a curve (the owner's suggestion): one SET+ hold up to a multiple of 5 below the driver's
 # speed, then taps. The margin below the driver's speed is the quanta that may still land after a SET+ release
 # (_up_overrun: one once a hold has measured that the car stops cleanly, cautious until then), so the hold can never
@@ -432,6 +437,14 @@ class CurveSlowdownLogic:
     hold_open = any(p.hold for p in self.inflight if p.direction == direction)
     expired_k = next((k for k, p in enumerate(self.expired) if p.direction == direction), None)
     if abs(steps - round(steps)) > 0.25:
+      if (ours_k is not None and hold_open and direction == SET_MINUS and
+          abs(i.set_speed - CAR_MIN_SET_SPEED) < self.half_step):
+        # Our SET- hold ran onto the car's own minimum (30 km/h): a short last step, still ours. No more holds
+        # this drive (the overrun was larger than assumed), but no disable either.
+        self.hold_misses = HOLD_MISS_LIMIT
+        self.holds_ok = False
+        self._consume_ours(direction, int(math.ceil(steps)))
+        return
       if ours_k is not None and not driver_recent and not after_gap and steps < 2.5:
         # Our press landed as a fraction of a step: the car's set speed steps don't match our
         # unit (e.g. km/h setting with an mph dash). We cannot tell our presses from the
@@ -741,12 +754,16 @@ class CurveSlowdownLogic:
     hold = False
     self.hold_margin = False
     if self.holds_allowed and not self.inflight:
-      if want_lower and reason == "stop" and self.holds_this_episode < len(HOLD_GOALS_MPH):
-        goal = HOLD_GOALS_MPH[self.holds_this_episode] * (1.609344 if self.step < MS_PER_MPH else 1.0) * self.step
+      if want_lower and reason == "stop" and self.holds_this_episode < MAX_STOP_HOLDS:
         hard = max(target, STOP_MIN_SET_SPEED)
         hold = set_speed - worst >= hard - self.half_step
         if hold:
-          self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
+          if self.hold_measured:
+            self.hold_bound = hard       # straight to the floor / target; the release keeps the measured overrun margin
+          else:
+            k = min(self.holds_this_episode, len(HOLD_GOALS_MPH) - 1)
+            goal = HOLD_GOALS_MPH[k] * (1.609344 if self.step < MS_PER_MPH else 1.0) * self.step
+            self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif (button == SET_PLUS and not want_lower and all_over and not self.restore_pending and not i.csc_active and
             not self.stop_episode and offset >= RESTORE_HOLD_MIN_QUANTA * q):
@@ -792,7 +809,7 @@ class CurveSlowdown:
   EVENT_COLUMNS = ["t_wall", "vEgo_mph", "aEgo", "brake", "gas", "cruise", "op", "set_mph", "csc_active", "csc_mph",
                    "road_curv", "fp_csc_active", "fp_csc_mph",
                    "lead_status", "lead_prob", "lead_d", "lead_v", "lead_y", "radar_has_lead", "radar_dist_bucket",
-                   "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "offset", "in_flight",
+                   "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "stop_floor", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
                    "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph",
@@ -934,15 +951,17 @@ class CurveSlowdown:
 
     # Stopped car ahead (Test: trigger and target are computed and logged, nothing is pressed)
     from opendbc.car.mazda.stopped_car_slowdown import plan_stop
+    p_stop, p_ratio, p_d = False, 1.0, 0.0
     if self._alive('modelV2'):
-      m = self.sm['modelV2']
-      p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), list(m.position.x), v_ego)
-    else:
-      p_stop, p_ratio, p_d = False, 1.0, 0.0
+      try:
+        m = self.sm['modelV2']
+        p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), list(m.position.x), v_ego)
+      except Exception:
+        p_stop, p_ratio, p_d = False, 1.0, 0.0     # a malformed plan only loses the red-light latch
     stop_inputs = StoppedCarInputs(
       enabled=bool(CC.enabled), cruise_enabled=cruise_enabled, brake_pressed=bool(CS.out.brakePressed), v_ego=v_ego,
       lead_alive=self._alive('radarState'), lead_status=bool(lead.status), lead_prob=float(lead.modelProb),
-      lead_d=float(lead.dRel), lead_v=float(lead.vLead), lead_y=float(lead.yRel),
+      lead_d=float(lead.dRel), lead_v=float(lead.vLead), lead_y=float(lead.yRel), lead_a=float(getattr(lead, "aLeadK", 0.0)),
       radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)),
       model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration),
       plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d)
@@ -1154,7 +1173,7 @@ class CurveSlowdown:
         float(plan.cscSpeed) / MS_PER_MPH if plan is not None else 0.0,
         si.lead_status, si.lead_prob, si.lead_d, si.lead_v, si.lead_y, si.radar_has_lead, si.radar_lead_distance,
         stop_active, self.trigger.target / MS_PER_MPH,
-        self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), lg.offset, len(lg.inflight),
+        self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), self.trigger.floor_mode, lg.offset, len(lg.inflight),
         lg.hold is not None, {SET_MINUS: "M", SET_PLUS: "P"}.get(button, ""), i.driver_button or "", lg.blocked, lg.restoring,
         *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0,
         (lg.anchor or 0.0) / MS_PER_MPH, si.plan_stop, si.plan_ratio, self.trigger.latched,
@@ -1210,7 +1229,7 @@ class CurveSlowdown:
           "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
           "radar_lead_rises_s": [round((f - self.trigger.start_frame) * DT_CTRL, 2) for f in self.trigger.radar_rises
                                  if f >= self.trigger.start_frame - 1500],
-          "driver_braked": self.stop_brake, "early": self.trigger.early,
+          "driver_braked": self.stop_brake, "early": self.trigger.early, "floor_mode": self.trigger.floor_mode,
           "prob_rise_s": (round((self.trigger.confirm_frame - self.trigger.start_frame) * DT_CTRL, 2)
                           if self.trigger.early and self.trigger.confirm_frame >= 0 else None),
           "anchor_mph_end": (lg.anchor or 0.0) / MS_PER_MPH})

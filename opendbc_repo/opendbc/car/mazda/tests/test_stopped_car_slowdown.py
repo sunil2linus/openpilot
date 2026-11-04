@@ -17,6 +17,11 @@ def approach(set_mph=45, d0=120, frames=6000, lead_kw=None, car_kw=None, curve=N
   return run(car, curve, frames, events=events, lead=lead, stop_mode=stop_mode, max_drop=max_drop)
 
 
+# deceleration of the stock cruise vs the set speed gap (vEgo - set, mph), measured on 9 drives (Nov 2026)
+MEASURED_DECEL = lambda gap: scs._interp(gap, [0.5, 3, 7.5, 10.5, 13.5, 16.5, 19.5], [0.0, 0.54, 0.70, 0.77, 0.86, 0.90, 1.6])  # noqa: E731
+MEASURED = lambda lg: (setattr(lg, "hold_overrun", 1), setattr(lg, "hold_measured", True))  # noqa: E731  owner's car profile
+
+
 def first_frame(r, what="any"):
   fs = [f for f, _ in r["presses"]] + r["holds"]
   return min(fs) if fs else None
@@ -100,7 +105,8 @@ def test_approach_45_mph_from_120_m_lowers_towards_20_and_restores():
   assert r["min"] >= 20 - 1e-6, r["min"]
   assert r["min"] <= 30, r["min"]                      # well on the way to the floor (lead still there)
   assert r["max"] <= 45 + 1e-6
-  assert r["presses"] and r["presses"][0][0] < (r["holds"][0] if r["holds"] else 10**9), "from 120 m the target starts above the set speed: taps first"
+  assert r["holds"] and r["holds"][0] < (r["presses"][0][0] if r["presses"] else 10**9), "120 m: floor mode, a hold first"
+  assert r["trigger"].floor_mode
   # the lead departs: normal restore
   lead2 = StoppedLead(120, present=lambda f: f < 2000)
   r2 = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 6500, lead=lead2, stop_mode=2, max_drop=10)
@@ -118,10 +124,12 @@ def test_urgent_approach_uses_holds_and_reaches_floor_fast():
 
 def test_relaxed_approach_taps_follow_the_target():
   # 45 mph, 200 m: not urgent (ttc 10 s, 1.1 m/s^2); the distance target starts above the set speed and
-  # comes down slowly, so taps keep up with it and no 5 mph hold is ever needed (room < 6 steps).
+  # comes down slowly, so taps keep up with it; within FLOOR_DISTANCE (130 m) floor mode takes over with holds.
   r = approach(45, 200, frames=5000)
   minus_holds = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
-  assert r["presses"] and minus_holds == [], (len(r["presses"]), minus_holds)
+  assert r["presses"] and r["presses"][0][0] < 200, r["presses"][:3]     # taps first (trigger 0.5 s + cruise settle)
+  # 70 m closer at ~20 m/s is ~3.5 s: no SET- hold before the lead is within 130 m
+  assert minus_holds and minus_holds[0]["frame"] > 300, minus_holds[:1]
   assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
   gaps = [b - a for (a, _), (b, _) in zip(r["presses"], r["presses"][1:])]
   assert min(gaps[:3]) >= cs.RELAXED_GAP_FRAMES, gaps[:3]          # relaxed pace while not urgent (it gets urgent closer in)
@@ -500,8 +508,8 @@ def test_stop_with_a_slower_car_starts_in_half_a_second_and_is_urgent():
     n += 1
     assert n < 100
   assert 49 <= n <= 51, n
-  assert tr.kind == scs.STOP_WITH_CAR and tr.urgent
-  assert abs(tr.target - scs.stopped_car_target(95.0)) < 1e-9
+  assert tr.kind == scs.STOP_WITH_CAR and tr.urgent and tr.floor_mode
+  assert abs(tr.target - scs.FLOOR_SPEED) < 1e-9                  # 95 m, confirmed: the floor (the car ahead is at 13 mph)
 
 
 def test_no_stop_with_car_while_just_following_or_without_a_car_or_model():
@@ -590,7 +598,12 @@ def test_restore_at_a_stop_holds_most_of_the_way_up():
     orig_tick(c)
     sets[lead.frame] = c.set_speed
   lead.tick = tick
-  r = run(car, NO_CURVE, 8000, lead=lead, max_drop=10)
+  # floor mode off: the tap-only lowering this restore case starts from (drive 3c, before floor mode)
+  scs.FLOOR_MODE_ENABLED = False
+  try:
+    r = run(car, NO_CURVE, 8000, lead=lead, max_drop=10)
+  finally:
+    scs.FLOOR_MODE_ENABLED = True
   plus = _plus_frames(r)
   assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]   # lowered by taps, as in drive 3c
   low = min(sets.values()) / MPH
@@ -794,3 +807,101 @@ def test_early_start_in_test_mode_sends_nothing():
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=Queue(125.0, v_mph=15.0), stop_mode=1, max_drop=10,
           model=lambda f: -0.7, plan=lambda f: True)
   assert r["ever_active"] and r["presses"] == [] and r["holds"] == []
+
+
+# ---------------- floor mode: straight to 20 mph with SET- holds (drive 00000043, Nov 4) ----------------
+
+class SlowingLead(T.StoppedLead):
+  """A car ahead at `v_mph` that brakes at `decel` m/s^2 down to `v_end` m/s (a car stopping at a light)."""
+  def __init__(self, d0, v_mph, decel=2.0, v_end=0.5, **kw):
+    super().__init__(d0, v_mph=v_mph, **kw)
+    self.decel, self.v_end = decel, v_end
+
+  @property
+  def a(self):
+    return -self.decel if self.v > self.v_end else 0.0     # what the radarState reports (aLeadK)
+
+  def tick(self, car):
+    self.v = max(self.v - self.decel * T.DT, self.v_end)
+    super().tick(car)
+
+
+def _episode_a(frames=700):
+  # 1:54.6: 45.5 mph, the model slowing, a car 110 m ahead at 29 mph braking to a stop; the stock cruise slows
+  # as measured for the set speed gap. Before floor mode: 13 taps in 5 s, 39.5 mph when the driver braked.
+  lead = SlowingLead(110, 29, prob=0.9, y=0.1)
+  car = Car(45, dash_offset_mph=0.0, decel_fn=MEASURED_DECEL)
+  r = run(car, NO_CURVE, frames, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.7, setup=MEASURED)
+  return r, car, lead
+
+
+def test_episode_a_replay_floor_hold_slows_faster_than_taps():
+  r, car, lead = _episode_a()
+  tr = r["trigger"]
+  assert r["ever_active"]
+  assert tr.floor_mode
+  start = tr.start_frame
+  assert r["holds"] and r["holds"][0] - start <= 30, (start, r["holds"][:2], r["presses"][:2])
+  assert r["sets"][start + 350] <= 25 * MPH + 1e-6, r["sets"][start + 350] / MPH      # <= 25 mph 3.5 s in
+  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  v_new = car.v_ego
+  # the same approach by taps along the distance target (floor mode off, no holds)
+  scs.FLOOR_MODE_ENABLED = False
+  try:
+    lead = SlowingLead(110, 29, prob=0.9, y=0.1)
+    car_old = Car(45, dash_offset_mph=0.0, decel_fn=MEASURED_DECEL)
+    run(car_old, NO_CURVE, 700, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.7,
+        setup=lambda lg: (MEASURED(lg), setattr(lg, "holds_ok", False), setattr(lg, "hold_misses", cs.HOLD_MISS_LIMIT)))
+  finally:
+    scs.FLOOR_MODE_ENABLED = True
+  # with the measured gap -> deceleration table the car still only slows ~1 m/s^2 on average (the gap shrinks as it
+  # slows), so the gain 7 s in is ~1 mph; the set speed is at 25 mph instead of ~31 by 3.5 s in
+  assert v_new / MPH <= 35.0, v_new / MPH
+  assert car_old.v_ego / MPH - v_new / MPH >= 1.0, (car_old.v_ego / MPH, v_new / MPH)
+
+
+def test_measured_car_one_hold_to_the_floor_then_taps():
+  r = run(Car(45, dash_offset_mph=0.0, decel_fn=MEASURED_DECEL), NO_CURVE, 2500, lead=T.StoppedLead(100),
+          stop_mode=2, max_drop=10, setup=MEASURED)
+  log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
+  assert len(log) >= 1 and near(log[0]["bound_mph"], 20), log
+  assert r["sets"][log[0]["frame"] + 350] <= 25 * MPH + 1e-6
+  assert near(r["min"], 20) and r["max"] <= 45 + 1e-6
+
+
+def test_stop_with_a_car_rolling_at_25_mph_never_sets_below_25():
+  # a slower car that keeps moving: the floor target never goes below its speed
+  lead = T.StoppedLead(90, v_mph=25.0, prob=0.9, y=0.1)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2000, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.6)
+  assert r["ever_active"] and r["trigger"].floor_mode
+  assert r["min"] >= 25 - 1e-6, r["min"]
+
+
+def test_floor_target_respects_a_braking_lead_guard():
+  tr = scs.StoppedCarTrigger()
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=20.0, lead_alive=True, lead_status=True,
+              lead_prob=0.9, lead_d=90.0, lead_v=11.0, lead_y=0.1, model_alive=True, model_accel=-0.8)
+  for _ in range(150):
+    tr.update(scs.StoppedCarInputs(**base))
+  assert tr.active and tr.floor_mode
+  assert near(tr.target / MPH, 11.0 / MPH)                                      # 25 mph car ahead, not braking
+  tr.update(scs.StoppedCarInputs(**dict(base, lead_a=-2.5)))
+  assert near(tr.target, scs.FLOOR_SPEED)                                       # braking hard: it will be slow soon
+
+
+def test_far_confirmed_stop_is_not_floor_mode_yet():
+  tr = scs.StoppedCarTrigger()
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=20.0, lead_alive=True, lead_status=True,
+              lead_prob=0.95, lead_d=180.0, lead_v=0.0, lead_y=0.1)
+  for _ in range(150):
+    tr.update(scs.StoppedCarInputs(**base))
+  assert tr.active and not tr.floor_mode and tr.target > scs.FLOOR_SPEED + 3 * MPH
+
+
+def test_hold_onto_the_car_minimum_is_ours_not_a_disable():
+  # a hold that keeps landing after release (latency 1.5 s) runs onto the car's own 18.6 mph minimum
+  car = Car(45, dash_offset_mph=0.0, hold_latency=1.5, min_set_mph=30 / 1.609344)
+  r = run(car, NO_CURVE, 2500, lead=T.StoppedLead(70), stop_mode=2, max_drop=10, setup=MEASURED)
+  lg = r["logic"]
+  assert not lg.disabled
+  assert r["min"] >= 30 / 1.609344 - 1e-6

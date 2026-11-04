@@ -9,6 +9,11 @@ lets a gentle cruise slowdown reach the floor speed about 15 m behind the lead, 
 approaches slower and the MRCC radar has time to react. It never stops the car: the MRCC or
 the driver does the final braking.
 
+Floor mode (drive 00000043, Nov 4): the car slows only ~0.5-0.9 m/s^2 while the set speed is 3-15 mph below its speed,
+but ~1.6 m/s^2 once the gap is 18 mph or more, so tapping down along the distance target was too slow (the driver
+braked at 28-40 mph three times). Once a stop is confirmed and the car ahead is within FLOOR_DISTANCE, the target
+goes straight to the floor (SET- holds), never below where the car ahead will be in FLOOR_LEAD_HORIZON s.
+
 Two ways in:
   * "stopped car": a confident vision lead in our lane that is stopped and that we are closing in on.
   * "stop with car": the driving model wants to slow down (red light / stop ahead: its desired acceleration is at
@@ -49,6 +54,9 @@ EGO_STOPPED_SPEED = 1.0     # m/s: we have stopped behind the lead: the driver's
 FLOOR_SPEED = 20 * MS_PER_MPH
 TARGET_DECEL = 1.0          # m/s^2 the stock cruise slows at once the set speed is lowered
 TARGET_MARGIN = 15.0        # m behind the lead where the floor speed should be reached
+FLOOR_MODE_ENABLED = True
+FLOOR_DISTANCE = 130.0      # m: a confirmed stop this close: target = floor (SET- holds), not the distance target
+FLOOR_LEAD_HORIZON = 2.0    # s: ... but not below the car ahead's speed this far ahead (a slower car that keeps moving)
 URGENT_TTC = 5.0            # s
 URGENT_DECEL = 1.5          # m/s^2: closing^2 / (2 (dRel - 15))
 
@@ -107,6 +115,7 @@ class StoppedCarInputs:
   lead_d: float
   lead_v: float
   lead_y: float
+  lead_a: float = 0.0               # radarState leadOne.aLeadK (m/s^2), for the floor mode's lead guard
   radar_has_lead: bool = False      # stock MRCC radar (CRZ_CTRL.RADAR_HAS_LEAD), logged only
   radar_lead_distance: int = 0      # its distance bucket (CRZ_CTRL.RADAR_LEAD_RELATIVE_DISTANCE: 1 farthest .. 5 nearest), logged only
   model_alive: bool = False         # modelV2 is being received
@@ -176,6 +185,7 @@ class StoppedCarTrigger:
     self.cruise_on_frames = 0
     self.target = 0.0
     self.urgent = False
+    self.floor_mode = False          # this episode: a confirmed stop within FLOOR_DISTANCE, straight to the floor
     self.required = 0.0
     self.ttc = float("inf")
     self.start_frame = -1
@@ -314,6 +324,7 @@ class StoppedCarTrigger:
         self.confirmed = not self.early
         self.confirm_frames = 0
         self.confirm_frame = self.frame if not self.early else -1
+        self.floor_mode = False
         self.start_frame = self.frame
         self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
         self.early_frames = self.early_gap = 0
@@ -360,19 +371,25 @@ class StoppedCarTrigger:
         self._release("lead left the lane", False)
       elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
         self._release("lead lost (vision)", False)
-    if self.active and i.lead_status:
-      self.target = stopped_car_target(i.lead_d)
-    if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
-      self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further
     if self.active and self.early and not self.confirmed:
       sure = i.lead_alive and i.lead_status and i.lead_prob >= EARLY_CONFIRM_PROB
       self.confirm_frames = self.confirm_frames + 1 if sure else 0
       if self.confirm_frames >= _frames(EARLY_CONFIRM_TIME) or self.urgent:
         self.confirmed = True
         self.confirm_frame = self.frame
+    if self.active and i.lead_status:
+      self.target = stopped_car_target(i.lead_d)
+      self.floor_mode = self.floor_mode or (FLOOR_MODE_ENABLED and self.confirmed and 0 < i.lead_d <= FLOOR_DISTANCE)
+      if self.floor_mode:
+        lead_soon = i.lead_v + min(i.lead_a, 0.0) * FLOOR_LEAD_HORIZON
+        self.target = min(self.target, max(FLOOR_SPEED, lead_soon))
+    if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
+      self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further
     if self.active and self.kind == STOP_WITH_CAR:
       # a stop with a much slower car: slow down at once (holds allowed); an early start only taps until confirmed
       self.urgent = self.confirmed
+    if self.active and self.floor_mode:
+      self.urgent = True             # fast pace and holds, both kinds
     self.hold_restore = EARLY_START_ENABLED and self.latched and not self.active
     return self.active
 

@@ -24,12 +24,14 @@ DT = 0.01
 
 class Car:
   def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
-               hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5):
+               hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.decel = decel
+    self.decel_fn = decel_fn          # decel_fn(gap_mph) -> m/s^2 the stock cruise slows at for that set speed gap
+    self.min_set = min_set_mph * MPH if min_set_mph else None   # the car's own minimum set speed (clamp)
     self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
     self.lag_fn = lag_fn              # lag_fn(n) -> frames until our n-th press lands (overrides lag)
     self.pending, self.frame, self.op_presses = [], 0, 0
@@ -61,6 +63,8 @@ class Car:
       else:
         new = ((mph + 5) // 5) * 5
       self.set_speed += (new - mph) * MPH
+      if self.min_set is not None and self.set_speed < self.min_set:
+        self.set_speed = self.min_set
       self.hold_next += int(100 * 5 / self.hold_rate)
     if released and self.frame - self.hold_last > 15 + int(self.hold_latency * 100):
       self.hold_last = None
@@ -87,7 +91,8 @@ class Car:
     self.pending = [p for p in self.pending if p[0] > self.frame]
     self._hold_tick()
     tgt = self.set_speed - self.dash_offset
-    self.v_ego += max(-self.decel * DT, min(self.accel * DT, tgt - self.v_ego))
+    dec = self.decel_fn((self.v_ego - tgt) / MPH) if self.decel_fn is not None else self.decel
+    self.v_ego += max(-dec * DT, min(self.accel * DT, tgt - self.v_ego))
 
 
 class StoppedLead:
@@ -169,7 +174,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       r_has, r_dist = lead.radar(f)
       li = scs.StoppedCarInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], brake_pressed=st["brake"],
                                 v_ego=car.v_ego, lead_alive=True, lead_status=status, lead_prob=prob, lead_d=d,
-                                lead_v=v, lead_y=y, radar_has_lead=r_has, radar_lead_distance=r_dist,
+                                lead_v=v, lead_y=y, lead_a=getattr(lead, "a", 0.0) if status else 0.0,
+                                radar_has_lead=r_has, radar_lead_distance=r_dist,
                                 model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f))
       active = trigger.update(li)
       ever_active = ever_active or active
