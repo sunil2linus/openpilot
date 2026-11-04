@@ -333,6 +333,28 @@ def test_driver_set_plus_mid_curve_we_stop():
   assert near(r["final"], 65), r["final"]
 
 
+def test_driver_taps_before_we_lowered_rearm_after_a_quiet_spell():
+  # drive 44: SET- then SET+ by the driver while the curve was already tracked, before any press of ours: the curve
+  # then got no slowdown at all. Now they stand us down for DRIVER_REARM s only.
+  first = _first_press_frame()
+  t1, t2 = first - 5, first + 200
+  r = run(Car(65), between(first - 10, 4000, 61), 5000,
+          events={t1: lambda s, c: c.press(cs.SET_MINUS, who="driver"), t2: lambda s, c: c.press(cs.SET_PLUS, who="driver")})
+  rearm = t2 + int(cs.DRIVER_REARM * 100)
+  ours = [f for f, b in r["presses"] if b == cs.SET_MINUS]
+  assert ours and all(f >= rearm for f in ours), (rearm, ours[:3])
+  assert r["logic"].rearms >= 1
+  assert r["min"] >= 60 - 1e-6 and r["max"] <= 65 + 1e-6
+  assert near(r["final"], 65), r["final"]                       # restored to the driver's (re-set) 65
+
+
+def test_driver_tap_after_our_lowering_still_stands_us_down_for_the_curve():
+  first = _first_press_frame()
+  r = run(Car(65), between(100, 3000, 61), 5000, events={first + 40: lambda s, c: c.press(cs.SET_PLUS, who="driver")})
+  assert [f for f, b in r["presses"] if b == cs.SET_MINUS and first + 40 <= f < 3000] == [], r["presses"]
+  assert r["logic"].rearms == 0
+
+
 def test_disengage_mid_curve_no_presses_while_off():
   def off(s, c):
     s["enabled"] = False

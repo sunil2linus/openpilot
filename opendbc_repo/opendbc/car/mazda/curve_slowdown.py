@@ -76,6 +76,9 @@ NO_EFFECT_LIMIT = 6                   # presses in a row with no effect before b
 NO_EFFECT_BACKOFF = 10.0              # s to wait after that before trying again
 NO_EFFECT_TRIPS = 3                   # back-offs before giving up (speed left alone)
 PAUSE_ABANDON = 30.0                  # s paused before we forget the driver's speed
+# A driver SET tap before we lowered anything for the current curve / stopped car (drive 44: SET- 28 s and SET+ 18 s
+# before a 30 mph curve the map had already announced) only stands us down this long, not for the whole curve.
+DRIVER_REARM = 8.0                    # s without a driver SET button, nothing of ours lowered or in flight
 DRIVER_QUIET = 1.0                    # s: none of our frames while the driver is on a SET button, nor this soon after
 EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
@@ -184,6 +187,8 @@ class CurveSlowdownLogic:
     self.driver_taps = []            # [(direction, frame)] of the driver's own recent taps, not yet seen on the set speed
     self.prev_driver_button = None
     self.last_driver_edge = {SET_MINUS: -10_000, SET_PLUS: -10_000}
+    self.blocked_frame = None        # frame the current block started (DRIVER_REARM)
+    self.rearms = 0                  # blocks lifted by DRIVER_REARM (logs)
     self.no_effect = 0
     self.no_effect_trips = 0
     self.backoff_until = 0
@@ -625,6 +630,16 @@ class CurveSlowdownLogic:
     if all_over:
       self.blocked = False
       self.holds_ok = self.hold_misses < HOLD_MISS_LIMIT
+    if not self.blocked:
+      self.blocked_frame = None
+    elif self.blocked_frame is None:
+      self.blocked_frame = self.frame
+    if (self.blocked and self.lower_presses == 0 and self.stop_presses == 0 and self.offset == 0 and not self.inflight and
+        self.hold is None and i.driver_button not in (SET_MINUS, SET_PLUS) and
+        self.frame - max(self.blocked_frame, *self.last_driver_edge.values()) >= _frames(DRIVER_REARM)):
+      self.blocked = False          # the driver adjusted before we did anything: their speed is the new reference
+      self.blocked_frame = None
+      self.rearms += 1
 
     if i.stop_restore_now and self.offset != 0:
       self.restore_pending = True
