@@ -10,7 +10,7 @@ from openpilot.selfdrive.ui.onroad.starpilot.widget_layout_manager import Widget
 from openpilot.selfdrive.ui.onroad.starpilot.widgets import (
   UnifiedSpeedWidget, PedalIconsWidget,
   AetherGaugeWidget, PersonalityButtonWidget, DriverMonitorWidget,
-  SteeringWheelWidget, StoppedTimerWidget, ModelSourceWidget
+  SteeringWheelWidget, StoppedTimerWidget, ModelSourceWidget, EventTagButtonWidget
 )
 from openpilot.selfdrive.ui.onroad.starpilot.stopping_point import render_stopping_point
 from openpilot.selfdrive.ui.onroad.starpilot.pause_indicators import render_lateral_paused, render_longitudinal_paused
@@ -71,12 +71,14 @@ class StarPilotOnroadView(AugmentedRoadView):
     self._driver_monitor_widget = DriverMonitorWidget(self.driver_state_renderer)
     self._model_source_widget = ModelSourceWidget()
     self._stopped_timer_widget = StoppedTimerWidget(self.is_in_reverse)
+    self._event_tag_widget = EventTagButtonWidget()
 
     # Register to layout zones
     self.layout_manager.register_widget("left", self._unified_speed_widget)
     self.layout_manager.register_widget("left", self._aethergauge_widget)
     self.layout_manager.register_widget("right", self._steering_wheel_widget)
     self.layout_manager.register_widget("right", self._pedals_widget)
+    self.layout_manager.register_widget("right", self._event_tag_widget)
     self.layout_manager.register_widget("right_center", self._model_source_widget)
     self.layout_manager.register_widget("bottom", self._personality_button_widget)
     self.layout_manager.register_widget("bottom", self._driver_monitor_widget)
@@ -90,6 +92,7 @@ class StarPilotOnroadView(AugmentedRoadView):
     self._child(self._driver_monitor_widget)
     self._child(self._model_source_widget)
     self._child(self._stopped_timer_widget)
+    self._child(self._event_tag_widget)
 
   def _update_state(self) -> None:
     rivian_lateral_mode.update()
@@ -179,12 +182,15 @@ class StarPilotOnroadView(AugmentedRoadView):
       return
 
     self._stopped_timer_widget.render(self._content_rect)
+    # TAG stays usable during small/mid alerts (often the moment worth tagging); drawn here, not in render_widgets
+    if self._event_tag_widget.is_visible:
+      self._event_tag_widget.render(self._event_tag_widget.rect)
     if alert_showing is not None:
       return
 
     self._render_developer_metrics()
 
-    self.layout_manager.render_widgets(exclude={"unified_speed"})
+    self.layout_manager.render_widgets(exclude={"unified_speed", "event_tag"})
 
     self._render_torque_bar()
     self._render_bottom_row_widgets()
