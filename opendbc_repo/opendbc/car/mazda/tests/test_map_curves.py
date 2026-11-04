@@ -867,3 +867,272 @@ def test_a_pass_with_the_turn_signal_or_off_the_apex_counts_for_nothing(tmp_path
   assert run(blinker=True) == []                                       # a lane change in the curve
   assert run(apex=30.0) == []                                          # never near the apex: another road
   assert run(exit_=200.0)[0][3] == ["vetoed"]                          # lost the road before the exit: not full
+
+
+# ---------------- GPS trust: a GPS that is off the road, or a road match that may be the wrong road ----------------
+
+QS = _load("qcom_structs", os.path.join(ROOT, "system", "qcomgpsd", "structs.py"))
+
+
+def _gps(v=20.0, ambiguous=False, acc=0.0, rel=0, dt=0.05):
+  return {"dt": dt, "v_ego": v, "acc": acc, "rel": rel, "ambiguous": ambiguous}
+
+
+def _drive(m, rm, trust, x, y, bearing, frames, v=20.0, acc=0.0, rel=0):
+  la, lo = pos(x, y)
+  for _ in range(frames):
+    w, f = rm.update(la, lo, bearing, acc)
+    m.update(la, lo, bearing, w, f, trust=trust, gps=_gps(v, rm.ambiguous, acc, rel))
+  return w
+
+
+def _with_trust(ways):
+  root, curves, ramps = write_files(ways)
+  store = MC.MapCurveStore(root, background=False)
+  return MC.MapCurves(store), MC.RoadMatcher(store), MC.GpsTrust(), curves, ramps
+
+
+def test_the_gps_chips_own_accuracy_is_kept():
+  report = {"q_FltEllipseSemimajorAxis": 7.5, "u_NumGpsSvsUsed": 9, "u_NumGloSvsUsed": 6, "u_NumBdsSvsUsed": 4,
+            "u_HorizontalReliability": 3, "u_EllipseConfidence": 39, "q_SensorAidMask": 0x4, "q_SensorDataUsageMask": 3}
+  acc, sats, flags = QS.position_quality(report)
+  assert acc == 7.5 and sats == 19
+  assert MC.gps_flags(flags) == {"reliability": 3, "sensorAided": True, "sensorData": True, "confidence": 39}
+  for bad in (float("nan"), -1.0, 0.0, 9999.0):                          # unknown, never a huge number
+    assert QS.position_quality({**report, "q_FltEllipseSemimajorAxis": bad})[0] == 0.0
+  from types import SimpleNamespace as N
+  q = MC.gps_quality(N(horizontalAccuracy=acc, satelliteCount=sats, flags=flags))
+  assert q == {"accuracy": 7.5, "satellites": 19, "reliability": 3, "confidence": 39, "sensorAided": True}
+  assert MC.gps_quality(N())["accuracy"] == 0.0                          # another GPS source without these fields
+
+
+def test_a_gps_far_off_the_road_pauses_the_map_after_ten_seconds():
+  m, rm, trust, curves, _ = _with_trust(G.curve_road(r=115, turn=40, split=True))
+  frames = int(MC.LOST_TIME / 0.05)
+  w = _drive(m, rm, trust, 100, -250, 0.0, frames - 1)                   # drive 3f: the track 100 m beside the road
+  assert w == 0 and not trust.paused and 90 <= rm.nearest_d <= 110, rm.nearest_d
+  _drive(m, rm, trust, 100, -250, 0.0, 1)
+  assert trust.paused and trust.reason == "lost" and m.paused and m.trust_status == MC.TRUST_PAUSED_LOST
+  assert [e[0] for e in trust.events] == ["pause"]
+  # slow (a residential street, not in the files) or no curve data here: never paused
+  m2, rm2, t2, _, _ = _with_trust(G.curve_road(r=115, turn=40, split=True))
+  _drive(m2, rm2, t2, 100, -250, 0.0, 3 * frames, v=10.0)
+  assert not t2.paused
+  t3 = MC.GpsTrust()
+  for _ in range(3 * frames):
+    t3.update(0.05, 20.0, 0.0, 0, False, False, False)
+  assert not t3.paused
+
+
+def test_after_a_pause_the_road_must_match_for_five_seconds():
+  m, rm, trust, curves, _ = _with_trust(G.curve_road(r=115, turn=40, split=True))
+  _drive(m, rm, trust, 100, -250, 0.0, int(MC.LOST_TIME / 0.05))
+  assert trust.paused
+  resume = int(MC.RESUME_TIME / 0.05)
+  _drive(m, rm, trust, 0, -250, 0.0, resume // 2)                        # back on the road ...
+  _drive(m, rm, trust, 100, -250, 0.0, 1)                                # ... one frame off it again: starts over
+  _drive(m, rm, trust, 0, -250, 0.0, resume - 1)
+  assert trust.paused and m.curve is None
+  _drive(m, rm, trust, 0, -250, 0.0, 1)
+  assert not trust.paused and m.curve is not None and m.status == MC.STATUS_CURVE
+  assert trust.shaky                                                     # trusted again, but not "steady" for a minute
+  _drive(m, rm, trust, 0, -250, 0.0, int(MC.STEADY_TIME / 0.05))
+  assert not trust.shaky and m.trust_status == MC.TRUST_OK
+
+
+def _parallel(gap, curve_on_b=True):
+  """Road A straight north; road B (another name) beside it, `gap` m east, with a 115 m left curve 300 m ahead."""
+  a = G.way(1, G.straight(0, -400, 0, 1400), name="Main Road")
+  if curve_on_b:
+    pts = G.straight(gap, -400, 0, 700)
+    c = G.arc(gap - 115, 300, 115, 0, 40)
+    pts += c[1:]
+    pts += G.straight(*c[-1], -40, 300)[1:]
+  else:
+    pts = G.straight(gap, -400, 0, 1400)
+  b = G.way(2, pts, name="Service Drive")
+  return {1: a, 2: b}
+
+
+def test_a_parallel_road_close_by_makes_the_match_doubtful_so_its_curve_is_held():
+  # the owner's case: the GPS lands on a parallel road that has a curve; the road the car is on has none
+  m, rm, trust, curves, _ = _with_trust(_parallel(20))
+  assert any(c["name"] == "Service Drive" for c in curves)
+  _drive(m, rm, trust, 12, -50, 0.0, 5)                                  # 8 m from B, 12 m from A
+  assert rm.ambiguous and m.curve is None and m.status == MC.STATUS_HELD and m.held is not None
+  assert m.held[0]["name"] == "Service Drive" and m.trust_status == MC.TRUST_LOW
+  # the same with a larger GPS error estimate: a road 30 m away is still too close to call
+  m, rm, trust, _, _ = _with_trust(_parallel(30))
+  _drive(m, rm, trust, 25, -50, 0.0, 5, acc=12.0)
+  assert rm.ambiguous and m.curve is None
+  # documented limit: with the other road farther than the ambiguity distance, the match is taken
+  m, rm, trust, _, _ = _with_trust(_parallel(50))
+  _drive(m, rm, trust, 47, -50, 0.0, 5)
+  assert not rm.ambiguous and m.curve is not None
+
+
+def test_a_road_that_only_starts_here_or_runs_the_other_way_does_not_make_the_match_doubtful():
+  m, rm, trust, _, _ = _with_trust(G.curve_road(r=115, turn=40, split=True))
+  _drive(m, rm, trust, 2, -250, 0.0, 3)
+  assert not rm.ambiguous and m.curve is not None                        # one road, two ways of the same chain
+  # the other carriageway of a divided road: one-way the other direction, 20 m away
+  a = G.way(1, G.straight(0, -400, 0, 1400), name="Big Road", oneway=True)
+  pts = G.straight(20, 1000, 180, 700)
+  c = G.arc(20 + 115, 300, 115, 180, 220)
+  b = G.way(2, pts + c[1:], name="Big Road", oneway=True)
+  m, rm, trust, _, _ = _with_trust({1: a, 2: b})
+  _drive(m, rm, trust, 3, -50, 0.0, 3)
+  assert rm.way_id == 1 and not rm.ambiguous
+
+
+def test_at_an_exit_split_a_ramp_curve_waits_until_the_ramp_is_clearly_apart():
+  m, rm, trust, _, ramps = _with_trust(G.ramp_scene())
+  h = math.radians(20)
+  _drive(m, rm, trust, 0, -200, 0.0, 3)
+  for along, held in ((40, True), (60, False)):                          # ramp 13.7 m / 20.5 m from the motorway
+    _drive(m, rm, trust, along * math.sin(h), along * math.cos(h), 20.0, 3)
+    assert rm.way_id == 11, (along, rm.way_id)
+    assert (m.status == MC.STATUS_HELD) == held, (along, m.status)
+  assert m.status == MC.STATUS_RAMP_CURVE and m.on_ramp
+  # with a GPS error of 10 m the ramp must be 25 m apart
+  m, rm, trust, _, _ = _with_trust(G.ramp_scene())
+  _drive(m, rm, trust, 0, -200, 0.0, 3, acc=10.0)
+  _drive(m, rm, trust, 60 * math.sin(h), 60 * math.cos(h), 20.0, 3, acc=10.0)
+  assert m.status == MC.STATUS_HELD and not m.on_ramp
+
+
+def test_the_gps_error_estimate_pauses_or_holds():
+  t = MC.GpsTrust()
+  confirm = int(MC.BAD_CONFIRM / 0.05)
+  for _ in range(confirm - 1):
+    t.update(0.05, 20.0, 80.0, 3, True, True, False)
+  assert not t.paused
+  t.update(0.05, 20.0, 80.0, 3, True, True, False)
+  assert t.paused and t.reason == "accuracy" and t.status == MC.TRUST_PAUSED_ACCURACY
+  for _ in range(int(MC.RESUME_TIME / 0.05)):
+    t.update(0.05, 20.0, 10.0, 3, True, True, False)
+  assert not t.paused
+  t.update(0.05, 20.0, 30.0, 3, True, True, False)
+  assert t.low and not t.paused                                          # 20-50 m: held, not paused
+  t2 = MC.GpsTrust()
+  for _ in range(confirm):
+    t2.update(0.05, 20.0, 0.0, 1, True, True, False)                     # reliability "very low"
+  assert t2.paused
+  t3 = MC.GpsTrust()
+  for _ in range(confirm - 1):
+    t3.update(0.05, 20.0, 80.0, 3, True, True, False)
+  t3.update(0.05, 20.0, 5.0, 3, True, True, False)                       # a blip: starts over
+  for _ in range(confirm - 1):
+    t3.update(0.05, 20.0, 80.0, 3, True, True, False)
+  assert not t3.paused
+
+
+def test_the_car_side_treats_paused_and_held_as_no_curve():
+  c = CTL.MapCurveControl(3.0)
+  assert c.update(F(status=1, radius=115, distance=40), 50 * MPH, False).active
+  for status in (MC.STATUS_PAUSED, MC.STATUS_HELD):
+    out = c.update(F(status=status, radius=115, distance=40), 50 * MPH, False)
+    assert not out.active, status
+  assert c.update(F(status=1, radius=115, distance=40), 50 * MPH, False).active
+  from types import SimpleNamespace as N
+  plan = N(mapCurveMode=2, mapCurveStatus=4, mapCurveDistance=0.0, mapCurveRadius=0.0, mapOnRamp=False, mapRampType=0,
+           mapRampToSpeed=0.0, mapRampToHighway=False, mapRampEndDistance=0.0, mapNavExit=0, mapNavExitDistance=0.0,
+           mapNavCurveRadius=0.0, mapNavCurveDistance=0.0, mapGpsTrust=4)
+  assert CTL.MapFields.from_plan(plan).gps_trust == 4
+
+
+def test_a_pass_that_did_not_turn_or_was_not_trusted_is_not_learned(tmp_path):
+  class P:
+    def get(self, key, encoding=None):
+      return None
+
+  def run(samples, shaky=False):
+    mp = MC.MapCurvesPlanner(P(), P())
+    mp.mc = MC.MapCurves(MC.MapCurveStore(tempfile.mkdtemp(), background=False),
+                         memory=MC.CurveMemory(str(tmp_path / f"t{len(samples)}{shaky}{id(samples)}.json")))
+    c = {"apex": (42.6, -83.1), "r": 115.0, "s_a": 0.0, "turn": 40.0, "name": "Wrong Road"}
+    mp.pass_curve, mp.pass_samples = c, samples
+    mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = False, 5.0, 16.0, False, shaky
+    mp._finish_pass()
+    e = mp.mc.memory._find(*c["apex"])
+    return (e["passes"] if e else []), getattr(mp, "pass_drops", [])
+
+  turn_time = math.radians(40) * 115 / 18.0                              # s to turn 40 deg on a 115 m arc at 18 m/s
+  real = _pass(115, seconds=turn_time)
+  passes, drops = run(real)
+  assert len(passes) == 1 and not drops
+  passes, drops = run(_pass(0, seconds=6.0))                             # straight on (a parallel road): 2000 m
+  assert passes == [] and drops[0]["reason"] == "turn" and drops[0]["driven_turn"] < 1
+  passes, drops = run(real, shaky=True)                                  # the match was not trusted in the pass
+  assert passes == [] and drops[0]["reason"] == "shaky"
+  assert abs(MC.driven_turn(real) - 40) < 2
+
+
+def test_while_the_match_is_shaky_the_camera_may_end_a_slowdown_for_any_curve():
+  m, curves, where = _false_kink()
+  m.update(*where)
+  m.curve["adv"] = 35 * MPH                                              # a signed curve: normally never ignored
+  t = MC.GpsTrust()                                                      # drive start: shaky
+  for _ in range(MC.VETO_CONFIRM):
+    m.update(*where, camera=_view(40.0, 400.0), trust=t, gps=_gps())
+  assert m.curve is None and m.veto_status == 1
+
+
+def test_publish_says_paused_held_or_no_data():
+  from types import SimpleNamespace as N
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mode = 2
+  m, rm, trust, _, _ = _with_trust(_parallel(20))
+  mp.mc = m
+  _drive(m, rm, trust, 12, -50, 0.0, 3)
+  plan = N()
+  mp.publish(plan)
+  assert plan.mapCurveStatus == MC.STATUS_HELD and plan.mapCurveRadius > 0 and plan.mapGpsTrust == MC.TRUST_LOW
+  m, rm, trust, _, _ = _with_trust(G.curve_road(r=115, turn=40, split=True))
+  mp.mc = m
+  _drive(m, rm, trust, 100, -250, 0.0, int(MC.LOST_TIME / 0.05))
+  plan = N()
+  mp.publish(plan)
+  assert plan.mapCurveStatus == MC.STATUS_PAUSED and plan.mapCurveRadius == 0 and not plan.mapOnRamp and plan.mapNavExit == 0
+
+
+def test_the_planner_says_map_curves_paused_once_per_drive(monkeypatch):
+  import time as _time
+  root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
+
+  class P:
+    def __init__(self, vals):
+      self.vals = vals
+
+    def get(self, key, encoding=None):
+      return self.vals.get(key)
+
+    def get_bool(self, key):
+      return False
+
+  class SM(dict):
+    alive = {"navInstruction": False}
+    valid = {"navInstruction": False}
+
+  clock = [1000.0]
+  monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
+  mp = MC.MapCurvesPlanner(P({"MazdaMapCurves": "2"}), P({}))
+  mp.mc = MC.MapCurves(MC.MapCurveStore(root, background=False))
+  mp.matcher = MC.RoadMatcher(mp.mc.store)
+  mp.pass_curve, mp.pass_samples = None, []
+
+  def drive(x, y, seconds):
+    notices = []
+    la, lo = pos(x, y)
+    for _ in range(int(seconds / 0.05)):
+      clock[0] += 0.05
+      mp.update(SM(), {"latitude": la, "longitude": lo, "bearing": 0.0}, 20.0, 20.0)
+      notices.append(mp.notice)
+    return [n for n in notices if n]
+
+  assert drive(100, -400, MC.LOST_TIME + 1) == ["paused"]
+  drive(0, -250, MC.RESUME_TIME + 1)                                     # back on the road
+  assert not mp.trust.paused
+  assert drive(100, -400, MC.LOST_TIME + 1) == []                        # once per drive
+  clock[0] += 60.0                                                       # next drive
+  assert drive(100, -400, MC.LOST_TIME + 1) == ["paused"]

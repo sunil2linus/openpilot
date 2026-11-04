@@ -65,8 +65,36 @@ NAV_MATCH_MIN = 150.0
 HIGHWAY_CLASSES = (1, 3)
 RAMP_TYPES = {"exit": 1, "entrance": 2, "interchange": 3, "link": 4, "two-way": 4}
 
-# frogpilotPlan.mapCurveStatus
+# frogpilotPlan.mapCurveStatus (the car side acts on 1 and 2 only: 4 and 5 are "no curve" on purpose)
 STATUS_NONE, STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_NO_DATA = 0, 1, 2, 3
+STATUS_PAUSED, STATUS_HELD = 4, 5   # paused: the GPS is not trusted; held: a curve found, but the road match is not trusted
+
+# GPS trust (GpsTrust). The device's GPS can be off by 100 m or more for a whole drive while reporting a fix (drive
+# 3f: the track had the road's exact shape, 90-180 m to one side): then nothing matches, or worse, a parallel road
+# matches. Safe by default: when the match is doubtful the map does not slow early; the camera curve slowdown is
+# the safety net.
+# starpilotPlan.mapGpsTrust
+TRUST_OK, TRUST_SHAKY, TRUST_LOW, TRUST_PAUSED_ACCURACY, TRUST_PAUSED_LOST = 0, 1, 2, 3, 4
+# The GPS chip's own error estimate (qcomgpsd fills gpsLocation.horizontalAccuracy since StarPilot; openpilot left
+# it 0). Its values have not been checked against a drive yet: until then it is only logged, and the pause and
+# the ambiguity distance work without it (USE_GPS_ACCURACY). Turn on once a drive shows ~3-15 m on open roads.
+USE_GPS_ACCURACY = False
+ACC_PAUSE = 50.0           # m: an error estimate above this (or reliability "very low") for BAD_CONFIRM pauses
+BAD_CONFIRM = 2.0          # s (a one-second blip under a bridge does not cancel a slowdown)
+ACC_LOW = 20.0             # m: from this up to ACC_PAUSE (or reliability "low") a curve is held, not slowed for
+ACC_RESUME = 30.0          # m: a paused gate resumes only with the error at or below this ...
+RESUME_TIME = 5.0          # s ... for this long, matched on a road (the first match after a blind spell is suspect)
+LOST_SPEED = 15.0          # m/s (34 mph): unmatched below this is normal (residential streets are not in the files)
+LOST_TIME = 10.0           # s unmatched at speed where curve data exists: paused ("GPS not on a known road")
+STEADY_TIME = 60.0         # s of matched driving (no suspicious gap) before the match is fully trusted ...
+STEADY_GAP = 2.0           # s ... a gap longer than this unmatched at speed with data starts it over
+AMB_MIN, AMB_MAX = 15.0, 45.0   # m: another road (heading within MATCH_HEADING) closer than clamp(2 x error + 5)
+AMB_DEFAULT_ACC = 5.0           # m: the error assumed when the GPS gives none (or USE_GPS_ACCURACY is off): good
+                                # drives were 1-4 m from the road; a far-off GPS is caught by the lost clock instead
+TIMER_EPS = 1e-6                # s: timers summed from dt steps reach their limit on the expected frame
+NEAREST_SEARCH = 220.0          # m: the nearest road is measured this far (logs: how far off the GPS is)
+PASS_TURN_SHARE = 0.5      # a pass that turned less than this share of the curve's turn did not drive the curve
+PASS_TURN_MIN = 10.0       # deg: ... checked for curves that turn at least this much
 # frogpilotPlan.mapNavExit
 NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
 
@@ -221,6 +249,92 @@ def cell_key(cla, clo):
   return cla * 10_000_000 + clo     # one int per grid cell (|clo| < 180 * MATCH_CELL)
 
 
+def gps_flags(flags):
+  """Decode gpsLocation.flags of source qcomdiag (system/qcomgpsd/structs.position_quality): reliability 0-4 (0 not
+  set, 1 very low .. 4 high), sensor aided, sensor data used, ellipse confidence %."""
+  flags = int(flags or 0)
+  return {"reliability": flags & 0x7, "sensorAided": bool(flags & 0x8), "sensorData": bool(flags & 0x10),
+          "confidence": (flags >> 8) & 0x7F}
+
+
+def gps_quality(gps_location):
+  """The fix quality keys added to the planner's gps_position (never raises: fakes and other sources give 0)."""
+  try:
+    q = gps_flags(getattr(gps_location, "flags", 0))
+    acc = float(getattr(gps_location, "horizontalAccuracy", 0.0) or 0.0)
+    return {"accuracy": acc if math.isfinite(acc) and acc > 0 else 0.0,
+            "satellites": int(getattr(gps_location, "satelliteCount", 0) or 0),
+            "reliability": q["reliability"], "confidence": q["confidence"], "sensorAided": q["sensorAided"]}
+  except (TypeError, ValueError):
+    return {"accuracy": 0.0, "satellites": 0, "reliability": 0, "confidence": 0, "sensorAided": False}
+
+
+class GpsTrust:
+  """Whether the GPS position is good enough for the map to slow the car early. Pure; fed once per planner frame.
+
+    * paused ("accuracy"): the GPS's own error above ACC_PAUSE (or reliability very low) for BAD_CONFIRM;
+      paused ("lost"): RoadMatcher matched no road for LOST_TIME at LOST_SPEED or more where curve data exists.
+      Resumes after RESUME_TIME of good, matched frames. While paused nothing is planned from the map.
+    * low (per frame): another road is close enough to be the one we are on (RoadMatcher.ambiguous), or the error
+      is between ACC_LOW and ACC_PAUSE (reliability low): a curve is held (logged, not slowed for).
+    * shaky: low, paused, or not yet STEADY_TIME of matched driving (drive start, after a pause or a suspicious gap):
+      the camera check may end a slowdown for any curve, and curve memory does not learn from passes.
+  Honest limit: a constant offset onto a parallel road farther than the ambiguity distance, with the GPS saying it
+  is accurate, looks like the right road until the curve; the camera check and the camera curve slowdown are the
+  protection there, and curve memory is protected by the driven-turn check."""
+
+  def __init__(self):
+    self.reset_drive()
+
+  def reset_drive(self):
+    self.paused, self.reason = False, ""
+    self.bad_t = self.lost_t = self.good_t = self.steady_t = self.gap_t = 0.0
+    self.low = False
+    self.shaky = True
+    self.events = []                       # (what, info) for the planner's log
+
+  @property
+  def status(self):
+    if self.paused:
+      return TRUST_PAUSED_LOST if self.reason == "lost" else TRUST_PAUSED_ACCURACY
+    if self.low:
+      return TRUST_LOW
+    return TRUST_SHAKY if self.shaky else TRUST_OK
+
+  def update(self, dt, v_ego, acc, rel, data_here, matched, ambiguous):
+    """acc: m (0 unknown), rel: reliability 0-4 (0 not set), matched: RoadMatcher found a road."""
+    bad = acc > ACC_PAUSE or rel == 1
+    self.bad_t = self.bad_t + dt if bad else 0.0
+    suspicious = v_ego >= LOST_SPEED and data_here and not matched
+    if matched:
+      self.lost_t = 0.0
+    elif suspicious:
+      self.lost_t += dt
+    if not self.paused:
+      if self.bad_t >= BAD_CONFIRM - TIMER_EPS:
+        self._pause("accuracy", acc, rel)
+      elif self.lost_t >= LOST_TIME - TIMER_EPS:
+        self._pause("lost", acc, rel)
+    else:
+      good = (acc <= ACC_RESUME or acc <= 0.0) and rel != 1 and (matched or not data_here)
+      self.good_t = self.good_t + dt if good else 0.0
+      if self.good_t >= RESUME_TIME - TIMER_EPS:
+        self.paused, self.good_t, self.lost_t, self.bad_t = False, 0.0, 0.0, 0.0
+        self.events.append(("resume", {"reason": self.reason, "acc": acc, "rel": rel}))
+        self.reason = ""
+    self.low = (not self.paused) and (bool(ambiguous) or ACC_LOW <= acc < ACC_PAUSE or rel == 2)
+    self.gap_t = self.gap_t + dt if suspicious else 0.0
+    if self.paused or self.gap_t > STEADY_GAP:
+      self.steady_t = 0.0
+    elif matched:
+      self.steady_t += dt
+    self.shaky = self.paused or self.low or self.steady_t < STEADY_TIME - TIMER_EPS
+
+  def _pause(self, reason, acc, rel):
+    self.paused, self.reason, self.good_t, self.steady_t = True, reason, 0.0, 0.0
+    self.events.append(("pause", {"reason": reason, "acc": acc, "rel": rel, "unmatched_s": round(self.lost_t, 1)}))
+
+
 class RoadIndex:
   """Road shape segments of one square in compact arrays (micro-degrees), with a grid of cells -> segment numbers.
   About 1 MB per square instead of the ~10 MB the decoded JSON lists would take."""
@@ -287,12 +401,25 @@ class RoadMatcher:
     self.on_link = False
     self.road_class = 0           # highwayClass of the matched road (0 unknown)
     self.is_forward = True
+    self.ambiguous = False        # another road (heading within MATCH_HEADING) closer than ambiguity_distance(acc)
+    self.other_d = 0.0            # m to that nearest other road (0 none)
+    self.nearest_d = 0.0          # m to the nearest road shape of any kind within NEAREST_SEARCH (0 none): for the logs
 
-  def update(self, lat, lon, bearing):
+  @staticmethod
+  def ambiguity_distance(acc):
+    acc = acc if acc > 0 else AMB_DEFAULT_ACC
+    return min(max(2.0 * acc + 5.0, AMB_MIN), AMB_MAX)
+
+  def update(self, lat, lon, bearing, acc=0.0):
+    """acc: the GPS's error estimate (m, 0 unknown) for the ambiguity check."""
+    self.ambiguous, self.other_d, self.nearest_d = False, 0.0, 0.0
     grid = self.store.grid
     if not grid or lat is None:
       self.way_id = 0
       return 0, True
+    amb = self.ambiguity_distance(acc)
+    other = {}                    # chain -> nearest heading-compatible distance alongside (projection inside a segment)
+    nearest = None
     cla, clo = int(math.floor(lat * MATCH_CELL)), int(math.floor(lon * MATCH_CELL))
     kx = math.radians(1.0) * EARTH_R * math.cos(math.radians(lat))
     ky = math.radians(1.0) * EARTH_R
@@ -306,9 +433,12 @@ class RoadMatcher:
           ll = dx * dx + dy * dy
           if ll < 1e-6:
             continue
-          t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll))
+          t_raw = -(ax * dx + ay * dy) / ll
+          t = max(0.0, min(1.0, t_raw))
           d = math.hypot(ax + t * dx, ay + t * dy)
-          if d > MATCH_DIST:
+          if nearest is None or d < nearest:
+            nearest = d
+          if d > max(MATCH_DIST, amb):
             continue
           diff = abs((math.degrees(math.atan2(dx, dy)) - bearing + 180.0) % 360.0 - 180.0)
           if diff <= MATCH_HEADING:
@@ -316,6 +446,10 @@ class RoadMatcher:
           elif diff >= 180.0 - MATCH_HEADING and not one:
             fwd = False
           else:
+            continue
+          if 0.0 < t_raw < 1.0 and d < other.get(cid, float("inf")):
+            other[cid] = d          # alongside (a road that only starts or ends here, e.g. at a junction, is not)
+          if d > MATCH_DIST:
             continue
           link = cls in LINK_CLASSES
           cand = (d, wid, fwd, cid, link, cls)
@@ -326,11 +460,17 @@ class RoadMatcher:
               stay = cand
             if not link and not self.on_link and (kind is None or d < kind[0]):
               kind = cand
+    if nearest is not None and nearest <= NEAREST_SEARCH:
+      self.nearest_d = nearest
     pick = stay or kind or best
     if pick is None:
       self.way_id, self.chain_id, self.road_class = 0, 0, 0
       return 0, True
     _, self.way_id, self.is_forward, self.chain_id, self.on_link, self.road_class = pick
+    others = [d for c, d in other.items() if c != self.chain_id]
+    if others:
+      self.other_d = min(others)
+      self.ambiguous = self.other_d <= amb
     return self.way_id, self.is_forward
 
 
@@ -573,6 +713,11 @@ def curve_pass_saturation(samples, dt=0.05):
         best_len, best_start = k - run_start, run_start
       run_start = None
   return samples[best_start][0]
+
+
+def driven_turn(samples, dt=0.05):
+  """Degrees the car itself turned during a pass (signed sum of curvature x distance, so lane wiggles cancel)."""
+  return abs(math.degrees(sum(k * v * dt for v, k, _, _, _ in samples))) if samples else 0.0
 
 
 def curve_pass_speed(samples):
@@ -841,19 +986,25 @@ class CurveVeto:
     return st["flips"] if st else (VETO_MAX_FLIPS if key in self.given_up else 0)
 
   @staticmethod
-  def vetoable(mc, c):
-    if c.get("ramp") or float(c.get("adv", 0.0) or 0.0) > 0 or "apex" not in c:
+  def vetoable(mc, c, shaky=False):
+    """shaky (GpsTrust): the road match may be wrong, so a ramp, signed or remembered curve may be on another road:
+    the camera may end the slowdown for any curve then."""
+    if "apex" not in c:
+      return False
+    if shaky:
+      return True
+    if c.get("ramp") or float(c.get("adv", 0.0) or 0.0) > 0:
       return False
     if mc.memory is not None and (mc.memory.speed_cap(c) is not None or mc.memory.radius(c) is not None):
       return False
     return True
 
-  def filter(self, mc, cid, cands, camera):
+  def filter(self, mc, cid, cands, camera, shaky=False):
     """cands: [(curve, m to its entry)] -> the same without the ignored curves."""
     out = []
     for c, d in cands:
       key = (cid, c["s_a"])
-      if key in self.given_up or not self.vetoable(mc, c):
+      if key in self.given_up or not self.vetoable(mc, c, shaky):
         self.state.pop(key, None)
         out.append((c, d))
         continue
@@ -943,6 +1094,9 @@ class MapCurves:
     self.veto_status = 0         # starpilotPlan.mapCurveVeto
     self.veto_radius = 0.0
     self.source = 0              # starpilotPlan.mapCurveSource
+    self.paused = False          # GpsTrust paused: nothing planned from the map
+    self.held = None             # (curve, distance) found but not acted on: the road match is not trusted
+    self.trust_status = TRUST_OK # starpilotPlan.mapGpsTrust
 
   # ---- the road ahead ----
   def _road(self, way_id, is_forward):
@@ -1015,28 +1169,43 @@ class MapCurves:
       return 2
     return 1 if learned is not None else 0
 
-  def update(self, lat, lon, bearing, way_id, is_forward, nav=None, camera=None):
+  def update(self, lat, lon, bearing, way_id, is_forward, nav=None, camera=None, trust=None, gps=None):
     """nav: (maneuver type, modifier, distance m) of the next maneuver, or None. camera: CameraView or None
-    (no camera check)."""
+    (no camera check). trust: GpsTrust (None: the position is trusted, as in the offline tests), fed here with
+    gps = {"dt", "v_ego", "acc", "rel", "ambiguous"}."""
     self.reset()
     self.veto.tick()
     if lat is None:
       return
     self.store.update(lat, lon)
     self.data_here = self.store.covers(lat, lon)
+    shaky = False
+    if trust is not None:
+      g = gps or {}
+      trust.update(float(g.get("dt", 0.05)), float(g.get("v_ego", 0.0)), float(g.get("acc", 0.0)), int(g.get("rel", 0)),
+                   self.data_here, bool(way_id), bool(g.get("ambiguous", False)))
+      self.trust_status = trust.status
+      if trust.paused:
+        self.paused = True
+        return                   # no curve, ramp or exit: all of them come from the position
+      shaky = trust.shaky
     road = self._road(way_id, is_forward) if way_id else None
     if road is not None:
       cid, increasing, s0, s1 = road
       self.chain_id = cid
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
-        cands = self.veto.filter(self, cid, cands, camera)
+        cands = self.veto.filter(self, cid, cands, camera, shaky)
       if cands:
         c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel))
-        self.curve, self.distance, self.radius = c, d, self._radius(c)
-        self.advisory = float(c.get("adv", 0.0) or 0.0)
-        self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
-        self.source = self._source(c)
+        if trust is not None and trust.low:
+          self.held = (c, d)     # another road this close may be the one we are on: do not slow early
+          self.status = STATUS_HELD
+        else:
+          self.curve, self.distance, self.radius = c, d, self._radius(c)
+          self.advisory = float(c.get("adv", 0.0) or 0.0)
+          self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
+          self.source = self._source(c)
       if self.veto.hidden is not None:
         self.veto_status = 1
         r_cam = self.veto.hidden[1]
@@ -1044,11 +1213,12 @@ class MapCurves:
       elif self.curve is not None and self.veto.flips((cid, self.curve["s_a"])) > 0:
         self.veto_status = 2
       ramp = self.store.ramps.get(cid)
-      if ramp is not None and (ramp["travel"] == "both" or (ramp["travel"] == "ab") == increasing):
+      if ramp is not None and (ramp["travel"] == "both" or (ramp["travel"] == "ab") == increasing) and \
+         not (trust is not None and trust.low):
         self.on_ramp, self.ramp = True, ramp
         end = ramp["end"] if ramp["travel"] != "both" or increasing else ramp["start"]
         self.ramp_end_dist = dist_m(lat, lon, *end)
-    if nav is not None:
+    if nav is not None and not (trust is not None and trust.low):
       self._nav_exit(lat, lon, bearing, *nav)
 
   def _nav_exit(self, lat, lon, bearing, mtype, modifier, distance):
@@ -1102,11 +1272,16 @@ class MapCurvesPlanner:
     self.mc = None
     self.announced_curve = None
     self.announced_exit = None
-    self.notice = None          # "curve" / "exit_data" / "exit_no_data" for one planner cycle
+    self.notice = None          # "curve" / "exit_data" / "exit_no_data" / "paused" for one planner cycle
     self.profile_path = PROFILE_PATH
     self.decel = PLAN_DECEL     # read with the mode at the start of every drive (the car side reads the same file then)
-    self.recorder = None        # camera check events (feature logs), started on first use
+    self.recorder = None        # camera check / GPS trust events (feature logs), started on first use
     self.recorder_failed = False
+    self.trust = GpsTrust()
+    self.pause_announced = False  # "Map curves paused" is shown once per drive (and when a pause ends a slowdown)
+    self.prev_slowing = False
+    self.held_logged = set()
+    self.gps_acc, self.gps_rel = 0.0, 0
 
   def _read_mode(self):
     try:
@@ -1132,6 +1307,11 @@ class MapCurvesPlanner:
       self._read_mode()
     if drive_start and self.mc is not None:
       self.mc.veto.reset_drive()  # a curve ignored or taken back last drive is checked afresh
+    if drive_start:
+      self.trust.reset_drive()
+      self.pause_announced, self.prev_slowing = False, False
+      self.held_logged = set()
+    dt = min(max(now - getattr(self, "last_call", now - 0.05), 0.01), 0.2)
     self.prev_started = started
     self.last_call = now
     self.counter += 1
@@ -1152,20 +1332,13 @@ class MapCurvesPlanner:
     if gps_position is None:
       self.mc.reset()
       return
-    way_id, is_forward = 0, True
-    try:
-      mm = json.loads(self.params_memory.get("MapMatchedWay") or "{}")
-      age = gps_position["location_mono_time"] - mm.get("location_mono_time", 0)
-      if mm.get("way_id") and isinstance(mm.get("is_forward"), bool) and 0 <= age <= 2_000_000_000:
-        way_id, is_forward = int(mm["way_id"]), mm["is_forward"]
-    except (TypeError, ValueError, KeyError):
-      pass
-    if not way_id:
-      # no map match from the map program (StarPilot): match the road shapes of the curve files ourselves
-      way_id, is_forward = self.matcher.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"])
-      self.road_class = self.matcher.road_class
-    else:
-      self.road_class = 0
+    # The road is matched here on the curve files' road shapes (StarPilot's map program publishes no way match; the
+    # old FrogPilot MapMatchedWay path read a key that never existed, so it never ran, and is gone).
+    self.gps_acc = float(gps_position.get("accuracy", 0.0) or 0.0)
+    self.gps_rel = int(gps_position.get("reliability", 0) or 0)
+    acc, rel = (self.gps_acc, self.gps_rel) if USE_GPS_ACCURACY else (0.0, 0)
+    way_id, is_forward = self.matcher.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], acc)
+    self.road_class = self.matcher.road_class
     nav = None
     try:
       if sm.alive["navInstruction"] and sm.valid["navInstruction"]:
@@ -1175,11 +1348,18 @@ class MapCurvesPlanner:
     except Exception:
       nav = None
     camera = camera_view(sm)
+    was_paused = self.trust.paused
     self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav,
-                   camera=camera)
+                   camera=camera, trust=self.trust,
+                   gps={"dt": dt, "v_ego": v_ego, "acc": acc, "rel": rel, "ambiguous": self.matcher.ambiguous})
     mc = self.mc
-    self._veto_log(mc, v_ego, set_speed, now)
+    if self.trust.paused and not was_paused and mc.data_here and (not self.pause_announced or self.prev_slowing):
+      self.pause_announced = True
+      self.notice = "paused"     # once per drive, and whenever a pause ends a slowdown (the speed comes back)
+    self._feature_log(mc, v_ego, set_speed, now, gps_position)
     self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"])
+    self.prev_slowing = mc.curve is not None and set_speed > 0 and \
+      plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel) < set_speed - 2 * MPH
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
@@ -1195,13 +1375,27 @@ class MapCurvesPlanner:
     elif not mc.on_ramp:
       self.announced_exit = None
 
-  VETO_COLUMNS = ["t_wall", "vEgo_mph", "set_mph", "map_status", "map_dist", "map_r", "veto", "veto_r"]
+  VETO_COLUMNS = ["t_wall", "vEgo_mph", "set_mph", "map_status", "map_dist", "map_r", "veto", "veto_r",
+                  "gps_acc", "gps_rel", "gps_sats", "trust", "chain", "near_road", "other_road", "ambig"]
 
-  def _veto_log(self, mc, v_ego, set_speed, now):
-    """Feature log of the camera check: a row per frame, an event when a curve is ignored, taken back or given up
-    on (never raises into the planner)."""
+  def _feature_log(self, mc, v_ego, set_speed, now, gps_position=None):
+    """Feature log of the camera check and the GPS trust gate: a row per frame, an event when a curve is ignored,
+    taken back or given up on, when the map pauses or resumes, and once per held curve (never raises into the
+    planner)."""
     try:
       events, mc.veto.events = mc.veto.events, []
+      trust_events, self.trust.events = self.trust.events, []
+      g = gps_position or {}
+      m = getattr(self, "matcher", None)
+      held = None
+      if mc.held is not None:
+        hc, hd = mc.held
+        key = (mc.chain_id, hc["s_a"])
+        if key not in self.held_logged:
+          self.held_logged.add(key)
+          held = {"name": hc.get("name", "") or "", "r": float(hc.get("r", 0.0)), "distance": round(hd, 1),
+                  "chain": mc.chain_id, "other_road_m": round(m.other_d, 1) if m else 0.0, "trust": mc.trust_status,
+                  "gps_acc": self.gps_acc, "gps_rel": self.gps_rel}
       if self.recorder is None and not self.recorder_failed:
         try:
           from openpilot.starpilot.common.feature_events import EventRecorder
@@ -1215,9 +1409,22 @@ class MapCurvesPlanner:
       if rec is None:
         return
       rec.add_row(now, (f"{time.time():.2f}", v_ego / MPH, set_speed / MPH, mc.status if mc.curve is not None else 0,  # noqa: TID251
-                        mc.distance, mc.radius, mc.veto_status, mc.veto_radius))
+                        mc.distance, mc.radius, mc.veto_status, mc.veto_radius, self.gps_acc, self.gps_rel,
+                        int(g.get("satellites", 0) or 0), mc.trust_status, mc.chain_id,
+                        round(m.nearest_d, 1) if m else 0.0, round(m.other_d, 1) if m else 0.0, bool(m and m.ambiguous)))
       for ev in events:
         rec.record("mapCurveVeto", now, {**{k: v for k, v in ev.items() if k != "curve"}, "set_mph": set_speed / MPH})
+      for what, info in trust_events:
+        # position rounded to ~10 m: enough to find the place in the drive, it stays on the device
+        rec.record("mapCurveGps", now, {"what": what, **info, "v_ego": round(v_ego, 2), "sats": int(g.get("satellites", 0) or 0),
+                                        "confidence": int(g.get("confidence", 0) or 0), "chain": mc.chain_id,
+                                        "near_road_m": round(m.nearest_d, 1) if m else 0.0,
+                                        "lat": round(float(g.get("latitude", 0.0)), 4), "lon": round(float(g.get("longitude", 0.0)), 4)})
+      if held is not None:
+        rec.record("mapCurveHeld", now, held)
+      for info in getattr(self, "pass_drops", []):
+        rec.record("mapCurvePassDropped", now, info)
+      self.pass_drops = []
       rec.tick(now)
     except Exception:
       pass
@@ -1232,6 +1439,7 @@ class MapCurvesPlanner:
           self._finish_pass()
         self.pass_curve, self.pass_samples = inside, []
         self.pass_blinker, self.pass_apex, self.pass_exit, self.pass_vetoed = False, float("inf"), float("inf"), False
+        self.pass_shaky = False
       if inside is not None and len(self.pass_samples) < 2400:
         cs, cc = sm["carState"], sm["carControl"]
         self.pass_samples.append((float(cs.vEgo), float(sm["controlsState"].curvature), bool(cc.latActive),
@@ -1241,12 +1449,23 @@ class MapCurvesPlanner:
           self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *inside["apex"]))
         self.pass_exit = self.mc.inside_exit
         self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, inside["s_a"]))
+        self.pass_shaky |= bool(self.trust.shaky)
     except Exception:
       self.pass_curve, self.pass_samples = None, []
 
   def _finish_pass(self):
     c, samples = self.pass_curve, self.pass_samples
     if self.pass_blinker or self.pass_apex > PASS_APEX_NEAR:
+      return
+    # the road match may have been wrong (GPS not trusted at some point in the pass), or the car did not turn
+    # through this curve (a parallel road): learning from it could make a real curve look gentle
+    turn_c = float(c.get("turn", 0.0) or 0.0)
+    driven = driven_turn(samples)
+    reason = "shaky" if getattr(self, "pass_shaky", False) else \
+      ("turn" if turn_c >= PASS_TURN_MIN and driven < PASS_TURN_SHARE * turn_c else None)
+    if reason is not None:
+      self.pass_drops = getattr(self, "pass_drops", []) + [{"reason": reason, "name": c.get("name", "") or "",
+                                                             "map_turn": turn_c, "driven_turn": round(driven, 1)}]
       return
     v_sat = curve_pass_saturation(samples)
     if v_sat is not None:
@@ -1262,9 +1481,22 @@ class MapCurvesPlanner:
     plan.mapCurveMode = self.mode
     if mc is None or self.mode == 0:
       return
-    plan.mapCurveStatus = mc.status if mc.curve is not None else (STATUS_NO_DATA if not mc.data_here else STATUS_NONE)
-    plan.mapCurveDistance = float(mc.distance)
-    plan.mapCurveRadius = float(mc.radius)
+    if not mc.data_here:
+      plan.mapCurveStatus = STATUS_NO_DATA
+    elif mc.paused:
+      plan.mapCurveStatus = STATUS_PAUSED
+    elif mc.curve is not None:
+      plan.mapCurveStatus = mc.status
+    elif mc.held is not None:
+      plan.mapCurveStatus = STATUS_HELD      # with the held curve's distance and radius, for the logs only
+    else:
+      plan.mapCurveStatus = STATUS_NONE
+    if mc.curve is None and mc.held is not None:
+      plan.mapCurveDistance = float(mc.held[1])
+      plan.mapCurveRadius = float(mc._radius(mc.held[0]))
+    else:
+      plan.mapCurveDistance = float(mc.distance)
+      plan.mapCurveRadius = float(mc.radius)
     plan.mapCurveAdvisory = float(mc.advisory)
     plan.mapCurveName = (mc.curve or {}).get("name", "") or ""
     plan.mapOnRamp = bool(mc.on_ramp)
@@ -1279,6 +1511,8 @@ class MapCurvesPlanner:
     plan.mapCurveVeto = int(mc.veto_status)
     plan.mapCurveVetoRadius = float(mc.veto_radius)
     plan.mapCurveSource = int(mc.source)
+    plan.mapGpsTrust = int(mc.trust_status)
+    plan.mapGpsAccuracy = float(self.gps_acc)
     plan.mapNavExit = mc.nav_exit
     plan.mapNavExitDistance = float(mc.nav_exit_dist)
     plan.mapNavExitSide = int(mc.nav_side)

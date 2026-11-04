@@ -272,6 +272,17 @@ def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster
     Priority.LOW, VisualAlert.none, AudibleAlert.none, 6.)   # 3 s was easy to miss (drive 37)
 
 
+def map_paused_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                     personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  sp = sm["starpilotPlan"]
+  why = "GPS not accurate" if sp.mapGpsTrust == 3 else "GPS not on a known road"
+  return Alert(
+    f"Map curves paused - {why}",
+    "Watch your speed in curves",
+    StarPilotAlertStatus.starpilot, AlertSize.mid,
+    Priority.LOW, VisualAlert.none, StarPilotAudibleAlert.curveNoData, 5.)
+
+
 def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
   sp = sm["starpilotPlan"]
   if sp.mapNavCurveRadius > 0:
@@ -1264,6 +1275,10 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       StarPilotAlertStatus.starpilot, AlertSize.small,
       Priority.LOW, VisualAlert.none, StarPilotAudibleAlert.curveNoData, 4.),
+  },
+
+  StarPilotEventName.mapCurvesPaused: {
+    ET.PERMANENT: map_paused_alert,
   },
 
   StarPilotEventName.mazdaStockLkasOff: {

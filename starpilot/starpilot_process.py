@@ -70,6 +70,7 @@ def get_next_periodic_update_check(monotonic_now, phase_seconds):
 
 
 def build_gps_position(gps_location, speed):
+  from openpilot.starpilot.controls.lib.map_curves import gps_quality
   return {
     "latitude": gps_location.latitude,
     "longitude": gps_location.longitude,
@@ -78,6 +79,7 @@ def build_gps_position(gps_location, speed):
     "hasFix": bool(getattr(gps_location, "hasFix", False)),
     "updatedAtMonotonic": time.monotonic(),
     "updatedAtSec": time.time(),
+    **gps_quality(gps_location),   # fix quality: error estimate (m), satellites, reliability (qcomgpsd)
   }
 
 

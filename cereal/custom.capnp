@@ -207,6 +207,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mapExitCurveData @44;
     mapExitNoCurveData @45;
     mazdaStockLkasOff @46;
+    mapCurvesPaused @47;
   }
 }
 
@@ -259,7 +260,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   slcIsLimitingMaxSet @44 :Bool;  # SLC target is below the configured Max Set
   # Mazda map curves from the curve files (starpilot/controls/lib/map_curves.py)
   mapCurveMode @45 :UInt8;           # 0 off, 1 test, 2 on
-  mapCurveStatus @46 :UInt8;         # 0 none, 1 curve, 2 ramp curve, 3 no curve data here
+  mapCurveStatus @46 :UInt8;         # 0 none, 1 curve, 2 ramp curve, 3 no curve data here, 4 paused: GPS not trusted, 5 curve held: road match not trusted
   mapCurveDistance @47 :Float32;     # m to the governing curve's entry (0 = in it)
   mapCurveRadius @48 :Float32;       # m (0 = no curve)
   mapCurveName @49 :Text;
@@ -279,6 +280,8 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveVeto @63 :UInt8;           # camera check of map curves: 0 none, 1 a map curve the camera sees as much gentler is ignored, 2 the governing curve was ignored and taken back this drive
   mapCurveVetoRadius @64 :Float32;   # m, the camera's radius of that curve (0 none)
   mapCurveSource @65 :UInt8;         # governing curve's radius from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap
+  mapGpsTrust @66 :UInt8;            # GPS trust for map curves: 0 ok, 1 shaky, 2 low (curves held), 3 paused: accuracy, 4 paused: not on a known road
+  mapGpsAccuracy @67 :Float32;       # m, the GPS chip's own error estimate (0 unknown)
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

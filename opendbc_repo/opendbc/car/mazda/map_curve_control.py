@@ -67,6 +67,7 @@ class MapFields:
   veto: int = 0                   # planner's camera check (logged only): 1 a map curve is ignored, 2 taken back
   veto_radius: float = 0.0        # m, the camera's radius of that curve
   source: int = 0                 # governing curve's radius: 0 map, 1 curve memory, 2 memory speed cap
+  gps_trust: int = 0              # planner's GPS trust (logged only): 0 ok, 1 shaky, 2 low, 3/4 paused
 
   @staticmethod
   def from_plan(plan):
@@ -77,7 +78,8 @@ class MapFields:
                      float(plan.mapNavCurveDistance), int(getattr(plan, "mapNavExitSide", 0)),
                      float(getattr(plan, "mapCurveAdvisory", 0.0)), float(getattr(plan, "mapNavCurveAdvisory", 0.0)),
                      int(getattr(plan, "mapRoadClass", 0)), int(getattr(plan, "mapCurveVeto", 0)),
-                     float(getattr(plan, "mapCurveVetoRadius", 0.0)), int(getattr(plan, "mapCurveSource", 0)))
+                     float(getattr(plan, "mapCurveVetoRadius", 0.0)), int(getattr(plan, "mapCurveSource", 0)),
+                     int(getattr(plan, "mapGpsTrust", 0)))
 
 
 @dataclass
@@ -140,6 +142,8 @@ class MapCurveControl:
       self.exit_intent = False
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
+    # only 1 and 2 are curves to act on: 4 (paused, GPS not trusted) and 5 (held, road match not trusted) are "no
+    # curve" on purpose, so the speed comes back as for any curve that ends
     radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory,
                               MAP_RAMP_DECEL if (f.status == STATUS_RAMP_CURVE or f.on_ramp) else self.decel)

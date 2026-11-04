@@ -105,6 +105,8 @@ class StarPilotEvents:
         self.events.add(StarPilotEventName.mapExitCurveData)
       elif notice == "exit_no_data":
         self.events.add(StarPilotEventName.mapExitNoCurveData)
+      elif notice == "paused":
+        self.events.add(StarPilotEventName.mapCurvesPaused)
 
     if starpilot_toggles.current_holiday_theme != "stock" and "holidayActive" not in self.played_events and self.startup_seen and alerts_empty and len(self.events) == 0:
       self.events.add(StarPilotEventName.holidayActive)

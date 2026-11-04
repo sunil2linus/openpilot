@@ -351,3 +351,34 @@ def relist(dat):
       del dat[key]
       i += 1
   return {**dat, **list_dict}
+
+
+# ---- fix quality from the position report (StarPilot: openpilot left horizontalAccuracy / satelliteCount at 0) ----
+# gpsLocation.flags for source qcomdiag (decoded by starpilot/controls/lib/map_curves.gps_flags):
+GPS_FLAG_RELIABILITY_MASK = 0x0007   # bits 0-2: u_HorizontalReliability (0 not set, 1 very low, 2 low, 3 medium, 4 high)
+GPS_FLAG_SENSOR_AIDED = 0x0008       # bit 3: position aided by the device's sensors (q_SensorAidMask bit 2)
+GPS_FLAG_SENSOR_DATA = 0x0010        # bit 4: any sensor data used for the fix
+GPS_FLAG_CONFIDENCE_SHIFT = 8        # bits 8-14: u_EllipseConfidence (%) of the error ellipse
+GPS_ACCURACY_MAX = 5000.0            # m: larger (or not a number) is taken as unknown (0)
+
+
+def position_quality(report):
+  """(horizontal accuracy m, satellites used, flags) of a parsed LOG_GNSS_POSITION_REPORT. The accuracy is the error
+  ellipse's semimajor axis at the chip's own confidence (in the flags), 0 when unknown."""
+  acc = report.get("q_FltEllipseSemimajorAxis", 0.0)
+  try:
+    acc = float(acc)
+  except (TypeError, ValueError):
+    acc = 0.0
+  if not (acc == acc) or acc <= 0.0 or acc > GPS_ACCURACY_MAX:   # acc == acc is False for NaN
+    acc = 0.0
+  sats = sum(int(report.get(k, 0) or 0) for k in ("u_NumGpsSvsUsed", "u_NumGloSvsUsed", "u_NumBdsSvsUsed"))
+  rel = int(report.get("u_HorizontalReliability", 0) or 0)
+  conf = int(report.get("u_EllipseConfidence", 0) or 0)
+  flags = min(max(rel, 0), 7) & GPS_FLAG_RELIABILITY_MASK
+  if int(report.get("q_SensorAidMask", 0) or 0) & 0x4:
+    flags |= GPS_FLAG_SENSOR_AIDED
+  if int(report.get("q_SensorDataUsageMask", 0) or 0):
+    flags |= GPS_FLAG_SENSOR_DATA
+  flags |= min(max(conf, 0), 100) << GPS_FLAG_CONFIDENCE_SHIFT
+  return acc, min(sats, 127), flags

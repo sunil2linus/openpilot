@@ -23,7 +23,7 @@ from openpilot.common.time_helpers import system_time_valid
 from openpilot.system.hardware.tici.pins import GPIO
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.qcomgpsd.modemdiag import ModemDiag, DIAG_LOG_F, setup_logs, send_recv
-from openpilot.system.qcomgpsd.structs import (dict_unpacker, position_report, relist,
+from openpilot.system.qcomgpsd.structs import (dict_unpacker, position_quality, position_report, relist,
                                               gps_measurement_report, gps_measurement_report_sv,
                                               glonass_measurement_report, glonass_measurement_report_sv,
                                               oemdre_measurement_report, oemdre_measurement_report_sv, oemdre_svpoly_report,
@@ -259,8 +259,6 @@ def main() -> NoReturn:
   unpack_svpoly, _ = dict_unpacker(oemdre_svpoly_report, True)
   unpack_position, _ = dict_unpacker(position_report)
 
-  unpack_position, _ = dict_unpacker(position_report)
-
   wait_for_modem()
 
   stop_download_event = Event()
@@ -288,6 +286,7 @@ def main() -> NoReturn:
   diag = ModemDiag()
   r = setup_quectel(diag)
   want_assistance = not r
+  last_failure_code = 0
   cloudlog.warning("quectel setup done")
   gpio_init(GPIO.GNSS_PWR_EN, True)
   gpio_set(GPIO.GNSS_PWR_EN, True)
@@ -388,6 +387,13 @@ def main() -> NoReturn:
       gps.speedAccuracy = math.sqrt(sum([x**2 for x in vNEDsigma]))
       # quectel gps verticalAccuracy is clipped to 500, set invalid if so
       gps.hasFix = gps.verticalAccuracy != 500
+      # StarPilot: the chip's own fix quality (openpilot left these at 0): error ellipse (m), satellites used,
+      # reliability / sensor aid / ellipse confidence in flags (structs.position_quality)
+      gps.horizontalAccuracy, gps.satelliteCount, gps.flags = position_quality(report)
+      if report["u_FailureCode"] != last_failure_code:
+        last_failure_code = report["u_FailureCode"]
+        if last_failure_code:
+          cloudlog.warning(f"qcom gnss position failure code {last_failure_code}")
       if gps.hasFix:
         want_assistance = False
         stop_download_event.set()

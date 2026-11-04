@@ -24,6 +24,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_vehicle_tunes import get_lead
 from openpilot.starpilot.common.starpilot_utilities import calculate_lane_width, calculate_road_curvature, extract_curve_profile
 from openpilot.starpilot.common.starpilot_variables import CRUISING_SPEED, MINIMUM_LATERAL_ACCELERATION, PLANNER_TIME, THRESHOLD
 from openpilot.starpilot.controls.lib.conditional_chill_mode import ConditionalChillMode
+from openpilot.starpilot.controls.lib.map_curves import gps_quality
 from openpilot.starpilot.controls.lib.conditional_experimental_mode import ConditionalExperimentalMode
 from openpilot.starpilot.controls.lib.starpilot_acceleration import StarPilotAcceleration
 from openpilot.starpilot.controls.lib.starpilot_events import StarPilotEvents
@@ -62,6 +63,9 @@ def _sanitize_json_value(value):
 
 def serialize_starpilot_toggles(starpilot_toggles):
   return json.dumps(_sanitize_json_value(vars(starpilot_toggles)), allow_nan=False)
+
+
+GPS_STALE_NS = 3_000_000_000   # a GPS message older than this (the service sends at 1 Hz) is not a position
 
 
 class StarPilotPlanner:
@@ -144,8 +148,16 @@ class StarPilotPlanner:
       "hasFix": bool(getattr(gps_location, "hasFix", False)),
       "updatedAtMonotonic": time.monotonic(),
       "updatedAtSec": time.time(),
+      **gps_quality(gps_location),   # fix quality: error estimate (m), satellites, reliability (qcomgpsd)
     }
-    self.gps_valid = self.gps_position["hasFix"] and (self.gps_position["latitude"] != 0 or self.gps_position["longitude"] != 0)
+    # a GPS that stopped sending (1 Hz service) keeps its last position in sm: never plan from a frozen position
+    try:
+      gps_fresh = bool(sm.alive[self.gps_location_service]) and \
+        sm.logMonoTime["modelV2"] - sm.logMonoTime[self.gps_location_service] <= GPS_STALE_NS
+    except (KeyError, TypeError):
+      gps_fresh = True
+    self.gps_valid = gps_fresh and self.gps_position["hasFix"] and \
+      (self.gps_position["latitude"] != 0 or self.gps_position["longitude"] != 0)
     bearing = self.gps_position["bearing"]
     if self.gps_valid:
       gps_memory_state = json.dumps(_sanitize_json_value(self.gps_position), allow_nan=False)
