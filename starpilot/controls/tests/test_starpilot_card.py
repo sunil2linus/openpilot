@@ -1975,16 +1975,36 @@ def test_mazda_aol_waits_for_the_first_engagement_then_stays_until_main_off(monk
   # drive 3a: AOL steered from a standstill with cruise off and the camera faulted its LKAS 5 s later
   card = _mazda_card(monkeypatch, tmp_path)
   toggles = make_toggles(always_on_lateral=True, always_on_lateral_main=True)
-  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
-  assert ret.alwaysOnLateralEnabled is False                     # main on, never engaged: no steering
+  ret = card.update(_slow(make_car_state(available=True)), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # main on, slow, never engaged: no steering
   ret = card.update(make_car_state(available=True, enabled=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
   assert ret.alwaysOnLateralEnabled is True                      # first SET (>= ~19 mph on the MRCC)
   ret = card.update(make_car_state(available=True, brake_pressed=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
   assert ret.alwaysOnLateralEnabled is True                      # braked, cruise off: still steering, down to 0
   ret = card.update(make_car_state(available=False), SimpleNamespace(distancePressed=False), make_sm(), toggles)
   assert ret.alwaysOnLateralEnabled is False                     # main off resets the latch
-  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
-  assert ret.alwaysOnLateralEnabled is False                     # main on again: waits for the next SET
+  ret = card.update(_slow(make_car_state(available=True)), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # main on again, slow: waits for the next SET
+
+
+def _slow(cs, v=3.0):
+  cs.vEgo = v
+  cs.standstill = v == 0.0
+  return cs
+
+
+def test_mazda_aol_arms_at_15_mph_without_a_cruise_set(monkeypatch, tmp_path):
+  card = _mazda_card(monkeypatch, tmp_path)
+  toggles = make_toggles(always_on_lateral=True, always_on_lateral_main=True)
+  sm, cpb = make_sm(), SimpleNamespace(distancePressed=False)
+  assert card.update(_slow(make_car_state(available=True), 0.0), cpb, sm, toggles).alwaysOnLateralEnabled is False
+  assert card.update(_slow(make_car_state(available=True), 6.6), cpb, sm, toggles).alwaysOnLateralEnabled is False  # 14.8 mph
+  assert card.update(_slow(make_car_state(available=True), 6.8), cpb, sm, toggles).alwaysOnLateralEnabled is True   # 15.2 mph
+  assert card.update(_slow(make_car_state(available=True), 2.0), cpb, sm, toggles).alwaysOnLateralEnabled is True   # stays on slowing
+  assert card.update(_slow(make_car_state(available=True), 0.0), cpb, sm, toggles).alwaysOnLateralEnabled is True   # and stopped
+  # main off, or main never on: speed alone does not arm it
+  assert card.update(make_car_state(available=False), cpb, sm, toggles).alwaysOnLateralEnabled is False
+  assert card.update(_slow(make_car_state(available=True), 5.0), cpb, sm, toggles).alwaysOnLateralEnabled is False
 
 
 def test_mazda_aol_latch_resets_in_park_or_reverse(monkeypatch, tmp_path):
@@ -1994,8 +2014,8 @@ def test_mazda_aol_latch_resets_in_park_or_reverse(monkeypatch, tmp_path):
   cs = make_car_state(available=True)
   cs.gearShifter = spc.GearShifter.park
   card.update(cs, SimpleNamespace(distancePressed=False), make_sm(), toggles)
-  ret = card.update(make_car_state(available=True), SimpleNamespace(distancePressed=False), make_sm(), toggles)
-  assert ret.alwaysOnLateralEnabled is False                     # parked once: leaving the spot does not steer
+  ret = card.update(_slow(make_car_state(available=True)), SimpleNamespace(distancePressed=False), make_sm(), toggles)
+  assert ret.alwaysOnLateralEnabled is False                     # parked once: leaving the spot slowly does not steer
 
 
 def test_other_brands_are_not_affected_by_the_mazda_latch(monkeypatch, tmp_path):

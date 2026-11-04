@@ -37,6 +37,8 @@ AOL_NON_BLOCKING_IMMEDIATE_DISABLE_ALERTS = {
 }
 
 
+MAZDA_AOL_ARM_SPEED = 15 * 0.44704  # m/s (15 mph): Mazda always-on lateral arms at this speed without a cruise set
+
 def aol_blocked_by_immediate_disable(*alert_types) -> bool:
   return any(
     ET.IMMEDIATE_DISABLE in alert_type and alert_type not in AOL_NON_BLOCKING_IMMEDIATE_DISABLE_ALERTS
@@ -74,10 +76,10 @@ class StarPilotCard:
       self.CP.brand == "hyundai" and not (hyundai_flags & HyundaiFlags.CANFD) and not hyundai_aol_before_engagement
     )
     self.hyundai_aol_ready = False
-    # Mazda (mazda-frogpilot-dev behaviour): always-on lateral only after cruise was engaged once while main is on
-    # (the MRCC cannot be set below ~19 mph), then down to 0 until main goes off or the car is put in P/R. Steering
-    # with cruise off from a standstill (leaving a parking spot) made the camera fault its LKAS 5 s later for the
-    # rest of the drive (drive 3a), leaving only the Torque Interceptor to steer.
+    # Mazda: always-on lateral only once cruise was engaged, or the car went MAZDA_AOL_ARM_SPEED or faster, while main
+    # is on; then down to 0 until main goes off or the car is put in P/R. Steering with cruise off from a standstill
+    # (leaving a parking spot) made the camera fault its LKAS 5 s later for the rest of the drive (drive 3a), leaving
+    # only the Torque Interceptor to steer. The owner asked for the speed arm (Nov 4) so he need not set cruise first.
     self.mazda_aol_needs_engagement = getattr(self.CP, "brand", None) == "mazda"
     self.mazda_aol_ready = False
     self.ev6_aol_needs_arming = (
@@ -550,7 +552,7 @@ class StarPilotCard:
     if self.mazda_aol_needs_engagement:
       if carState.gearShifter in NON_DRIVING_GEARS or not carState.cruiseState.available:
         self.mazda_aol_ready = False
-      elif sm["selfdriveState"].active or carState.cruiseState.enabled:
+      elif sm["selfdriveState"].active or carState.cruiseState.enabled or carState.vEgo >= MAZDA_AOL_ARM_SPEED:
         self.mazda_aol_ready = True
       self.always_on_lateral_enabled &= self.mazda_aol_ready
     self.always_on_lateral_enabled &= sm["starpilotPlan"].lateralCheck
