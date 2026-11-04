@@ -75,6 +75,7 @@ NO_EFFECT_LIMIT = 6                   # presses in a row with no effect before b
 NO_EFFECT_BACKOFF = 10.0              # s to wait after that before trying again
 NO_EFFECT_TRIPS = 3                   # back-offs before giving up (speed left alone)
 PAUSE_ABANDON = 30.0                  # s paused before we forget the driver's speed
+DRIVER_QUIET = 1.0                    # s: none of our frames while the driver is on a SET button, nor this soon after
 EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
 # Stopped car ahead (shares this controller with the curve slowdown)
@@ -133,6 +134,7 @@ class SlowdownInputs:
   curve_floor: float = 0.0        # m/s: when > 0 the curve may go this low (a ramp), past the max drop
   curve_budget: int = 0           # SET- presses allowed for this curve when more than the usual budget (a ramp)
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
+  hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
 
 
 @dataclass
@@ -163,7 +165,13 @@ class CurveSlowdownLogic:
     self.curve_free_frames = _frames(RESTORE_DELAY)
     self.reason_free_frames = _frames(RESTORE_DELAY)   # frames with neither the curve nor a stopped car active
 
-    self.offset = 0                  # steps we are below the driver's speed (negative: above)
+    # The driver's speed: the set speed they had before our presses moved it (None: we are not managing it).
+    # A restore only brings the actual set speed back to it, never above (drive 2026-11-03: the driver brought the
+    # speed back himself and the old step count added its steps on top). `offset` is derived from it.
+    self.anchor = None
+    self.prev_set_speed = None       # the set speed before the last observed change
+    self.driver_events = []          # driver set speed changes while we managed it (for the per-event log)
+    self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
     self.inflight = []               # [Press] not yet (fully) seen on the set speed, oldest first
     self.latencies = []              # frames from our press to the set speed change, learned on the road
@@ -209,8 +217,15 @@ class CurveSlowdownLogic:
     self.driver_hold = None          # the driver's hold being watched: dict(dir, down, release, landed, after, last)
 
   @property
+  def offset(self):
+    """Steps the actual set speed is below the driver's speed (negative: above), 0 when not managing."""
+    if self.anchor is None or self.last_set_speed is None:
+      return 0
+    return int(round(self.anchor / self.step)) - int(round(self.last_set_speed / self.step))
+
+  @property
   def managing(self):
-    return self.offset != 0 or bool(self.inflight)
+    return self.anchor is not None or bool(self.inflight)
 
   @property
   def in_flight(self):
@@ -250,8 +265,8 @@ class CurveSlowdownLogic:
     return max(_frames(MIN_IN_FLIGHT_WINDOW), int(LATE_FACTOR * latency))
 
   def _forget(self):
-    """Leave the set speed where it is and stop managing it."""
-    self.offset = 0
+    """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
+    self.anchor = None
     self.restoring = False
     self.no_effect = 0
     self.no_effect_trips = 0
@@ -266,9 +281,34 @@ class CurveSlowdownLogic:
     self.disabled = True
 
   def _apply_ours(self, direction, n=1):
-    self.offset += n if direction == SET_MINUS else -n
+    """One of our presses landed. The set speed itself says where we are (offset); a landing with nothing
+    anchored (a press given up on landing late, or ours landing after the driver took over) anchors at the speed
+    before it, so it is put right."""
+    if self.anchor is None and self.prev_set_speed is not None:
+      self.anchor = self.prev_set_speed
     self.no_effect = 0
     self.no_effect_trips = 0
+
+  def _driver_change(self, direction, steps):
+    """The driver changed the set speed while we may be managing it. SET+: they are taking back our lowering;
+    the anchor stays (the rest is restored later) until they reach it, then there is nothing to restore. SET-:
+    their new choice: we stop managing and leave it (a missed restore is the safe side)."""
+    before = self.anchor
+    self.restoring = False
+    self.blocked = True
+    if direction == SET_MINUS:
+      self._forget()
+      action = "adopted_lower"
+    elif self.anchor is not None and self.last_set_speed >= self.anchor - self.half_step:
+      ours_down = any(p.direction == SET_MINUS for p in self.inflight)
+      self.anchor = self.last_set_speed if ours_down else None
+      action = "reached_anchor"
+    else:
+      action = "kept" if self.anchor is not None else "none"
+    if before is not None and len(self.driver_events) < 20:     # drained by the per-event log every frame
+      self.driver_events.append({"dir": direction, "steps": steps, "set_before": self.prev_set_speed,
+                                 "set_after": self.last_set_speed, "anchor_before": before, "anchor_after": self.anchor,
+                                 "inflight": len(self.inflight), "action": action})
 
   def _quantum_steps(self):
     return int(round(HOLD_QUANTUM_MPH * 1.609344)) if self.step < MS_PER_MPH else HOLD_QUANTUM_MPH
@@ -378,6 +418,7 @@ class CurveSlowdownLogic:
     self.cruise_gap = False
     if abs(delta) < self.half_step:
       return
+    self.prev_set_speed = self.last_set_speed
     self.last_set_speed = i.set_speed
     direction = SET_PLUS if delta > 0 else SET_MINUS
     steps = abs(delta) / self.step
@@ -406,11 +447,9 @@ class CurveSlowdownLogic:
     one_step = n == 1
     if one_step and driver_k is not None:
       # The driver tapped this button just before: their step, even if ours is in flight too.
-      # Their speed moves by this step: keep `offset`, so driver_speed = set_speed + offset * step
-      # shifts with it. No more lowering for this curve.
+      # No more lowering for this curve (_driver_change says what happens to the restore).
       del self.driver_taps[driver_k]
-      self.restoring = False
-      self.blocked = True
+      self._driver_change(direction, 1)
     elif ours_k is not None and (n <= n_ours or hold_open):
       # Ours (one press, several presses landing between two samples, or a hold stepping several
       # at once). Any landing also confirms that the car is listening, so the next press may go out.
@@ -445,16 +484,12 @@ class CurveSlowdownLogic:
       self.blocked = True
     elif one_step:
       # A single unexplained step is a driver tap (or the driver's tap matched our pending
-      # press first and this is our own press landing). Either way the driver's speed moves by
-      # this step: keep `offset`, so driver_speed = set_speed + offset * step shifts with it.
-      # No more lowering for this curve.
-      self.restoring = False
-      self.blocked = True
+      # press first and this is our own press landing). No more lowering for this curve.
+      self._driver_change(direction, 1)
     elif driver_recent:
-      # The driver held the button: they set a new speed.
+      # The driver held the button: several steps of theirs.
       self.driver_taps = [(d, f) for d, f in self.driver_taps if d != direction]
-      self._forget()
-      self.blocked = True
+      self._driver_change(direction, n)
     elif ours_k is not None:
       # More steps than we have presses in flight, in our direction: the car may step more than
       # once per press. We can't keep the limits reliably, so switch off for this drive.
@@ -501,11 +536,18 @@ class CurveSlowdownLogic:
     if not cruise_ok:
       if self.last_set_speed is not None:
         self.cruise_gap = True
+      if i.driver_button == SET_MINUS:
+        self.set_while_off = True     # SET with cruise off engages at the current speed: the driver's new speed
       # Freeze the timers of a press in flight while cruise is off, so it is still
       # recognised as ours when cruise comes back (the set speed is not observed meanwhile).
       for p in self.inflight + self.expired:
         p.frame += 1
       self.hold = None     # a hold is not continued across a cruise cancel
+    elif self.set_while_off:
+      self.set_while_off = False
+      if self.anchor is not None:
+        self._forget()
+        self.blocked = True
 
     # The driver's own SET+/SET- taps (rising edge). Our own frames are never read back here:
     # pandad reports transmitted frames on bus + 128 and the bus-0 parser ignores those.
@@ -556,9 +598,10 @@ class CurveSlowdownLogic:
         self.flicker = True
       self.prev_csc_active = i.csc_active
       self.curve_free_frames = 0 if i.csc_active else self.curve_free_frames + 1
-      self.reason_free_frames = 0 if (i.csc_active or i.stop_active) else self.reason_free_frames + 1
+      self.reason_free_frames = 0 if (i.csc_active or i.stop_active or i.hold_restore) else self.reason_free_frames + 1
     if self.offset == 0 and not self.inflight:
       self.flicker = False
+      self.anchor = None             # back at the driver's speed: nothing left to restore
     restore_delay = FLICKER_RESTORE_DELAY if self.flicker else RESTORE_DELAY
     curve_over = self.curve_free_frames >= _frames(restore_delay)
     all_over = self.reason_free_frames >= _frames(restore_delay)
@@ -642,6 +685,11 @@ class CurveSlowdownLogic:
           return d, off
       return None, None
 
+    # Nothing while the driver is on a SET button or just was: their change is attributed cleanly first.
+    if i.driver_button in (SET_MINUS, SET_PLUS) or \
+       self.frame - max(self.last_driver_edge.values()) < _frames(DRIVER_QUIET):
+      return None, None
+
     # One unconfirmed press at a time, a bounded number in flight, nothing while a hold settles;
     # also wait during a back-off.
     if (self.pending is not None or len(self.inflight) >= MAX_IN_FLIGHT or self.frame < self.backoff_until or
@@ -722,6 +770,8 @@ class CurveSlowdownLogic:
           self.hold_bound = driver_speed
     if want_lower and reason == "stop":
       self.stop_episode = True
+    if button == SET_MINUS and self.anchor is None:
+      self.anchor = i.set_speed      # the driver's speed, before our first press moves it
     off = self._send(button, hold=hold)
     if off is None:
       return None, None
@@ -746,7 +796,8 @@ class CurveSlowdown:
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
                    "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph",
-                   "map_veto", "gps_trust", "gps_acc", "decel_learn", "answer_frames"]
+                   "map_veto", "gps_trust", "gps_acc", "decel_learn", "answer_frames",
+                   "anchor_mph", "plan_stop", "plan_ratio", "stop_latched", "stop_early"]
 
   def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
     import cereal.messaging as messaging
@@ -882,12 +933,19 @@ class CurveSlowdown:
     v_ego = float(CS.out.vEgo)
 
     # Stopped car ahead (Test: trigger and target are computed and logged, nothing is pressed)
+    from opendbc.car.mazda.stopped_car_slowdown import plan_stop
+    if self._alive('modelV2'):
+      m = self.sm['modelV2']
+      p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), list(m.position.x), v_ego)
+    else:
+      p_stop, p_ratio, p_d = False, 1.0, 0.0
     stop_inputs = StoppedCarInputs(
       enabled=bool(CC.enabled), cruise_enabled=cruise_enabled, brake_pressed=bool(CS.out.brakePressed), v_ego=v_ego,
       lead_alive=self._alive('radarState'), lead_status=bool(lead.status), lead_prob=float(lead.modelProb),
       lead_d=float(lead.dRel), lead_v=float(lead.vLead), lead_y=float(lead.yRel),
       radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)),
-      model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration))
+      model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration),
+      plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d)
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -945,6 +1003,7 @@ class CurveSlowdown:
       stop_target=float(self.trigger.target),
       stop_urgent=bool(self.trigger.urgent),
       stop_restore_now=bool(self.trigger.restore_now) and self.stop_mode == ON,
+      hold_restore=bool(self.trigger.hold_restore) and self.stop_mode == ON,
     )
     button, offset = self.logic.update(inputs)
     if self.profile is not None:
@@ -1097,13 +1156,21 @@ class CurveSlowdown:
         stop_active, self.trigger.target / MS_PER_MPH,
         self.trigger.urgent, self.trigger.required, min(self.trigger.ttc, 99.0), lg.offset, len(lg.inflight),
         lg.hold is not None, {SET_MINUS: "M", SET_PLUS: "P"}.get(button, ""), i.driver_button or "", lg.blocked, lg.restoring,
-        *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0))
+        *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0,
+        (lg.anchor or 0.0) / MS_PER_MPH, si.plan_stop, si.plan_ratio, self.trigger.latched,
+        self.trigger.early and self.trigger.active))
+    for ev in lg.driver_events:
+      # a driver set speed change while we managed it (what happened to the restore)
+      self.recorder.record("driverSetChange", t, {k: (v / MS_PER_MPH if isinstance(v, float) and k != "steps" else v)
+                                                  for k, v in ev.items()}, min_gap=0.0)
+    lg.driver_events = []
     self._map_episode(t, i, plan)
     # curve slowdown episode: from the first SET- for a curve to the restore being complete
     if self.curve_event is None and button == SET_MINUS and lg.last_action in ("tap", "hold") and not stop_active and i.csc_active:
       self.curve_event = self.recorder.open("curveSlowdown", t, {
         "mode": "on", "set_mph_before": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
-        "csc_mph": i.csc_speed / MS_PER_MPH, "max_drop_steps": lg.max_drop_steps, **self._profile_summary()})
+        "csc_mph": i.csc_speed / MS_PER_MPH, "max_drop_steps": lg.max_drop_steps,
+        "anchor_mph": (lg.anchor or i.set_speed) / MS_PER_MPH, **self._profile_summary()})
       self.curve_presses = 0
     if self.curve_event is not None:
       if button is not None:
@@ -1119,12 +1186,16 @@ class CurveSlowdown:
         "set_mph_before": i.set_speed / MS_PER_MPH,
         "vEgo_mph": i.v_ego / MS_PER_MPH, "lead_d": si.lead_d, "lead_v": si.lead_v, "lead_prob": si.lead_prob,
         "lead_y": si.lead_y, "target_mph": self.trigger.target / MS_PER_MPH, "required_decel": self.trigger.required,
-        "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent, **self._profile_summary()})
+        "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent, "early": self.trigger.early,
+        "latched": self.trigger.latched, "latch_age_s": round(self.trigger.latch_age, 2), "plan_ratio_at_start": si.plan_ratio,
+        "plan_stop_d": si.plan_stop_d, "anchor_mph": ((lg.anchor or i.set_speed) / MS_PER_MPH), **self._profile_summary()})
       self.stop_presses_at_start = lg.stop_presses
+      self.stop_brake = False
       self.stop_holds_at_start = len(lg.hold_log)
       self.stop_min_set = i.set_speed
     if self.stop_event is not None:
       self.stop_min_set = min(self.stop_min_set, i.set_speed)
+      self.stop_brake = getattr(self, "stop_brake", False) or i.brake_pressed
       done = not stop_active and lg.offset == 0 and not lg.inflight
       if done or (not stop_active and self.stop_mode == 1):
         holds = lg.hold_log[self.stop_holds_at_start:]
@@ -1138,11 +1209,16 @@ class CurveSlowdown:
           "hold_overrun_learned": lg.hold_overrun, "hold_measured": lg.hold_measured, "holds_learned_all_drives": self.profile.holds if self.profile else 0,
           "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
           "radar_lead_rises_s": [round((f - self.trigger.start_frame) * DT_CTRL, 2) for f in self.trigger.radar_rises
-                                 if f >= self.trigger.start_frame - 1500]})
+                                 if f >= self.trigger.start_frame - 1500],
+          "driver_braked": self.stop_brake, "early": self.trigger.early,
+          "prob_rise_s": (round((self.trigger.confirm_frame - self.trigger.start_frame) * DT_CTRL, 2)
+                          if self.trigger.early and self.trigger.confirm_frame >= 0 else None),
+          "anchor_mph_end": (lg.anchor or 0.0) / MS_PER_MPH})
         self.stop_event = None
     if self.near_miss is not None and self.stop_mode in (1, 2):
       cand = self.trigger.near_miss_candidate(si)
       self.near_miss.update(t, cand, stop_active, self.trigger.blockers(si) if cand else (),
                             {"lead_d": si.lead_d, "lead_v": si.lead_v, "lead_prob": si.lead_prob, "lead_y": si.lead_y,
-                             "vEgo_mph": i.v_ego / MS_PER_MPH, "model_accel": si.model_accel})
+                             "vEgo_mph": i.v_ego / MS_PER_MPH, "model_accel": si.model_accel,
+                             "latched": self.trigger.latched, "plan_ratio": si.plan_ratio})
     self.recorder.tick(t)

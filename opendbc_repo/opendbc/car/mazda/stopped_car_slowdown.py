@@ -64,6 +64,26 @@ GO_SLOWER = 2.0             # m/s: the car ahead is no longer much slower than u
 GO_TIME = 1.0               # s both must hold before the stop with a car is released
 STOPPED_CAR, STOP_WITH_CAR = "stopped car", "stop with car"
 
+# Red light first (drive 2026-11-03 21:12): the stop-ahead warning fired 5 s before a hard brake, but the queue car
+# ahead was only 25-37 % "a car" to the model at 110-130 m (the radar saw it at 11 m), below STOP_CAR_MIN_PROB.
+# Once the model has planned a stop (the same check as the planner's red light warning, stop_warning.plan_slowdown),
+# a low-confidence stopped or much slower car near our lane starts the slowdown (taps only until it is confirmed).
+EARLY_START_ENABLED = True
+PLAN_STOP_RATIO = 0.70      # planned minimum speed <= this share of ours ... (stop_warning.STOP_SLOWDOWN)
+PLAN_STOP_HORIZON = 8.0     # ... within this many seconds of the plan (STOP_HORIZON)
+PLAN_STOP_POINTS = 2        # ... on this many consecutive plan points (STOP_HOLD_POINTS)
+PLAN_STOP_DECEL = 0.9       # m/s^2 implied to get there (STOP_DECEL)
+PLAN_STOP_BUFFER = 2.0      # m (STOP_BUFFER)
+LATCH_DEBOUNCE = 0.5        # s of the planned stop before the latch sets ...
+LATCH_DROPOUT = 0.25        # ... gaps up to this long allowed
+LATCH_HOLD = 4.0            # s the latch stays after the plan last showed the stop (~80 m at 45 mph)
+STOP_CAR_EARLY_MIN_PROB = 0.2   # the car ahead while latched (11 such cases on 2026-11-03: the driver braked in 10)
+EARLY_HOLD = 0.5            # s (cumulative) of the early condition before the start ...
+EARLY_DROPOUT = 0.3         # ... the lead may blink out this long (it is intermittent at 110 m)
+EARLY_CONFIRM_PROB = 0.4    # an early start is confirmed (holds, fast pace) once the car is this sure ...
+EARLY_CONFIRM_TIME = 0.3    # ... for this long, or the stop is urgent
+RELEASE_LOST_TIME_LATCHED = 5.0  # s without the car before "lead lost" while the plan still shows a stop
+
 # Near-miss candidate (logged when the trigger did not fire)
 NEAR_MISS_LEAD_SPEED = 3.0
 NEAR_MISS_DISTANCE = 120.0
@@ -91,6 +111,44 @@ class StoppedCarInputs:
   radar_lead_distance: int = 0      # its distance bucket (CRZ_CTRL.RADAR_LEAD_RELATIVE_DISTANCE: 1 farthest .. 5 nearest), logged only
   model_alive: bool = False         # modelV2 is being received
   model_accel: float = 0.0          # modelV2.action.desiredAcceleration: < 0 the model wants to slow down
+  plan_stop: bool = False           # the model plans a stop ahead (plan_stop(), the red light warning's check)
+  plan_ratio: float = 1.0           # slowest planned speed in the horizon / ours (logs)
+  plan_stop_d: float = 0.0          # m to where the stop is planned (logs)
+
+
+def _interp(x, xp, fp):
+  if not xp:
+    return 0.0
+  if x <= xp[0]:
+    return fp[0]
+  for k in range(1, len(xp)):
+    if x <= xp[k]:
+      x0, x1, y0, y1 = xp[k - 1], xp[k], fp[k - 1], fp[k]
+      return y0 if x1 == x0 else y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+  return fp[-1]
+
+
+def plan_stop(model_t, model_v, model_x, v_ego):
+  """(stop planned, slowest planned speed / ours, m to it): the model's plan drops to PLAN_STOP_RATIO of our speed or
+  less within PLAN_STOP_HORIZON on PLAN_STOP_POINTS points in a row, implying PLAN_STOP_DECEL or more (the planner's
+  red light warning, stop_warning.StopWarningLogic.plan_slowdown / stop_ahead, without its lead and alert gates)."""
+  if not model_t or len(model_t) != len(model_v) or v_ego <= 0.5:
+    return False, 1.0, 0.0
+  horizon = [v for t, v in zip(model_t, model_v, strict=True) if t <= PLAN_STOP_HORIZON]
+  ratio = min(horizon) / v_ego if horizon else 1.0
+  slow = PLAN_STOP_RATIO * v_ego
+  t_min, v_min = None, None
+  for k, (t, v) in enumerate(zip(model_t, model_v, strict=True)):
+    if t > PLAN_STOP_HORIZON:
+      break
+    held = model_v[k:k + PLAN_STOP_POINTS]
+    if len(held) == PLAN_STOP_POINTS and all(x <= slow for x in held) and (v_min is None or v < v_min):
+      t_min, v_min = t, v
+  if t_min is None:
+    return False, ratio, 0.0
+  d = _interp(t_min, model_t, model_x) if len(model_x) == len(model_t) else (v_ego + v_min) * t_min / 2
+  required = (v_ego ** 2 - max(v_min, 0.0) ** 2) / (2 * max(d - PLAN_STOP_BUFFER, 1.0))
+  return required >= PLAN_STOP_DECEL and v_ego >= START_SPEED, ratio, d
 
 
 def stopped_car_target(d_rel, floor=FLOOR_SPEED, decel=TARGET_DECEL, margin=TARGET_MARGIN):
@@ -130,6 +188,19 @@ class StoppedCarTrigger:
     self.kind = None                 # STOPPED_CAR or STOP_WITH_CAR while active (or last active)
     self.prev_radar_has_lead = False
     self.radar_rises = []            # frames at which the stock radar picked up a lead (for the logs)
+    # red light first: the stop-ahead latch and the early start
+    self.latched = False
+    self.latch_frames = 0            # debounce of the planned stop
+    self.latch_gap = 0
+    self.latch_set_frame = -1
+    self.last_plan_stop = -10_000
+    self.early = False               # the active episode started early (low-confidence car while latched)
+    self.confirmed = False           # ... and has since been confirmed (prob / urgency): holds and fast pace allowed
+    self.confirm_frames = 0
+    self.confirm_frame = -1
+    self.early_frames = 0
+    self.early_gap = 0
+    self.hold_restore = False        # latched and not active: keep the lowered set speed (no SET+) for now
 
   def _lead_ok(self, i):
     return (i.lead_alive and i.lead_status and i.lead_prob >= MIN_PROB and abs(i.lead_y) <= MAX_LATERAL and
@@ -148,6 +219,31 @@ class StoppedCarTrigger:
 
   def _stop_with_car(self, i):
     return self._model_slowing(i) and self._slow_car(i)
+
+  def _early_stop_with_car(self, i):
+    return (EARLY_START_ENABLED and self.latched and self._model_slowing(i) and
+            self._slow_car(i, min_prob=STOP_CAR_EARLY_MIN_PROB))
+
+  def _update_latch(self, i):
+    if i.plan_stop:
+      self.latch_frames += 1
+      self.latch_gap = 0
+      self.last_plan_stop = self.frame
+    else:
+      self.latch_gap += 1
+      if self.latch_gap > _frames(LATCH_DROPOUT):
+        self.latch_frames = 0
+    if not self.latched and self.latch_frames >= _frames(LATCH_DEBOUNCE):
+      self.latched = True
+      self.latch_set_frame = self.frame
+    if self.latched and (self.frame - self.last_plan_stop > _frames(LATCH_HOLD) or i.v_ego < EGO_STOPPED_SPEED):
+      self.latched = False
+      self.latch_frames = 0
+
+  @property
+  def latch_age(self):
+    """s since the stop-ahead latch set (0 when not latched)."""
+    return (self.frame - self.latch_set_frame) * DT_CTRL if self.latched else 0.0
 
   def blockers(self, i):
     """Why the trigger is not (yet) active, for the near-miss log."""
@@ -179,6 +275,8 @@ class StoppedCarTrigger:
       out.append("stop with car: no modelV2")
     elif i.model_accel > MODEL_SLOW_ACCEL:
       out.append(f"stop with car: model accel {i.model_accel:.2f} > {MODEL_SLOW_ACCEL}")
+    if i.lead_status and STOP_CAR_EARLY_MIN_PROB <= i.lead_prob < STOP_CAR_MIN_PROB and not self.latched:
+      out.append("stop ahead not latched (a low-confidence car only counts after a planned stop)")
     if not out and not self.active:
       out.append(f"held {self.hold_frames * DT_CTRL:.2f} s < {HOLD_TIME}")
     return out
@@ -191,6 +289,7 @@ class StoppedCarTrigger:
     if i.radar_has_lead and not self.prev_radar_has_lead:
       self.radar_rises.append(self.frame)
     self.prev_radar_has_lead = i.radar_has_lead
+    self._update_latch(i)
     lead_ok = self._lead_ok(i)
     stop_with_car = self._stop_with_car(i)
     gates = (i.enabled and i.cruise_enabled and not i.brake_pressed and
@@ -200,30 +299,47 @@ class StoppedCarTrigger:
 
     if not self.active:
       self.hold_frames = self.hold_frames + 1 if ((lead_ok or stop_with_car) and gates and i.v_ego >= START_SPEED) else 0
-      if self.hold_frames >= _frames(HOLD_TIME):
+      if self._early_stop_with_car(i) and gates and i.v_ego >= START_SPEED:
+        self.early_frames += 1
+        self.early_gap = 0
+      else:
+        self.early_gap += 1
+        if self.early_gap > _frames(EARLY_DROPOUT) or not self.latched:
+          self.early_frames = 0
+      early_start = self.early_frames >= _frames(EARLY_HOLD)
+      if self.hold_frames >= _frames(HOLD_TIME) or early_start:
         self.active = True
-        self.kind = STOPPED_CAR if lead_ok else STOP_WITH_CAR
+        self.early = self.hold_frames < _frames(HOLD_TIME)
+        self.kind = STOPPED_CAR if (lead_ok and not self.early) else STOP_WITH_CAR
+        self.confirmed = not self.early
+        self.confirm_frames = 0
+        self.confirm_frame = self.frame if not self.early else -1
         self.start_frame = self.frame
         self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
+        self.early_frames = self.early_gap = 0
         self.release_reason = None
     elif self.kind == STOP_WITH_CAR or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
       # a stop with a much slower car (or a "stopped" car that is rolling slowly towards the stop): the car ahead
       # may be moving, so "moved away" is not a release; traffic moving again is
       self.kind = STOP_WITH_CAR
       self.moving_frames = 0
-      vision = i.lead_alive and i.lead_status and i.lead_prob >= STOP_CAR_MIN_PROB
+      min_prob = STOP_CAR_EARLY_MIN_PROB if self.early else STOP_CAR_MIN_PROB
+      vision = i.lead_alive and i.lead_status and i.lead_prob >= min_prob
       still_there = vision and abs(i.lead_y) <= STOP_CAR_MAX_LATERAL
       self.lost_frames = 0 if still_there else self.lost_frames + 1
-      going = (i.model_alive and i.model_accel > GO_ACCEL and
+      # traffic moving again also needs the model to no longer plan a stop (21:11:57: released, set back to 45,
+      # then the hard stop 15 s later)
+      going = (i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop and
                (not still_there or i.v_ego - i.lead_v < GO_SLOWER))
       self.go_frames = self.go_frames + 1 if going else 0
+      lost_time = RELEASE_LOST_TIME_LATCHED if self.latched else RELEASE_LOST_TIME
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
       elif self.go_frames >= _frames(GO_TIME):
         self._release("traffic moving again (model no longer slowing, car ahead not much slower)", False)
-      elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
+      elif self.lost_frames >= _frames(lost_time):
         self._release("lead lost (vision)", False)
     else:
       vision = i.lead_alive and i.lead_status and i.lead_prob >= LOST_MIN_PROB
@@ -246,8 +362,18 @@ class StoppedCarTrigger:
         self._release("lead lost (vision)", False)
     if self.active and i.lead_status:
       self.target = stopped_car_target(i.lead_d)
+    if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
+      self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further
+    if self.active and self.early and not self.confirmed:
+      sure = i.lead_alive and i.lead_status and i.lead_prob >= EARLY_CONFIRM_PROB
+      self.confirm_frames = self.confirm_frames + 1 if sure else 0
+      if self.confirm_frames >= _frames(EARLY_CONFIRM_TIME) or self.urgent:
+        self.confirmed = True
+        self.confirm_frame = self.frame
     if self.active and self.kind == STOP_WITH_CAR:
-      self.urgent = True             # a stop with a much slower car: slow down at once (holds allowed)
+      # a stop with a much slower car: slow down at once (holds allowed); an early start only taps until confirmed
+      self.urgent = self.confirmed
+    self.hold_restore = EARLY_START_ENABLED and self.latched and not self.active
     return self.active
 
   def _release(self, reason, restore_now=True):

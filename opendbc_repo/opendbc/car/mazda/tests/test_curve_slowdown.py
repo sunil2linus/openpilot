@@ -143,8 +143,9 @@ class CSC:
 
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
-        model=lambda f: None, setup=None):
-  """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2."""
+        model=lambda f: None, setup=None, plan=lambda f: False):
+  """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
+  plan(f): True while the model plans a stop ahead (the red light check)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -162,23 +163,24 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       csc.update(curve_fn(f), car.set_speed, car.v_ego)
     hist.append((csc.active, csc.speed))
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
-    stop_active, stop_target, stop_urgent, restore_now = False, 0.0, False, False
+    stop_active, stop_target, stop_urgent, restore_now, hold_restore = False, 0.0, False, False, False
     if lead is not None:
       status, prob, d, v, y = lead.state(f, car)
       r_has, r_dist = lead.radar(f)
       li = scs.StoppedCarInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], brake_pressed=st["brake"],
                                 v_ego=car.v_ego, lead_alive=True, lead_status=status, lead_prob=prob, lead_d=d,
                                 lead_v=v, lead_y=y, radar_has_lead=r_has, radar_lead_distance=r_dist,
-                                model_alive=model(f) is not None, model_accel=model(f) or 0.0)
+                                model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f))
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
       restore_now = trigger.restore_now and stop_mode == 2
+      hold_restore = trigger.hold_restore and stop_mode == 2
     inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
                             v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=car.v_ego < 0.3,
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
-                            stop_urgent=stop_urgent, stop_restore_now=restore_now)
+                            stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore)
     btn, off = logic.update(inp)
     if btn is not None:
       assert off in (0, 1)
@@ -304,7 +306,9 @@ def test_driver_set_minus_during_lowering_is_respected():
   first = _first_press_frame()
   r = run(Car(65), between(100, 1500, 61), 4000,
           events={first + 40: lambda s, c: c.press(cs.SET_MINUS, who="driver")})
-  assert near(r["final"], 64), r["final"]             # driver's one-step reduction kept, ours restored
+  # the driver's SET- is their new choice: we stop managing and leave the speed where they put it
+  assert near(r["final"], 63), r["final"]
+  assert [f for f, b in r["presses"] if b == cs.SET_PLUS] == [], r["presses"]
 
 
 def test_driver_hold_minus_5_is_respected():
@@ -318,8 +322,9 @@ def test_driver_hold_minus_5_is_respected():
 def test_driver_set_plus_mid_curve_we_stop():
   r = run(Car(65), between(100, 1500, 61), 5000, events={800: lambda s, c: c.press(cs.SET_PLUS, who="driver")})
   assert [f for f, b in r["presses"] if b == cs.SET_MINUS and f >= 800] == [], r["presses"]
-  assert r["max"] <= 66 + 1e-6
-  assert near(r["final"], 66), r["final"]             # driver's +1 respected, our drop restored
+  # the driver's +1 takes back one of our steps: the rest is restored to their 65, never above
+  assert r["max"] <= 65 + 1e-6
+  assert near(r["final"], 65), r["final"]
 
 
 def test_disengage_mid_curve_no_presses_while_off():
@@ -678,7 +683,8 @@ def test_driver_tap_same_direction_while_our_presses_in_flight():
     r = run(Car(55, dash_offset_mph=0.0, lag=lag), between(100, 1500, 40), 5000, max_drop=15,
             events={first + 89: lambda s, c: c.press(cs.SET_MINUS, who="driver")})
     assert r["max"] <= 55 + 1e-6, (lag, r["max"])
-    assert near(r["final"], 54), (lag, r["final"])          # driver meant 54: restore to that, not 55
+    # the driver's SET- is their new choice: never restored above it (only our own late landings are put back)
+    assert r["final"] <= 54 + 1e-6, (lag, r["final"])
     assert r["min"] >= 54 - 15 - 1e-6, (lag, r["min"])
 
 
@@ -880,3 +886,118 @@ def test_restore_hold_never_passes_the_driver_speed_whatever_lands_after_the_rel
     r = run(Car(47, dash_offset_mph=0.0, hold_latency=latency), between(100, 1500, 30), 4000, max_drop=15,
             setup=_measured_clean)
     assert r["max"] <= 47 + 1e-6 and near(r["final"], 47), (latency, r["max"], r["final"])
+
+
+# ---------------- restore to the driver's remembered set speed (drive 2026-11-03) ----------------
+# The old step count added its steps on top of a speed the driver had already brought back with the stock buttons
+# (21:00 45 -> 48, 21:08 40 -> 43, 21:14 45 -> 47). Now the restore only brings the actual set speed up to the speed
+# the driver had before our first press (the anchor), never above.
+
+def _taps(button, n, every=30):
+  """Events: the driver taps `button` n times, `every` frames apart, starting at the given frame."""
+  def at(start):
+    return {start + k * every: (lambda s, c, b=button: c.press(b, who="driver")) for k in range(n)}
+  return at
+
+
+def _after_curve(r):
+  return [f for f, b in r["presses"] if b == cs.SET_PLUS]
+
+
+def test_driver_brings_the_speed_back_and_we_add_nothing_on_top():
+  # 21:00 / 21:08: lowered 3 steps, brake (cruise off), RES at the lowered speed, the driver taps SET+ x3
+  def brake(s, c):
+    s["brake"], s["cruise"] = True, False
+
+  def resume(s, c):
+    s["brake"], s["cruise"] = False, True
+
+  for taps_at in (1402, 1440, 1600):          # right after RES (21:08), during our restore, after it is done
+    ev = {1100: brake, 1400: resume, **_taps(cs.SET_PLUS, 3)(taps_at)}
+    r = run(Car(45), between(100, 1050, 30), 5000, events=ev, max_drop=3)
+    assert near(r["min"], 42), r["min"]
+    if taps_at == 1402:
+      assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (taps_at, r["final"], r["max"])
+    elif taps_at == 1440:
+      # our first restore tap was already on its way: the driver's own third tap makes 46. Nothing of ours
+      # after their first tap (we wait while they are on the buttons, then they are at or above 45)
+      assert near(r["final"], 46), (taps_at, r["final"])
+      assert [f for f in _after_curve(r) if f > taps_at] == [], r["presses"]
+    else:
+      assert near(r["final"], 48), (taps_at, r["final"])    # restored to 45 first, then the driver's own +3
+
+
+def test_driver_brings_it_back_part_way_we_restore_only_the_rest():
+  ev = _taps(cs.SET_PLUS, 1)(1200)            # one tap while we hold the speed down in the curve
+  r = run(Car(65), between(100, 1500, 61), 5000, events=ev)
+  assert near(r["final"], 65) and r["max"] <= 65 + 1e-6, (r["final"], r["max"])
+
+
+def test_driver_raises_above_the_old_speed_and_we_never_pull_it_down():
+  # 21:14: lowered 45 -> 43; the stock switch then reported SET+ up to 51 and SET- back to 45: nothing from us after
+  ev = {**_taps(cs.SET_PLUS, 8, every=25)(600), **_taps(cs.SET_MINUS, 6, every=25)(1200)}
+  r = run(Car(45), between(100, 1500, 30), 5000, events=ev, max_drop=2)
+  assert near(r["min"], 43), r["min"]
+  assert near(r["final"], 45), r["final"]
+  ours_after = [(f, b) for f, b in r["presses"] if f >= 600]
+  assert ours_after == [], ours_after
+  assert r["logic"].anchor is None
+
+
+def test_driver_set_minus_during_our_restore_stops_it_there():
+  base = run(Car(65), between(100, 1000, 50), 4000, max_drop=5)
+  first_plus = _after_curve(base)[0]
+  r = run(Car(65), between(100, 1000, 50), 5000, max_drop=5, events=_taps(cs.SET_MINUS, 1)(first_plus + 40))
+  after = [f for f in _after_curve(r) if f > first_plus + 40]
+  assert after == [], r["presses"]
+  assert r["final"] < 65 - 1e-6 and r["max"] <= 65 + 1e-6
+
+
+def test_a_new_reason_after_the_driver_raised_the_speed_anchors_at_the_new_speed():
+  ev = _taps(cs.SET_PLUS, 3)(1700)            # after the first curve: 65 -> restored 65, driver +3 -> 68
+  curve = lambda f: 60 * MPH if (100 <= f < 1500 or 3000 <= f < 4000) else None  # noqa: E731
+  r = run(Car(65), curve, 7000, events=ev)
+  assert near(r["final"], 68), r["final"]
+  assert r["max"] <= 68 + 1e-6
+
+
+def test_no_press_of_ours_while_the_driver_is_on_a_button_or_just_was():
+  quiet = cs._frames(cs.DRIVER_QUIET)
+  ev = _taps(cs.SET_MINUS, 1)(1600)
+  r = run(Car(65), between(100, 1500, 61), 5000, events=ev)
+  assert [f for f, _ in r["presses"] if 1600 <= f < 1600 + quiet] == [], r["presses"]
+
+
+def test_set_with_cruise_off_is_the_drivers_new_speed_even_at_the_same_number():
+  def off(s, c):
+    s["brake"], s["cruise"] = True, False
+
+  def press_set(s, c):
+    c.driver_button, c.driver_button_until = cs.SET_MINUS, c.frame + 10    # SET with cruise off: engage here
+
+  def on(s, c):
+    s["brake"], s["cruise"] = False, True
+
+  r = run(Car(65), between(100, 1050, 50), 5000, max_drop=5, events={1100: off, 1300: press_set, 1320: on})
+  assert [f for f in _after_curve(r) if f >= 1320] == [], r["presses"]
+  assert near(r["final"], 60), r["final"]
+
+
+def test_fuzz_never_above_the_drivers_speed():
+  import random
+  for seed in range(60):
+    rnd = random.Random(seed)
+    lag = rnd.choice((10, 15, 30, 60, 90))
+    ev = {}
+    top = 55
+    for _ in range(rnd.randint(1, 4)):
+      f = rnd.randint(150, 2500)
+      b = rnd.choice((cs.SET_PLUS, cs.SET_MINUS))
+      ev[f] = (lambda s, c, b=b: c.press(b, who="driver"))
+    r = run(Car(top, lag=lag, lose=(lambda n: n % 7 == 3) if seed % 2 else None), between(100, 1500, 40), 6000,
+            events=ev, max_drop=10)
+    driver_ups = sum(1 for f in ev if True)
+    assert r["max"] <= top + driver_ups + 1e-6, (seed, r["max"])
+    # with only SET- taps from the driver, never back above the starting speed
+    if all(ev[f].__defaults__[0] == cs.SET_MINUS for f in ev):
+      assert r["max"] <= top + 1e-6 and r["final"] <= top + 1e-6, (seed, r["max"], r["final"])

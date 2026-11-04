@@ -601,3 +601,196 @@ def test_restore_at_a_stop_holds_most_of_the_way_up():
   back = min(f for f in sets if f > plus[0] and near(sets[f] / MPH, 45))
   assert (back - plus[0]) * T.DT < 7.0, (back - plus[0]) * T.DT
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+# ---------------- red light first: a low-confidence car after a planned stop (drive 2026-11-03 21:12) ----------------
+
+SWL = importlib.util.spec_from_file_location(
+  "stop_warning", os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "starpilot", "controls", "lib", "stop_warning.py"))
+
+
+def _stop_warning():
+  m = importlib.util.module_from_spec(SWL)
+  SWL.loader.exec_module(m)
+  return m
+
+
+def _plan(v_ego, v_min, t_dip=4.0, n=33):
+  """A model plan: our speed, then down to v_min from t_dip on (velocity.t / velocity.x / position.x)."""
+  ts = [10.0 * (k / (n - 1)) ** 2 for k in range(n)]
+  vs = [v_ego if t < t_dip else max(v_min, v_ego - 2.5 * (t - t_dip)) for t in ts]
+  xs = [0.0]
+  for k in range(1, n):
+    xs.append(xs[-1] + (vs[k] + vs[k - 1]) / 2 * (ts[k] - ts[k - 1]))
+  return ts, vs, xs
+
+
+def test_the_planned_stop_check_matches_the_red_light_warning():
+  sw = _stop_warning()
+  logic = sw.StopWarningLogic()
+  v = 20.0
+  for v_min, t_dip in ((0.0, 3.0), (5.0, 4.0), (15.0, 2.0), (19.0, 1.0), (0.0, 7.5), (0.0, 9.0)):
+    ts, vs, xs = _plan(v, v_min, t_dip)
+    stop, ratio, d = scs.plan_stop(ts, vs, xs, v)
+    ref = sw.StopWarningLogic.plan_slowdown(type("I", (), {"model_t": ts, "model_v": vs, "model_x": xs, "v_ego": v})())
+    want = ref is not None and ref[3] >= sw.STOP_DECEL
+    assert stop == want, (v_min, t_dip, stop, ref)
+    assert ratio <= 1.0
+  del logic
+  assert scs.plan_stop([], [], [], 20.0) == (False, 1.0, 0.0)
+
+
+def _latched_inputs(**kw):
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=45 * MPH, lead_alive=True, lead_status=True,
+              lead_prob=0.26, lead_d=118.0, lead_v=13 * MPH, lead_y=-0.8, model_alive=True, model_accel=-0.6, plan_stop=True)
+  base.update(kw)
+  return scs.StoppedCarInputs(**base)
+
+
+def test_latch_sets_after_half_a_second_and_holds_four_seconds():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(40):
+    tr.update(_latched_inputs(lead_status=False))
+  assert not tr.latched
+  for k in range(20):                          # a 0.2 s gap is tolerated
+    tr.update(_latched_inputs(lead_status=False, plan_stop=(k % 2 == 0) or True))
+  assert tr.latched
+  for _ in range(int(scs.LATCH_HOLD / scs.DT_CTRL)):
+    tr.update(_latched_inputs(lead_status=False, plan_stop=False))
+  assert tr.latched
+  tr.update(_latched_inputs(lead_status=False, plan_stop=False))
+  assert not tr.latched
+  tr2 = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr2.update(_latched_inputs(lead_status=False))
+  assert tr2.latched
+  tr2.update(_latched_inputs(lead_status=False, v_ego=0.5))   # stopped: the latch ends
+  assert not tr2.latched
+
+
+def test_a_low_confidence_slow_car_starts_the_slowdown_only_after_a_planned_stop():
+  # 21:12: the queue car was 25-37 % "a car" at 110-130 m; the red light check had fired
+  tr = scs.StoppedCarTrigger()
+  for _ in range(40):
+    tr.update(_latched_inputs(lead_status=False))          # the stop is planned first: latched
+  n = 0
+  while not tr.update(_latched_inputs(lead_status=(n % 15 != 0))):   # the car blinks out now and then
+    n += 1
+    assert n < 200
+  assert tr.kind == scs.STOP_WITH_CAR and tr.early and not tr.urgent      # taps until it is confirmed
+  # without a planned stop first: nothing (the near-miss log says why)
+  tr = scs.StoppedCarTrigger()
+  for _ in range(300):
+    assert not tr.update(_latched_inputs(plan_stop=False))
+  assert any("not latched" in b for b in tr.blockers(_latched_inputs(plan_stop=False)))
+
+
+def test_the_early_start_still_needs_a_slow_car_near_our_lane_and_the_model_slowing():
+  for kw in (dict(lead_v=43 * MPH), dict(lead_status=False), dict(lead_y=2.5), dict(lead_d=160.0),
+             dict(model_accel=-0.2), dict(lead_prob=0.15)):
+    tr = scs.StoppedCarTrigger()
+    for _ in range(40):
+      tr.update(_latched_inputs(lead_status=False))
+    for _ in range(300):
+      tr.update(_latched_inputs(**kw, plan_stop=False) if False else _latched_inputs(**kw))
+    assert not tr.active, kw
+
+
+def test_an_early_start_is_confirmed_when_the_car_is_sure_and_then_slows_fast():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(40):
+    tr.update(_latched_inputs(lead_status=False))
+  while not tr.update(_latched_inputs()):
+    pass
+  assert not tr.urgent
+  for _ in range(int(scs.EARLY_CONFIRM_TIME / scs.DT_CTRL) + 1):
+    tr.update(_latched_inputs(lead_prob=0.5, lead_d=100.0))
+  assert tr.confirmed and tr.urgent
+  tr.update(_latched_inputs(lead_prob=0.3))
+  assert tr.urgent                             # sticky
+  # the early episode's low-confidence car does not count as lost
+  for _ in range(300):
+    assert tr.update(_latched_inputs(lead_prob=0.25))
+
+
+def test_while_a_stop_is_planned_traffic_moving_and_lead_lost_wait():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(40):
+    tr.update(_latched_inputs(lead_status=False))
+  while not tr.update(_latched_inputs(lead_prob=0.6)):
+    pass
+  for _ in range(300):                         # lost 3 s with the stop still planned: still active
+    assert tr.update(_latched_inputs(lead_status=False))
+  for _ in range(250):
+    tr.update(_latched_inputs(lead_status=False))
+  assert not tr.active and tr.release_reason.startswith("lead lost")
+  assert tr.hold_restore                       # still latched: keep the lowered speed for now
+  # moving again only once the model no longer plans the stop
+  tr = scs.StoppedCarTrigger()
+  for _ in range(40):
+    tr.update(_latched_inputs(lead_status=False))
+  while not tr.update(_latched_inputs(lead_prob=0.6)):
+    pass
+  for _ in range(300):
+    assert tr.update(_latched_inputs(lead_prob=0.6, model_accel=0.3, lead_v=44 * MPH))
+  for _ in range(101):
+    tr.update(_latched_inputs(lead_prob=0.6, model_accel=0.3, lead_v=44 * MPH, plan_stop=False))
+  assert not tr.active and tr.release_reason.startswith("traffic moving")
+
+
+def test_2112_replay_starts_earlier_and_lower_than_on_the_drive():
+  # 21:12 (t s after 21:11:40): the stop planned from t 24.5, a queue car at 110-125 m seen at 0.27-0.58, the
+  # confident start only at t 28.5 on the drive (45 -> 40 by t 29.5), the driver braking hard at t 30.5
+  F = lambda t: int(round((t - 20.0) * 100))      # frame of drive time t (the run starts at t 20)  # noqa: E731
+
+  class Queue(StoppedLead):
+    """The car ahead: ~30 mph, 150 m ahead at t 20 (115-125 m at t 23-27 as on the drive), braking for the light
+    from t 28 at 3 m/s^2 down to a crawl; seen intermittently and unsure until t 28."""
+    def state(self, f, car):
+      t = 20.0 + f / 100
+      if t < 23.0 or (t < 28.0 and int(t * 10) % 6 == 0):
+        return (False, 0.0, 0.0, 0.0, 0.0)
+      prob = 0.3 if t < 28.0 else 0.8
+      return (True, prob, self.d, self.v, -0.8)
+
+    def tick(self, car):
+      self.frame += 1
+      if 20.0 + self.frame / 100 >= 28.0:
+        self.v = max(self.v - 3.0 * T.DT, 0.5)
+      self.d = max(self.d - (car.v_ego - self.v) * T.DT, 0.0)
+
+  lead = Queue(150.0, v_mph=30.0)
+  plan = lambda f: 20.0 + f / 100 >= 24.5  # noqa: E731
+  model = lambda f: -0.7 if 20.0 + f / 100 >= 24.0 else 0.0  # noqa: E731
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, F(30.5), lead=lead, stop_mode=2, max_drop=10, model=model, plan=plan)
+  first = first_frame(r)
+  assert first is not None and first <= F(26.0), (first, F(26.0))
+  assert r["sets"][F(28.0)] / MPH >= 40 - 1e-6        # unsure until t 28: gentle taps only
+  i = F(29.5)
+  assert r["sets"][i] / MPH <= 38 + 1e-6, r["sets"][i] / MPH   # on the drive: 40 at t 29.5
+  assert r["min"] >= 20 - 1e-6
+  assert [f for f, b in r["presses"] if b == cs.SET_PLUS] == []
+
+
+def test_a_false_early_start_drops_a_few_mph_and_comes_back():
+  # a ghost "car" for 1.5 s while the model plans a stop that then goes away (a green light)
+  class Ghost(StoppedLead):
+    def state(self, f, car):
+      return (True, 0.25, 115.0, 12 * MPH, 0.5) if 100 <= f < 250 else (False, 0.0, 0.0, 0.0, 0.0)
+
+  plan = lambda f: f < 300  # noqa: E731
+  model = lambda f: -0.6 if f < 300 else 0.3  # noqa: E731
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=Ghost(115.0), stop_mode=2, max_drop=10, model=model, plan=plan)
+  assert r["ever_active"] and r["holds"] == []
+  assert r["min"] >= 45 - 3 - 1e-6, r["min"]
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_early_start_in_test_mode_sends_nothing():
+  class Queue(StoppedLead):
+    def state(self, f, car):
+      return (True, 0.3, self.d, self.v, -0.8)
+
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=Queue(125.0, v_mph=15.0), stop_mode=1, max_drop=10,
+          model=lambda f: -0.7, plan=lambda f: True)
+  assert r["ever_active"] and r["presses"] == [] and r["holds"] == []
