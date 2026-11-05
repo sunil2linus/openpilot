@@ -154,6 +154,7 @@ SAFE_MODE_MANAGED_KEYS = (
   "MazdaCurveSlowdown",
   "MazdaMapCurves",
   "MazdaStoppedCarSlowdown",
+  "MazdaSpeedLimitFollow",
   "SetSpeedLimit",
   "SLCFallback",
   "SLCMapboxFiller",

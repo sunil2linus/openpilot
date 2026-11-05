@@ -498,6 +498,7 @@ class VehicleSettingsManagerView(PanelManagerView):
         ("MazdaCurveMapRange", tr_noop("Map Build Range"),
          (tr_noop("30 mi"), tr_noop("50 mi"), tr_noop("100 mi"), tr_noop("200 mi"), tr_noop("300 mi")), 2),
         ("MazdaStoppedCarSlowdown", tr_noop("Stopped Car Slowdown"), modes, 0),
+        ("MazdaSpeedLimitFollow", tr_noop("Speed Limit Follow"), modes, 0),
         ("StopWarningRedLight", tr_noop("Stop Ahead Warning"), modes, 0),
         ("StopWarningStoppedCar", tr_noop("Stopped Car Warning"), modes, 0),
         ("MazdaStopWarningChime", tr_noop("Stop Warning Chime"), (tr_noop("5%"), tr_noop("10%"), tr_noop("20%"), tr_noop("30%")), 0)):

@@ -135,9 +135,13 @@ CAR_MIN_SET_SPEED = 30.0 * MS_PER_KPH    # the car's own minimum set speed (18.6
 # one SET+ hold up to a multiple of 5 at least _up_overrun() quanta below the driver's speed (with the default of one:
 # 5 mph below), released when the next landing would pass that, then 1 mph taps; so the hold can never take the set
 # speed past the driver's speed. A hold is only used when it gains at least RESTORE_HOLD_MIN_GAIN quanta over taps.
-# Gentle (0.5 s taps, no holds) stays for the releases where the car may still be ahead: lead lost (vision), lead left
-# the lane, cruise off / brake, unless the stock radar is following a car (radar_restore).
+# Gentle (0.5 s taps, no holds) stays for the releases where the car may still be ahead: lead lost (vision), and lead
+# left / leaving the lane, cruise off / brake or disengaged while a slower car is still in our lane (drive 4c: with
+# nothing slower in our lane those restore with the hold, stop_clear_ahead), unless the radar follows a car.
 RESTORE_HOLD_MIN_GAIN = 1
+# Speed limit follow (speed_limit_follow.py, drive 4c): a higher posted limit becomes the driver's speed (the anchor);
+# the restore rule above then brings the set speed up: 5 mph or less by taps, more by one hold to 5 below, then taps.
+LIMIT_DRIVER_QUIET = 3.0                 # s after the driver's last SET edge before a higher limit is adopted
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -170,6 +174,12 @@ class SlowdownInputs:
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
   radar_lead: bool = False        # the stock radar follows a lead (CRZ_CTRL.RADAR_HAS_LEAD, debounced: trigger.radar_stable)
+  # the posted limit rose to this (m/s) and the driver's speed matched the old one (speed_limit_follow.py): make it
+  # the driver's speed
+  limit_raise: float = 0.0
+  # stopped car trigger: released by brake / disengage / lane exit and no slower car is in our lane: the restore may
+  # use SET+ holds (stopped_car_slowdown CLEAR_*)
+  stop_clear_ahead: bool = False
 
 
 @dataclass
@@ -252,6 +262,7 @@ class CurveSlowdownLogic:
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
     self.standstill_frames = 0
     self.last_action = None          # "tap" / "hold" / "restore" of the last frame sent (for logs)
+    self.limit_adopted = None        # (driver's speed before, new limit) on the frame a higher limit was adopted
     # What the car profile (car_profile.py) remembers across drives: every hold whose landing after the release was
     # measured, ours (_finish_hold) and the driver's own (a held SET-/SET+ on the stock switch, watched below, so
     # Test mode learns the car too), is counted here with its quanta after the release.
@@ -621,6 +632,7 @@ class CurveSlowdownLogic:
     """Returns (button, counter_offset) to send this frame, or (None, None)."""
     self.frame += 1
     self.last_action = None
+    self.limit_adopted = None
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
     if self.new_wheel:
       self.wheel_frame = self.frame
@@ -787,6 +799,14 @@ class CurveSlowdownLogic:
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
         if target_rose:
           self.holds_this_episode = max(0, self.holds_this_episode - 1)   # the floor hold stays available
+        if not crosses and self.hold.frames_sent:
+          # stopped between two landings (its reason went, a pedal, ...): the quantum the car was about to step can
+          # still land right after our last frame (drive 4c sim: 15 ms later). That one is this hold's, not an
+          # overrun (which would switch holds off for the drive); it stays within the bound (floor / driver's speed).
+          self.hold.remaining += q
+          self.hold.reserve += q
+          if self.hold_log:
+            self.hold_log[-1]["aborted"] = True
         self.hold = None
         return None, None
       if self.phase_lock:
@@ -815,6 +835,16 @@ class CurveSlowdownLogic:
     if (self.pending is not None or len(self.inflight) >= MAX_IN_FLIGHT or self.frame < self.backoff_until or
         any(p.hold for p in self.inflight)):
       return None, None
+
+    # A higher posted limit (the driver's speed was the old one): it becomes the driver's speed, never more; the
+    # restore below brings the set speed up. Not while a reason is active, the driver stands us down or is adjusting.
+    if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
+        self.last_set_speed is not None and i.limit_raise > driver_speed + self.half_step and
+        self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
+      self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
+      self.anchor = i.limit_raise
+      offset = self.offset
+      driver_speed = set_speed + offset * self.step
 
     want_lower = False
     room = 0
@@ -847,8 +877,9 @@ class CurveSlowdownLogic:
     # Relaxed pacing for a stopped car that is not urgent, and for the gentle restore after a lost /
     # left-lane release (the car may still be ahead: a re-trigger should win over the taps).
     radar_restore = RADAR_LEAD_FAST_RESTORE and i.radar_lead and not want_lower and self.stop_episode
+    fast_stop = self.restore_pending or radar_restore or i.stop_clear_ahead
     gentle = (want_lower and reason == "stop" and not urgent) or \
-             (not want_lower and self.stop_episode and not self.restore_pending and not radar_restore)
+             (not want_lower and self.stop_episode and not fast_stop)
     gap = RELAXED_GAP_FRAMES if gentle else BUTTON_GAP_FRAMES
     if self.frame - self.last_send_frame <= gap:
       return None, None
@@ -876,7 +907,7 @@ class CurveSlowdownLogic:
             self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
-            (not self.stop_episode or self.restore_pending or radar_restore or i.fast_restore)):
+            (not self.stop_episode or fast_stop or i.fast_restore)):
         # one rule for every restore hold (RESTORE_HOLD_MIN_GAIN): a stop episode only when its car has clearly
         # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins
         driver_steps = int(round(driver_speed / self.step))
@@ -924,9 +955,11 @@ class CurveSlowdown:
                    "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph",
                    "map_veto", "gps_trust", "gps_acc", "decel_learn", "answer_frames",
                    "anchor_mph", "plan_stop", "plan_ratio", "stop_latched", "stop_early",
-                   "lead_v_f", "radar_stable", "radar_follow", "radar_hold"]
+                   "lead_v_f", "radar_stable", "radar_follow", "radar_hold",
+                   "lead_y_path", "leaving", "clear_ahead", "warn_cond", "warn_s", "warn_start", "stop_kind",
+                   "slc_mph", "slc_src", "limit_stable_mph", "limit_offer_mph", "limit_raise_mph"]
 
-  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0):
+  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0, limit_mode=0):
     import cereal.messaging as messaging
     from opendbc.car.mazda.values import MazdaSafetyFlags
     from opendbc.car.mazda.curve_target import CurveTarget, lateral_limit
@@ -937,6 +970,12 @@ class CurveSlowdown:
       choice = 1
     max_drop = MAX_DROP_CHOICES_MPH[choice] if 0 <= choice < len(MAX_DROP_CHOICES_MPH) else DEFAULT_MAX_DROP_MPH
     self.logic = CurveSlowdownLogic(params.get_bool("IsMetric"), max_drop)
+    self.limit_mode = limit_mode
+    self.limit_follow = None
+    if limit_mode:
+      from opendbc.car.mazda.speed_limit_follow import SpeedLimitFollower
+      self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"))
+    self.limit_want = 0.0
     self.curve_enabled = curve_enabled
     self.stop_mode = stop_mode
     self.has_ti = bool(CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
@@ -1070,19 +1109,30 @@ class CurveSlowdown:
     # Stopped car ahead (Test: trigger and target are computed and logged, nothing is pressed)
     from opendbc.car.mazda.stopped_car_slowdown import plan_stop
     p_stop, p_ratio, p_d = False, 1.0, 0.0
+    path_x, path_y, model_length, lane_change = [], [], 0.0, False
     if self._alive('modelV2'):
       try:
         m = self.sm['modelV2']
-        p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), list(m.position.x), v_ego)
+        path_x, path_y = list(m.position.x), list(m.position.y)
+        model_length = float(path_x[-1]) if path_x else 0.0
+        p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), path_x, v_ego)
       except Exception:
         p_stop, p_ratio, p_d = False, 1.0, 0.0     # a malformed plan only loses the red-light latch
+      try:
+        lane_change = str(self.sm['modelV2'].meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
+      except Exception:
+        lane_change = False
+    from opendbc.car.mazda.stopped_car_slowdown import lead_path_offset
+    lead_y_path = (lead_path_offset(float(lead.dRel), float(lead.yRel), path_x, path_y)
+                   if (lead.status and path_x) else float(lead.yRel))
     stop_inputs = StoppedCarInputs(
       enabled=bool(CC.enabled), cruise_enabled=cruise_enabled, brake_pressed=bool(CS.out.brakePressed), v_ego=v_ego,
       lead_alive=self._alive('radarState'), lead_status=bool(lead.status), lead_prob=float(lead.modelProb),
       lead_d=float(lead.dRel), lead_v=float(lead.vLead), lead_y=float(lead.yRel), lead_a=float(getattr(lead, "aLeadK", 0.0)),
       radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)),
       model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration),
-      plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d, a_ego=float(CS.out.aEgo))
+      plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d, a_ego=float(CS.out.aEgo), lead_y_path=lead_y_path,
+      model_length=model_length, lane_change=lane_change)
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -1120,6 +1170,17 @@ class CurveSlowdown:
         curve_active = curve_active or mo.active
         fast_restore = mo.fast_restore
 
+    # Posted limit rising (speed_limit_follow.py; Test: logged only)
+    from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
+    self.limit_want = 0.0
+    if self.limit_follow is not None:
+      from opendbc.car.mazda.speed_limit_follow import LimitInputs
+      li = LimitInputs(limit=float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
+                       source=str(getattr(plan, "slcSpeedLimitSource", "") or ""),
+                       gps_trust=int(getattr(plan, "mapGpsTrust", 0) or 0), driver_speed=driver_speed,
+                       cruise_enabled=cruise_enabled)
+      self.limit_want = self.limit_follow.update(li)
+
     inputs = SlowdownInputs(
       enabled=bool(CC.enabled),
       cruise_enabled=cruise_enabled,
@@ -1143,8 +1204,15 @@ class CurveSlowdown:
       hold_restore=bool(self.trigger.hold_restore) and self.stop_mode == ON,
       btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       radar_lead=bool(self.trigger.radar_stable),
+      stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
+      limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
+    if self.limit_follow is not None:
+      try:
+        self._limit_bookkeeping(inputs)
+      except Exception:
+        pass
     if self.profile is not None:
       try:
         import time
@@ -1279,6 +1347,36 @@ class CurveSlowdown:
         self.map_event = None
 
   # ---- per-event logs (never raises into the car controller: called inside try/except) ----
+  def _limit_bookkeeping(self, i):
+    """Close the follower's offer once taken (On) or noted (Test), and log it."""
+    lg, lf = self.logic, self.limit_follow
+    adopted = lg.limit_adopted
+    if adopted is None and self.limit_mode == 1 and self.limit_want > 0:
+      adopted = (i.set_speed + lg.offset * lg.step, self.limit_want)
+    if adopted is not None:
+      o = lf.offer
+      lf.mark_adopted()
+      if self.recorder is not None:
+        import time
+        gap_steps = int(round((adopted[1] - i.set_speed) / lg.step))
+        self.recorder.record("speedLimitAdopt", time.monotonic(), {
+          "mode": "on" if self.limit_mode == 2 else "test", "old_mph": (o.old * lf.step / MS_PER_MPH) if o else None,
+          "new_mph": adopted[1] / MS_PER_MPH, "source": o.source if o else "", "set_mph": i.set_speed / MS_PER_MPH,
+          "driver_mph_before": adopted[0] / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "gap_steps": gap_steps,
+          "how": "taps" if gap_steps <= lg._quantum_steps() else "hold to 5 below, then taps",
+          "offer_age_s": round((lf.frame - o.frame) * DT_CTRL, 2) if o else None, "clear_ahead": i.stop_clear_ahead,
+          "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
+    if lf.events:
+      if self.recorder is not None:
+        import time
+        for kind, data in lf.events[-3:]:
+          unit = lf.step / MS_PER_MPH
+          self.recorder.record(kind, time.monotonic(), {"old_mph": data["old"] * unit, "new_mph": data["new"] * unit,
+                                                        "source": data["source"], "reason": data["reason"],
+                                                        "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH},
+                               min_gap=10.0, signals=False)
+      lf.events = []
+
   def _log(self, i, si, stop_active, button, a_ego, plan=None):
     if self.recorder is None:
       return
@@ -1298,7 +1396,14 @@ class CurveSlowdown:
         *self._map_row(plan), bool(self.decel_learner.active) if self.decel_learner else False, lg.latency or 0,
         (lg.anchor or 0.0) / MS_PER_MPH, si.plan_stop, si.plan_ratio, self.trigger.latched,
         self.trigger.early and self.trigger.active, self.trigger.lead_v_f, self.trigger.radar_stable,
-        self.trigger.radar_follow, self.trigger.radar_hold))
+        self.trigger.radar_follow, self.trigger.radar_hold,
+        si.lead_y_path if si.lead_y_path is not None else si.lead_y, self.trigger.leaving, self.trigger.clear_ahead,
+        self.trigger.warn_cond, round(self.trigger.warn_frames * DT_CTRL, 2), self.trigger.warn_start and self.trigger.active,
+        self.trigger.kind if self.trigger.active else "",
+        float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0) / MS_PER_MPH if plan is not None else 0.0,
+        str(getattr(plan, "slcSpeedLimitSource", "") or "") if plan is not None else "",
+        self.limit_follow.stable_speed / MS_PER_MPH if self.limit_follow else 0.0,
+        self.limit_follow.offer_speed / MS_PER_MPH if self.limit_follow else 0.0, self.limit_want / MS_PER_MPH))
     if lg.driver_events:
       # driver set speed changes while we managed it (what happened to the restore): one summary-only event per
       # frame (drive 44: five 400-row events in a few seconds helped make card lag); the episode events have the rows
@@ -1358,7 +1463,8 @@ class CurveSlowdown:
           "prob_rise_s": (round((self.trigger.confirm_frame - self.trigger.start_frame) * DT_CTRL, 2)
                           if self.trigger.early and self.trigger.confirm_frame >= 0 else None),
           "anchor_mph_end": (lg.anchor or 0.0) / MS_PER_MPH,
-          "radar_hold_s": round(getattr(self, "radar_hold_frames", 0) * DT_CTRL, 2)})
+          "radar_hold_s": round(getattr(self, "radar_hold_frames", 0) * DT_CTRL, 2),
+          "warn_start": self.trigger.warn_start, "clear_release": self.trigger.clear_release})
         self.stop_event = None
     if self.near_miss is not None and self.stop_mode in (1, 2):
       cand = self.trigger.near_miss_candidate(si)

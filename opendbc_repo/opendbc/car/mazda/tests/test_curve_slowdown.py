@@ -159,7 +159,8 @@ class CSC:
 
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
-        model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True):
+        model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
+        limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
@@ -173,7 +174,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   ever_active = False
   start = car.set_speed
   min_set = max_set = car.set_speed
-  a_ego, vs, follow, radar_hold = 0.0, [], [], []
+  a_ego, vs, follow, radar_hold, clear, kinds = 0.0, [], [], [], [], []
   for f in range(frames):
     if events and f in events:
       events[f](st, car)
@@ -191,7 +192,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                                 lead_v=v, lead_y=y, lead_a=getattr(lead, "a", 0.0) if status else 0.0,
                                 radar_has_lead=r_has, radar_lead_distance=r_dist,
                                 model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f),
-                                a_ego=a_ego)
+                                a_ego=a_ego, lead_y_path=lead.y_path(f, car) if (status and hasattr(lead, "y_path")) else None,
+                                model_length=model_length(f), lane_change=lane_change(f))
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
@@ -199,6 +201,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       hold_restore = trigger.hold_restore and stop_mode == 2
       follow.append(trigger.radar_follow)
       radar_hold.append(trigger.radar_hold)
+      clear.append(trigger.clear_ahead)
+      kinds.append(trigger.kind if active else None)
     if wheel_phase is not None and wheel_alive(f):
       ctr = ((f - wheel_phase) // 10) % 16       # the wheel's CRZ_BTNS frame every 10 frames (10 Hz)
     inp = cs.SlowdownInputs(btn_counter=ctr if wheel_phase is not None else -1, enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
@@ -206,7 +210,9 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
                             stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore,
-                            radar_lead=bool(lead is not None and trigger.radar_stable))
+                            radar_lead=bool(lead is not None and trigger.radar_stable),
+                            stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
+                            limit_raise=limit(f))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16
@@ -230,7 +236,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
     sets.append(car.set_speed)
   return dict(presses=presses, holds=holds, sets=sets, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
               start=start / MPH, logic=logic, trigger=trigger, ever_active=ever_active, vs=vs, follow=follow,
-              radar_hold=radar_hold, radar_hold_frames=sum(radar_hold))
+              radar_hold=radar_hold, radar_hold_frames=sum(radar_hold), clear=clear, kinds=kinds)
 
 
 def between(a, b, mph):

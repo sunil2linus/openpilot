@@ -64,7 +64,8 @@ def test_trigger_holds_half_a_second_and_releases():
     pass
   for _ in range(201):
     tr.update(inp(y=1.8))
-  assert not tr.active and tr.release_reason == "lead left the lane"
+  assert not tr.active and tr.release_reason == "lead leaving the lane"     # drive 4c: a jump out is a lane exit
+  assert tr.clear_release
   while not tr.update(inp()):
     pass
   assert not tr.update(inp(brake=True, cruise=False)) and "brake" in tr.release_reason
@@ -391,9 +392,9 @@ def test_lost_release_restores_gently_and_the_retrigger_wins():
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
 
 
-def test_left_lane_release_restores_by_taps_only():
-  # R3-1: the lead drifts out of our lane for good: a correct release, restored by taps at the relaxed pacing
-  # (no SET+ hold), never above the driver's speed.
+def test_left_lane_release_restores_with_the_fast_hold():
+  # R3-1: the lead drifts out of our lane for good: a correct release. Drive 4c: with nothing slower left in our lane
+  # the restore uses the SET+ hold (5 below, then taps), never above the driver's speed.
   lead = StoppedLead(120)
   orig_state = lead.state
   lead.state = lambda f, c: (lambda st: (st[0], st[1], st[2], st[3], 1.6 if f >= 350 else st[4]))(orig_state(f, c))
@@ -404,11 +405,9 @@ def test_left_lane_release_restores_by_taps_only():
   lead.tick = tick
   car = Car(45, dash_offset_mph=0.0, lag=10)
   r, rel = _releases(lambda: run(car, NO_CURVE, 3000, lead=lead, max_drop=10))
-  assert [reason for _, reason, _ in rel] == ["lead left the lane"], rel
+  assert [reason for _, reason, _ in rel] == ["lead leaving the lane"], rel
   assert rel[0][2] is False
-  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS], "no SET+ hold"
-  plus = _plus_frames(r)
-  assert plus and all(b - a >= cs.RELAXED_GAP_FRAMES for a, b in zip(plus, plus[1:])), plus
+  assert [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS], "a SET+ hold"
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
 
 
@@ -704,15 +703,26 @@ def test_a_low_confidence_slow_car_starts_the_slowdown_only_after_a_planned_stop
   assert any("not latched" in b for b in tr.blockers(_latched_inputs(plan_stop=False)))
 
 
+class _NoWarningStart:
+  """The early start alone, without the start on the stop ahead warning (drive 4c) that would also fire here."""
+  def __enter__(self):
+    self.old, scs.WARNING_START_ENABLED = scs.WARNING_START_ENABLED, False
+
+  def __exit__(self, *a):
+    scs.WARNING_START_ENABLED = self.old
+
+
 def test_the_early_start_still_needs_a_slow_car_near_our_lane_and_the_model_slowing():
-  for kw in (dict(lead_v=43 * MPH), dict(lead_status=False), dict(lead_y=2.5), dict(lead_d=160.0),
-             dict(model_accel=-0.2), dict(lead_prob=0.15)):
-    tr = scs.StoppedCarTrigger()
-    for _ in range(40):
-      tr.update(_latched_inputs(lead_status=False))
-    for _ in range(300):
-      tr.update(_latched_inputs(**kw, plan_stop=False) if False else _latched_inputs(**kw))
-    assert not tr.active, kw
+  # (a planned stop with no car for 1 s is now a start on the stop ahead warning: see the drive 4c tests)
+  with _NoWarningStart():
+    for kw in (dict(lead_v=43 * MPH), dict(lead_status=False), dict(lead_y=2.5), dict(lead_d=160.0),
+               dict(model_accel=-0.2), dict(lead_prob=0.15)):
+      tr = scs.StoppedCarTrigger()
+      for _ in range(40):
+        tr.update(_latched_inputs(lead_status=False))
+      for _ in range(300):
+        tr.update(_latched_inputs(**kw))
+      assert not tr.active, kw
 
 
 def test_an_early_start_is_confirmed_when_the_car_is_sure_and_then_slows_fast():
@@ -733,6 +743,11 @@ def test_an_early_start_is_confirmed_when_the_car_is_sure_and_then_slows_fast():
 
 
 def test_while_a_stop_is_planned_traffic_moving_and_lead_lost_wait():
+  with _NoWarningStart():
+    _while_a_stop_is_planned()
+
+
+def _while_a_stop_is_planned():
   tr = scs.StoppedCarTrigger()
   for _ in range(40):
     tr.update(_latched_inputs(lead_status=False))
@@ -792,14 +807,17 @@ def test_2112_replay_starts_earlier_and_lower_than_on_the_drive():
 
 
 def test_a_false_early_start_drops_a_few_mph_and_comes_back():
-  # a ghost "car" for 1.5 s while the model plans a stop that then goes away (a green light)
+  # a ghost "car" for 1.5 s while the model plans a stop that then goes away (a green light); the early start alone
+  # (the stop ahead warning start is covered by test_false_stop_ahead_warning_costs_a_few_mph_and_comes_back_fast)
   class Ghost(StoppedLead):
     def state(self, f, car):
       return (True, 0.25, 115.0, 12 * MPH, 0.5) if 100 <= f < 250 else (False, 0.0, 0.0, 0.0, 0.0)
 
   plan = lambda f: f < 300  # noqa: E731
   model = lambda f: -0.6 if f < 300 else 0.3  # noqa: E731
-  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=Ghost(115.0), stop_mode=2, max_drop=10, model=model, plan=plan)
+  with _NoWarningStart():
+    r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=Ghost(115.0), stop_mode=2, max_drop=10, model=model,
+            plan=plan)
   assert r["ever_active"] and r["holds"] == []
   assert r["min"] >= 45 - 3 - 1e-6, r["min"]
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
@@ -1064,12 +1082,13 @@ def test_radar_flicker_during_the_approach_keeps_lowering_and_never_restores():
 def test_a_single_noisy_lead_speed_frame_does_not_start_a_stop():
   # T1: vLead jumped 18 / 28 / 42 mph frame to frame for a car doing ~40: the filtered speed never looks slow
   cycle = [18, 28, 42, 39, 40, 41]
-  tr = scs.StoppedCarTrigger()
-  for f in range(400):
-    tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=cycle[(f // 10) % len(cycle)] * MPH))
-    assert not tr.active, f
-  tr = scs.StoppedCarTrigger()                  # sanity: a car really at 13 mph does start it
-  assert any(tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH)) for _ in range(400))
+  with _NoWarningStart():
+    tr = scs.StoppedCarTrigger()
+    for f in range(400):
+      tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=cycle[(f // 10) % len(cycle)] * MPH))
+      assert not tr.active, f
+    tr = scs.StoppedCarTrigger()                  # sanity: a car really at 13 mph does start it
+    assert any(tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH)) for _ in range(400))
 
 
 class _T1Lead(StoppedLead):
@@ -1136,3 +1155,326 @@ def test_radar_follow_needs_a_moving_car_and_a_dropout_needs_longer_to_count_aga
   for _ in range(60):
     tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH, radar_has_lead=True))
   assert tr3.radar_stable and tr3.radar_follow
+
+
+# ---------------- drive 4c: clear restore, car leaving our lane, start on the stop ahead warning ----------------
+
+def _brake(s, c):
+  s["cruise"], s["brake"] = False, True
+
+
+def _resume(s, c):
+  s["cruise"], s["brake"] = True, False
+
+
+class _Switch(StoppedLead):
+  """A stopped car until frame F; from then the only car ahead is `after_d` m away at `after_mph` (tag 3: a car
+  79 m ahead at 36 mph when cruise came back)."""
+  def __init__(self, F, d0, after_mph=36.0, after_d=79.0, **kw):
+    super().__init__(d0, **kw)
+    self.F, self.after_v, self.after_d = F, after_mph * MPH, after_d
+
+  def tick(self, car):
+    if self.frame + 1 == self.F:
+      self.d, self.v = self.after_d, self.after_v
+    super().tick(car)
+
+
+def test_brake_release_is_clear_only_without_a_slower_car_in_our_lane():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw()):
+    pass
+  tr.update(_sw(brake_pressed=True))
+  assert not tr.active and tr.release_reason == "cruise off / brake" and tr.clear_release
+  tr.update(_sw(brake_pressed=True, lead_status=False))
+  assert tr.clear_ahead                                                  # nothing ahead
+  for _ in range(60):
+    tr.update(_sw(brake_pressed=True, v_ego=27 * MPH, lead_v=36 * MPH, lead_d=79.0, lead_prob=0.9, lead_y=0.1))
+  assert tr.clear_ahead                                                  # faster than us (tag 3)
+  for _ in range(60):
+    tr.update(_sw(brake_pressed=True, lead_v=0.0, lead_d=60.0, lead_prob=0.9, lead_y=0.1))
+  assert not tr.clear_ahead                                              # a stopped car in our lane
+  tr.update(_sw(brake_pressed=True, lead_v=0.0, lead_d=60.0, lead_prob=0.9, lead_y=0.1, lead_y_path=1.6))
+  assert tr.clear_ahead                                                  # ... the next lane over
+  tr.update(_sw(brake_pressed=True, lead_v=0.0, lead_d=60.0, lead_prob=0.3, lead_y=0.1))
+  assert tr.clear_ahead                                                  # too unsure to count
+
+
+def test_lost_release_is_never_clear():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw()):
+    pass
+  for _ in range(600):
+    tr.update(_sw(lead_status=False, model_alive=False))
+  assert not tr.active and tr.release_reason.startswith("lead lost")
+  for _ in range(1000):
+    tr.update(_sw(lead_status=False, model_alive=False))
+    assert not tr.clear_ahead
+
+
+def test_drive_4c_brake_release_restores_with_a_hold_when_the_car_ahead_is_faster():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, events={330: _brake, 600: _resume},
+                                 lead=_Switch(330, 100), max_drop=10))
+  assert rel and rel[0][1] == "cruise off / brake"
+  ups = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups and 600 <= ups[0]["frame"] <= 600 + 150 and near(ups[0]["bound_mph"], 40), ups[:1]
+  tail = [mph for f, mph in _set_changes(r) if f > 600]
+  assert tail[-6:] == [40.0, 41.0, 42.0, 43.0, 44.0, 45.0], tail
+  back = next(k for k, s in enumerate(r["sets"]) if k > 600 and near(s / MPH, 45))
+  assert (back - 600) * T.DT <= 5.0, back
+  assert r["max"] <= 45 + 1e-6
+
+
+def test_brake_release_stays_gentle_while_a_slower_car_is_ahead():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, events={330: _brake, 600: _resume},
+                                 lead=_Switch(330, 100, after_mph=12.0, after_d=60.0), max_drop=10))
+  ups = [f for f, b in r["presses"] if b == cs.SET_PLUS and f < 1000]
+  assert ups and all(b - a >= cs.RELAXED_GAP_FRAMES for a, b in zip(ups, ups[1:])), ups
+  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] < 1000]
+  assert r["max"] <= 45 + 1e-6
+
+
+def _stop_with_car_active(**kw):
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_sw(lead_prob=0.9, lead_y=0.2, **kw)):
+    pass
+  return tr
+
+
+def test_leaving_needs_offset_drift_raw_agreement_and_half_a_second():
+  tr = _stop_with_car_active()
+  ys = [0.2] * 50 + [0.2 + 0.0065 * k for k in range(100)] + [0.85] * 200     # drifts out to 0.85 and stays
+  n = None
+  for k, y in enumerate(ys):
+    if not tr.update(_sw(lead_prob=0.9, lead_y=y)):
+      n = k
+      break
+  assert n is not None and tr.release_reason == "lead leaving the lane" and tr.clear_release, (n, tr.release_reason)
+  first_out = next(k for k, y in enumerate(ys) if y >= scs.LEAVE_Y_MIN)
+  assert first_out + 40 <= n <= first_out + 120, (first_out, n)
+  # offset constant from the start (no drift): stays
+  tr = _stop_with_car_active(lead_y_path=0.9)
+  for _ in range(300):
+    assert tr.update(_sw(lead_prob=0.9, lead_y=0.9, lead_y_path=0.9))
+  # raw yRel grows on a curve but the car stays on our path: stays
+  tr = _stop_with_car_active()
+  for k in range(300):
+    assert tr.update(_sw(lead_prob=0.9, lead_y=min(0.2 + 0.01 * k, 1.9), lead_y_path=0.1))
+  # the path wobbles but raw yRel says centred: stays
+  tr = _stop_with_car_active()
+  for k in range(300):
+    assert tr.update(_sw(lead_prob=0.9, lead_y=0.2, lead_y_path=min(0.2 + 0.01 * k, 1.0)))
+
+
+def test_lead_switch_restarts_the_lateral_baseline():
+  tr = _stop_with_car_active(lead_d=60.0)
+  for k in range(30):
+    tr.update(_sw(lead_prob=0.9, lead_d=60.0, lead_y=0.2 + 0.02 * k))
+  for k in range(300):                       # another car (110 m) at 0.1 -> 0.6: never "leaving"
+    assert tr.update(_sw(lead_prob=0.9, lead_d=110.0, lead_y=min(0.1 + 0.005 * k, 0.6)))
+
+
+class _Tag2(SlowingLead):
+  """Tag 2: a car slowing at a red light, centred, then moving into a right-turn lane (-0.25 -> -1.8 m)."""
+  def y_path(self, f, car):
+    return -0.25 if f < 150 else max(-1.8, -0.25 - (f - 150) * 0.0075)
+
+  def state(self, f, car):
+    st = super().state(f, car)
+    return (st[0], st[1], st[2], st[3], self.y_path(f, car)) if st[0] else st
+
+
+def test_tag2_replay_suv_turning_right_releases_within_a_second_and_restores_fast():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500,
+                                 lead=_Tag2(90, 31, decel=1.0, v_end=8.0, prob=0.9), max_drop=10,
+                                 model=lambda f: -0.7 if f < 300 else 0.3, plan=lambda f: f < 300))
+  assert r["logic"].hold_log[0]["direction"] == cs.SET_MINUS
+  out = 150 + int((scs.LEAVE_Y_MIN - 0.25) / 0.0075)      # first frame |y| >= 0.8
+  assert rel and rel[0][1] == "lead leaving the lane" and rel[0][0] <= out + 100, (rel, out)
+  assert not [f for f in _minus_frames(r) if f > rel[0][0]]           # never lowered for that car again
+  ups = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups, "fast restore"
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6 and r["min"] >= 20 - 1e-6
+
+
+class _CurveAhead(StoppedLead):
+  """A stopped car straight ahead in a curve: raw yRel grows to 1.9 m, the offset from the path stays 0.1."""
+  def y_path(self, f, car):
+    return 0.1
+
+  def state(self, f, car):
+    st = super().state(f, car)
+    return (st[0], st[1], st[2], st[3], min(0.1 + f * 0.009, 1.9)) if st[0] else st
+
+
+def test_stopped_car_straight_ahead_in_a_curve_is_not_released():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=_CurveAhead(100), max_drop=10))
+  assert [x[1] for x in rel][:1] == ["ego stopped behind the lead"], rel
+  assert near(r["min"], 20)
+
+
+def test_a_car_that_left_our_lane_does_not_start_it_again_until_it_comes_back():
+  tr = _stop_with_car_active()
+  for k in range(400):
+    tr.update(_sw(lead_prob=0.9, lead_y=min(0.2 + 0.01 * k, 1.8)))
+  assert not tr.active and tr.release_reason == "lead leaving the lane" and tr.left_car
+  for _ in range(300):
+    assert not tr.update(_sw(lead_prob=0.9, lead_y=1.8))      # still slow, still in the next lane: no restart
+  for _ in range(100):
+    tr.update(_sw(lead_prob=0.9, lead_y=0.1))                 # it came back in front of us
+  assert tr.active
+
+
+def test_warning_gates_match_the_planner_warning():
+  sw = _stop_warning()
+  v = 20.0
+  ts, vs, xs = _plan(v, 0.0, 3.0)
+  for lead in (dict(lead_status=False), dict(lead_d=40.0, lead_v=19.0), dict(lead_d=150.0, lead_v=19.0),
+               dict(lead_d=150.0, lead_v=0.0), dict(lead_d=230.0, lead_v=0.0)):
+    for model_length in (0.0, 120.0, 190.0):
+      kw = dict(lead_status=True, lead_d=0.0, lead_v=0.0, lead_a=0.0)
+      kw.update(lead)
+      ref = sw.lead_is_relevant(kw["lead_status"], kw["lead_d"], kw["lead_v"], 0.0, False, v, model_length)
+      mine = scs.lead_relevant(kw["lead_status"], kw["lead_d"], kw["lead_v"], 0.0, False, v, model_length)
+      if model_length > 0:
+        assert mine == ref, (lead, model_length)
+  assert scs.WARN_DEBOUNCE == sw.STOP_DEBOUNCE and scs.WARN_DROPOUT == sw.STOP_DROPOUT
+  assert scs.WARN_MIN_SPEED == sw.STOP_MIN_SPEED and scs.WARN_NOT_SLOWING_ACCEL == sw.NOT_SLOWING_ACCEL
+  assert scs.WARN_ACCEL_TAU == sw.ACCEL_FILTER_TAU and scs.WARN_LANE_CHANGE_HOLD == sw.LANE_CHANGE_HOLD
+  assert scs.WARN_REARM == sw.REARM_TIME
+  assert scs.PLAN_STOP_RATIO == sw.STOP_SLOWDOWN and scs.PLAN_STOP_DECEL == sw.STOP_DECEL
+
+
+def test_stop_ahead_warning_alone_starts_a_floor_hold_after_one_second():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_latched_inputs(lead_status=False, plan_stop=False))
+  n = 0
+  while not tr.update(_latched_inputs(lead_status=False)):
+    n += 1
+    assert n < 200
+    if 20 < n < 95:
+      assert any("warning held" in b for b in tr.blockers(_latched_inputs(lead_status=False)))
+  assert 98 <= n <= 102, n
+  assert tr.kind == scs.STOP_AHEAD and tr.warn_start and tr.urgent and tr.floor_mode
+  assert near(tr.target / MPH, 20)
+
+
+def test_stop_ahead_start_is_blocked_by_a_relevant_lead_lane_change_braking_or_low_speed():
+  cases = (dict(lead_status=True, lead_d=40.0, lead_v=40 * MPH, lead_prob=0.9, lead_y=0.1), dict(lane_change=True),
+           dict(a_ego=-0.8),
+           dict(v_ego=22 * MPH), dict(brake_pressed=True), dict(plan_stop=False))
+  for kw in cases:
+    tr = scs.StoppedCarTrigger()
+    base = dict(lead_status=False)
+    base.update(kw)
+    for _ in range(300):
+      tr.update(_latched_inputs(**base))
+    assert not tr.active, kw
+
+
+def test_stop_ahead_hands_over_to_the_car_when_it_appears():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_latched_inputs(lead_status=False)):
+    pass
+  for _ in range(50):                                 # a car at our speed: still the planned stop
+    assert tr.update(_latched_inputs(lead_prob=0.9, lead_d=60.0, lead_v=44 * MPH, lead_y=0.1))
+  assert tr.kind == scs.STOP_AHEAD
+  tr.update(_latched_inputs(lead_prob=0.4, lead_d=113.0, lead_v=27 * MPH, lead_y=0.3))
+  assert tr.active and tr.kind == scs.STOP_WITH_CAR and tr.urgent and tr.floor_mode
+  assert near(tr.target / MPH, 20)
+
+
+def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_latched_inputs(lead_status=False)):
+    pass
+  for _ in range(99):
+    assert tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
+  assert not tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
+  assert tr.release_reason.startswith("stop ahead cleared") and tr.restore_now
+  # the model stays a little negative: released once the latch runs out (LATCH_HOLD)
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_latched_inputs(lead_status=False)):
+    pass
+  n = 0
+  while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
+    n += 1
+    assert n < 1000
+  assert abs(n - scs.LATCH_HOLD / scs.DT_CTRL) <= 3 and tr.release_reason.startswith("stop ahead cleared")
+  # and not again for the same stop: the condition must be gone WARN_REARM first
+  tr2 = scs.StoppedCarTrigger()
+  while not tr2.update(_latched_inputs(lead_status=False)):
+    pass
+  tr2.update(_latched_inputs(lead_status=False, brake_pressed=True))
+  for _ in range(250):
+    assert not tr2.update(_latched_inputs(lead_status=False))
+
+
+def test_stop_ahead_brake_release_is_clear():
+  tr = scs.StoppedCarTrigger()
+  while not tr.update(_latched_inputs(lead_status=False)):
+    pass
+  tr.update(_latched_inputs(lead_status=False, brake_pressed=True))
+  assert not tr.active and tr.clear_release and tr.clear_ahead
+
+
+class _Tag4(SlowingLead):
+  """Tag 4: the stop is planned from frame 100 (the warning holds 1 s), the car is seen 0.8 s after that."""
+  def state(self, f, car):
+    if f < 280:
+      return (False, 0.0, 0.0, 0.0, 0.0)
+    return (True, 0.4 if f < 360 else 0.9, self.d, self.v, 0.3)
+
+
+def test_tag4_replay_lowering_starts_on_the_warning_before_the_car_is_seen():
+  def go():
+    return run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1200, lead=_Tag4(150, 27, decel=1.5, v_end=0.0), max_drop=10,
+               model=lambda f: -0.7, plan=lambda f: f >= 100)
+  r = go()
+  first = first_frame(r)
+  assert r["holds"] and r["holds"][0] == first and first <= 215, (first, r["holds"][:2])
+  at20 = next(k for k, s in enumerate(r["sets"]) if near(s / MPH, 20))
+  assert (at20 - first) * T.DT <= 3.5 and r["min"] >= 20 - 1e-6
+  with _NoWarningStart():
+    r2 = go()
+  assert first_frame(r2) >= first + 100, (first_frame(r2), first)
+
+
+class _NoCar(StoppedLead):
+  def state(self, f, car):
+    return (False, 0.0, 0.0, 0.0, 0.0)
+
+  def tick(self, car):
+    self.frame += 1
+
+
+def test_false_stop_ahead_warning_costs_a_few_mph_and_comes_back_fast():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10,
+                                 model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400))
+  assert rel and rel[0][1].startswith("stop ahead cleared") and rel[0][2]
+  assert [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS], "restored with a SET+ hold"
+  assert r["logic"].holds_allowed                                   # the cut-short SET- hold did not switch holds off
+  back = next(k for k, s in enumerate(r["sets"]) if k > rel[0][0] and near(s / MPH, 45))
+  assert (back - rel[0][0]) * T.DT <= 7.0, back
+  assert r["max"] <= 45 + 1e-6 and min(r["vs"]) / MPH >= 45 - 20
+
+
+def test_stop_ahead_start_in_test_mode_sends_nothing():
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=_NoCar(200), stop_mode=1, max_drop=10,
+          model=lambda f: -0.7, plan=lambda f: f >= 100)
+  assert r["ever_active"] and r["presses"] == [] and r["holds"] == []
+
+
+def test_stop_ahead_then_a_radar_followed_car_is_left_to_the_mrcc():
+  class Appears(SlowingLead):
+    def state(self, f, car):
+      return (True, 0.9, self.d, self.v, 0.1) if f >= 250 else (False, 0.0, 0.0, 0.0, 0.0)
+  lead = Appears(150, 30, decel=0.5, v_end=5.0, radar_from=1000, follow_from=80)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=lead, max_drop=10, model=lambda f: -0.7,
+          plan=lambda f: f >= 100)
+  assert r["holds"] and r["holds"][0] <= 215
+  rh = r["radar_hold"]
+  first_rh = rh.index(True)
+  assert all(f < first_rh for f in _minus_frames(r)), (first_rh, _minus_frames(r)[-3:])
+  assert r["min"] >= 20 - 1e-6

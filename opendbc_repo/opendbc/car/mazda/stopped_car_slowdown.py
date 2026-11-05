@@ -124,6 +124,58 @@ EARLY_CONFIRM_PROB = 0.4    # an early start is confirmed (holds, fast pace) onc
 EARLY_CONFIRM_TIME = 0.3    # ... for this long, or the stop is urgent
 RELEASE_LOST_TIME_LATCHED = 5.0  # s without the car before "lead lost" while the plan still shows a stop
 
+# Restore after a release where the car may still be ahead (drive 4c, tag 3 / t 778): cruise re-engaged 2 s after the
+# driver braked at a red light; the only car ahead was 79 m away at 36 mph against our 27, yet the set speed came back
+# 35 -> 45 by 0.5 s taps (the "cruise off / brake" release restores gently). Now such a release (CLEAR_RELEASE_REASONS)
+# restores with the usual SET+ hold rule whenever no slower car is in our lane (clear_ahead, checked every frame); a
+# "lead lost (vision)" release stays gentle: there "no lead" is the dropout itself.
+CLEAR_RELEASE_REASONS = frozenset({"cruise off / brake", "openpilot disengaged", "lead left the lane", "lead leaving the lane"})
+CLEAR_LATERAL = MAX_LATERAL         # m: |lead offset from our path| within this is "in our lane" for the restore check
+CLEAR_MIN_PROB = STOP_CAR_MIN_PROB  # a car sure enough to start a stop with car keeps the restore gentle
+CLEAR_SLOWER = MIN_CLOSING          # m/s: a car at least this much slower than us (or stopped) keeps the restore gentle
+
+# A car ahead moving out of our lane (drive 4c, tag 2, t 736-740): a white SUV slowing for a red light, centred
+# (yRel -0.15..-0.34 m at 65-100 m, prob 0.87-0.96) when the stop with car started and held 45 -> 35, then drifting
+# into a right-turn lane: -0.82 (738), -0.95 (739), -1.68 (740); the driver braked at 740 while we still held, since
+# "still there" allows |yRel| <= 2.0 m and the lost release takes 2-5 s. Now the episode is released once the car's
+# offset from the model path is LEAVE_Y_MIN or more, has grown LEAVE_DRIFT from its smallest value in this episode,
+# and the raw yRel agrees (so a curve, which bends the path too, does not count), for LEAVE_TIME. A lead switch
+# (LEAD_JUMP) restarts the baseline. The release is a "clear" one: the SET- hold stops at once and the restore uses
+# SET+ holds unless another slower car is in our lane.
+LEAVE_ENABLED = True
+LEAVE_Y_MIN = 0.8           # m: tag 2's first clearly-off reading was 0.82; centred readings were 0.15-0.34
+LEAVE_DRIFT = 0.4           # m grown since the episode's smallest |offset| (0.82 - 0.34 = 0.48 at the worst baseline)
+LEAVE_TIME = 0.5            # s
+LEAVE_TAU = 0.2             # s: low-pass on the path offset
+LEAVE_MAX_DISTANCE = 120.0  # m: beyond this the lead's lateral position is too noisy to call (tag 2: 65-100 m)
+LEAVE_MIN_PROB = LOST_MIN_PROB
+# a car released as leaving does not start a slowdown again until its offset is below LEAVE_Y_MIN - LEAVE_BACK (it
+# came back) or another car is the lead
+LEAVE_BACK = 0.5            # m
+
+# Red light, no car seen yet (drive 4c, tag 4, 45 mph): the planner's STOP AHEAD warning fired at t 1654.0, the
+# camera's first lead (prob 0.40, 113 m, 27 mph) at 1654.8, our first SET- tap at 1655.2 (early start: taps until
+# confirmed), the hold only at 1656.2, 20 mph at 1658.8; the driver braked at 1659.2 (-4.4 m/s^2). The owner wants
+# the lowering to start on the warning itself, with the long press at once. Evidence for the warning: 6 of 6 this
+# drive and 17 of 17 on earlier drives were followed by the driver braking within 0.8-5 s; starpilotPlan.redLight
+# (FrogPilot's flag) fired 8 times at speed with no stop and is not used. The warning's gates are replicated here
+# (stop_warning.py: STOP_DEBOUNCE / STOP_DROPOUT / STOP_MIN_SPEED / NOT_SLOWING_ACCEL / ACCEL_FILTER_TAU /
+# LANE_CHANGE_HOLD / REARM_TIME and lead_is_relevant) rather than read from starpilotOnroadEvents: that event only
+# exists while StopWarningRedLight is On, is a one-frame pulse re-published at 1 Hz, and the plan rule itself is
+# already replicated (plan_stop).
+WARNING_START_ENABLED = True
+WARN_DEBOUNCE = 1.0            # s the warning condition must hold (STOP_DEBOUNCE)
+WARN_DROPOUT = 0.25            # s (STOP_DROPOUT)
+WARN_MIN_SPEED = 25 * MS_PER_MPH   # (STOP_MIN_SPEED)
+WARN_NOT_SLOWING_ACCEL = -0.5  # m/s^2 on the filtered aEgo: the MRCC / driver is not already slowing (NOT_SLOWING_ACCEL)
+WARN_ACCEL_TAU = 0.5           # s (ACCEL_FILTER_TAU)
+WARN_LANE_CHANGE_HOLD = 2.0    # s (LANE_CHANGE_HOLD)
+WARN_REARM = 3.0               # s the condition must be gone before another start on the warning (REARM_TIME)
+WARN_FLOOR = True              # a warning-only start aims at the floor (20 mph) with a SET- hold at once (owner)
+STOP_AHEAD = "stop ahead"      # kind: the planned stop alone, no car seen yet
+# FrogPilot's lead relevance (stop_warning.lead_is_relevant), duplicated so this module stays dependency free
+REL_STOP_DISTANCE, REL_LEAD_STOP_MARGIN, REL_MAX_T_FOLLOW, REL_PLANNER_TIME, REL_CRUISING_SPEED = 6.0, 4.0, 3.0, 10.0, 5.0
+
 # Near-miss candidate (logged when the trigger did not fire)
 NEAR_MISS_LEAD_SPEED = 3.0
 NEAR_MISS_DISTANCE = 120.0
@@ -156,6 +208,9 @@ class StoppedCarInputs:
   plan_ratio: float = 1.0           # slowest planned speed in the horizon / ours (logs)
   plan_stop_d: float = 0.0          # m to where the stop is planned (logs)
   a_ego: float = 0.0                # m/s^2 (CS.out.aEgo): the MRCC braking for the car ahead
+  lead_y_path: float | None = None  # m: the lead's offset from the model path (yRel sign, lead_path_offset); None = lead_y
+  model_length: float = 0.0         # m: modelV2.position.x[-1] (the planner's model_length), for the lead relevance
+  lane_change: bool = False         # modelV2.meta.laneChangeState starting / finishing
 
 
 def _interp(x, xp, fp):
@@ -196,6 +251,25 @@ def plan_stop(model_t, model_v, model_x, v_ego):
 def stopped_car_target(d_rel, floor=FLOOR_SPEED, decel=TARGET_DECEL, margin=TARGET_MARGIN):
   """Set speed (true speed, m/s) from which a `decel` slowdown reaches `floor` `margin` m before the lead."""
   return math.sqrt(floor ** 2 + 2 * decel * max(d_rel - margin, 0.0))
+
+
+def lead_path_offset(lead_d, lead_y, model_x, model_y):
+  """lead_y (radarState yRel = -lead y, so right positive) plus the model path's lateral position at the lead's
+  distance (model y is left positive), so a car in our lane on a curve reads ~0. Returns lead_y without a path."""
+  xs, ys = list(model_x), list(model_y)
+  if len(xs) < 2 or len(xs) != len(ys):
+    return lead_y
+  return lead_y + _interp(lead_d, xs, ys)
+
+
+def lead_relevant(lead_status, lead_d, lead_v, lead_a, standstill, v_ego, model_length):
+  """stop_warning.lead_is_relevant (FrogPilot's is_lead_relevant); model_length <= 0 (unknown) skips its path term."""
+  following_speed = max(v_ego, REL_CRUISING_SPEED)
+  lead_speed = lead_v + min(lead_a, 0.0) * REL_PLANNER_TIME / 2
+  in_path = model_length <= 0 or lead_d < (0.0 if standstill else model_length) + REL_STOP_DISTANCE + REL_LEAD_STOP_MARGIN
+  return bool(lead_status and in_path and
+              lead_d < REL_STOP_DISTANCE + following_speed * REL_MAX_T_FOLLOW +
+              max(following_speed - lead_speed, 0.0) * REL_PLANNER_TIME)
 
 
 def urgency(v_ego, lead_d, lead_v):
@@ -256,12 +330,34 @@ class StoppedCarTrigger:
     self.radar_flicker = False       # a follow ended by a dropout this episode: RADAR_REACQUIRE_TIME to count again
     self.radar_hold = False          # active, and the MRCC handles the car ahead: no SET- / SET+ from us
     self.radar_match_frames = 0      # following at the car's speed
+    # restore after a brake / lane exit release (CLEAR_*)
+    self.clear_release = False       # the last release was one where the car ahead may be gone (CLEAR_RELEASE_REASONS)
+    self.clear_ahead = False         # ... and no slower car is in our lane now: the restore may use SET+ holds
+    # the car ahead leaving our lane (LEAVE_*)
+    self.y_f = None                  # filtered offset from the path
+    self.y_base = None               # smallest |y_f| this episode / since the last lead switch
+    self.leave_frames = 0
+    self.leaving = False
+    self.left_car = False            # the current lead was released as leaving our lane: it does not start one again
+    # the stop ahead warning (WARN_*)
+    self.a_f = None
+    self.since_lane_change = _frames(WARN_LANE_CHANGE_HOLD)
+    self.warn_frames = 0
+    self.warn_gap = 0
+    self.warn_off_frames = _frames(WARN_REARM)
+    self.warn_cond = False
+    self.warning = False             # the warning condition has held WARN_DEBOUNCE
+    self.warn_latched = False        # an episode started on the warning: the condition must be gone WARN_REARM first
+    self.warn_start = False          # this episode started on the warning alone (logs)
 
   def _filter_lead_v(self, i):
     if i.lead_alive and i.lead_status:
       if self.prev_lead_d is not None and abs(i.lead_d - self.prev_lead_d) > LEAD_JUMP:
         self.lead_v_hist = []        # another car: start again
         self.radar_follow = False
+        self.y_f = self.y_base = None
+        self.leave_frames = 0
+        self.left_car = False
       self.prev_lead_d = i.lead_d
       self.lead_v_hist.append((self.frame, i.lead_v))
     else:
@@ -298,9 +394,58 @@ class StoppedCarTrigger:
                i.v_ego - self.lead_v_f <= RADAR_FOLLOW_CLOSING and not stopping)
     self.radar_match_frames = self.radar_match_frames + 1 if matched else 0
 
+  @staticmethod
+  def _y_path(i):
+    return i.lead_y if i.lead_y_path is None else i.lead_y_path
+
+  def _update_leaving(self, i):
+    present = i.lead_alive and i.lead_status
+    if not present:
+      self.left_car = False
+    if present:
+      y = self._y_path(i)
+      alpha = DT_CTRL / (LEAVE_TAU + DT_CTRL)
+      self.y_f = y if self.y_f is None else self.y_f + alpha * (y - self.y_f)
+      if self.left_car and abs(self.y_f) < LEAVE_Y_MIN - LEAVE_BACK:
+        self.left_car = False        # it came back into our lane
+      if self.active:
+        self.y_base = abs(self.y_f) if self.y_base is None else min(self.y_base, abs(self.y_f))
+    self.leaving = bool(LEAVE_ENABLED and self.active and present and self.y_f is not None and self.y_base is not None and
+                        i.lead_prob >= LEAVE_MIN_PROB and 0 < i.lead_d <= LEAVE_MAX_DISTANCE and
+                        abs(self.y_f) >= LEAVE_Y_MIN and abs(i.lead_y) >= LEAVE_Y_MIN and
+                        abs(self.y_f) - self.y_base >= LEAVE_DRIFT)
+    self.leave_frames = self.leave_frames + 1 if self.leaving else 0
+
+  def _update_warning(self, i):
+    alpha = DT_CTRL / (WARN_ACCEL_TAU + DT_CTRL)
+    self.a_f = i.a_ego if self.a_f is None else self.a_f + alpha * (i.a_ego - self.a_f)
+    self.since_lane_change = 0 if i.lane_change else self.since_lane_change + 1
+    relevant = lead_relevant(i.lead_alive and i.lead_status, i.lead_d, i.lead_v, i.lead_a, i.v_ego < EGO_STOPPED_SPEED,
+                             i.v_ego, i.model_length)
+    self.warn_cond = bool(i.plan_stop and i.cruise_enabled and not i.brake_pressed and self.a_f > WARN_NOT_SLOWING_ACCEL and
+                          i.v_ego >= WARN_MIN_SPEED and not relevant and
+                          self.since_lane_change >= _frames(WARN_LANE_CHANGE_HOLD))
+    if self.warn_cond:
+      self.warn_frames += 1
+      self.warn_gap = 0
+      self.warn_off_frames = 0
+    else:
+      self.warn_gap += 1
+      self.warn_off_frames += 1
+      if self.warn_gap > _frames(WARN_DROPOUT):
+        self.warn_frames = 0
+      if self.warn_off_frames >= _frames(WARN_REARM):
+        self.warn_latched = False
+    self.warning = self.warn_cond and self.warn_frames >= _frames(WARN_DEBOUNCE)
+
+  def _slower_car_ahead(self, i):
+    v = self.lead_v_f
+    return (i.lead_alive and i.lead_status and i.lead_prob >= CLEAR_MIN_PROB and abs(self._y_path(i)) <= CLEAR_LATERAL and
+            0 < i.lead_d <= STOP_CAR_MAX_DISTANCE and (v <= STOPPED_SPEED or i.v_ego - v >= CLEAR_SLOWER))
+
   def _lead_ok(self, i):
     v = self.lead_v_f
-    return (i.lead_alive and i.lead_status and i.lead_prob >= MIN_PROB and abs(i.lead_y) <= MAX_LATERAL and
+    return (not self.left_car and i.lead_alive and i.lead_status and i.lead_prob >= MIN_PROB and abs(i.lead_y) <= MAX_LATERAL and
             v <= STOPPED_SPEED and i.v_ego - v >= MIN_CLOSING and i.lead_d > 0)
 
   @staticmethod
@@ -310,7 +455,7 @@ class StoppedCarTrigger:
   def _slow_car(self, i, max_lateral=STOP_CAR_MAX_LATERAL, min_prob=STOP_CAR_MIN_PROB):
     """A car ahead (near our lane) that is stopped or much slower than us (its filtered speed)."""
     v = self.lead_v_f
-    return (i.lead_alive and i.lead_status and i.lead_prob >= min_prob and abs(i.lead_y) <= max_lateral and
+    return (not self.left_car and i.lead_alive and i.lead_status and i.lead_prob >= min_prob and abs(i.lead_y) <= max_lateral and
             0 < i.lead_d <= STOP_CAR_MAX_DISTANCE and
             (i.v_ego - v >= STOP_CAR_SLOWER or v <= STOP_CAR_RATIO * i.v_ego))
 
@@ -374,6 +519,18 @@ class StoppedCarTrigger:
       out.append(f"stop with car: model accel {i.model_accel:.2f} > {MODEL_SLOW_ACCEL}")
     if i.lead_status and STOP_CAR_EARLY_MIN_PROB <= i.lead_prob < STOP_CAR_MIN_PROB and not self.latched:
       out.append("stop ahead not latched (a low-confidence car only counts after a planned stop)")
+    if i.plan_stop and not self.active:
+      if self.since_lane_change < _frames(WARN_LANE_CHANGE_HOLD):
+        out.append("stop ahead: lane change")
+      if self.a_f is not None and self.a_f <= WARN_NOT_SLOWING_ACCEL:
+        out.append(f"stop ahead: already slowing aEgo {self.a_f:.2f}")
+      if lead_relevant(i.lead_alive and i.lead_status, i.lead_d, i.lead_v, i.lead_a, i.v_ego < EGO_STOPPED_SPEED,
+                       i.v_ego, i.model_length):
+        out.append("stop ahead: lead relevant")
+      if self.warn_latched:
+        out.append("stop ahead: already started for this stop")
+      elif self.warn_cond and not self.warning:
+        out.append(f"stop ahead: warning held {self.warn_frames * DT_CTRL:.2f} s < {WARN_DEBOUNCE}")
     if not out and not self.active:
       out.append(f"held {self.hold_frames * DT_CTRL:.2f} s < {HOLD_TIME}")
     return out
@@ -388,7 +545,9 @@ class StoppedCarTrigger:
     self.prev_radar_has_lead = i.radar_has_lead
     self._filter_lead_v(i)
     self._update_latch(i)
+    self._update_warning(i)
     self._update_radar(i)
+    self._update_leaving(i)
     lead_ok = self._lead_ok(i)
     stop_with_car = self._stop_with_car(i)
     gates = (i.enabled and i.cruise_enabled and not i.brake_pressed and
@@ -406,19 +565,41 @@ class StoppedCarTrigger:
         if self.early_gap > _frames(EARLY_DROPOUT) or not self.latched:
           self.early_frames = 0
       early_start = self.early_frames >= _frames(EARLY_HOLD)
-      if self.hold_frames >= _frames(HOLD_TIME) or early_start:
+      warn_start = (WARNING_START_ENABLED and self.warning and not self.warn_latched and gates and
+                    i.v_ego >= WARN_MIN_SPEED)
+      if self.hold_frames >= _frames(HOLD_TIME) or early_start or warn_start:
         self.active = True
         self.early = self.hold_frames < _frames(HOLD_TIME)
-        self.kind = STOPPED_CAR if (lead_ok and not self.early) else STOP_WITH_CAR
-        self.confirmed = not self.early
+        self.warn_start = not (self.hold_frames >= _frames(HOLD_TIME) or early_start)
+        self.kind = STOPPED_CAR if (lead_ok and not self.early) else (STOP_AHEAD if self.warn_start else STOP_WITH_CAR)
+        self.confirmed = not self.early or self.warn_start     # the warning start: holds and the fast pace at once
         self.confirm_frames = 0
-        self.confirm_frame = self.frame if not self.early else -1
-        self.floor_mode = False
+        self.confirm_frame = self.frame if self.confirmed else -1
+        self.floor_mode = self.warn_start and WARN_FLOOR
+        if self.warn_start:
+          self.warn_latched = True
+        self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
+        self.leave_frames = 0
+        self.clear_release = False
         self.start_frame = self.frame
         self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
         self.early_frames = self.early_gap = 0
         self.release_reason = None
-    elif self.kind == STOP_WITH_CAR or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
+    elif self.kind == STOP_AHEAD and not self._slow_car(i, min_prob=STOP_CAR_EARLY_MIN_PROB):
+      # the planned stop alone, no slower car seen yet (a car at our speed does not end it: the plan still shows the
+      # stop, the MRCC keeps the gap to that car)
+      going = i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop
+      self.go_frames = self.go_frames + 1 if going else 0
+      if not gates:
+        self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
+      elif i.v_ego < EGO_STOPPED_SPEED:
+        self._release("ego stopped behind the lead")
+      elif self.go_frames >= _frames(GO_TIME) or not self.latched:
+        self._release("stop ahead cleared (no stop planned)")
+    elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
+      if self.kind == STOP_AHEAD:
+        # the car for the planned stop appeared: from here on a stop with a car (confirmed / floor mode stay)
+        self.lost_frames = self.go_frames = 0
       # a stop with a much slower car (or a "stopped" car that is rolling slowly towards the stop): the car ahead
       # may be moving, so "moved away" is not a release; traffic moving again is
       self.kind = STOP_WITH_CAR
@@ -439,6 +620,8 @@ class StoppedCarTrigger:
         self._release("ego stopped behind the lead")
       elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
         self._release("radar following the car ahead at our speed")
+      elif self.leave_frames >= _frames(LEAVE_TIME):
+        self._release("lead leaving the lane", False)
       elif self.go_frames >= _frames(GO_TIME):
         self._release("traffic moving again (model no longer slowing, car ahead not much slower)")
       elif self.lost_frames >= _frames(lost_time):
@@ -446,9 +629,11 @@ class StoppedCarTrigger:
     else:
       vision = i.lead_alive and i.lead_status and i.lead_prob >= LOST_MIN_PROB
       self.moving_frames = self.moving_frames + 1 if (vision and i.lead_v > RELEASE_LEAD_SPEED) else 0
-      # "still there" = a vision lead in our lane that is not driving away; the stock radar never counts
-      still_there = vision and abs(i.lead_y) <= MAX_LATERAL and i.lead_v <= RELEASE_LEAD_SPEED
-      out = vision and abs(i.lead_y) > MAX_LATERAL
+      # "still there" = a vision lead in our lane that is not driving away; the stock radar never counts. In our lane
+      # = its offset from the model path (lead_path_offset), so a stopped car ahead in a curve stays ours (drive 4c)
+      y_lane = self._y_path(i)
+      still_there = vision and abs(y_lane) <= MAX_LATERAL and i.lead_v <= RELEASE_LEAD_SPEED
+      out = vision and abs(y_lane) > MAX_LATERAL
       self.lost_frames = 0 if still_there else self.lost_frames + 1
       self.out_of_lane_frames = self.out_of_lane_frames + 1 if out else 0
       if not gates:
@@ -459,8 +644,10 @@ class StoppedCarTrigger:
         self._release("ego stopped behind the lead")
       elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
         self._release("radar following the car ahead at our speed")
+      elif self.leave_frames >= _frames(LEAVE_TIME):
+        self._release("lead leaving the lane", False)
       elif self.out_of_lane_frames >= _frames(RELEASE_LOST_TIME):
-        # the car may still be ahead: the gentle restore (taps, normal pacing) so a re-trigger wins
+        # a "clear" release: the restore uses SET+ holds only while no slower car is in our lane (clear_ahead)
         self._release("lead left the lane", False)
       elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
         self._release("lead lost (vision)", False)
@@ -476,6 +663,8 @@ class StoppedCarTrigger:
       if self.floor_mode:
         lead_soon = i.lead_v + min(i.lead_a, 0.0) * FLOOR_LEAD_HORIZON if FLOOR_LEAD_GUARD else 0.0
         self.target = min(self.target, max(FLOOR_SPEED, lead_soon))
+    if self.active and self.kind == STOP_AHEAD:
+      self.target = FLOOR_SPEED if WARN_FLOOR else stopped_car_target(max(i.plan_stop_d, 0.0))
     if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
       self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further
     if self.active and self.kind == STOP_WITH_CAR:
@@ -490,6 +679,7 @@ class StoppedCarTrigger:
     if self.radar_hold:
       self.target, self.urgent = 100.0, False    # the MRCC handles the car ahead: no SET- (and no SET+ while active)
     self.hold_restore = EARLY_START_ENABLED and self.latched and not self.active
+    self.clear_ahead = bool(not self.active and self.clear_release and not self._slower_car_ahead(i))
     return self.active
 
   def _release(self, reason, restore_now=True):
@@ -499,6 +689,9 @@ class StoppedCarTrigger:
     self.go_frames = 0
     self.release_reason = reason
     self.restore_now = restore_now
+    self.clear_release = reason in CLEAR_RELEASE_REASONS
+    self.left_car = reason == "lead leaving the lane"
+    self.leave_frames = 0
     self.radar_flicker = False
     self.radar_match_frames = 0
     self.radar_hold = False
