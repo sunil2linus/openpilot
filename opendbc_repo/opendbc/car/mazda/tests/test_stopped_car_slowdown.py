@@ -9,6 +9,7 @@ _spec.loader.exec_module(T)
 cs, scs, MPH = T.cs, T.scs, T.MPH
 Car, StoppedLead, run, near, between = T.Car, T.StoppedLead, T.run, T.near, T.between
 NO_CURVE = lambda f: None  # noqa: E731
+CAR_MIN_MPH = 30 / 1.609344   # the car's own minimum set speed
 
 
 def approach(set_mph=45, d0=120, frames=6000, lead_kw=None, car_kw=None, curve=NO_CURVE, events=None, stop_mode=2, max_drop=10):
@@ -200,8 +201,9 @@ def test_hold_rates_and_latencies_never_cross_floor_or_target():
   for rate in (3.0, 5.0, 8.3):
     for latency in (0.0, 0.5, 1.0):
       for d0 in (60, 150):
-        r = approach(45, d0, frames=3000, car_kw=dict(hold_rate=rate, hold_latency=latency))
-        assert r["min"] >= 20 - 1e-6, (rate, latency, d0, r["min"])
+        r = approach(45, d0, frames=3000, car_kw=dict(hold_rate=rate, hold_latency=latency, min_set_mph=CAR_MIN_MPH))
+        # phase-locked stop holds aim at 20 with no overrun margin: a car that keeps stepping lands on its minimum
+        assert r["min"] >= (CAR_MIN_MPH if latency else 20) - 1e-6, (rate, latency, d0, r["min"])
         assert r["max"] <= 45 + 1e-6, (rate, latency, d0, r["max"])
         assert not r["logic"].disabled, (rate, latency, d0)
 
@@ -265,17 +267,17 @@ def test_hold_log_records_each_hold():
   assert r["logic"].hold_measured
 
 
-def test_45_mph_two_holds_then_taps():
-  # 45 mph, stopped car at 60 m: hold 1 aims 15 mph down, hold 2 10 more, then taps to the floor.
-  # With the release overrun still assumed to be one quantum, the holds release one quantum early
-  # (45 -> 35, 35 -> 30); a car that does overrun lands 30 / 25. Taps finish to 20.
+def test_45_mph_one_hold_straight_to_the_floor():
+  # drive 45: two holds with a 1.5 s pause (45 -> 35, 34 -> 25), because the release kept two quanta of margin and
+  # the target followed the car ahead. Phase-locked now: one hold, released as 20 lands; nothing left for taps.
   r = approach(45, 60, frames=3000)
   log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
-  assert len(log) == 2, log
-  assert log[0]["landed"] >= 10 and log[1]["landed"] >= 5, log
+  assert len(log) == 1 and log[0]["phase_lock"], log
+  assert near(log[0]["bound_mph"], 20) and log[0]["landed"] >= 20, log
   assert near(r["min"], 20) and r["max"] <= 45 + 1e-6
-  minus = [f for f, b in r["presses"] if b == cs.SET_MINUS]
-  assert minus and all(f > log[1]["release_frame"] for f in minus)     # taps only after the holds
+  assert [f for f, b in r["presses"] if b == cs.SET_MINUS] == []
+  first = log[0]["frame"]
+  assert r["sets"][first + 400] <= 20 * MPH + 1e-6          # 45 -> 20 in one go, within 4 s
 
 
 def test_lead_moves_during_first_hold_abort_and_immediate_restore():
@@ -299,10 +301,11 @@ def test_set_plus_hold_never_above_driver_speed_for_overrun_0_to_3_quanta():
   for latency in (0.0, 0.6, 1.2, 1.8):
     for d0 in (200, 60):
       lead = StoppedLead(d0, present=lambda f: f < 1500)
-      r = run(Car(55, dash_offset_mph=0.0, hold_latency=latency), NO_CURVE, 6000, lead=lead, max_drop=10)
+      r = run(Car(55, dash_offset_mph=0.0, hold_latency=latency, min_set_mph=CAR_MIN_MPH), NO_CURVE, 6000, lead=lead,
+              max_drop=10)
       assert r["max"] <= 55 + 1e-6, (latency, d0, r["max"])
       assert near(r["final"], 55), (latency, d0, r["final"])
-      assert r["min"] >= 20 - 1e-6, (latency, d0, r["min"])
+      assert r["min"] >= CAR_MIN_MPH - 1e-6, (latency, d0, r["min"])
 
 
 def _releases(fn):
@@ -380,7 +383,7 @@ def test_lost_release_restores_gently_and_the_retrigger_wins():
   assert rel[0][2] is False and rel[1][2] is True, rel                     # gentle restore, then restore at once
   stop_f = rel[1][0]
   plus_before = [f for f in _plus_frames(r) if f < stop_f]
-  assert 1 <= len(plus_before) <= 2, plus_before
+  assert len(plus_before) <= 2, plus_before          # (the one hold to 20 may still be settling: then none)
   assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] < stop_f], "no SET+ hold"
   assert near(r["min"], 20), r["min"]
   plus_after = [f for f in _plus_frames(r) if f >= stop_f]
@@ -465,11 +468,13 @@ def test_random_stopped_car_drives_keep_limits():
     gone = rng.randint(300, 3000)
     lead = StoppedLead(d0, prob=rng.choice([0.9, 0.95]), y=rng.choice([0.0, 0.5, -0.8]), present=lambda f, g=gone: f < g)
     car = Car(set_mph, dash_offset_mph=rng.choice([0, 2]), lag=rng.choice([5, 15, 40]), lose=lambda n, lost=lost: n in lost,
-              hold_rate=rate, hold_start=start, hold_latency=latency, hold_ignored=ignored)
+              hold_rate=rate, hold_start=start, hold_latency=latency, hold_ignored=ignored, min_set_mph=CAR_MIN_MPH)
     curve = between(1200, 2200, rng.uniform(set_mph - 20, set_mph)) if rng.random() < 0.3 else NO_CURVE
     r = run(car, curve, 7000, lead=lead, max_drop=rng.choice([5, 10]))
     assert r["max"] <= set_mph + 1e-6, (set_mph, d0, rate, latency, r["max"])
-    assert r["min"] >= 20 - 1e-6, (set_mph, d0, rate, latency, start, r["min"])
+    # a phase-locked stop hold aims at 20 with no overrun margin: a car that steps once more after the release
+    # lands on its own 30 km/h minimum, never lower
+    assert r["min"] >= CAR_MIN_MPH - 1e-6, (set_mph, d0, rate, latency, start, r["min"])
     assert not r["logic"].disabled, (set_mph, d0, rate, latency)
     assert near(r["final"], set_mph), (set_mph, d0, rate, latency, loss, ignored, r["final"])
 
@@ -869,15 +874,24 @@ def test_measured_car_one_hold_to_the_floor_then_taps():
   assert near(r["min"], 20) and r["max"] <= 45 + 1e-6
 
 
-def test_stop_with_a_car_rolling_at_25_mph_never_sets_below_25():
-  # a slower car that keeps moving: the floor target never goes below its speed
+def test_stop_with_a_car_rolling_at_25_mph_goes_to_the_floor_and_comes_back():
+  # owner's choice (drive 45): no lead-speed guard: straight to 20; the stock radar keeps the gap to a car that keeps
+  # moving, and the release (traffic moving again) restores the driver's speed
   lead = T.StoppedLead(90, v_mph=25.0, prob=0.9, y=0.1)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2000, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.6)
   assert r["ever_active"] and r["trigger"].floor_mode
-  assert r["min"] >= 25 - 1e-6, r["min"]
+  assert near(r["min"], 20), r["min"]
 
 
 def test_floor_target_respects_a_braking_lead_guard():
+  scs.FLOOR_LEAD_GUARD = True       # off by default (drive 45); the guard itself still works
+  try:
+    _guard_check()
+  finally:
+    scs.FLOOR_LEAD_GUARD = False
+
+
+def _guard_check():
   tr = scs.StoppedCarTrigger()
   base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=20.0, lead_alive=True, lead_status=True,
               lead_prob=0.9, lead_d=90.0, lead_v=11.0, lead_y=0.1, model_alive=True, model_accel=-0.8)
@@ -951,3 +965,26 @@ def test_taps_are_unchanged_by_the_wheel_counter():
   a = run(Car(65), T.between(100, 1500, 61), 4000, wheel_phase=None)
   b = run(Car(65), T.between(100, 1500, 61), 4000, wheel_phase=3)
   assert a["presses"] == b["presses"] and a["holds"] == b["holds"] == []
+
+
+# ---------------- fast restore while the stock radar follows a car (owner's request, drive 45) ----------------
+
+def _restore(radar_from):
+  lead = StoppedLead(120, present=lambda f: f < 700, radar_from=radar_from)     # vision loses it: a gentle release
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 5000, lead=lead, max_drop=10))
+  stop_f = rel[0][0]
+  plus_holds = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] >= stop_f]
+  return r, rel, plus_holds
+
+
+def test_restore_uses_set_plus_holds_while_the_radar_follows_a_car():
+  r, rel, plus_holds = _restore(radar_from=1000.0)
+  assert rel[0][1] == "lead lost (vision)" and rel[0][2] is False, rel        # a release that restores gently ...
+  assert plus_holds, r["logic"].hold_log                                       # ... but the radar has a car: holds
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_restore_without_a_radar_lead_stays_gentle():
+  r, rel, plus_holds = _restore(radar_from=None)
+  assert rel[0][1] == "lead lost (vision)" and plus_holds == [], plus_holds
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6

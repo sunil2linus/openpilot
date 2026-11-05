@@ -57,6 +57,9 @@ TARGET_MARGIN = 15.0        # m behind the lead where the floor speed should be 
 FLOOR_MODE_ENABLED = True
 FLOOR_DISTANCE = 130.0      # m: a confirmed stop this close: target = floor (SET- holds), not the distance target
 FLOOR_LEAD_HORIZON = 2.0    # s: ... but not below the car ahead's speed this far ahead (a slower car that keeps moving)
+# drive 45: the guard made two holds with a pause; the owner wants one hold to 20 mph (the radar keeps the gap if the
+# car ahead keeps moving, and traffic moving again restores)
+FLOOR_LEAD_GUARD = False
 URGENT_TTC = 5.0            # s
 URGENT_DECEL = 1.5          # m/s^2: closing^2 / (2 (dRel - 15))
 
@@ -381,7 +384,7 @@ class StoppedCarTrigger:
       self.target = stopped_car_target(i.lead_d)
       self.floor_mode = self.floor_mode or (FLOOR_MODE_ENABLED and self.confirmed and 0 < i.lead_d <= FLOOR_DISTANCE)
       if self.floor_mode:
-        lead_soon = i.lead_v + min(i.lead_a, 0.0) * FLOOR_LEAD_HORIZON
+        lead_soon = i.lead_v + min(i.lead_a, 0.0) * FLOOR_LEAD_HORIZON if FLOOR_LEAD_GUARD else 0.0
         self.target = min(self.target, max(FLOOR_SPEED, lead_soon))
     if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
       self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further

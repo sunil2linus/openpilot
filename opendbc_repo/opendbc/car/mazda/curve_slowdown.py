@@ -101,7 +101,18 @@ HOLD_FRAME_GAP = 10                      # frames between the hold's SET frames 
 HOLD_PHASE_LOCK = True
 HOLD_COUNTER_OFFSET = 0                  # create_button_cmd adds 1: CTR = wheel CTR + 1
 HOLD_FALLBACK_FRAMES = 12                # no new wheel frame this long after our last hold frame: send anyway
-HOLD_MAX_SECONDS = 4.0                   # a hold is released after this at the latest
+# Drive 45: phase-locked holds landed as real long presses (45 -> 40 -> 35, 34 -> 30 -> 25) with nothing landing after
+# the release, but each stopped at 35 / 25 because the release kept the old margin (two quanta) and the target
+# followed the car ahead's speed, so there were two holds with a 1.5 s pause. With phase lock the margins come from
+# phase-locked holds only: down 0 quanta (a stop hold aims at 20 mph; one quantum too many is clamped by the car at
+# its 30 km/h minimum and handled), up 2 (never above the driver's speed) until a phase-locked hold of either
+# direction has measured the car, then the worst seen, at least 1.
+LOCK_OVERRUN_DOWN_DEFAULT = 0
+LOCK_OVERRUN_UP_DEFAULT = 2
+# Owner's request (drive 45): after a stop, while the stock radar is following a car ahead, bring the speed back with
+# SET+ holds (5 mph steps) instead of slow taps: the radar keeps the gap to that car, the set speed only caps it.
+RADAR_LEAD_FAST_RESTORE = True
+HOLD_MAX_SECONDS = 6.0                   # a hold is released after this at the latest
 HOLD_NO_EFFECT_SECONDS = 1.0             # a hold with no set speed change by then is released (the car ignores it)
 HOLD_QUANTUM_MPH = 5                     # the car's long-press step
 HOLD_SETTLE = 1.5                        # s after the last frame or landing during which changes are still the hold's
@@ -152,6 +163,7 @@ class SlowdownInputs:
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
+  radar_lead: bool = False        # the stock radar reports a lead it follows (CRZ_CTRL.RADAR_HAS_LEAD)
 
 
 @dataclass
@@ -217,6 +229,8 @@ class CurveSlowdownLogic:
     # and when, any landing size is handled, and holds stop after HOLD_MISS_LIMIT holds with no effect.
     self.hold = None                 # the Press of the hold being sent, while frames are still going out
     self.prev_btn_counter = -1
+    self.lock_overrun = {SET_MINUS: LOCK_OVERRUN_DOWN_DEFAULT, SET_PLUS: LOCK_OVERRUN_UP_DEFAULT}
+    self.lock_measured = False       # a phase-locked hold has measured what lands after a release
     self.wheel_frame = -10_000       # frame a new wheel CRZ_BTNS frame was last seen
     self.new_wheel = False
     self.phase_lock = False
@@ -338,12 +352,18 @@ class CurveSlowdownLogic:
 
   def _up_overrun(self):
     """Quanta assumed to land after a SET+ release: conservative until a hold has measured the car."""
+    if self.phase_lock:
+      return self.lock_overrun[SET_PLUS]
     return (self.hold_overrun + 1) if self.hold_measured else HOLD_UP_OVERRUN_DEFAULT
+
+  def _down_overrun(self):
+    """Quanta assumed to land after a SET- release."""
+    return self.lock_overrun[SET_MINUS] if self.phase_lock else self.hold_overrun
 
   def _hold_reserve(self):
     """Steps a hold may still take after we stop sending (we release right after a quantum lands, so
     the next one is the overrun), plus the tap the button-down gives."""
-    return self.hold_overrun * self._quantum_steps() + 1
+    return self._down_overrun() * self._quantum_steps() + 1
 
   def _finish_hold(self, p):
     """A hold is resolved: learn how it landed."""
@@ -352,6 +372,22 @@ class CurveSlowdownLogic:
     q = self._quantum_steps()
     after = sum(n for f, n in p.landings if f > p.release_frame + HOLD_FRAME_GAP + _frames(0.2))
     quanta_after = -(-after // q)          # round up: a partial quantum after release counts as one
+    locked = any(e.get("phase_lock") for e in self.hold_log if e["frame"] == p.frame)
+    clamped = p.direction == SET_MINUS and self.last_set_speed is not None and \
+      abs(self.last_set_speed - CAR_MIN_SET_SPEED) < self.half_step
+    if locked and p.landed > q and clamped:
+      # it ran onto the car's minimum: what landed after the release is cut short, so it measures nothing; be
+      # wider upwards than the default until a clean hold has measured the car
+      self.lock_overrun[SET_MINUS] = max(self.lock_overrun[SET_MINUS], 1)
+      if not self.lock_measured:
+        self.lock_overrun[SET_PLUS] = max(self.lock_overrun[SET_PLUS], LOCK_OVERRUN_UP_DEFAULT + 1)
+    elif locked and p.landed > q:
+      # the car steps the same way in both directions: one measurement sets both margins
+      self.lock_overrun[SET_MINUS] = max(self.lock_overrun[SET_MINUS], quanta_after)
+      # upwards one more than seen, like _up_overrun for unlocked holds: never above the driver's speed
+      up = quanta_after + 1 if not self.lock_measured else max(self.lock_overrun[SET_PLUS], quanta_after + 1)
+      self.lock_overrun[SET_PLUS] = up
+      self.lock_measured = True
     if p.landed > q:
       # A real staircase was seen: the overrun after a release is learned as the worst seen, never
       # below one quantum (the release always comes just after a landing, so at most the next one
@@ -458,11 +494,20 @@ class CurveSlowdownLogic:
     if abs(steps - round(steps)) > 0.25:
       if (ours_k is not None and hold_open and direction == SET_MINUS and
           abs(i.set_speed - CAR_MIN_SET_SPEED) < self.half_step):
-        # Our SET- hold ran onto the car's own minimum (30 km/h): a short last step, still ours. No more holds
-        # this drive (the overrun was larger than assumed), but no disable either.
-        self.hold_misses = HOLD_MISS_LIMIT
-        self.holds_ok = False
+        # Our SET- hold ran onto the car's own minimum (30 km/h): a short last step, still ours. The overrun was
+        # larger than assumed: a phase-locked hold keeps one more quantum of margin from now on; otherwise no more
+        # holds this drive. Never a disable.
+        if self.phase_lock:
+          self.lock_overrun[SET_MINUS] = max(self.lock_overrun[SET_MINUS], 1)
+        else:
+          self.hold_misses = HOLD_MISS_LIMIT
+          self.holds_ok = False
         self._consume_ours(direction, int(math.ceil(steps)))
+        return
+      if (ours_k is not None and direction == SET_PLUS and self.prev_set_speed is not None and
+          abs(self.prev_set_speed - CAR_MIN_SET_SPEED) < self.half_step):
+        # our first SET+ from the car's 30 km/h minimum lands on the next whole step: one press, one (short) step
+        self._consume_ours(direction, 1)
         return
       if ours_k is not None and not driver_recent and not after_gap and steps < 2.5:
         # Our press landed as a fraction of a step: the car's set speed steps don't match our
@@ -725,7 +770,7 @@ class CurveSlowdownLogic:
         next_land = (int(round(i.set_speed / self.step)) // q + 1) * q * self.step
         crosses = next_land > self.hold_bound + self.half_step
       else:
-        overrun = (1 + (self.hold_overrun if d == SET_MINUS else self._up_overrun())) * q * self.step
+        overrun = (1 + (self._down_overrun() if d == SET_MINUS else self._up_overrun())) * q * self.step
         crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
                    (i.set_speed + overrun > self.hold_bound + self.half_step))
       reason_gone = (reason != "stop") if d == SET_MINUS else (reason is not None or offset <= 0)
@@ -791,8 +836,9 @@ class CurveSlowdownLogic:
     urgent = want_lower and reason == "stop" and i.stop_urgent
     # Relaxed pacing for a stopped car that is not urgent, and for the gentle restore after a lost /
     # left-lane release (the car may still be ahead: a re-trigger should win over the taps).
+    radar_restore = RADAR_LEAD_FAST_RESTORE and i.radar_lead and not want_lower and self.stop_episode
     gentle = (want_lower and reason == "stop" and not urgent) or \
-             (not want_lower and self.stop_episode and not self.restore_pending)
+             (not want_lower and self.stop_episode and not self.restore_pending and not radar_restore)
     gap = RELAXED_GAP_FRAMES if gentle else BUTTON_GAP_FRAMES
     if self.frame - self.last_send_frame <= gap:
       return None, None
@@ -806,12 +852,14 @@ class CurveSlowdownLogic:
     hold = False
     self.hold_margin = False
     if self.holds_allowed and not self.inflight:
-      if want_lower and reason == "stop" and self.holds_this_episode < MAX_STOP_HOLDS:
+      # stop holds only when urgent (confirmed and close: floor mode); an unconfirmed early start or a far stopped car
+      # taps (this used to follow from the wide overrun margin, now it is explicit)
+      if want_lower and reason == "stop" and i.stop_urgent and self.holds_this_episode < MAX_STOP_HOLDS:
         hard = max(target, STOP_MIN_SET_SPEED)
         hold = set_speed - worst >= hard - self.half_step
         if hold:
-          if self.hold_measured:
-            self.hold_bound = hard       # straight to the floor / target; the release keeps the measured overrun margin
+          if self.hold_measured or self.phase_lock:
+            self.hold_bound = hard       # straight to the floor / target; the release keeps the overrun margin
           else:
             k = min(self.holds_this_episode, len(HOLD_GOALS_MPH) - 1)
             goal = HOLD_GOALS_MPH[k] * (1.609344 if self.step < MS_PER_MPH else 1.0) * self.step
@@ -828,7 +876,8 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True
-      elif button == SET_PLUS and (self.stop_episode or i.fast_restore) and self.restore_pending and not want_lower:
+      elif button == SET_PLUS and (self.stop_episode or i.fast_restore) and (self.restore_pending or radar_restore) and \
+           not want_lower:
         # only when the lead has clearly gone (moved away, or we stopped behind it); a lost or left-lane
         # release restores by taps so a re-trigger wins if the car is still there.
         # upwards the bound is the driver's speed itself: a tap, the first quantum and the quanta that may
@@ -1090,6 +1139,7 @@ class CurveSlowdown:
       stop_restore_now=bool(self.trigger.restore_now) and self.stop_mode == ON,
       hold_restore=bool(self.trigger.hold_restore) and self.stop_mode == ON,
       btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
+      radar_lead=bool(getattr(CS, "radar_has_lead", False)),
     )
     button, offset = self.logic.update(inputs)
     if self.profile is not None:

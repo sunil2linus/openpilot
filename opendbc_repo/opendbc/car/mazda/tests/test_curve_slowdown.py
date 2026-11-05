@@ -89,7 +89,10 @@ class Car:
   def tick(self):
     self.frame += 1
     for f, d in [p for p in self.pending if p[0] <= self.frame]:
-      self.set_speed += d
+      if self.min_set is not None and d > 0 and abs(self.set_speed - self.min_set) < 1e-6:
+        self.set_speed = (round(self.min_set / MPH) + 1) * MPH   # 30 km/h shows 19; the first SET+ lands on 20 mph
+      else:
+        self.set_speed += d
     self.pending = [p for p in self.pending if p[0] > self.frame]
     self._hold_tick()
     tgt = self.set_speed - self.dash_offset
@@ -172,6 +175,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
     hist.append((csc.active, csc.speed))
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
     stop_active, stop_target, stop_urgent, restore_now, hold_restore = False, 0.0, False, False, False
+    r_has = False
     if lead is not None:
       status, prob, d, v, y = lead.state(f, car)
       r_has, r_dist = lead.radar(f)
@@ -191,7 +195,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=car.v_ego < 0.3,
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
-                            stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore)
+                            stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore,
+                            radar_lead=bool(lead is not None and r_has))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16
