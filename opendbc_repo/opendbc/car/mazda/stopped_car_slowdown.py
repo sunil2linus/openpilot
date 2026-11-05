@@ -60,6 +60,35 @@ FLOOR_LEAD_HORIZON = 2.0    # s: ... but not below the car ahead's speed this fa
 # drive 45: the guard made two holds with a pause; the owner wants one hold to 20 mph (the radar keeps the gap if the
 # car ahead keeps moving, and traffic moving again restores)
 FLOOR_LEAD_GUARD = False
+# The car ahead's speed (drive 4b, T1): the vision lead's vLead jumped 18 / 28 / 42 mph frame to frame while the car
+# ahead was really doing ~40, and one slow frame started a "stop with car" (45 -> 30). It is filtered: the median over
+# VLEAD_WINDOW, the highest value while fewer than VLEAD_MIN_FILL s are in the window (a short window can never look
+# slow); a distance jump of LEAD_JUMP m is a new car and starts the window again.
+VLEAD_WINDOW = 0.5          # s
+VLEAD_MIN_FILL = 0.3        # s
+LEAD_JUMP = 20.0            # m
+# The stock radar following the car ahead (drive 4b, T5-T7; owner's rules): when the radar was seen tracking the car
+# while it was still moving, the MRCC brakes for it itself (drive 44: radar tracked -> the MRCC stopped by itself;
+# not tracked / flickering -> the driver braked at -4.6 m/s^2). Then we stop lowering and leave the set speed
+# alone (no SET-, no SET+) while it handles the car ahead: we have matched its speed, or the car is braking
+# (aEgo <= RADAR_BRAKING_ACCEL), or no hard braking is needed yet (required < RADAR_YIELD_DECEL). Once the MRCC has
+# matched the car (within RADAR_FOLLOW_CLOSING for RADAR_RESTORE_TIME), the episode releases and the speed goes back
+# up with SET+ holds; the radar keeps the gap, the set speed only caps it. A stopped car the radar reports without
+# having tracked it moving is not trusted (the dangerous case). A radar dropout of more than RADAR_DROPOUT (drive 4b:
+# the radar dropped a car at 42 m for 1 s) ends the follow at once (lowering resumes, floor hold) and, until the
+# episode ends, the radar must then be on RADAR_REACQUIRE_TIME continuously to count again.
+RADAR_FOLLOW_ENABLED = True
+RADAR_TRACK_TIME = 1.0      # s of RADAR_HAS_LEAD (gaps up to RADAR_DROPOUT) before the radar counts as tracking
+RADAR_DROPOUT = 0.3         # s
+RADAR_REACQUIRE_TIME = 2.0  # s, after a dropout ended a follow
+RADAR_FOLLOW_CLOSING = 3.0  # m/s: we are at the car's speed (within this)
+RADAR_BRAKING_ACCEL = -0.8  # m/s^2: the MRCC is braking (more than a lowered set speed alone gives, ~0.9 at most)
+RADAR_YIELD_DECEL = 1.0     # m/s^2: required deceleration below this: no urgency yet, leave it to the MRCC
+# The match release also needs the car ahead not braking harder than RADAR_MATCH_LEAD_DECEL and the model no longer
+# slowing / planning a stop: a car stopping at a light is followed down to the stop (owner: "wait for our car to come
+# to a stop"), then the ego-stopped restore.
+RADAR_RESTORE_TIME = 2.0    # s at the car's speed with the radar following before the release
+RADAR_MATCH_LEAD_DECEL = 1.0  # m/s^2
 URGENT_TTC = 5.0            # s
 URGENT_DECEL = 1.5          # m/s^2: closing^2 / (2 (dRel - 15))
 
@@ -119,13 +148,14 @@ class StoppedCarInputs:
   lead_v: float
   lead_y: float
   lead_a: float = 0.0               # radarState leadOne.aLeadK (m/s^2), for the floor mode's lead guard
-  radar_has_lead: bool = False      # stock MRCC radar (CRZ_CTRL.RADAR_HAS_LEAD), logged only
+  radar_has_lead: bool = False      # stock MRCC radar (CRZ_CTRL.RADAR_HAS_LEAD): debounced here, drives the radar follow
   radar_lead_distance: int = 0      # its distance bucket (CRZ_CTRL.RADAR_LEAD_RELATIVE_DISTANCE: 1 farthest .. 5 nearest), logged only
   model_alive: bool = False         # modelV2 is being received
   model_accel: float = 0.0          # modelV2.action.desiredAcceleration: < 0 the model wants to slow down
   plan_stop: bool = False           # the model plans a stop ahead (plan_stop(), the red light warning's check)
   plan_ratio: float = 1.0           # slowest planned speed in the horizon / ours (logs)
   plan_stop_d: float = 0.0          # m to where the stop is planned (logs)
+  a_ego: float = 0.0                # m/s^2 (CS.out.aEgo): the MRCC braking for the car ahead
 
 
 def _interp(x, xp, fp):
@@ -214,21 +244,75 @@ class StoppedCarTrigger:
     self.early_frames = 0
     self.early_gap = 0
     self.hold_restore = False        # latched and not active: keep the lowered set speed (no SET+) for now
+    # the car ahead's speed, filtered (VLEAD_*)
+    self.lead_v_hist = []            # [(frame, vLead)]
+    self.lead_v_f = 0.0
+    self.prev_lead_d = None
+    # the stock radar (RADAR_*)
+    self.radar_frames = 0            # frames the radar has reported a lead (gaps up to RADAR_DROPOUT)
+    self.radar_gap = 0
+    self.radar_stable = False        # ... long enough to count as tracking
+    self.radar_follow = False        # tracking a car it was seen tracking while that car was moving
+    self.radar_flicker = False       # a follow ended by a dropout this episode: RADAR_REACQUIRE_TIME to count again
+    self.radar_hold = False          # active, and the MRCC handles the car ahead: no SET- / SET+ from us
+    self.radar_match_frames = 0      # following at the car's speed
+
+  def _filter_lead_v(self, i):
+    if i.lead_alive and i.lead_status:
+      if self.prev_lead_d is not None and abs(i.lead_d - self.prev_lead_d) > LEAD_JUMP:
+        self.lead_v_hist = []        # another car: start again
+        self.radar_follow = False
+      self.prev_lead_d = i.lead_d
+      self.lead_v_hist.append((self.frame, i.lead_v))
+    else:
+      self.prev_lead_d = None
+    self.lead_v_hist = [(f, v) for f, v in self.lead_v_hist if self.frame - f < _frames(VLEAD_WINDOW)]
+    if not self.lead_v_hist:
+      self.lead_v_f = i.lead_v
+      return
+    values = sorted(v for _, v in self.lead_v_hist)
+    if self.frame - self.lead_v_hist[0][0] < _frames(VLEAD_MIN_FILL):
+      self.lead_v_f = values[-1]
+    else:
+      n = len(values)
+      self.lead_v_f = values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
+
+  def _update_radar(self, i):
+    if i.radar_has_lead:
+      self.radar_frames += 1
+      self.radar_gap = 0
+    else:
+      self.radar_gap += 1
+      if self.radar_gap > _frames(RADAR_DROPOUT):
+        self.radar_frames = 0
+    need = RADAR_REACQUIRE_TIME if self.radar_flicker else RADAR_TRACK_TIME
+    self.radar_stable = self.radar_frames >= _frames(need)
+    vision = i.lead_alive and i.lead_status and i.lead_prob >= STOP_CAR_EARLY_MIN_PROB
+    if self.radar_follow and not self.radar_stable:
+      self.radar_follow = False
+      self.radar_flicker = self.active   # during an episode: the radar must prove itself for longer
+    elif self.radar_stable and vision and self.lead_v_f > STOPPED_SPEED:
+      self.radar_follow = True
+    stopping = i.plan_stop or self._model_slowing(i) or i.lead_a < -RADAR_MATCH_LEAD_DECEL
+    matched = (self.active and self.radar_follow and i.lead_status and self.lead_v_f > STOPPED_SPEED and
+               i.v_ego - self.lead_v_f <= RADAR_FOLLOW_CLOSING and not stopping)
+    self.radar_match_frames = self.radar_match_frames + 1 if matched else 0
 
   def _lead_ok(self, i):
+    v = self.lead_v_f
     return (i.lead_alive and i.lead_status and i.lead_prob >= MIN_PROB and abs(i.lead_y) <= MAX_LATERAL and
-            i.lead_v <= STOPPED_SPEED and i.v_ego - i.lead_v >= MIN_CLOSING and i.lead_d > 0)
+            v <= STOPPED_SPEED and i.v_ego - v >= MIN_CLOSING and i.lead_d > 0)
 
   @staticmethod
   def _model_slowing(i):
     return i.model_alive and i.model_accel <= MODEL_SLOW_ACCEL
 
-  @staticmethod
-  def _slow_car(i, max_lateral=STOP_CAR_MAX_LATERAL, min_prob=STOP_CAR_MIN_PROB):
-    """A car ahead (near our lane) that is stopped or much slower than us."""
+  def _slow_car(self, i, max_lateral=STOP_CAR_MAX_LATERAL, min_prob=STOP_CAR_MIN_PROB):
+    """A car ahead (near our lane) that is stopped or much slower than us (its filtered speed)."""
+    v = self.lead_v_f
     return (i.lead_alive and i.lead_status and i.lead_prob >= min_prob and abs(i.lead_y) <= max_lateral and
             0 < i.lead_d <= STOP_CAR_MAX_DISTANCE and
-            (i.v_ego - i.lead_v >= STOP_CAR_SLOWER or i.lead_v <= STOP_CAR_RATIO * i.v_ego))
+            (i.v_ego - v >= STOP_CAR_SLOWER or v <= STOP_CAR_RATIO * i.v_ego))
 
   def _stop_with_car(self, i):
     return self._model_slowing(i) and self._slow_car(i)
@@ -278,10 +362,10 @@ class StoppedCarTrigger:
         out.append(f"prob {i.lead_prob:.2f} < {MIN_PROB}")
       if abs(i.lead_y) > MAX_LATERAL:
         out.append(f"yRel {i.lead_y:.1f} > {MAX_LATERAL}")
-      if i.lead_v > STOPPED_SPEED:
-        out.append(f"vLead {i.lead_v:.1f} > {STOPPED_SPEED} m/s")
-      if i.v_ego - i.lead_v < MIN_CLOSING:
-        out.append(f"closing {i.v_ego - i.lead_v:.1f} < {MIN_CLOSING} m/s")
+      if self.lead_v_f > STOPPED_SPEED:
+        out.append(f"vLead {self.lead_v_f:.1f} > {STOPPED_SPEED} m/s")
+      if i.v_ego - self.lead_v_f < MIN_CLOSING:
+        out.append(f"closing {i.v_ego - self.lead_v_f:.1f} < {MIN_CLOSING} m/s")
     if i.v_ego < START_SPEED and not self.active:
       out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {START_SPEED / MS_PER_MPH:.0f} mph")
     if not i.model_alive:
@@ -302,12 +386,14 @@ class StoppedCarTrigger:
     if i.radar_has_lead and not self.prev_radar_has_lead:
       self.radar_rises.append(self.frame)
     self.prev_radar_has_lead = i.radar_has_lead
+    self._filter_lead_v(i)
     self._update_latch(i)
+    self._update_radar(i)
     lead_ok = self._lead_ok(i)
     stop_with_car = self._stop_with_car(i)
     gates = (i.enabled and i.cruise_enabled and not i.brake_pressed and
              self.cruise_on_frames >= _frames(CRUISE_SETTLE))
-    self.required, self.ttc = urgency(i.v_ego, i.lead_d, i.lead_v) if (i.lead_status and i.lead_alive) else (0.0, float("inf"))
+    self.required, self.ttc = urgency(i.v_ego, i.lead_d, self.lead_v_f) if (i.lead_status and i.lead_alive) else (0.0, float("inf"))
     self.urgent = self.ttc <= URGENT_TTC or self.required >= URGENT_DECEL
 
     if not self.active:
@@ -351,8 +437,10 @@ class StoppedCarTrigger:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
+      elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
+        self._release("radar following the car ahead at our speed")
       elif self.go_frames >= _frames(GO_TIME):
-        self._release("traffic moving again (model no longer slowing, car ahead not much slower)", False)
+        self._release("traffic moving again (model no longer slowing, car ahead not much slower)")
       elif self.lost_frames >= _frames(lost_time):
         self._release("lead lost (vision)", False)
     else:
@@ -369,6 +457,8 @@ class StoppedCarTrigger:
         self._release("lead moved away (vision)")
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
+      elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
+        self._release("radar following the car ahead at our speed")
       elif self.out_of_lane_frames >= _frames(RELEASE_LOST_TIME):
         # the car may still be ahead: the gentle restore (taps, normal pacing) so a re-trigger wins
         self._release("lead left the lane", False)
@@ -393,6 +483,12 @@ class StoppedCarTrigger:
       self.urgent = self.confirmed
     if self.active and self.floor_mode:
       self.urgent = True             # fast pace and holds, both kinds
+    closing_f = i.v_ego - self.lead_v_f
+    handles = (RADAR_FOLLOW_ENABLED and self.radar_follow and i.lead_status and
+               (closing_f <= RADAR_FOLLOW_CLOSING or i.a_ego <= RADAR_BRAKING_ACCEL or self.required < RADAR_YIELD_DECEL))
+    self.radar_hold = self.active and handles
+    if self.radar_hold:
+      self.target, self.urgent = 100.0, False    # the MRCC handles the car ahead: no SET- (and no SET+ while active)
     self.hold_restore = EARLY_START_ENABLED and self.latched and not self.active
     return self.active
 
@@ -403,6 +499,9 @@ class StoppedCarTrigger:
     self.go_frames = 0
     self.release_reason = reason
     self.restore_now = restore_now
+    self.radar_flicker = False
+    self.radar_match_frames = 0
+    self.radar_hold = False
 
   def near_miss_candidate(self, i):
     stopped = (i.lead_alive and i.lead_status and i.lead_v <= NEAR_MISS_LEAD_SPEED and

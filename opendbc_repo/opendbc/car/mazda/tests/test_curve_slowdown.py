@@ -103,11 +103,13 @@ class Car:
 class StoppedLead:
   """A lead car `d0` m ahead at `v_mph`, in our lane (y) with `prob`; the gap closes with our speed.
   `moves_at`: frame from which the lead drives off at `drive_off_mph`. `radar_from`: distance below which
-  the stock radar reports it (None: never); `radar_present(f)`: radar dropout control."""
+  the stock radar reports it (None: never); `radar_present(f)`: radar dropout control. `follow_from`: while the radar
+  reports the car and it is this close or closer, the MRCC brakes for it at `follow_decel` m/s^2 down to its speed."""
   def __init__(self, d0, v_mph=0.0, prob=0.95, y=0.1, present=lambda f: True, moves_at=None, drive_off_mph=15.0,
-               radar_from=None, radar_present=lambda f: True):
+               radar_from=None, radar_present=lambda f: True, follow_from=None, follow_decel=1.5):
     self.d, self.v, self.prob, self.y, self.present = d0, v_mph * MPH, prob, y, present
     self.moves_at, self.drive_off, self.radar_from, self.radar_present = moves_at, drive_off_mph * MPH, radar_from, radar_present
+    self.follow_from, self.follow_decel = follow_from, follow_decel
     self.frame = 0
 
   def state(self, f, car):
@@ -126,6 +128,10 @@ class StoppedLead:
     if self.moves_at is not None and self.frame >= self.moves_at:
       self.v = min(self.v + 2.0 * DT, self.drive_off)
     self.d = max(self.d - (car.v_ego - self.v) * DT, 0.0)
+    if (self.follow_from is not None and self.radar(self.frame)[0] and self.d <= self.follow_from and
+        car.v_ego > self.v):
+      before = getattr(car, "v_before", car.v_ego)
+      car.v_ego = max(min(car.v_ego, before - self.follow_decel * DT), self.v)   # the MRCC follows the tracked car
     if self.present(self.frame) and self.d < 12.0 and car.v_ego > self.v:
       car.v_ego = max(car.v_ego - 3.0 * DT, self.v)      # the MRCC (or the driver) brakes behind the lead
 
@@ -167,6 +173,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   ever_active = False
   start = car.set_speed
   min_set = max_set = car.set_speed
+  a_ego, vs, follow, radar_hold = 0.0, [], [], []
   for f in range(frames):
     if events and f in events:
       events[f](st, car)
@@ -183,12 +190,15 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                                 v_ego=car.v_ego, lead_alive=True, lead_status=status, lead_prob=prob, lead_d=d,
                                 lead_v=v, lead_y=y, lead_a=getattr(lead, "a", 0.0) if status else 0.0,
                                 radar_has_lead=r_has, radar_lead_distance=r_dist,
-                                model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f))
+                                model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f),
+                                a_ego=a_ego)
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
       restore_now = trigger.restore_now and stop_mode == 2
       hold_restore = trigger.hold_restore and stop_mode == 2
+      follow.append(trigger.radar_follow)
+      radar_hold.append(trigger.radar_hold)
     if wheel_phase is not None and wheel_alive(f):
       ctr = ((f - wheel_phase) // 10) % 16       # the wheel's CRZ_BTNS frame every 10 frames (10 Hz)
     inp = cs.SlowdownInputs(btn_counter=ctr if wheel_phase is not None else -1, enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
@@ -196,7 +206,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
                             stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore,
-                            radar_lead=bool(lead is not None and r_has))
+                            radar_lead=bool(lead is not None and trigger.radar_stable))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16
@@ -210,13 +220,17 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       else:
         presses.append((f, btn))
         car.press(btn)
+    car.v_before = car.v_ego
     car.tick()
     if lead is not None:
       lead.tick(car)
+    a_ego = (car.v_ego - car.v_before) / DT
+    vs.append(car.v_ego)
     min_set, max_set = min(min_set, car.set_speed), max(max_set, car.set_speed)
     sets.append(car.set_speed)
   return dict(presses=presses, holds=holds, sets=sets, min=min_set / MPH, max=max_set / MPH, final=car.set_speed / MPH,
-              start=start / MPH, logic=logic, trigger=trigger, ever_active=ever_active)
+              start=start / MPH, logic=logic, trigger=trigger, ever_active=ever_active, vs=vs, follow=follow,
+              radar_hold=radar_hold, radar_hold_frames=sum(radar_hold))
 
 
 def between(a, b, mph):

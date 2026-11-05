@@ -539,7 +539,8 @@ def test_stop_with_car_ignores_a_moving_lead_and_releases_when_traffic_moves():
   for _ in range(99):                        # green: the model accelerates, the car ahead is at our speed
     assert tr.update(_sw(model_accel=0.4, v_ego=30 * MPH, lead_v=29 * MPH))
   assert not tr.update(_sw(model_accel=0.4, v_ego=30 * MPH, lead_v=29 * MPH))
-  assert tr.release_reason.startswith("traffic moving again") and not tr.restore_now   # gentle restore
+  # drive 4b (owner): traffic moving again restores at once, with SET+ holds (a re-trigger aborts a hold)
+  assert tr.release_reason.startswith("traffic moving again") and tr.restore_now
 
 
 def test_stop_with_car_other_releases():
@@ -988,3 +989,150 @@ def test_restore_without_a_radar_lead_stays_gentle():
   r, rel, plus_holds = _restore(radar_from=None)
   assert rel[0][1] == "lead lost (vision)" and plus_holds == [], plus_holds
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+# ---------------- drive 4b: the stock radar following the car ahead, the filtered lead speed, fast restores ----------------
+
+def _set_changes(r):
+  s = r["sets"]
+  return [(k, round(s[k] / MPH, 1)) for k in range(1, len(s)) if abs(s[k] - s[k - 1]) > 1e-6]
+
+
+def _minus_frames(r):
+  return sorted([f for f, b in r["presses"] if b == cs.SET_MINUS] +
+                [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS])
+
+
+def test_radar_tracked_slowing_car_is_left_to_the_mrcc():
+  # T5-T7: a slower car the stock radar was already following while it was moving, the MRCC braking for it: we do not
+  # lower the set speed at all, and nothing is pressed until we have stopped behind it
+  lead = SlowingLead(110, 29, decel=1.0, radar_from=1000, follow_from=80)
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=lead, max_drop=10,
+                                 model=lambda f: -0.6 if f >= 200 else 0.0))
+  assert r["ever_active"]
+  assert r["radar_hold_frames"] > 0
+  assert r["presses"] == [] and r["holds"] == [], (r["presses"][:5], r["holds"][:5])
+  assert rel and rel[0][1] == "ego stopped behind the lead", rel
+
+
+def test_radar_picks_up_a_slower_car_after_we_lowered_restores_with_holds_once_matched():
+  # owner's rule 1: the car ahead keeps moving and the radar tracks it: once the MRCC is at its speed, back to the
+  # driver's speed with a SET+ hold to 5 below it, then 1 mph taps
+  lead = StoppedLead(120, v_mph=25, radar_from=100, follow_from=100)
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=lead, max_drop=10,
+                                 model=lambda f: -0.6 if f < 600 else 0.0))
+  log = r["logic"].hold_log
+  assert log and log[0]["direction"] == cs.SET_MINUS
+  first_rh = r["radar_hold"].index(True)
+  assert all(f < first_rh for f in _minus_frames(r)), (first_rh, _minus_frames(r))
+  assert rel and rel[0][1].startswith("radar following") and rel[0][2], rel
+  plus_holds = [h for h in log if h["direction"] == cs.SET_PLUS]
+  assert plus_holds and plus_holds[0]["frame"] >= rel[0][0]
+  assert near(plus_holds[0]["bound_mph"], 40)
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+  # the hold stops 5 mph below the driver's speed, the last 5 are taps
+  ups = [mph for f, mph in _set_changes(r) if f > rel[0][0]]
+  assert ups[-6:] == [40.0, 41.0, 42.0, 43.0, 44.0, 45.0], ups
+
+
+def test_radar_flicker_during_the_approach_keeps_lowering_and_never_restores():
+  # (a) a stopped car the radar blinks on and off for: never trusted (it was never seen moving): today's floor hold
+  r = approach(lead_kw=dict(radar_from=1000, radar_present=lambda f: (f // 60) % 2 == 0))
+  stop = next(k for k, v in enumerate(r["vs"]) if v < 0.3)
+  assert near(r["min"], 20)
+  assert all(f > stop for f in _plus_frames(r))
+  # (b) drive 4b: the radar dropped the car at 42 m for a second: the follow ends at once and we lower (floor hold)
+
+  def mk(rp):
+    return SlowingLead(110, 23, radar_from=1000, follow_from=80, radar_present=rp, v_end=0.0)
+  ds = []
+  probe = mk(lambda f: True)
+  tick = probe.tick
+  probe.tick = lambda car: (tick(car), ds.append(probe.d))
+  run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=probe, max_drop=10, model=lambda f: -0.6 if f >= 200 else 0.0)
+  D = next(k for k, d in enumerate(ds) if d <= 42)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=mk(lambda f: not (D <= f < D + 100)), max_drop=10,
+          model=lambda f: -0.6 if f >= 200 else 0.0)
+  fl = r["follow"]
+  assert any(fl[:D]) and not all(fl[D:D + 100])
+  assert any(h["direction"] == cs.SET_MINUS and h["frame"] >= D for h in r["logic"].hold_log)
+  stop = next(k for k, v in enumerate(r["vs"]) if v < 0.3)
+  assert all(f > stop for f in _plus_frames(r))
+  assert r["max"] <= 45 + 1e-6
+
+
+def test_a_single_noisy_lead_speed_frame_does_not_start_a_stop():
+  # T1: vLead jumped 18 / 28 / 42 mph frame to frame for a car doing ~40: the filtered speed never looks slow
+  cycle = [18, 28, 42, 39, 40, 41]
+  tr = scs.StoppedCarTrigger()
+  for f in range(400):
+    tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=cycle[(f // 10) % len(cycle)] * MPH))
+    assert not tr.active, f
+  tr = scs.StoppedCarTrigger()                  # sanity: a car really at 13 mph does start it
+  assert any(tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH)) for _ in range(400))
+
+
+class _T1Lead(StoppedLead):
+  """13 mph until frame 400 (the noisy slow frames), then the car ahead's real 44 mph."""
+  def tick(self, car):
+    if self.frame + 1 == 400:
+      self.v = 44 * MPH
+    super().tick(car)
+
+
+def test_t1_false_start_restores_with_a_hold_then_taps_never_above_the_driver():
+  lead = _T1Lead(120, v_mph=13, prob=0.9)
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=lead, max_drop=10,
+                                 model=lambda f: -0.6 if f < 400 else 0.3, plan=lambda f: f < 400))
+  assert rel and rel[0][1].startswith("traffic moving") and rel[0][2], rel
+  plus_holds = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert plus_holds and plus_holds[0]["frame"] >= rel[0][0]
+  back = next(k for k, s in enumerate(r["sets"]) if k > rel[0][0] and near(s / MPH, 45))
+  assert (back - rel[0][0]) * T.DT <= 6.0, back - rel[0][0]     # 20 -> 45: was ~25 slow taps (12 s+)
+  assert r["max"] <= 45 + 1e-6 and near(r["final"], 45)
+
+
+def test_stop_behind_a_radar_tracked_car_no_set_plus_until_stopped_then_holds():
+  # owner's rule 2: the car ahead is stopping and the radar tracks and brakes for it: wait until we have stopped,
+  # then back to the driver's speed in 5 mph steps
+  lead = SlowingLead(120, 25, decel=1.5, v_end=0.0, radar_from=80, follow_from=80)
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 4000, lead=lead, max_drop=10,
+                                 model=lambda f: -0.6))
+  stop = next(k for k, v in enumerate(r["vs"]) if v < 0.3)
+  assert all(f > stop for f in _plus_frames(r)), (stop, _plus_frames(r)[:3])
+  first_rh = r["radar_hold"].index(True)
+  assert all(f < first_rh for f in _minus_frames(r))
+  assert rel and rel[0][1] == "ego stopped behind the lead"
+  assert any(h["direction"] == cs.SET_PLUS and h["frame"] > stop for h in r["logic"].hold_log)
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_radar_follow_needs_a_moving_car_and_a_dropout_needs_longer_to_count_again():
+  base = dict(lead_prob=0.9, lead_d=60.0, lead_v=20 * MPH, radar_has_lead=True)
+  tr = scs.StoppedCarTrigger()
+  for _ in range(99):
+    tr.update(_latched_inputs(**base))
+  assert not tr.radar_stable
+  tr.update(_latched_inputs(**base))
+  assert tr.radar_stable and tr.radar_follow
+  # a stopped car reported by the radar without having tracked it moving is not followed
+  tr2 = scs.StoppedCarTrigger()
+  for _ in range(200):
+    tr2.update(_latched_inputs(**dict(base, lead_v=0.0)))
+  assert tr2.radar_stable and not tr2.radar_follow
+  # during an episode, a dropout > 0.3 s ends the follow; it then takes 2 s of radar to count again
+  tr3 = scs.StoppedCarTrigger()
+  while not tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH)):
+    pass
+  for _ in range(150):
+    tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH, radar_has_lead=True))
+  assert tr3.radar_follow
+  for _ in range(40):
+    tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH))
+  assert not tr3.radar_follow and tr3.radar_flicker
+  for _ in range(150):
+    tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH, radar_has_lead=True))
+  assert not tr3.radar_stable
+  for _ in range(60):
+    tr3.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH, radar_has_lead=True))
+  assert tr3.radar_stable and tr3.radar_follow
