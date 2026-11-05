@@ -25,13 +25,15 @@ DT = 0.01
 class Car:
   def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
                hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None,
-               hold_phase_window=None):
+               hold_phase_window=None, plus_jumps=True, jump_extra=0):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.decel = decel
     self.hold_phase_window = hold_phase_window   # frames: a hold frame later than this after the wheel's reads as a tap
+    self.plus_jumps = plus_jumps      # SET+ while faster than the set speed sets the current speed (drive 4d)
+    self.jump_extra = jump_extra      # ... landing this many steps above it
     self.decel_fn = decel_fn          # decel_fn(gap_mph) -> m/s^2 the stock cruise slows at for that set speed gap
     self.min_set = min_set_mph * MPH if min_set_mph else None   # the car's own minimum set speed (clamp)
     self.lose = lose                  # lose(n) -> True drops our n-th press (1-based), like the real MRCC does
@@ -83,6 +85,8 @@ class Car:
       self.driver_button_until = self.frame + 10      # the stock switch reports the tap for one 10 Hz frame
       self.driver_button = button
     d = -self.step if button == cs.SET_MINUS else self.step
+    if self.plus_jumps and button == cs.SET_PLUS and self.v_ego > self.set_speed + self.step:
+      d = (round(self.v_ego / self.step) + self.jump_extra) * self.step - self.set_speed
     lag = self.lag_fn(self.op_presses) if (who == "op" and self.lag_fn is not None) else self.lag
     self.pending.append((self.frame + lag, d))
 
@@ -193,7 +197,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                                 radar_has_lead=r_has, radar_lead_distance=r_dist,
                                 model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f),
                                 a_ego=a_ego, lead_y_path=lead.y_path(f, car) if (status and hasattr(lead, "y_path")) else None,
-                                model_length=model_length(f), lane_change=lane_change(f))
+                                model_length=model_length(f), lane_change=lane_change(f), gas_pressed=st["gas"])
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
@@ -212,6 +216,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore,
                             radar_lead=bool(lead is not None and trigger.radar_stable),
                             stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
+                            stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
                             limit_raise=limit(f))
     btn, off = logic.update(inp)
     if btn is not None:

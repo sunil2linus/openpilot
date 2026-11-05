@@ -142,6 +142,25 @@ RESTORE_HOLD_MIN_GAIN = 1
 # Speed limit follow (speed_limit_follow.py, drive 4c): a higher posted limit becomes the driver's speed (the anchor);
 # the restore rule above then brings the set speed up: 5 mph or less by taps, more by one hold to 5 below, then taps.
 LIMIT_DRIVER_QUIET = 3.0                 # s after the driver's last SET edge before a higher limit is adopted
+# Fast restores at any speed (drive 4d, t 2017-2022 and 1825-1829): after a stop the restore waited until we were
+# back at KEEP_SPEED (12 mph) while the car ahead was already driving off; the radar keeps the gap and the set speed
+# only caps it (owner). A restore that may use holds (the car ahead clearly gone, nothing slower in our lane, or the
+# radar following a car) now goes at any speed; SET- still needs START_SPEED / KEEP_SPEED.
+FAST_RESTORE_ANY_SPEED = True
+# SET+ on the gas (drive 4d, tag 3, t 1943-1954): after a green light the driver drove 10 s on the gas with the set
+# speed at 20 (our restore waits while the gas is pressed). On this car a SET+ press while the car is faster than the
+# set speed sets the current speed (tags 3/4: 20 -> 39 and 20 -> 38 at once, then the long press steps). So:
+#  * any SET+ tap of ours that may jump (the car JUMP_STEPS or more faster than the set speed; both drive 4d jumps
+#    landed on round(vEgo)) is booked as one jump of up to the driver's speed (it used to read as "more steps than
+#    our presses" and switch everything off for the drive), and is only sent while where it may land (plus
+#    GAS_JUMP_MARGIN on the gas: the car keeps accelerating until it lands) stays at or below the driver's speed;
+#    no holds then;
+#  * on the gas, once nothing slower is in our lane, SET+ taps (no holds, never SET-) restore too.
+# (SET- while the car is faster than the set speed lands as a normal step: every floor hold and curve tap does that.)
+GAS_JUMP_ENABLED = True
+JUMP_STEPS = 2                           # the car this much faster than the set speed: a SET+ jumps
+JUMP_UNCERT = 0                          # steps: the jump may land this much above round(vEgo) (drive 4d: 0)
+GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= the driver's speed
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -180,6 +199,8 @@ class SlowdownInputs:
   # stopped car trigger: released by brake / disengage / lane exit and no slower car is in our lane: the restore may
   # use SET+ holds (stopped_car_slowdown CLEAR_*)
   stop_clear_ahead: bool = False
+  # stopped car trigger: no car ahead in our lane, or it is pulling away from us (restores at any speed)
+  stop_pulling_away: bool = False
 
 
 @dataclass
@@ -194,6 +215,7 @@ class Press:
   frames_sent: int = 0
   release_frame: int = -1  # hold: frame of the last SET- frame sent
   landings: list = field(default_factory=list)   # hold: [(frame, steps)]
+  jump: bool = False       # a SET+ on the gas: the set speed jumps to the current speed (up to `reserve` steps, once)
 
 
 class CurveSlowdownLogic:
@@ -476,7 +498,7 @@ class CurveSlowdownLogic:
       if p is None:
         break
       take = n if p.hold else min(n, p.remaining)
-      p.remaining = max(p.remaining - take, 0)
+      p.remaining = 0 if p.jump else max(p.remaining - take, 0)
       p.landed += take
       p.landings.append((self.frame, take))
       n -= take
@@ -505,6 +527,18 @@ class CurveSlowdownLogic:
     driver_k = match[1] if match is not None and match[0] == "driver" else None
     driver_recent = (driver_k is not None or self.prev_driver_button == direction or
                      self.frame - self.last_driver_edge[direction] <= _frames(DRIVER_RECENT))
+    jp = next((p for p in self.inflight + self.expired if p.jump and p.direction == direction), None)
+    if jp is not None and direction == SET_PLUS and driver_k is None and steps <= jp.reserve + 0.25:
+      # our SET+ jump (to the current speed), on time or late, a whole number of steps or not (from the car's 30 km/h
+      # minimum): all of it is ours, up to the driver's speed
+      for lst in (self.inflight, self.expired):
+        if jp in lst:
+          lst.remove(jp)
+      jp.landed, jp.remaining = int(math.ceil(steps - 0.25)), 0
+      if self.pending is jp:
+        self.pending = None
+      self._apply_ours(direction, jp.landed)
+      return
     n_ours = sum(p.remaining for p in self.inflight if p.direction == direction)
     hold_open = any(p.hold for p in self.inflight if p.direction == direction)
     expired_k = next((k for k, p in enumerate(self.expired) if p.direction == direction), None)
@@ -744,9 +778,13 @@ class CurveSlowdownLogic:
     # speed; the MRCC keeps holding behind the car ahead), once we have been stopped STANDSTILL_RESTORE_DELAY.
     # While creeping in a queue nothing is sent until we are clearly rolling again.
     stopped_restore = self.restore_pending and self.standstill_frames >= _frames(STANDSTILL_RESTORE_DELAY)
+    fast_any = FAST_RESTORE_ANY_SPEED and self.offset > 0 and i.stop_pulling_away and (
+      self.restore_pending or (i.stop_clear_ahead and not i.stop_active) or
+      (RADAR_LEAD_FAST_RESTORE and i.radar_lead and self.stop_episode and not i.stop_active))
+    restore_only = not (speed_ok or stopped_restore) and fast_any    # rolling slowly: SET+ only
     can_act = (i.enabled and cruise_ok and i.plan_alive and not i.brake_pressed and
                (not i.standstill or stopped_restore) and
-               (speed_ok or stopped_restore or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED)) and
+               (speed_ok or stopped_restore or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED) or fast_any) and
                self.cruise_on_frames >= _frames(CRUISE_SETTLE))
     if not can_act:
       self.hold = None
@@ -853,14 +891,17 @@ class CurveSlowdownLogic:
       room = int((set_speed - target + 1e-3) // self.step)
       budget_ok = (self.lower_presses < max(self.max_lower_presses, i.curve_budget)) if reason == "curve" else \
                   (self.stop_presses < MAX_STOP_PRESSES)
-      want_lower = budget_ok and room >= (2 if self.restoring else 1)
+      want_lower = budget_ok and room >= (2 if self.restoring else 1) and not restore_only
 
+    # on the gas the stop reasons' "over" timer is frozen (reason_free_frames): a clear stop restore still may go
+    gas_restore = (GAS_JUMP_ENABLED and i.gas_pressed and not i.csc_active and not i.stop_active and
+                   (self.restore_pending or i.stop_clear_ahead))
     button = None
     if want_lower:
       self.restoring = False
       button = SET_MINUS
-    elif offset != 0 and (all_over or self.restore_pending) and \
-         (self.frame - self.last_minus_frame >= _frames(MIN_DWELL) or self.restore_pending):
+    elif offset != 0 and (all_over or self.restore_pending or gas_restore) and \
+         (self.frame - self.last_minus_frame >= _frames(MIN_DWELL) or self.restore_pending or gas_restore):
       self.restoring = True
       button = SET_PLUS if offset > 0 else SET_MINUS
     elif offset == 0:
@@ -868,7 +909,16 @@ class CurveSlowdownLogic:
       self.stop_episode = False
       self.holds_this_episode = 0
 
-    if button is None or i.gas_pressed or i.other_button_active:
+    # a SET+ while the car is faster than the set speed jumps to the current speed (see GAS_JUMP_*)
+    v_hi = int(round(i.v_ego / self.step)) + JUMP_UNCERT
+    faster = button == SET_PLUS and v_hi >= int(round(i.set_speed / self.step)) + JUMP_STEPS
+    jump = False
+    if faster:
+      if self.inflight or v_hi + (GAS_JUMP_MARGIN if i.gas_pressed else 0) > int(round(driver_speed / self.step)):
+        return None, None              # it could land above the driver's speed (or on top of a press in flight)
+      jump = True
+    gas_ok = GAS_JUMP_ENABLED and button == SET_PLUS and gas_restore and offset > 0
+    if button is None or (i.gas_pressed and not gas_ok) or i.other_button_active:
       return None, None
     if any(p.direction != button for p in self.inflight):
       # Never reverse direction while a press may still land.
@@ -892,7 +942,7 @@ class CurveSlowdownLogic:
     worst = (q + self._hold_reserve()) * self.step      # tap + first quantum + pending quantum + measured overrun
     hold = False
     self.hold_margin = False
-    if self.holds_allowed and not self.inflight:
+    if self.holds_allowed and not self.inflight and not jump and not i.gas_pressed:
       # stop holds only when urgent (confirmed and close: floor mode); an unconfirmed early start or a far stopped car
       # taps (this used to follow from the wide overrun margin, now it is explicit)
       if want_lower and reason == "stop" and i.stop_urgent and self.holds_this_episode < MAX_STOP_HOLDS:
@@ -930,6 +980,10 @@ class CurveSlowdownLogic:
       off = self._send(button, hold=hold)
       if off is None:
         return None, None
+      if jump and self.pending is not None and not self.pending.hold:
+        p = self.pending                # lands as one jump up to the current speed, never past the driver's speed
+        p.jump = True
+        p.reserve = p.remaining = max(1, int(round(driver_speed / self.step)) - int(round(i.set_speed / self.step)))
     if button == SET_MINUS and want_lower:
       if reason == "curve":
         self.lower_presses += 1
@@ -938,7 +992,7 @@ class CurveSlowdownLogic:
       self.last_minus_frame = self.frame
     if off is None:
       return None, None
-    self.last_action = "hold" if hold else ("tap" if want_lower else "restore")
+    self.last_action = "hold" if hold else ("tap" if want_lower else ("jump" if jump else "restore"))
     return button, off
 
 
@@ -1132,7 +1186,7 @@ class CurveSlowdown:
       radar_has_lead=bool(getattr(CS, "radar_has_lead", False)), radar_lead_distance=int(getattr(CS, "radar_lead_distance", 0)),
       model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration),
       plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d, a_ego=float(CS.out.aEgo), lead_y_path=lead_y_path,
-      model_length=model_length, lane_change=lane_change)
+      model_length=model_length, lane_change=lane_change, gas_pressed=bool(CS.out.gasPressed))
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -1205,6 +1259,7 @@ class CurveSlowdown:
       btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       radar_lead=bool(self.trigger.radar_stable),
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
+      stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)

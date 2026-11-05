@@ -1043,7 +1043,8 @@ def test_radar_picks_up_a_slower_car_after_we_lowered_restores_with_holds_once_m
   assert log and log[0]["direction"] == cs.SET_MINUS
   first_rh = r["radar_hold"].index(True)
   assert all(f < first_rh for f in _minus_frames(r)), (first_rh, _minus_frames(r))
-  assert rel and rel[0][1].startswith("radar following") and rel[0][2], rel
+  # (drive 4d: at a moving car's speed it is now released on vision too, often before the radar match)
+  assert rel and (rel[0][1].startswith("radar following") or rel[0][1] == "at the moving car's speed") and rel[0][2], rel
   plus_holds = [h for h in log if h["direction"] == cs.SET_PLUS]
   assert plus_holds and plus_holds[0]["frame"] >= rel[0][0]
   assert near(plus_holds[0]["bound_mph"], 40)
@@ -1478,3 +1479,199 @@ def test_stop_ahead_then_a_radar_followed_car_is_left_to_the_mrcc():
   first_rh = rh.index(True)
   assert all(f < first_rh for f in _minus_frames(r)), (first_rh, _minus_frames(r)[-3:])
   assert r["min"] >= 20 - 1e-6
+
+
+# ---------------- drive 4d: a slower car that keeps moving, restores at any speed, the driver on the gas ----------------
+
+def test_moving_slower_car_target_stays_above_its_speed_until_it_brakes():
+  tr = scs.StoppedCarTrigger()
+  kw = dict(lead_prob=0.9, lead_y=0.1, lead_d=110.0, lead_v=31 * MPH, lead_a=-0.2)
+  while not tr.update(_sw(**kw)):
+    pass
+  for _ in range(100):
+    tr.update(_sw(**kw))
+  assert tr.active and tr.floor_mode and 25 <= tr.target / MPH <= 27, tr.target / MPH
+  for _ in range(300):                              # it brakes for the light: the floor from now on
+    tr.update(_sw(**dict(kw, lead_a=-1.5)))
+  assert near(tr.target / MPH, 20) and tr.floor_committed
+  for _ in range(300):                              # and stays there even if it eases off again
+    tr.update(_sw(**kw))
+  assert near(tr.target / MPH, 20)
+
+
+class _Tag4Lead(StoppedLead):
+  """Tag 4: a car 110 m ahead slows from 42 to 31 mph and keeps going (later speeds up to 45)."""
+  def __init__(self, *a, speed_up_at=1500, **kw):
+    super().__init__(*a, **kw)
+    self.speed_up_at, self.a = speed_up_at, 0.0
+
+  def tick(self, car):
+    if self.frame < self.speed_up_at:
+      target, rate = 31 * MPH, 0.6       # tag 4: aLeadK -0.25..-1.0 while it slowed, about -0.65 on average
+    else:
+      target, rate = 45 * MPH, 1.0
+    dv = max(-rate * T.DT, min(rate * T.DT, target - self.v))
+    self.a = dv / T.DT
+    self.v += dv
+    super().tick(car)
+
+
+def test_tag4_replay_a_slower_car_that_keeps_moving_is_not_a_stop():
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3500,
+                                 lead=_Tag4Lead(110, v_mph=42, prob=0.9), max_drop=10,
+                                 model=lambda f: -0.6, plan=lambda f: 60 <= f < 1200))
+  assert r["ever_active"]
+  assert r["min"] >= 25 - 1e-6, r["min"]                                   # not 20 for a car doing 31
+  assert rel and rel[0][1] == "at the moving car's speed" and rel[0][2], rel
+  ups = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] >= rel[0][0]]
+  assert ups, "back with the hold"
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+class _GasCar(Car):
+  """The driver on the gas: the car accelerates at 1.5 m/s^2 whatever the set speed (up to `top`)."""
+  def __init__(self, *a, top_mph=42, **kw):
+    super().__init__(*a, **kw)
+    self.gas, self.top = False, top_mph * MPH
+
+  def tick(self):
+    if self.gas:
+      v = self.v_ego
+      super().tick()
+      self.v_ego = min(max(v + 1.5 * T.DT, self.v_ego), max(self.top, self.v_ego))
+    else:
+      super().tick()
+
+
+def _gas_run(v_resume_mph, top_mph=42, jump_extra=0, lose=None):
+  car = _GasCar(45, dash_offset_mph=0.0, top_mph=top_mph, jump_extra=jump_extra, lose=lose)
+  lead = StoppedLead(100)
+
+  def brake(s, c):
+    s["cruise"], s["brake"] = False, True
+
+  def stop(s, c):
+    c.v_ego = 0.0
+
+  def resume(s, c):
+    s["cruise"], s["brake"], s["gas"] = True, False, True
+    c.gas = True
+    c.v_ego = v_resume_mph * MPH
+    lead.d, lead.v = 300.0, 30.0                    # the queue drove off: nothing slower ahead any more
+
+  def lift(s, c):
+    s["gas"] = False
+    c.gas = False
+  events = {330: brake, 400: stop, 800: resume, 1800: lift}
+  return _releases(lambda: run(car, NO_CURVE, 3000, events=events, lead=lead, max_drop=10))
+
+
+def test_tag3_replay_on_the_gas_the_restore_goes_on():
+  # after a stop at a red light (set 20, the driver's speed 45) the driver drives off on the gas
+  r, rel = _gas_run(5)                            # slower than the set speed: SET+ taps while on the gas
+  assert rel and rel[0][1] == "cruise off / brake"
+  back = next(k for k, s in enumerate(r["sets"]) if k > 800 and near(s / MPH, 45))
+  assert back < 1800, back                        # back at 45 before the gas is lifted
+  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and 800 <= h["frame"] < 1800]
+  assert r["max"] <= 45 + 1e-6 and near(r["final"], 45) and not r["logic"].disabled
+
+
+def test_on_the_gas_faster_than_the_set_speed_one_set_plus_jumps_to_the_current_speed():
+  r, rel = _gas_run(35)                           # already at 35 with the set speed at 20 (tags 3/4: 20 -> 39 / 38)
+  s = r["sets"]
+  big = [(k, s[k] / MPH) for k in range(801, 1800) if s[k] - s[k - 1] > 2 * MPH]
+  assert big and 34 <= big[0][1] <= 45 - cs.GAS_JUMP_MARGIN + 1, big[:2]
+  assert r["max"] <= 45 + 1e-6 and near(r["final"], 45) and not r["logic"].disabled
+
+
+def test_set_plus_jump_is_never_sent_when_it_could_pass_the_drivers_speed():
+  r, rel = _gas_run(45, top_mph=45)               # at the driver's 45 on the gas, set 25: no jump (it could land at 46)
+  s = r["sets"]
+  assert r["max"] <= 45 + 1e-6
+  assert not [k for k in range(801, 1800) if s[k] - s[k - 1] > 2 * MPH]
+  assert near(r["final"], 45) and not r["logic"].disabled
+  # a jump landing one above the shown speed, presses ignored now and then: never above 45, never switched off
+  for v, extra in ((35, 1), (40, 1), (43, 1), (44, 0)):
+    r, rel = _gas_run(v, top_mph=v, jump_extra=extra, lose=lambda n: n % 4 == 0)
+    assert r["max"] <= 45 + 1e-6, (v, extra, r["max"])
+    assert near(r["final"], 45) and not r["logic"].disabled, (v, extra, r["final"])
+
+
+def test_restore_starts_below_12_mph_once_the_car_ahead_pulls_away():
+  car = Car(45, dash_offset_mph=0.0)
+  lead = StoppedLead(100)
+
+  def brake(s, c):
+    s["cruise"], s["brake"] = False, True
+
+  def slow(s, c):
+    c.v_ego = 1.0
+    lead.d, lead.v = 8.0, 0.0
+
+  def resume(s, c):
+    s["cruise"], s["brake"] = True, False
+    lead.moves_at, lead.drive_off = lead.frame, 25 * MPH        # the car ahead drives off
+  speeds = {}
+  orig = lead.tick
+  lead.tick = lambda c: (orig(c), speeds.__setitem__(lead.frame, c.v_ego))
+  r = run(car, NO_CURVE, 2500, events={330: brake, 500: slow, 700: resume}, lead=lead, max_drop=10)
+  ups = [f for f, b in r["presses"] if b == cs.SET_PLUS] + [h["frame"] for h in r["logic"].hold_log
+                                                            if h["direction"] == cs.SET_PLUS]
+  first = min(ups)
+  assert speeds[first - 1] < cs.KEEP_SPEED, (first, speeds[first - 1] / MPH)
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_driver_on_the_gas_releases_and_that_car_does_not_restart_it():
+  tr = scs.StoppedCarTrigger()
+  kw = dict(lead_prob=0.9, lead_y=0.1, lead_d=90.0, lead_v=13 * MPH)
+  while not tr.update(_sw(**kw)):
+    pass
+  for _ in range(99):
+    assert tr.update(_sw(gas_pressed=True, **kw))
+  assert not tr.update(_sw(gas_pressed=True, **kw))
+  assert tr.release_reason == "driver on the gas" and tr.clear_release and not tr.restore_now
+  for _ in range(300):
+    assert not tr.update(_sw(gas_pressed=True, **kw))          # nothing starts on the gas
+  for _ in range(300):
+    assert not tr.update(_sw(**kw))                            # nor for that car afterwards
+  n = 0
+  while not tr.update(_sw(**dict(kw, lead_d=130.0))):         # another car (a distance jump): it may
+    n += 1
+    assert n < 200
+
+
+def test_moving_car_release_needs_a_steady_car_and_no_planned_stop():
+  base = dict(lead_prob=0.9, lead_y=0.1, lead_d=60.0, lead_v=30 * MPH, v_ego=31 * MPH, model_accel=-0.6)
+  for kw, released in ((dict(lead_a=-0.1), True), (dict(lead_a=-0.55), False), (dict(lead_a=-0.1, plan_stop=True), False)):
+    tr = scs.StoppedCarTrigger()
+    while not tr.update(_sw(**dict(base, v_ego=45 * MPH, lead_a=-0.1))):
+      pass
+    gone = False
+    for _ in range(400):
+      if not tr.update(_sw(**dict(base, **kw))):
+        gone = True
+        break
+    assert gone == released, kw
+    if released:
+      assert tr.release_reason == "at the moving car's speed" and tr.restore_now
+
+
+def test_an_overridden_car_counts_again_once_it_slows_a_lot_or_the_gas_is_off_a_while():
+  kw = dict(lead_prob=0.9, lead_y=0.1, lead_d=90.0, lead_v=13 * MPH)
+
+  def overridden():
+    tr = scs.StoppedCarTrigger()
+    while not tr.update(_sw(**kw)):
+      pass
+    for _ in range(101):
+      tr.update(_sw(gas_pressed=True, **kw))
+    assert tr.release_reason == "driver on the gas" and tr.overridden
+    return tr
+  tr = overridden()
+  for _ in range(int(scs.OVERRIDE_REARM / scs.DT_CTRL) - 10):
+    assert not tr.update(_sw(**kw))
+  assert any(tr.update(_sw(**kw)) for _ in range(100))            # 5 s off the gas: it counts again
+  tr = overridden()
+  slower = dict(kw, lead_v=5 * MPH)                               # 13 -> 5 mph: it is slowing for something
+  assert any(tr.update(_sw(**slower)) for _ in range(100))
