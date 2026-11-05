@@ -26,7 +26,12 @@ MS_PER_KPH = 1 / 3.6
 OFF, TEST, ON = 0, 1, 2
 
 LIMIT_STABLE_TIME = 3.0      # s the new value must be reported unchanged (map matching flaps between roads at junctions)
-LIMIT_OLD_MAX_AGE = 30.0     # s: the old limit counts as "what the driver matched" only this long after it was last seen
+LIMIT_OLD_MAX_AGE = 30.0     # s: the previous limit counts as the old one only this long after it was last seen
+# Drive 4d (tag 2, t 740-808): 45 mph road, a red light, a right turn onto a 55 mph road; while waiting at the light the
+# map matched the cross road for 28 s (45 -> 40 at t 759, then 40 -> 55 at t 787). The driver's speed (45) was not the
+# 40 just before the 55, so nothing was offered. The old limit is now the last limit the driver's speed matched (seen
+# within LIMIT_MATCH_MAX_AGE, a long red light included), whatever came in between.
+LIMIT_MATCH_MAX_AGE = 90.0   # s
 LIMIT_OFFER_TIME = 30.0      # s an offer (old -> new) stays open (cruise may be off meanwhile: drive 4c, t 776-778)
 # slcSpeedLimitSource values that are a posted limit; never "None" (with the Speed Limit Controller active that can be
 # the set speed itself), "Previous Limit" (a remembered value) or "Vision" (the sign reader, not checked on this car)
@@ -71,6 +76,8 @@ class SpeedLimitFollower:
     self.stable_last_seen = -10_000
     self.candidate = None
     self.candidate_frames = 0
+    self.matched = None            # the last stable limit the driver's speed was at (steps) ...
+    self.matched_seen = -10_000    # ... and when
     self.offer = None
     self.events = []               # (kind, dict) for the per-event log, drained by the caller
 
@@ -100,12 +107,17 @@ class SpeedLimitFollower:
         reported = int(round(x))
     if reported is not None and reported == self.stable:
       self.stable_last_seen = self.frame
+      if i.cruise_enabled and i.driver_speed > 0 and abs(self._steps(i.driver_speed) - self.stable) < 0.5:
+        self.matched, self.matched_seen = self.stable, self.frame
     if reported == self.candidate:
       self.candidate_frames += 1
     else:
       self.candidate, self.candidate_frames = reported, 0
     if self.candidate is not None and self.candidate != self.stable and self.candidate_frames >= _frames(LIMIT_STABLE_TIME):
       old, old_seen, new = self.stable, self.stable_last_seen, self.candidate
+      if (self.matched is not None and self.matched != old and self.matched < new and
+          self.frame - self.matched_seen <= _frames(LIMIT_MATCH_MAX_AGE)):
+        old, old_seen = self.matched, self.frame        # the limit the driver was at, before a short detour (4d)
       self.stable, self.stable_last_seen = new, self.frame
       if old is not None and new > old:
         why = "old limit not seen recently" if self.frame - old_seen > _frames(LIMIT_OLD_MAX_AGE) else \

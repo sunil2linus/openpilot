@@ -82,6 +82,23 @@ def test_offer_ends_when_adopted_declined_or_old():
   assert _feed(f, 10, 50)[-1] == 0.0                              # too late
 
 
+def test_drive_4d_a_cross_road_limit_while_waiting_at_the_light_does_not_hide_the_old_one():
+  # 45 (the driver's speed) -> 40 for 28 s at the light (the cross road) -> 55 after the turn: offered 45 -> 55
+  f = _settled(45)
+  _feed(f, 2800, 40)
+  out = _feed(f, STABLE + 10, 55)
+  assert abs(out[-1] / MPH - 55) < 1e-6
+  assert f.offer.old == 45
+  # ... but not when the driver's speed was last at 45 too long ago
+  f = _settled(45)
+  _feed(f, int(slf.LIMIT_MATCH_MAX_AGE / slf.DT_CTRL) + 100, 40)
+  assert _feed(f, STABLE + 10, 55)[-1] == 0.0
+  # and a driver who set 40 on the 40 road is matched to 40: a 40 -> 55 rise is offered from 40
+  f = _settled(45)
+  _feed(f, 2800, 40, driver_mph=40)
+  assert abs(_feed(f, STABLE + 10, 55, driver_mph=40)[-1] / MPH - 55) < 1e-6
+
+
 def test_old_limit_forgotten_after_30_s_unknown():
   f = _settled(45)
   _feed(f, int(slf.LIMIT_OLD_MAX_AGE / slf.DT_CTRL) + 100, 0, source="None")
