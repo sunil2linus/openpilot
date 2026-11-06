@@ -368,43 +368,70 @@ class FakeParams:
 
 
 def test_planner_and_car_side_use_the_same_decel(tmp_path):
-  assert CT.MAP_DECEL == MC.PLAN_DECEL == CP.DECEL_DEFAULT
+  # Since drive 50 both sides plan road curves with the same firm constant, whatever the car profile measured (the
+  # learned staircase pace is logged, read alike by both, and no longer planned with: it would start the slowdown
+  # earlier again, see curve_target.MAP_DECEL)
+  assert CT.MAP_DECEL == MC.PLAN_DECEL == 0.45
   assert tuple(MC.PROFILE_DECEL_RANGE) == tuple(CP.DECEL_RANGE)
   assert MC.PROFILE_PATH == CP.PROFILE_PATH
   path = str(tmp_path / "p.json")
-  # no profile yet: both use the constant
-  assert MC.read_profile_decel(path) == CP.read_profile_decel(path) == CT.MAP_DECEL
+  # no profile yet: both read the same default
+  assert MC.PROFILE_DECEL_DEFAULT == CP.DECEL_DEFAULT
+  assert MC.read_profile_decel(path) == CP.read_profile_decel(path) == CP.DECEL_DEFAULT
   for episodes in ([0.2] * 12, [0.33] * 15, [0.9] * 12, [0.01] * 12, [0.2] * 5):
     p = CP.CarProfile(path=path, fingerprint="MAZDA_CX5", ti=True)
     for d in episodes:
       p.add_decel_episode(d)
     p.save(in_thread=False)
-    # the car side (CurveSlowdown._load_profile -> MapCurveControl)
-    car_side = CP.CarProfile(path=path, fingerprint="MAZDA_CX5", ti=True).decel(CT.MAP_DECEL)
-    ctl = CTL.MapCurveControl(3.0, car_side)
-    # the planner (MapCurvesPlanner._read_mode -> MapCurves.decel)
+    # both read the measurement alike (logs) ...
+    assert MC.read_profile_decel(path) == CP.read_profile_decel(path)
+    expected = CP.clamp_decel(sorted(episodes)[len(episodes) // 2]) if len(episodes) >= CP.DECEL_MIN_EPISODES else CP.DECEL_DEFAULT
+    assert abs(CP.read_profile_decel(path) - expected) < 1e-9, (episodes, expected)
+    # ... and neither plans with it: the car side (CurveSlowdown -> MapCurveControl) and the planner
+    # (MapCurvesPlanner._read_mode -> MapCurves.decel) use the constant
+    ctl = CTL.MapCurveControl(3.0)
     pl = MC.MapCurvesPlanner(FakeParams({"MazdaMapCurves": "2"}), FakeParams({}))
     pl.profile_path = path
     pl._read_mode()
-    assert ctl.decel == ctl.curve.decel == pl.decel == MC.read_profile_decel(path) == CP.read_profile_decel(path), episodes
-    expected = CP.clamp_decel(sorted(episodes)[len(episodes) // 2]) if len(episodes) >= CP.DECEL_MIN_EPISODES else CT.MAP_DECEL
-    assert abs(pl.decel - expected) < 1e-9, (episodes, pl.decel, expected)
+    assert ctl.decel == ctl.curve.decel == pl.decel == CT.MAP_DECEL, episodes
+    assert pl.profile_decel == CP.read_profile_decel(path)
     # and the plan itself: the same set speed for the same curve on both sides (reaction speed = the driver's speed)
     v = MC.plan_speed(150.0, 400.0, 0.0, reaction_speed=20.0, decel=pl.decel)
     assert abs(v - CT.map_curve_speed(150.0, 400.0, 2.2, 0.0, reaction_speed=20.0, decel=ctl.decel)) < 1e-9
     os.remove(path)
-  # the planner object keeps the value it read for the drive and gives it to MapCurves
-  p = CP.CarProfile(path=path, fingerprint="MAZDA_CX5", ti=True)
-  for _ in range(12):
-    p.add_decel_episode(0.3)
-  p.save(in_thread=False)
+  # the planner object gives MapCurves the constant, and keeps it over a re-read
   pl = MC.MapCurvesPlanner(FakeParams({"MazdaMapCurves": "2"}), FakeParams({}))
   pl.profile_path = path
   pl._read_mode()
   pl.mc = MC.MapCurves(MC.MapCurveStore(str(tmp_path / "nocurves"), background=False), decel=pl.decel)
-  assert pl.mc.decel == 0.3
+  assert pl.mc.decel == MC.PLAN_DECEL
   pl._read_mode()
-  assert pl.mc.decel == 0.3
+  assert pl.mc.decel == MC.PLAN_DECEL
+
+
+def test_planner_and_car_side_use_the_same_max_drop_floor():
+  """The driver's Curve Max Drop bounds the speed a road curve is planned for on both sides (drive 50: planning for
+  32 mph when the car would only go to 35 started the slowdown ~50 m early)."""
+  for metric in (False, True):
+    for choice, mph in enumerate(cs.MAX_DROP_CHOICES_MPH):
+      lg = cs.CurveSlowdownLogic(metric, mph)
+      pl = MC.MapCurvesPlanner(FakeParams({"MazdaMapCurves": "2", "MazdaCurveSlowdownMaxDrop": str(choice), "IsMetric": metric}),
+                               FakeParams({}))
+      pl._read_mode()
+      assert pl.max_drop_mph == mph and pl.metric == metric
+      for v in (20.0, 25.0, 30.0):
+        car_floor = v - lg.max_drop_steps * lg.step            # CurveSlowdownLogic's floor for the driver's speed v
+        assert abs(pl._floor(v) - car_floor) < 1e-9, (metric, mph, v)
+        # the car side's plan (MapCurveControl: the road curve's plan with the floor) equals the planner's
+        ctl = CTL.MapCurveControl(3.0)
+        _, sp = ctl.curve.update(91.0, 300.0, v, 0.0, ctl.decel, floor=car_floor)
+        assert abs(MC.plan_speed(91.0, 300.0, 0.0, v, decel=pl.decel, floor=pl._floor(v)) - sp) < 1e-9
+  assert MC.MAX_DROP_CHOICES_MPH == cs.MAX_DROP_CHOICES_MPH and MC.DEFAULT_MAX_DROP_MPH == cs.DEFAULT_MAX_DROP_MPH
+  # a bad or missing setting reads as the default on both sides
+  pl = MC.MapCurvesPlanner(FakeParams({"MazdaMapCurves": "2", "MazdaCurveSlowdownMaxDrop": "x"}), FakeParams({}))
+  pl._read_mode()
+  assert pl.max_drop_mph == cs.DEFAULT_MAX_DROP_MPH
+  assert pl._floor(0.0) == 0.0
 
 
 def test_learned_decel_changes_the_plan_consistently():

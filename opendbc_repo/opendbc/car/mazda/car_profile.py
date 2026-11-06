@@ -9,10 +9,11 @@ drives in a small JSON file (PROFILE_PATH) so that every drive starts tuned inst
     restore holds keep worst + 1 quanta of margin instead of the cautious default. The margin never goes below
     what was seen: a worse landing raises it at once (CurveSlowdownLogic does that; this file remembers it).
   * Cruise decel: how fast the stock cruise slows when the set speed is a little below the true speed (the pace of
-    the 1 mph staircase the map curve slowdown plans with). Measured by DecelLearner over clean episodes, median
-    over DECEL_MIN_EPISODES or more, clamped to DECEL_RANGE, and written as "use" so the car side (curve_target /
-    map_curve_control) and the planner (starpilot/controls/lib/map_curves.py, another process) read the same number.
-    Until then both use their constant (DECEL_DEFAULT = MAP_DECEL = PLAN_DECEL).
+    a 1 mph staircase). Measured by DecelLearner over clean episodes, median over DECEL_MIN_EPISODES or more, clamped
+    to DECEL_RANGE, and written as "use". Logged only since drive 50: map curves no longer plan with the staircase
+    pace; the car side commands the set speed below the plan so the cruise slows at curve_target.MAP_DECEL, and the
+    planner (starpilot/controls/lib/map_curves.py) plans with the same constant. The measurement stays (it describes
+    the car, and the logs compare it with what the follower gets).
 
 Rules: the file is read once when the car controller starts (card, real time: a few KB, never raises), written in
 the background (tmp + rename, every SAVE_INTERVAL when something changed, and when cruise goes off), and dropped when
@@ -33,8 +34,8 @@ LATENCY_KEEP = 9                 # as CurveSlowdownLogic.latencies
 HOLD_MIN_MEASURED = 5            # holds measured (over all drives) before a drive starts as measured
 DECEL_MIN_EPISODES = 10
 DECEL_KEEP = 40                  # newest episodes kept (the median is over these)
-DECEL_RANGE = (0.15, 0.40)       # m/s^2: the learned decel is used within this (map_curves.py clamps the same way)
-DECEL_DEFAULT = 0.25             # m/s^2 = curve_target.MAP_DECEL = map_curves.PLAN_DECEL, used until measured
+DECEL_RANGE = (0.15, 0.40)       # m/s^2: the learned decel is reported within this (map_curves.py clamps the same way)
+DECEL_DEFAULT = 0.25             # m/s^2: the staircase pace assumed until measured (drive 38: ~0.28); logs only
 SAVE_INTERVAL = 120.0            # s between background writes while something changed
 
 # DecelLearner: an episode is the set speed sitting GAP_MIN..GAP_MAX below the true speed (dash offset taken out)

@@ -93,10 +93,11 @@ def test_profile_loads_applies_learns_and_saves(tmp_path, monkeypatch):
   lg = c.logic
   assert lg.latencies == [11, 10, 12] and lg.latency == 11
   assert lg.hold_measured and lg.hold_overrun == 2 and lg._up_overrun() == 3
-  assert c.decel_used == 0.2 and c.map_control.decel == 0.2 and c.map_control.curve.decel == 0.2
+  # the measured staircase pace is kept in the profile (logs) but map curves plan with the constant (drive 50)
+  assert c.profile.decel() == 0.2 and c.decel_used == MAP_DECEL and c.map_control.decel == c.map_control.curve.decel == MAP_DECEL
   assert c.profile.data["drives"] == 1
   summary = c._profile_summary()
-  assert summary["answer_frames"] == 11 and summary["hold_overrun"] == 2 and summary["decel_used"] == 0.2 and "0.20" in summary["profile"]
+  assert summary["answer_frames"] == 11 and summary["hold_overrun"] == 2 and summary["decel_used"] == MAP_DECEL and "0.20" in summary["profile"]
   # a few frames of driving: the learner runs, nothing raises, the profile stays
   for _ in range(50):
     c.update(CC, car_state(43, 45), None, None, False)

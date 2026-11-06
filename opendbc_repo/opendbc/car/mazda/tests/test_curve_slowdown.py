@@ -25,12 +25,19 @@ DT = 0.01
 class Car:
   def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
                hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None,
-               hold_phase_window=None, plus_jumps=True, jump_extra=0):
+               hold_phase_window=None, plus_jumps=True, jump_extra=0, cruise_gain=None, cruise_dead=1.0, cruise_max=1.0):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.decel = decel
+    # The stock cruise as measured on drives 44/45/4c/4d/4f/50 (no lead, no pedals, over 27 mph): it slows about
+    # `cruise_gain` m/s^2 per m/s the set speed is below the true speed (0.19 measured: 2-4 mph gap 0.27, 6-8 mph 0.66,
+    # 10-12 mph 0.84 m/s^2), capped at `cruise_max`, and answers a set speed change `cruise_dead` s later. Off (None) the
+    # old fixed `decel` / `decel_fn` model is used, which the older tests were written against.
+    self.cruise_gain, self.cruise_max = cruise_gain, cruise_max
+    self.cruise_dead_frames = int(round(cruise_dead / DT))
+    self.gaps = []                    # set speed gap seen each frame (true speed - set speed), for the dead time
     self.hold_phase_window = hold_phase_window   # frames: a hold frame later than this after the wheel's reads as a tap
     # SET+ while faster than the set speed sets the current speed (drive 4d) on the gas only (drives 4c-4f: every jump
     # had the gas pressed within 0.5 s; off the gas a normal step, drive 4f); "always": also off the gas (a car that
@@ -110,6 +117,16 @@ class Car:
     self.pending = [p for p in self.pending if p[0] > self.frame]
     self._hold_tick()
     tgt = self.set_speed - self.dash_offset
+    if self.cruise_gain is not None:
+      self.gaps.append(self.v_ego - tgt)
+      if len(self.gaps) > self.cruise_dead_frames + 1:
+        del self.gaps[0]
+      gap = self.gaps[0] if len(self.gaps) > self.cruise_dead_frames else 0.0   # what the cruise acts on now
+      if gap > 0:
+        self.v_ego -= min(self.cruise_gain * gap, self.cruise_max) * DT
+      elif gap < 0:
+        self.v_ego += max(0.0, min(self.accel * DT, tgt - self.v_ego))    # back up to the set speed, never past it
+      return
     dec = self.decel_fn((self.v_ego - tgt) / MPH) if self.decel_fn is not None else self.decel
     self.v_ego += max(-dec * DT, min(self.accel * DT, tgt - self.v_ego))
 

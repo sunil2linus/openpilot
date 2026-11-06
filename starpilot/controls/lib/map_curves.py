@@ -38,14 +38,24 @@ EARTH_R = 6371008.8
 
 LOOKAHEAD = 1000.0        # m along the road
 PLAN_LAT = 2.2            # m/s^2: as the car side (curve_target.MAP_LATERAL_ACCEL)
-PLAN_DECEL = 0.25         # m/s^2: as the car side for road curves (curve_target.MAP_DECEL), until the car profile has measured it
-# The car profile (opendbc/car/mazda/car_profile.py, written by the car controller in card) holds the cruise decel
-# measured on this car as decel.use; both sides read it once per drive and clamp it the same way, so the planner's
-# "Slowing to" notices and the car side's set speed target agree.
+# PLAN_DECEL: as the car side for road curves (curve_target.MAP_DECEL, the drive evidence is there): the slowdown is
+# planned firm and the car side commands the set speed below the plan so the stock cruise really slows that hard
+# (drive 50: the old gentle 0.25 plan started 380-395 m before West Utica's 30 mph curve). The car profile's learned
+# decel (car_profile.py decel.use, the pace of the small-step staircase) is still measured and logged but no longer
+# planned with on either side: it would only start the slowdown earlier again. Both sides use this constant, so the
+# planner's "Slowing to" notices and the car side's set speed target agree.
+PLAN_DECEL = 0.45         # m/s^2
 PROFILE_PATH = "/data/media/0/mazda_car_profile.json"
 PROFILE_DECEL_RANGE = (0.15, 0.40)
+PROFILE_DECEL_DEFAULT = 0.25   # car_profile.DECEL_DEFAULT: the staircase pace assumed until measured (logs only)
 PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry
 PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET- press
+# The driver's Curve Max Drop (MazdaCurveSlowdownMaxDrop, an index into MAX_DROP_CHOICES_MPH, read as the car side's
+# curve_slowdown.py reads it): the car side never takes a road curve below the driver's speed less this, so the plan
+# aims for that speed, not lower (drive 50: planning for 32 mph when the car would only go to 35 started the slowdown
+# ~50 m earlier than the 35 needed). Whole 1 mph / 1 km/h steps, as CurveSlowdownLogic counts them.
+MAX_DROP_CHOICES_MPH = (5, 10, 15)
+DEFAULT_MAX_DROP_MPH = 10
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
 AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our heading
 NEAR = 15.0               # m
@@ -157,17 +167,28 @@ def curve_speed_limit(radius, advisory=0.0, lat_limit=PLAN_LAT):
   return min(v, advisory + ADVISORY_OVER) if advisory > 0 else v
 
 
-def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL):
+def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL, floor=0.0):
   """Highest speed (m/s) from which the stock cruise (reacting for PLAN_REACTION_TIME at `reaction_speed`, then
-  slowing at `decel`) reaches the curve speed PLAN_LEAD_TIME before its entry (the car side's map_curve_speed)."""
-  v_curve = curve_speed_limit(radius, advisory, lat_limit)
+  slowing at `decel`) reaches the curve speed (never below `floor`, the driver's max drop) PLAN_LEAD_TIME before its
+  entry (the car side's map_curve_speed)."""
+  v_curve = max(curve_speed_limit(radius, advisory, lat_limit), floor)
   room = distance - v_curve * PLAN_LEAD_TIME - PLAN_REACTION_TIME * max(reaction_speed, v_curve)
   return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
 
 
-def read_profile_decel(path=PROFILE_PATH, default=PLAN_DECEL):
-  """The decel to plan with: the car profile's measured value (clamped to PROFILE_DECEL_RANGE), else the default.
-  A few KB once per drive; never raises. Mirrors car_profile.read_profile_decel (this module stays dependency free)."""
+def max_drop_floor(driver_speed, max_drop_mph=DEFAULT_MAX_DROP_MPH, metric=False):
+  """The lowest speed (m/s) the car side takes a road curve to: the driver's speed less the Curve Max Drop in whole
+  steps (CurveSlowdownLogic.max_drop_steps); 0 when there is no driver's speed."""
+  if driver_speed <= 0:
+    return 0.0
+  steps = int(round(max_drop_mph * 1.609344)) if metric else int(round(max_drop_mph))
+  return max(driver_speed - steps * ((1 / 3.6) if metric else MPH), 0.0)
+
+
+def read_profile_decel(path=PROFILE_PATH, default=PROFILE_DECEL_DEFAULT):
+  """The car profile's measured cruise decel (clamped to PROFILE_DECEL_RANGE), else the default. Kept for the logs
+  and the tests that check both sides read the file alike; the plan itself uses PLAN_DECEL (see there). A few KB;
+  never raises. Mirrors car_profile.read_profile_decel (this module stays dependency free)."""
   try:
     with open(path) as f:
       use = json.load(f).get("decel", {}).get("use")
@@ -1161,7 +1182,8 @@ class MapCurves:
     self.store = store if store is not None else MapCurveStore()
     self.release_after_apex = release_after_apex
     self.memory = memory
-    self.decel = decel           # the cruise's slowdown for the plan (PLAN_DECEL, or the car profile's measured value)
+    self.decel = decel           # the cruise's slowdown for the plan (PLAN_DECEL)
+    self.floor = 0.0             # m/s: the driver's max drop floor this cycle (max_drop_floor; the car side plans with it too)
     self.veto = CurveVeto()      # camera check (acts only when update() gets a camera view)
     self.reset()
 
@@ -1305,7 +1327,8 @@ class MapCurves:
       if cands:
         cands = self.veto.filter(self, cid, cands, camera, shaky)
       if cands:
-        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel))
+        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel,
+                                                    floor=0.0 if cd[0].get("ramp") else self.floor))
         if trust is not None and trust.low:
           self.held = (c, d)     # another road this close may be the one we are on: do not slow early
           self.status = STATUS_HELD
@@ -1382,7 +1405,10 @@ class MapCurvesPlanner:
     self.announced_exit = None
     self.notice = None          # "curve" / "exit_data" / "exit_no_data" / "paused" for one planner cycle
     self.profile_path = PROFILE_PATH
-    self.decel = PLAN_DECEL     # read with the mode at the start of every drive (the car side reads the same file then)
+    self.decel = PLAN_DECEL     # the plan's decel (the same constant on the car side)
+    self.profile_decel = PROFILE_DECEL_DEFAULT   # what the car profile measured (logs only), read with the mode at the start of every drive
+    self.max_drop_mph = DEFAULT_MAX_DROP_MPH   # the driver's Curve Max Drop, read with the mode (the car side reads it at start too)
+    self.metric = False
     self.recorder = None        # camera check / GPS trust events (feature logs), started on first use
     self.recorder_failed = False
     self.trust = GpsTrust()
@@ -1396,9 +1422,22 @@ class MapCurvesPlanner:
       self.mode = int(self.params.get(self.PARAM, encoding="utf8") or 0)
     except (TypeError, ValueError):
       self.mode = 0
-    self.decel = read_profile_decel(self.profile_path)
+    self.profile_decel = read_profile_decel(self.profile_path)
+    try:
+      raw = self.params.get("MazdaCurveSlowdownMaxDrop", encoding="utf8")
+      choice = 1 if raw is None or raw == "" else int(raw)    # as curve_slowdown.CurveSlowdown reads it
+      self.max_drop_mph = MAX_DROP_CHOICES_MPH[choice] if 0 <= choice < len(MAX_DROP_CHOICES_MPH) else DEFAULT_MAX_DROP_MPH
+    except (TypeError, ValueError, AttributeError):
+      self.max_drop_mph = DEFAULT_MAX_DROP_MPH
+    try:
+      self.metric = bool(self.params.get_bool("IsMetric"))
+    except Exception:
+      self.metric = False
     if self.mc is not None:
       self.mc.decel = self.decel
+
+  def _floor(self, set_speed):
+    return max_drop_floor(set_speed, self.max_drop_mph, self.metric)
 
   def update(self, sm, gps_position, v_ego, set_speed):
     self.notice = None
@@ -1458,6 +1497,8 @@ class MapCurvesPlanner:
       nav = None
     camera = camera_view(sm)
     was_paused = self.trust.paused
+    floor = self._floor(set_speed)
+    self.mc.floor = floor
     self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav,
                    camera=camera, trust=self.trust,
                    gps={"dt": dt, "v_ego": v_ego, "acc": acc, "rel": rel, "ambiguous": self.matcher.ambiguous})
@@ -1467,12 +1508,14 @@ class MapCurvesPlanner:
       self.notice = "paused"     # once per drive, and whenever a pause ends a slowdown (the speed comes back)
     self._feature_log(mc, v_ego, set_speed, now, gps_position)
     self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"], dt=self.call_dt)
+    road_floor = 0.0 if mc.status == STATUS_RAMP_CURVE else floor     # ramp curves are planned without the max drop floor
     self.prev_slowing = mc.curve is not None and set_speed > 0 and \
-      plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel) < set_speed - 2 * MPH
+      plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor) < set_speed - 2 * MPH
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
-      if key != self.announced_curve and plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel) < set_speed - 2 * MPH and \
+      if key != self.announced_curve and \
+         plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor) < set_speed - 2 * MPH and \
          curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"

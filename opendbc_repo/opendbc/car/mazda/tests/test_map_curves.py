@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import sys
 import tempfile
 
@@ -422,41 +423,262 @@ def test_never_keeps_a_lowered_speed_when_the_next_road_is_a_freeway():
   assert not c.update(F(on_ramp=False, road_class=1), 70 * MPH, 0).adopt
 
 
-def test_west_utica_slows_before_the_curve_not_in_it():
-  # route 36: 45 mph, the 117 m curve (~36 mph). The set speed comes down in 1 mph steps that the stock cruise can
-  # follow: drive 38 showed it follows small steps at only ~0.28 m/s^2, ~1.5 s after each press.
+# ---------------- map curve follower (drive 50: West Utica Road, 45 mph, the 91 m curve) ----------------
+# The old plan (0.25 m/s^2 staircase) began 380-395 m before the curve and the car crawled down 1 mph at a time. Now
+# the plan is firm (MAP_DECEL) and the follower asks the cruise for a set speed below the plan; the simulated car is the
+# stock cruise as measured (Car(cruise_gain=0.19): 0.19 m/s^2 per m/s of set speed gap, ~1 s dead time).
+
+CT = _load("curve_target", os.path.join(HERE, "..", "curve_target.py"))
+WEST_UTICA_R = 91.0
+MEASURED_CRUISE = dict(cruise_gain=0.19, cruise_dead=1.0)
+
+
+def drive_map(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, length=80.0, follow=True, decel=None,
+              metric=False, events=None, frames=6000, second=None, camera=None, stop=None, car_kw=None):
+  """Drive at the driver's speed towards a map curve `start_d` m ahead (`length` m long), the map control and the
+  controller in the loop. follow=False: the old plan-only staircase (no true speed, no max drop in the plan).
+  second: (radius, gap m) of a curve starting that far after the first one's exit. camera(x) / stop(x): the camera
+  curve target / stopped car target (m/s) at x m before the entry, or None. Returns the run's numbers."""
+  step = cs.MS_PER_KPH if metric else MPH
+  car = T.Car(set_mph * MPH / step, dash_offset_mph=0.0, lag=10, accel=0.6, step=step, **dict(MEASURED_CRUISE, **(car_kw or {})))
+  car.set_speed = car.v_ego = set_mph * MPH
+  logic = cs.CurveSlowdownLogic(metric, max_drop)
+  ctl = CTL.MapCurveControl(3.0, decel if decel is not None else CTL.MAP_DECEL)
+  md = logic.max_drop_steps * logic.step
+  x = start_d
+  st = dict(gas=False, brake=False, enabled=True, cruise=True)
+  presses, sets, vs, xs, gaps = [], [], [], [], []
+  first = v_entry = v_entry2 = None
+  v_prev = car.v_ego
+  a_hist = []
+  for f in range(frames):
+    if events and f in events:
+      events[f](st, car)
+    if x > -length:
+      fld = F(status=1, radius=radius, distance=max(x, 0.0))
+    elif second is not None and x > -length - second[1] - length:
+      fld = F(status=1, radius=second[0], distance=max(second[1] + length + x, 0.0))
+    else:
+      fld = F(status=0)
+    driver = car.set_speed + logic.offset * logic.step if st["cruise"] else 0.0
+    mo = ctl.update(fld, driver, 0, v_ego=car.v_ego if follow else 0.0, max_drop=md if follow else 0.0)
+    # the wrapper's combination with the camera curve target (curve_slowdown.CurveSlowdown.update)
+    cam = camera(x) if camera is not None else None
+    active, speed, floor, budget = cam is not None, cam if cam is not None else CTL.NO_CURVE, 0.0, 0
+    if mo.active and (not active or mo.speed < speed):
+      speed, floor, budget = mo.speed, mo.floor, mo.budget
+    elif mo.active and mo.track:
+      speed += cs.CURVE_MARGIN
+    active = active or mo.active
+    stop_t = stop(x) if stop is not None else None
+    inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed, v_ego=car.v_ego,
+                            gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=False, plan_alive=True,
+                            csc_active=active, csc_speed=min(speed, 100.0), other_button_active=False,
+                            driver_button=car.driver_button_now(), curve_floor=floor, curve_budget=budget,
+                            curve_track=mo.active and mo.track, fast_restore=mo.fast_restore,
+                            stop_active=stop_t is not None, stop_target=stop_t or 0.0, stop_urgent=False)
+    btn, off = logic.update(inp)
+    if btn is not None:
+      if logic.last_action == "hold":
+        car.hold_frame(btn)
+      else:
+        car.press(btn)
+      presses.append((f, round(x), btn, logic.last_action))
+      if first is None and btn == cs.SET_MINUS:
+        first = x
+    if st["gas"]:
+      car.gas_frame = car.frame
+    car.tick()
+    a_hist.append((car.v_ego - v_prev) / T.DT)
+    v_prev = car.v_ego
+    x_new = x - car.v_ego * T.DT
+    if x > 0 >= x_new:
+      v_entry = car.v_ego
+    if second is not None and x > -length - second[1] >= x_new:
+      v_entry2 = car.v_ego
+    x = x_new
+    sets.append(car.set_speed)
+    vs.append(car.v_ego)
+    xs.append(x)
+    if 50 < x < 150:
+      gaps.append(car.v_ego - car.set_speed)
+  n = 50                                      # peak decel over half a second
+  peak = max(-sum(a_hist[i:i + n]) / n for i in range(len(a_hist) - n)) if len(a_hist) > n else 0.0
+  in_curve = [v for v, xx in zip(vs, xs, strict=True) if -length < xx <= 0]
+  return dict(first=first, v_entry=v_entry / MPH if v_entry else None, v_entry2=v_entry2 / MPH if v_entry2 else None,
+              min_v=min(vs) / MPH, min_in_curve=min(in_curve) / MPH if in_curve else None, peak=peak, presses=presses,
+              n_minus=sum(1 for p in presses if p[2] == cs.SET_MINUS), n_plus=sum(1 for p in presses if p[2] == cs.SET_PLUS),
+              min_set=min(sets) / MPH, final_set=sets[-1] / MPH, max_gap=max(gaps) / MPH if gaps else 0.0,
+              logic=logic, sets=sets, vs=vs, xs=xs)
+
+
+def test_west_utica_follower_starts_later_and_slows_firmer():
+  # drive 50: the slowdown began 380 m (17 s) before the entry, 1 mph SET- steps every 1-2 s, the car at 35.5 ~50 m
+  # before the entry (max drop 10: the curve's 32 mph held at 35). The old plan reproduced on the measured cruise:
+  old = drive_map(max_drop=10, follow=False, decel=0.25)
+  assert old["first"] >= 350 and old["max_gap"] <= 4.0, (old["first"], old["max_gap"])
+  for max_drop, v_curve in ((10, 35.0), (15, math.sqrt(2.2 * WEST_UTICA_R) / MPH)):
+    r = drive_map(max_drop=max_drop)
+    # starts about half as far out (the plan is firm and aims for the max drop floor, not below it) ...
+    assert 170 <= r["first"] <= 260 and r["first"] <= old["first"] - 120, (max_drop, r["first"])
+    # ... asks the cruise for a real gap over the last 150 m (the old staircase sat 1-2 mph below the true speed on
+    # drive 50, 3.7 on the simulated cruise) ...
+    assert r["max_gap"] >= 5.0 and r["max_gap"] >= old["max_gap"] + 2.0, (max_drop, r["max_gap"], old["max_gap"])
+    # ... and is at the curve's speed at the entry, never more than ~1 mph below it, with a firm but gentle slowdown
+    assert abs(r["v_entry"] - v_curve) <= 1.0, (max_drop, r["v_entry"], v_curve)
+    assert r["min_v"] >= v_curve - 1.0 and r["min_in_curve"] >= v_curve - 1.0, (max_drop, r["min_v"], r["min_in_curve"])
+    assert r["peak"] <= 0.7, (max_drop, r["peak"])
+    # the temporary undershoot stays within MAP_UNDERSHOOT of the curve's speed (so of the max drop floor), the set
+    # speed the car settles at is the curve's speed (>= the floor), and the driver's speed comes back after the curve
+    assert r["min_set"] >= v_curve - 5 - 1e-6 and r["min_set"] <= v_curve - 3, (max_drop, r["min_set"])
+    in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
+    assert min(in_curve_sets) >= 45 - max_drop - 1e-6 and max(in_curve_sets) <= math.ceil(v_curve) + 1e-6, (max_drop, min(in_curve_sets))
+    assert abs(r["final_set"] - 45) < 1e-6
+    # a reasonable number of presses: down to the undershoot, up to the curve's speed, and the restore
+    assert r["n_minus"] <= 20 and r["n_plus"] <= 25, (max_drop, r["n_minus"], r["n_plus"])
+    raises = [p for p in r["presses"] if p[3] == "raise"]
+    assert raises and all(0 < p[1] < 60 for p in raises), raises       # the step back up comes just before the entry
+    seq = "".join("M" if b == cs.SET_MINUS else "P" for _, _, b, _ in r["presses"])
+    assert seq.count("PM") == 0, seq                                   # no ping-pong
+
+
+def test_follower_works_for_a_slower_or_quicker_cruise():
+  # the measured gain is a median; a cruise answering 0.15 or 0.25 m/s^2 per m/s still arrives at the curve's speed
+  for gain in (0.15, 0.25):
+    r = drive_map(max_drop=10, car_kw=dict(cruise_gain=gain))
+    assert abs(r["v_entry"] - 35) <= 1.0 and r["min_in_curve"] >= 34.0 and r["min_set"] >= 30 - 1e-6, (gain, r["v_entry"], r["min_in_curve"])
+
+
+def test_follower_hands_control_back_to_the_driver():
+  # a driver SET- tap mid-slowdown: their new speed, as today: we stop managing (nothing of ours while the curve the
+  # tap came in is on), and whatever the map asks for later is relative to that speed, which also comes back after
+  r0 = drive_map(max_drop=10)
+  mid = next(f for f, x, b, _ in r0["presses"] if x < 150)
+  r = drive_map(max_drop=10, events={mid + 60: lambda st, car: car.press(cs.SET_MINUS, who="driver")}, frames=mid + 3500)
+  theirs = r["sets"][mid + 90] / MPH                       # where the driver's tap put the set speed
+  assert theirs <= 45 - 2 and all(abs(sp / MPH - theirs) < 1e-6 for sp in r["sets"][mid + 90:mid + 360]), theirs
+  assert [p for p in r["presses"] if mid + 60 < p[0] <= mid + 360] == []        # nothing of ours for the next 3 s
+  assert r["logic"].anchor is None or r["logic"].anchor <= theirs * MPH + 1e-6  # never managing from the old 45 again
+  assert abs(r["final_set"] - theirs) < 1e-6, (r["final_set"], theirs)
+  # a driver SET+ tap mid-slowdown stands us down for the curve: no SET- of ours after it
+  r = drive_map(max_drop=10, events={mid + 60: lambda st, car: car.press(cs.SET_PLUS, who="driver")}, frames=mid + 3500)
+  assert [p for p in r["presses"] if p[0] > mid + 60 and p[2] == cs.SET_MINUS] == []
+  assert abs(r["final_set"] - 45) < 1e-6
+  # the brake mid-slowdown: nothing while braking; the gas: nothing on the gas
+  for pedal in ("brake", "gas"):
+    def on(st, car, pedal=pedal):
+      st[pedal] = True
+    r = drive_map(max_drop=10, events={mid + 60: on}, frames=mid + 400)
+    assert all(p[0] <= mid + 60 for p in r["presses"]), (pedal, r["presses"])
+
+
+def test_follower_second_curve_right_after_the_first():
+  # a 120 m curve (36.3 mph) 150 m after West Utica's exit: the set speed goes from 35 up to the second curve's speed,
+  # not back to 45 in between, and the car enters it at that speed; the driver's speed comes back after it
+  v2 = math.sqrt(2.2 * 120.0) / MPH
+  r = drive_map(max_drop=10, second=(120.0, 150.0), frames=9000)
+  assert abs(r["v_entry"] - 35) <= 1.0 and abs(r["v_entry2"] - v2) <= 1.0, (r["v_entry"], r["v_entry2"], v2)
+  between = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -230 < xx <= -80]
+  assert max(between) <= math.ceil(v2) + 1e-6, max(between)
+  assert abs(r["final_set"] - 45) < 1e-6
+  assert r["n_minus"] <= 20, r["n_minus"]
+
+
+def test_follower_in_km_h():
+  # 72 km/h (45 mph), max drop 10 mph = 16 km/h: the curve held at 56 km/h; 1 km/h steps
+  r = drive_map(max_drop=10, metric=True, set_mph=72 / 1.609344)
+  v_curve = 56 / 1.609344
+  assert abs(r["v_entry"] - v_curve) <= 1.0 and r["min_in_curve"] >= v_curve - 1.0, (r["v_entry"], r["min_in_curve"])
+  assert r["min_set"] >= v_curve - 5 - 1e-6, r["min_set"]
+  assert 170 <= r["first"] <= 260, r["first"]
+  assert abs(r["final_set"] * 1.609344 - 72) < 1e-6
+  assert r["n_minus"] <= 30, r["n_minus"]
+
+
+def test_follower_lowest_target_wins_camera_and_stopped_car():
+  # max drop 15 (floor 30): the camera sees the curve a little tighter (29.8 mph true) near it: the step back up stops
+  # at the camera's target (31 with its 0.3 m/s margin), never at the map's 32; the undershoot still happened first
+  def cam(x):
+    return 29.8 * MPH if x < 120 else None
+  r = drive_map(max_drop=15, camera=cam)
+  in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
+  assert max(in_curve_sets) <= 31 + 1e-6 and min(in_curve_sets) >= 31 - 1e-6, (min(in_curve_sets), max(in_curve_sets))
+  assert 26 <= r["min_set"] <= 28, r["min_set"]
+
+  # max drop 10 (floor 35): a camera target below the floor is held at the floor, as today
+  def cam35(x):
+    return 33.5 * MPH if x < 120 else None
+  r = drive_map(max_drop=10, camera=cam35)
+  in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
+  assert max(in_curve_sets) <= 35 + 1e-6 and min(in_curve_sets) >= 35 - 1e-6, (min(in_curve_sets), max(in_curve_sets))
+
+  # a stopped car ahead wants 25 mph while the follower would step back up: the stop's lower target wins, no step up
+  def stop(x):
+    return 25 * MPH if x < 60 else None
+  r = drive_map(max_drop=10, stop=stop, frames=4500)
+  assert not any(p[3] == "raise" for p in r["presses"]), [p for p in r["presses"] if p[3] == "raise"]
+  assert r["min_set"] <= 25 + 1e-6, r["min_set"]
+
+
+def test_follower_invariants_over_curves_speeds_and_settings():
+  rng = random.Random(7)
+  checked = 0
+  while checked < 14:
+    set_mph, max_drop = rng.choice([35, 45, 55, 65]), rng.choice([5, 10, 15])
+    radius, gain = rng.choice([60, 91, 120, 160, 220, 300]), rng.choice([0.15, 0.19, 0.25])
+    v_c = max(math.sqrt(2.2 * radius) / MPH, set_mph - max_drop)        # the speed the curve is taken at
+    if v_c > set_mph - 2:
+      continue
+    checked += 1
+    r = drive_map(radius=radius, set_mph=set_mph, max_drop=max_drop, start_d=700.0, frames=9000, car_kw=dict(cruise_gain=gain))
+    case = (set_mph, max_drop, radius, gain)
+    assert max(r["sets"]) / MPH <= set_mph + 1e-6, case                                   # never above the driver's speed
+    assert r["min_set"] >= max(v_c - 5, 25) - 1e-6, (case, r["min_set"])                 # undershoot bounded
+    in_curve = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
+    assert min(in_curve) >= set_mph - max_drop - 1e-6 and max(in_curve) <= math.ceil(v_c) + 1e-6, (case, in_curve[0])
+    assert abs(r["v_entry"] - v_c) <= 1.5 and r["min_in_curve"] >= v_c - 1.5, (case, r["v_entry"], r["min_in_curve"])
+    assert abs(r["final_set"] - set_mph) < 1e-6, (case, r["final_set"])                   # restored after the curve
+    seq = "".join("M" if b == cs.SET_MINUS else "P" for _, _, b, _ in r["presses"])
+    assert seq.count("PM") <= 1, (case, seq)                                              # no ping-pong
+    assert r["peak"] <= (0.7 if gain <= 0.19 else 0.9), (case, r["peak"])
+
+
+def test_follower_command_and_plan_shapes():
+  # the plan: firm, aims for the max drop floor, starts about 200 m out for West Utica at 45 (old plan: ~390 m)
   c = CTL.MapCurveControl(3.0)
-  start = None
-  for d in range(500, -1, -2):
-    if c.update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).active:
-      start = d
-      break
-  assert start is not None and 280 <= start <= 340, start
-  # the set speed (whole mph, following the plan at the car's position) and the cruise following it like on drive 38
-  v_curve = math.sqrt(2.2 * 116.6)
-  ctl = CTL.MapCurveControl(3.0)
-  v, x, t, sets, max_gap = 45 * MPH, 500.0, 0.0, [], 0.0
-  while x > 0:
-    out = ctl.update(F(status=1, radius=116.6, distance=x), 45 * MPH, 0)
-    target = math.ceil(out.speed / MPH - 1e-9) * MPH if out.active else 45 * MPH
-    sets.append((t, min(45 * MPH, target)))
-    lagged = [sp for tt, sp in sets if tt <= t - 1.5]
-    set_now = lagged[-1] if lagged else 45 * MPH
-    if v > set_now + 0.05:
-      v = max(v - 0.28 * 0.01, set_now)
-    max_gap = max(max_gap, (v - sets[-1][1]) / MPH)
-    x -= v * 0.01
-    t += 0.01
-  assert v <= v_curve + 0.6 * MPH, v / MPH                     # at the curve's speed (within ~0.5 mph) at its entry
-  assert max_gap <= 2.0, max_gap                               # the cruise never falls far behind the set speed
-  # gradual: the planned speed comes down by well under 1 mph per second, never in jumps
-  prev, steps = None, []
-  for d in range(start, -1, -1):
-    sp = CTL.MapCurveControl(3.0).update(F(status=1, radius=116.6, distance=d), 45 * MPH, 0).speed
-    if prev is not None:
-      steps.append((prev - sp) / MPH / (1.0 / 18.0))          # mph per second at ~40 mph (18 m/s)
-    prev = sp
-  assert max(steps) < 0.7, max(steps)
+  md = 10 * MPH
+  start = next(d for d in range(500, -1, -2) if c.update(F(status=1, radius=WEST_UTICA_R, distance=d), 45 * MPH, 0, 20.0, md).active)
+  assert 190 <= start <= 215, start
+  c = CTL.MapCurveControl(3.0)
+  start15 = next(d for d in range(500, -1, -2) if c.update(F(status=1, radius=WEST_UTICA_R, distance=d), 45 * MPH, 0, 20.0, 15 * MPH).active)
+  assert 240 <= start15 <= 265, start15
+  c = CTL.MapCurveControl(3.0, 0.25)
+  old = next(d for d in range(500, -1, -2) if c.update(F(status=1, radius=WEST_UTICA_R, distance=d), 45 * MPH, 0).active)
+  assert old >= 380, old
+  # the follower: the gap for the required decel, bounded by the undershoot, the curve's speed once nearly there
+  v_c = 35 * MPH
+  required = ((45 * MPH) ** 2 - v_c ** 2) / (2 * (400 - v_c - 45 * MPH))        # over the room after the lead and dead times
+  assert abs(CT.map_follow_speed(45 * MPH, v_c, 400.0) - (45 * MPH - required / CT.MAP_FOLLOW_GAIN)) < 1e-9
+  # nearly there with no room left: the gap is capped (MAP_FOLLOW_MAX_DECEL), then bounded by the undershoot
+  assert abs(CT.map_follow_speed(45 * MPH, v_c, 20.0) - (45 * MPH - CT.MAP_FOLLOW_MAX_DECEL / CT.MAP_FOLLOW_GAIN)) < 1e-9
+  assert abs(CT.map_follow_speed(v_c + 2.5 * MPH, v_c, 20.0) - (v_c - CT.MAP_UNDERSHOOT)) < 1e-9
+  assert CT.map_follow_speed(v_c + CT.MAP_SETTLE - 0.01, v_c, 100.0) == v_c
+  f = CT.MapCurveFollower()
+  assert f.update(20.0, v_c, 200.0, 19.5) <= 19.5                      # never above the plan
+  low = f.update(19.0, v_c, 150.0, 19.0)
+  assert f.update(19.0, v_c, 170.0, 19.0) == low                       # more room again (a GPS step): the command does not rise
+  assert f.update(v_c + 0.5, v_c, 20.0, v_c + 0.1) == v_c              # settled: the curve's speed
+  assert f.update(v_c + CT.MAP_SETTLE + 0.5 * CT.MAP_SETTLE_HYST, v_c, 10.0, v_c + 2.0) == v_c   # within the hysteresis: still
+  assert f.update(v_c + CT.MAP_SETTLE + CT.MAP_SETTLE_HYST + 0.1, v_c, 10.0, v_c + 2.0) < v_c    # clearly too fast: a gap again
+  f.update(19.0, v_c + 1.0, 150.0, 19.0)                               # another curve speed: starts over
+  assert f.cmd is not None and not f.settled
+  # ramp curves and exits keep the staircase plan (no follower, no undershoot floor)
+  c = CTL.MapCurveControl(3.0)
+  out = on_ramp_for(c, HOLD + 1, 70 * MPH, status=2, radius=45, distance=80, on_ramp=True, ramp_type=1)
+  assert out.active and not out.track and abs(out.floor - 25 * MPH) < 1e-9
+  for _ in range(3):
+    out = c.update(F(status=2, radius=45, distance=80, on_ramp=True, ramp_type=1), 70 * MPH, 0, v_ego=30.0, max_drop=md)
+  assert out.active and not out.track and abs(out.floor - 25 * MPH) < 1e-9 and abs(out.speed - c.curve.speed) < 1e-9
 
 
 def test_a_road_curve_stops_governing_after_its_apex_when_the_camera_slowdown_is_on():

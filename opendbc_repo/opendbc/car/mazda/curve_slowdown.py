@@ -195,8 +195,12 @@ class SlowdownInputs:
   stop_target: float = 0.0      # m/s, true speed; clipped to [STOP_MIN_SET_SPEED, driver's speed] here
   stop_urgent: bool = False     # fast pace for the stopped car
   stop_restore_now: bool = False  # the stopped car reason just cleared (lead moving, ego stopped, lead lost): restore at once
-  curve_floor: float = 0.0        # m/s: when > 0 the curve may go this low (a ramp), past the max drop
+  curve_floor: float = 0.0        # m/s: when > 0 the curve may go this low (a ramp, a followed map curve's undershoot), past the max drop
   curve_budget: int = 0           # SET- presses allowed for this curve when more than the usual budget (a ramp)
+  # csc_speed is a map curve follower's set speed command (map_curve_control.py): no margin on it, and when it comes
+  # back up during the curve (the car is nearly at the curve's speed) the set speed is raised to it with SET+ taps at
+  # once, not after the curve, so the car does not end up below the curve's speed
+  curve_track: bool = False
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
@@ -836,7 +840,7 @@ class CurveSlowdownLogic:
         floor = max(i.curve_floor, MIN_SET_SPEED)
       else:
         floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
-      targets.append(("curve", max(i.csc_speed + CURVE_MARGIN, floor)))
+      targets.append(("curve", max(i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN), floor)))
     if i.stop_active:
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
     reason, target = min(targets, key=lambda rt: rt[1]) if targets else (None, None)
@@ -926,9 +930,19 @@ class CurveSlowdownLogic:
     gas_restore = (GAS_JUMP_ENABLED and i.gas_pressed and not i.csc_active and not i.stop_active and
                    (self.restore_pending or i.stop_clear_ahead))
     button = None
+    raise_in_curve = False
     if want_lower:
       self.restoring = False
       button = SET_MINUS
+    elif (i.curve_track and reason == "curve" and not self.blocked and offset > 0 and room <= -1 and
+          not restore_only and self.frame - self.last_minus_frame >= _frames(MIN_DWELL)):
+      # A followed map curve's command came back up (the car is nearly at the curve's speed, see
+      # curve_target.MapCurveFollower): raise the set speed to it now, with taps, while the curve is still on. Up
+      # only to the lowest target (a stopped car ahead that wants less is the reason then, and this does not run);
+      # `restoring` makes a re-lowering wait for a whole extra step, as after any restore (no ping-pong).
+      self.restoring = True
+      button = SET_PLUS
+      raise_in_curve = True
     elif offset != 0 and (all_over or self.restore_pending or gas_restore) and \
          (self.frame - self.last_minus_frame >= _frames(MIN_DWELL) or self.restore_pending or gas_restore):
       self.restoring = True
@@ -1028,7 +1042,7 @@ class CurveSlowdownLogic:
       self.last_minus_frame = self.frame
     if off is None:
       return None, None
-    self.last_action = "hold" if hold else ("tap" if want_lower else ("jump" if jump else "restore"))
+    self.last_action = "hold" if hold else ("tap" if want_lower else ("jump" if jump else ("raise" if raise_in_curve else "restore")))
     return button, off
 
 
@@ -1072,7 +1086,11 @@ class CurveSlowdown:
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
     # The car profile: what earlier drives learned about this car (answer time, hold overrun, cruise decel), see
-    # car_profile.py. Loaded here (a few KB), applied to the logic, saved in the background as it learns.
+    # car_profile.py. Loaded here (a few KB), applied to the logic, saved in the background as it learns. The learned
+    # cruise decel is still measured and logged, but map curves no longer plan with it: it measures the pace of the
+    # small-step staircase (0.15-0.40 m/s^2), and the follower (curve_target.MapCurveFollower) commands the set speed
+    # below the plan so the cruise slows at MAP_DECEL instead; planning with the learned pace would only start the
+    # slowdown earlier again (the planner uses the same constant, see map_curves.PLAN_DECEL).
     from opendbc.car.mazda.curve_target import MAP_DECEL
     self.profile = None
     self.decel_learner = None
@@ -1081,8 +1099,6 @@ class CurveSlowdown:
     self.prev_cruise = False
     try:
       self.profile = self._load_profile(CP, params)
-      if self.profile is not None:
-        self.decel_used = self.profile.decel(MAP_DECEL)
     except Exception:
       self.profile = None
     self.map_mode = map_mode
@@ -1248,18 +1264,24 @@ class CurveSlowdown:
     curve_active = curve_active and self.curve_enabled
 
     # Map curves (Test: computed and logged only; On: combined with the camera curve target)
-    curve_floor, curve_budget, fast_restore = 0.0, 0, False
+    curve_floor, curve_budget, fast_restore, curve_track = 0.0, 0, False, False
     self.map_out = None
     if self.map_control is not None and plan_alive:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
       signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
-      mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal)
+      mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal, v_ego=v_ego,
+                                                  max_drop=lg.max_drop_steps * lg.step)
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
         if mo.active and (not curve_active or mo.speed < curve_speed):
           curve_speed = mo.speed
           curve_floor, curve_budget = mo.floor, mo.budget
+        elif mo.active and mo.track:
+          curve_speed += CURVE_MARGIN   # the camera's target is the lower one: it keeps its margin (the controller adds none to a tracked target)
+        # the follower's command is tracked both ways even when the camera's target is the lower one (the set speed
+        # then comes back up to the camera's target, never above the lowest)
+        curve_track = mo.active and mo.track
         curve_active = curve_active or mo.active
         fast_restore = mo.fast_restore
 
@@ -1287,6 +1309,7 @@ class CurveSlowdown:
       csc_speed=min(float(curve_speed), 100.0),
       curve_floor=curve_floor,
       curve_budget=curve_budget,
+      curve_track=curve_track,
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -1417,6 +1440,9 @@ class CurveSlowdown:
         "radius_m": float(plan.mapCurveRadius), "distance_m": float(plan.mapCurveDistance),
         "advisory_mph": float(getattr(plan, "mapCurveAdvisory", 0.0)) / MS_PER_MPH,
         "target_mph": mo.speed / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
+        "plan_mph": (mo.plan / MS_PER_MPH if mo.plan < 100.0 else 0.0),
+        "curve_speed_mph": (mo.curve_speed / MS_PER_MPH if mo.curve_speed < 100.0 else 0.0), "track": bool(mo.track),
+        "max_drop_steps": lg.max_drop_steps,
         "lat_limit": self.lat_limit, "on_ramp": bool(plan.mapOnRamp), "ramp_type": int(plan.mapRampType),
         "ramp_to_mph": float(plan.mapRampToSpeed) / MS_PER_MPH, "ramp_to_highway": bool(plan.mapRampToHighway),
         "nav_exit": int(plan.mapNavExit), "nav_exit_m": float(plan.mapNavExitDistance),

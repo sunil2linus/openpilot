@@ -2,10 +2,14 @@
 Map curves on the Mazda set speed controller: turns the map curve fields of starpilotPlan (published by
 starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
 
-  * Curve ahead (or the one we are in): the set speed allowed now so that a gentle cruise slowdown
+  * Curve ahead (or the one we are in): the set speed allowed now so that a firm cruise slowdown
     (MAP_DECEL, after the cruise's MAP_REACTION_TIME) reaches the curve's speed (MAP_LATERAL_ACCEL, or the car's
-    lateral limit if lower) MAP_LEAD_TIME before its entry. It starts at the first 1 mph step and ends with
-    the camera curve target's 1 mph end gap. Ramp curves and exits use the firmer MAP_RAMP_DECEL.
+    lateral limit if lower, and never below the driver's Curve Max Drop floor) MAP_LEAD_TIME before its entry.
+    It starts at the first 1 mph step and ends with the camera curve target's 1 mph end gap. While it is on, the
+    set speed asked for is the follower's (curve_target.MapCurveFollower): below the plan by the gap that makes the
+    stock cruise slow at the needed rate, at most MAP_UNDERSHOOT below the curve's speed (the floor given to the
+    controller allows exactly that), and back up to the curve's speed once the car is nearly there; the controller
+    tracks it both ways (SlowdownInputs.curve_track). Ramp curves and exits keep their MAP_RAMP_DECEL staircase.
   * Ramps (we are on an exit / entrance / interchange ramp and the curve is on it): may go past the
     driver's Max Drop, down to 25 mph, with a bigger SET- budget.
   * Navigation exit before the split: never on navigation alone. Once the driver signals toward the exit's side
@@ -27,9 +31,11 @@ Pure logic (no openpilot imports) so it can be unit tested; the wrapper in curve
 from dataclasses import dataclass
 
 try:
-  from opendbc.car.mazda.curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL
+  from opendbc.car.mazda.curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
+                                              MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL, MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET)
 except ImportError:          # offline tests load this file directly
-  from curve_target import MapCurveTarget, NO_CURVE, START_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL
+  from curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
+                            MAP_LATERAL_ACCEL, MAP_DECEL, MAP_RAMP_DECEL, MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET)
 
 MPH = 0.44704
 OFF, TEST, ON = 0, 1, 2
@@ -91,15 +97,20 @@ class MapOutput:
   fast_restore: bool = False
   adopt: bool = False           # off an exit onto a street: keep the lowered set speed as the driver's speed
   why: str = ""                 # curve / ramp / nav exit / street cap (for the logs)
+  track: bool = False           # a road curve's follower command: the controller tracks it both ways (SET+ when it comes back up)
+  plan: float = NO_CURVE        # m/s, the plan the follower works under (logs)
+  curve_speed: float = NO_CURVE # m/s, the speed the governing road curve is taken at (its shape, sign, max drop floor)
 
 
 class MapCurveControl:
   def __init__(self, lat_accel, decel=MAP_DECEL):
-    """decel: the cruise's slowdown for road curves, m/s^2 (MAP_DECEL, or what the car profile learned on this
-    car; the planner reads the same value, see car_profile.py). Ramp curves and exits keep MAP_RAMP_DECEL."""
+    """decel: the cruise's planned slowdown for road curves, m/s^2 (MAP_DECEL; the planner plans with the same
+    constant). Ramp curves and exits keep MAP_RAMP_DECEL."""
     lat_accel = min(lat_accel, MAP_LATERAL_ACCEL)
+    self.lat_accel = lat_accel
     self.decel = decel
     self.curve = MapCurveTarget(lat_accel, decel)
+    self.follower = MapCurveFollower()
     self.nav = MapCurveTarget(lat_accel, MAP_RAMP_DECEL)
     self.on_street_exit = False
     self.exit_intent = False      # the driver signalled for the announced exit
@@ -127,8 +138,9 @@ class MapCurveControl:
       return 0.0, 0.0, 0.0
     return self.last_nav          # brief drop-out: keep the last plan (a ceiling, the ramp curve is lower)
 
-  def update(self, f: MapFields, driver_speed, signal):
-    """signal: turn signal side, -1 left, 1 right, 0 none."""
+  def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0):
+    """signal: turn signal side, -1 left, 1 right, 0 none. v_ego: the true speed (m/s) for the road curve follower
+    (0: plan only, the staircase). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan)."""
     out = MapOutput()
     if f.on_ramp:
       if self.ramp_frames == 0:
@@ -139,34 +151,53 @@ class MapCurveControl:
     ramp_held = self.ramp_frames >= RAMP_HOLD / DT_CTRL
     if f.mode == OFF or driver_speed <= 0:
       self.curve.active = self.nav.active = False
+      self.follower.reset()
       self.exit_intent = False
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
     # only 1 and 2 are curves to act on: 4 (paused, GPS not trusted) and 5 (held, road match not trusted) are "no
     # curve" on purpose, so the speed comes back as for any curve that ends
     radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
+    road_curve = f.status == STATUS_CURVE and not f.on_ramp
+    # a road curve is never planned below the driver's Curve Max Drop (the controller would not go there anyway, and
+    # planning for a lower speed only starts the slowdown earlier than that speed needs)
+    floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory,
-                              MAP_RAMP_DECEL if (f.status == STATUS_RAMP_CURVE or f.on_ramp) else self.decel)
+                              self.decel if road_curve else MAP_RAMP_DECEL, floor=floor)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
     nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held)
     na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)
     speed, why = NO_CURVE, ""
     if a:
       speed, why = sp, ("ramp" if ramp_curve else "curve")
+      out.plan = sp
+    track = False
+    if a and road_curve and v_ego > 0:
+      # the set speed to ask for so the cruise really slows at the planned rate (see curve_target.MapCurveFollower)
+      out.curve_speed = map_curve_target(radius, self.lat_accel, f.advisory, floor)
+      speed = self.follower.update(v_ego, out.curve_speed, f.distance, sp)
+      track = True
+    else:
+      self.follower.reset()
     if na and nsp < speed:
-      speed, why = nsp, "nav exit"
+      speed, why, track = nsp, "nav exit", False
     exit_to_street = f.on_ramp and ramp_held and f.ramp_type == RAMP_EXIT and not f.ramp_to_highway
     progress = self.ramp_end_first - f.ramp_end_distance >= STREET_PROGRESS
     street_exit = exit_to_street and progress and f.ramp_to_speed > 0
     capped = False
     if street_exit and f.ramp_end_distance <= STREET_CAP_DISTANCE and f.ramp_to_speed < driver_speed - START_GAP:
       if f.ramp_to_speed < speed:
-        speed, why = f.ramp_to_speed, "street cap"
+        speed, why, track = f.ramp_to_speed, "street cap", False
       capped = True
     out.active = a or na or capped
     out.speed = speed
+    out.track = track
     if ramp_curve or na or capped:
       out.floor, out.budget = RAMP_FLOOR, RAMP_BUDGET
+    elif track:
+      # the follower may ask up to MAP_UNDERSHOOT below the curve's speed (so at most that far below the max drop
+      # floor, which the curve's speed never goes under): that is the floor the controller gets, and nothing lower
+      out.floor, out.budget = out.curve_speed - MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET
     out.fast_restore = f.on_ramp and ramp_held and f.ramp_to_highway and not out.active
     out.adopt = self.on_street_exit and not f.on_ramp and f.road_class not in HIGHWAY_CLASSES
     # keep the lowered speed after an exit onto a street: known when the road after it is matched as not a freeway

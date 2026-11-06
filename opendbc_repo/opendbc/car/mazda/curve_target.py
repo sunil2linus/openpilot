@@ -116,11 +116,17 @@ class CurveTarget:
 
 MAP_LATERAL_ACCEL = 2.2       # m/s^2: map curves are planned at most at this (route 35/36: the 30 mph curve on West
                               # Utica at 45 mph = 3.2 m/s^2 with the steering at 100 % for 3.5-4.5 s, out of the lane once)
-# planned slowdown for a road curve. Drive 38 (Dobry Drive, 45 -> 39 mph in 1 mph taps): the stock cruise follows
-# small set speed steps at only ~0.28 m/s^2 (0.6 mph a second), not the 0.6-0.7 it gives for a big drop, and fell
-# 2.6 mph behind a 1 mph a second staircase, entering the curve at 41.6 instead of 38. Planning at 0.25 keeps the
-# staircase at the cruise's own pace: it starts earlier and is gentler, and the car is at the curve's speed before it.
-MAP_DECEL = 0.25              # m/s^2
+# Planned slowdown for a road curve: where the slowdown starts. Drive 38 (Dobry Drive, 45 -> 39 mph in 1 mph taps)
+# showed the stock cruise follows small set speed steps at only ~0.28 m/s^2, so the plan was made gentle (0.25) and
+# the staircase long. Drive 50 (West Utica, 45 mph, the 91 m curve held at 35 by the Curve Max Drop) showed the
+# other side of that: the slowdown began 380-395 m (17-21 s) before the curve and the car crawled down 1 mph at a
+# time, "slowing way before the curve" (owner). Measured on drives 44/45/4c/4d/4f/50 (cruise on, no lead, no pedals,
+# over 27 mph), the cruise slows in proportion to how far the set speed is below the true speed, about 0.19 m/s^2
+# per m/s of gap (2-4 mph: 0.27, 6-8: 0.66, 10-12: 0.84, 14-16: 0.95 m/s^2), about a second after the press. So the
+# plan is now firm (MAP_DECEL) and the set speed is commanded below the plan (MapCurveFollower, below) so the cruise
+# delivers that decel: the slowdown starts about half as far out and the car is still at the curve's speed
+# MAP_LEAD_TIME before the entry.
+MAP_DECEL = 0.45              # m/s^2: what a 5-6 mph set speed gap gives on this cruise (6-8 mph: 0.66 m/s^2 measured)
 MAP_RAMP_DECEL = 0.5          # m/s^2 for exits and ramp curves: the room is short, the drop bigger (the cruise slows harder)
 MAP_LEAD_TIME = 1.0           # s: be at the curve's speed this long before its entry (slow before the curve, not in it)
 MAP_REACTION_TIME = 1.5       # s: the stock cruise starts slowing about this long after a SET- press
@@ -128,21 +134,65 @@ ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advis
 # map curves start at the first 1 mph step (the map does not flicker, and a later start would need a bigger, quicker
 # drop to catch up)
 MAP_START_GAP = 1.0 * MS_PER_MPH  # m/s
+# The follower (road curves only; ramps, exits and the camera curve slowdown keep their staircase):
+#  * MAP_FOLLOW_GAIN: the measured 0.19 m/s^2 per m/s of gap, taken a little lower so the gap asked for errs on the
+#    firm side (a bigger gap slows more; the undershoot bounds below keep it in check).
+#  * MAP_FOLLOW_DEAD_TIME: the cruise answers a set speed change about a second later; the room counted on for the
+#    required decel starts after it.
+#  * MAP_UNDERSHOOT: the set speed is never asked more than this below the curve's speed, so the car cannot run away
+#    below it, and the lowest set speed asked for is at most this far under the driver's Curve Max Drop floor
+#    (the curve's speed is never planned below that floor).
+#  * MAP_FOLLOW_MAX_DECEL: the gap asked for never means more than this. Until the cruise answers (the dead time) the
+#    car has not slowed while the room has shrunk, so a pure feedback would escalate; for a short 5 mph drop it ran the
+#    gap to the undershoot bound (10 mph, ~0.8 m/s^2 on the measured cruise) where 0.5 was needed. Capped, the measured
+#    cruise peaks at ~0.65; a car that would need more arrives a little fast and the camera slowdown has the rest.
+#  * MAP_SETTLE: this close to the curve's speed the set speed goes back up to it (SET+ taps): the taps take ~1 s and
+#    the cruise answers them a second later, during which it slows ~2 mph more at 0.45 m/s^2 (the simulated measured
+#    cruise enters West Utica at 35.1 for 35 with 2.0; with 1.5 it dipped to 34.0 first).
+MAP_FOLLOW_GAIN = 0.17        # (m/s^2) per m/s of set speed gap
+MAP_FOLLOW_DEAD_TIME = 1.0    # s
+MAP_UNDERSHOOT = 5 * MS_PER_MPH   # m/s
+MAP_SETTLE = 2.0 * MS_PER_MPH     # m/s
+MAP_FOLLOW_MAX_DECEL = 0.6    # m/s^2: a 7.9 mph gap at MAP_FOLLOW_GAIN
+MAP_SETTLE_HYST = 1.0 * MS_PER_MPH  # m/s: once settled, only this much above the settle speed asks for a gap again (no churn)
+MAP_MIN_ROOM = 5.0            # m: the required decel is never computed over less than this (a curve we are nearly in)
+MAP_FOLLOW_BUDGET = 40        # SET- presses for one followed curve (max drop + undershoot + ignored presses, also in km/h)
 
 
 def map_curve_speed(radius, distance, lat_accel, advisory=0.0, reaction_speed=0.0, decel=MAP_DECEL,
-                    lead_time=MAP_LEAD_TIME, reaction_time=MAP_REACTION_TIME):
+                    lead_time=MAP_LEAD_TIME, reaction_time=MAP_REACTION_TIME, floor=0.0):
   """Set speed allowed now (m/s, true speed) for a map curve of `radius` m starting `distance` m ahead
   (`advisory`: its yellow sign speed in m/s, 0 if the map has none; `reaction_speed`: the speed driven while the
-  cruise reacts, the driver's set speed). The cruise reacts, then slows at `decel` and reaches the curve's speed
-  `lead_time` before the entry."""
+  cruise reacts, the driver's set speed; `floor`: the lowest speed the set speed may be taken to, the driver's Curve
+  Max Drop: the plan aims for that, not lower). The cruise reacts, then slows at `decel` and reaches the curve's
+  speed `lead_time` before the entry."""
   if radius <= 0:
     return NO_CURVE
+  v_curve = map_curve_target(radius, lat_accel, advisory, floor)
+  room = distance - v_curve * lead_time - reaction_time * max(reaction_speed, v_curve)
+  return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
+
+
+def map_curve_target(radius, lat_accel, advisory=0.0, floor=0.0):
+  """The speed (m/s, true) a map curve is taken at: its shape at lat_accel, at most the advisory sign + ADVISORY_OVER,
+  and never below `floor` (the driver's Curve Max Drop, 0 for none)."""
   v_curve = math.sqrt(lat_accel * radius)
   if advisory > 0:
     v_curve = min(v_curve, advisory + ADVISORY_OVER)
-  room = distance - v_curve * lead_time - reaction_time * max(reaction_speed, v_curve)
-  return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
+  return max(v_curve, floor)
+
+
+def map_follow_speed(v_ego, v_curve, distance, lead_time=MAP_LEAD_TIME, dead_time=MAP_FOLLOW_DEAD_TIME,
+                     gain=MAP_FOLLOW_GAIN, undershoot=MAP_UNDERSHOOT, settle=MAP_SETTLE, max_decel=MAP_FOLLOW_MAX_DECEL):
+  """The set speed (m/s, true) to ask the cruise for now so that it is at `v_curve` `lead_time` before the curve's
+  entry `distance` m ahead: the decel needed over the room left (after the cruise's dead time), at most `max_decel`,
+  turned into the set speed gap that makes the cruise slow that hard, bounded below by `v_curve` - `undershoot`.
+  Within `settle` of the curve's speed the answer is the curve's speed itself."""
+  if v_ego <= v_curve + settle:
+    return v_curve
+  room = max(distance - v_curve * lead_time - v_ego * dead_time, MAP_MIN_ROOM)
+  required = min((v_ego ** 2 - v_curve ** 2) / (2 * room), max_decel)
+  return max(v_ego - required / gain, v_curve - undershoot)
 
 
 class MapCurveTarget:
@@ -154,11 +204,42 @@ class MapCurveTarget:
     self.active = False
     self.speed = NO_CURVE
 
-  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None):
+  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None, floor=0.0):
     self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory, reaction_speed=driver_speed,
-                                 decel=self.decel if decel is None else decel)
+                                 decel=self.decel if decel is None else decel, floor=floor)
     if not self.active:
       self.active = radius > 0 and self.speed <= driver_speed - MAP_START_GAP
     else:
       self.active = radius > 0 and self.speed < driver_speed - END_GAP
     return self.active, self.speed
+
+
+class MapCurveFollower:
+  """The set speed to command for the road curve MapCurveTarget made active: map_follow_speed, never above the plan,
+  and only ever going down until the car is nearly at the curve's speed (then up to it), so the buttons are not
+  churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends."""
+
+  def __init__(self):
+    self.cmd = None
+    self.v_curve = None
+    self.settled = False          # the car is (nearly) at the curve's speed: the command is the curve's speed
+
+  def reset(self):
+    self.cmd = self.v_curve = None
+    self.settled = False
+
+  def update(self, v_ego, v_curve, distance, plan_speed):
+    if self.v_curve is None or abs(v_curve - self.v_curve) > 0.05:
+      self.cmd, self.settled = None, False   # a new curve (or its speed changed: curve memory, the max drop floor moved)
+    self.v_curve = v_curve
+    if v_ego <= v_curve + MAP_SETTLE:
+      self.settled = True
+    elif v_ego > v_curve + MAP_SETTLE + MAP_SETTLE_HYST:
+      self.settled = False        # clearly too fast again (a downhill, a slow landing): ask for a gap again
+    if self.settled:
+      self.cmd = v_curve
+    else:
+      want = min(map_follow_speed(v_ego, v_curve, distance), plan_speed)   # the plan is never below the curve's speed
+      if self.cmd is None or want < self.cmd:
+        self.cmd = want           # down with the car only (small rises of the command do not move the buttons)
+    return self.cmd
