@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import cereal.messaging as messaging
 import numpy as np
 
-from cereal import car, custom, log
+from cereal import car, custom
 from opendbc.car import gen_empty_fingerprint
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.chrysler.values import JEEPS as CHRYSLER_JEEPS
@@ -31,6 +31,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.starpilot.common.model_versions import is_tinygrad_model_version
 from openpilot.starpilot.common.lateral_delay import full_lateral_delay
 from openpilot.starpilot.common.lateral_only_experimental import lateral_only_experimental_available
+from openpilot.starpilot.common.live_torque import read_live_torque_cache
 from openpilot.starpilot.common.longitudinal_mode import read_mode_values
 from openpilot.starpilot.common.accel_profile import (
   ACCELERATION_PROFILES,
@@ -750,14 +751,7 @@ class StarPilotVariables:
     self._sync_stock_param("VEgoStarting", "VEgoStartingStock", toggle.vEgoStarting)
     self._sync_stock_param("VEgoStopping", "VEgoStoppingStock", toggle.vEgoStopping)
 
-    msg_bytes = self.params.get("LiveTorqueParameters")
-    if msg_bytes:
-      LTP = messaging.log_from_bytes(msg_bytes, log.LiveTorqueParametersData)
-      has_auto_tune = LTP.useParams
-      toggle.liveValid = LTP.liveValid
-    else:
-      has_auto_tune = False
-      toggle.liveValid = False
+    has_auto_tune, toggle.liveValid = read_live_torque_cache(self.params.get("LiveTorqueParameters"))
 
     toggle.debug_mode = self.params.get_bool("DebugMode")
     toggle.force_offroad = self.params.get_bool("ForceOffroad")
