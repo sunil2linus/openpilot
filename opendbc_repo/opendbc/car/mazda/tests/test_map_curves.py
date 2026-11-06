@@ -918,10 +918,16 @@ def test_a_record_without_a_direction_stands_in_until_that_way_is_driven_and_is_
   mem = MC.CurveMemory(str(path))
   assert mem.radius(c, usual) == 118.0 and mem.radius(c, other) == 118.0 and mem.speed_cap(c, usual) == 14.15
   mem.add_pass(c, 119.0, t=13000.0, v=35.0 * MPH, direction=usual)        # the first pass kept per direction
-  assert mem.radius(c, usual) is None and mem.speed_cap(c, usual) is None  # that way starts afresh (one pass: nothing yet)
+  # the old radius (it can only make the curve faster) stops at once: one pass of its own is nothing yet; the old cap
+  # (it can only make the curve slower) stays on the safe side until this way has two clean passes or a cap of its own
+  assert mem.radius(c, usual) is None and mem.speed_cap(c, usual) == 14.15
   assert mem.radius(c, other) == 118.0 and mem.speed_cap(c, other) == 14.15   # the old record still stands in the other way
-  mem.add_saturated_pass(c, 35.0 * MPH, t=17000.0, direction=other)
+  mem.add_pass(c, 121.0, t=17000.0, v=35.0 * MPH, direction=usual)        # two clean passes: this way decides alone
+  assert mem.radius(c, usual) in (119.0, 121.0) and mem.speed_cap(c, usual) is None
+  mem.add_saturated_pass(c, 35.0 * MPH, t=21000.0, direction=other)       # a cap of its own: the old one steps back
   assert abs(mem.speed_cap(c, other) - 0.9 * 35.0 * MPH) < 0.01 and mem.radius(c, other) is None
+  mem.add_pass(c, 101.0, t=25000.0, v=25.0 * MPH, direction=other)
+  assert abs(mem.speed_cap(c, other) - 0.9 * 35.0 * MPH) < 0.01       # one pass, well under its own cap: unchanged
   mem.note_veto(c, usual)
   legacy = [e for e in mem.entries if "dir" not in e]
   assert len(legacy) == 1 and legacy[0] == old                           # never written to, still in the file
@@ -932,8 +938,18 @@ def test_a_record_without_a_direction_stands_in_until_that_way_is_driven_and_is_
   assert all("lat" in e and "lon" in e and isinstance(e.get("passes", []), list) for e in data["curves"])  # old readers
   again = MC.CurveMemory(str(path))
   assert again.radius(c, other) is None and abs(again.speed_cap(c, other) - 0.9 * 35.0 * MPH) < 0.01
-  assert again.radius(c, usual) is None and again._find(*c["apex"], usual)["veto_hits"] == 1
+  assert again.radius(c, usual) in (119.0, 121.0) and again._find(*c["apex"], usual)["veto_hits"] == 1
   assert again._find(*c["apex"]) == old                                  # no direction (the tools): the old record
+  # an old record with a cap but no usable radius: the cap alone carries over to the first directional pass
+  path2 = tmp_path / "cap_only.json"
+  path2.write_text(json.dumps({"version": 1, "curves": [{"lat": c["apex"][0], "lon": c["apex"][1], "passes": [],
+                                                          "cap": 14.15, "cap_t": 3000.0, "cap_hits": 1}]}))
+  mem2 = MC.CurveMemory(str(path2))
+  assert mem2.speed_cap(c, usual) == 14.15 and mem2.radius(c, usual) is None
+  mem2.add_pass(c, 119.0, t=13000.0, v=33.0 * MPH, direction=usual)
+  assert mem2.speed_cap(c, usual) == 14.15 and len(mem2.entries) == 2
+  mem2.add_pass(c, 121.0, t=17000.0, v=33.0 * MPH, direction=usual)
+  assert mem2.speed_cap(c, usual) is None and mem2.radius(c, usual) in (119.0, 121.0)
 
 
 def test_a_divided_road_is_still_one_pass_per_direction(tmp_path):

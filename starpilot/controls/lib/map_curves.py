@@ -790,9 +790,9 @@ class CurveMemory:
     * the radius the car actually drove: used instead of the map's once MEMORY_MIN_PASSES clean passes agree;
     * a speed cap ("cap", m/s) after a pass where the steering maxed out: SAT_FACTOR of that speed, never below the
       curve's yellow sign or CAP_FLOOR. Each clean pass near the cap raises it by CAP_RISE (searching back up).
-  Records written before directions were kept (no "dir") hold passes of both ways: such a record stands in for a
-  direction only until a pass that way is recorded (which starts a record of its own, without the old passes), and
-  is never written to again; it stays in the file. `direction` None (the offline tests and tools: unknown) reads
+  Records written before directions were kept (no "dir") hold passes of both ways: such a record's radius stands in
+  for a direction only until a pass that way is recorded (which starts a record of its own, without the old passes),
+  its cap a little longer (speed_cap); it is never written to again and stays in the file. `direction` None (the offline tests and tools: unknown) reads
   and writes the record without a direction, as before."""
 
   def __init__(self, path=MEMORY_PATH):
@@ -865,10 +865,18 @@ class CurveMemory:
       return False
 
   def speed_cap(self, c, direction=None):
-    """Speed cap (m/s) for curve dict `c` driven in `direction` from passes where the steering maxed out, or None."""
+    """Speed cap (m/s) for curve dict `c` driven in `direction` from passes where the steering maxed out, or None.
+    A cap only ever makes a curve slower, so a record without a direction keeps capping a direction (safe side) until
+    that direction's own record has a cap of its own or MEMORY_MIN_PASSES clean passes; then it decides alone."""
     try:
       e = self._find(*c["apex"], direction)
-      cap = None if e is None else e.get("cap")
+      if e is None:
+        return None
+      cap = e.get("cap")
+      if not cap and direction is not None and e.get("dir") is not None and \
+         len([p for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 2]) < MEMORY_MIN_PASSES:
+        legacy = self._find(*c["apex"])          # the record without a direction, if any
+        cap = None if legacy is None or legacy.get("dir") is not None else legacy.get("cap")
       return float(cap) if cap else None
     except (KeyError, TypeError, ValueError):
       return None
