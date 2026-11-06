@@ -1878,3 +1878,89 @@ def test_unsure_car_blinking_far_lead_does_not_go_up_and_down():
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 900, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0)
   assert [f for f, b in r["presses"] if b == cs.SET_PLUS] == [] and r["holds"] == [], r["presses"]
   assert r["min"] >= 45 - 5 - 1e-6
+
+
+def _red_then_green(car, frames=2500):
+  # a planned stop (no car) from t 1 s to t 7 s, then the light turns green (the plan clears, the model speeds up)
+  plan = lambda f: 100 <= f < 700  # noqa: E731
+  model = lambda f: -0.7 if 100 <= f < 700 else 0.3  # noqa: E731
+  nobody = StoppedLead(200.0, present=lambda f: False)
+  return run(car, NO_CURVE, frames, lead=nobody, stop_mode=2, max_drop=10, model=model, plan=plan)
+
+
+def test_drive_4f_tag3_restore_after_a_green_light_uses_the_long_press_off_the_gas():
+  # drive 4f, tag 3: 45 -> 20 for a red light, green at ~33 mph; off the gas every SET+ landed +1 mph, so booking
+  # them as possible jumps (taps only, no hold) took 8.8 s back to 45
+  # (decel 0.8: the car stays ~10 mph faster than the rising set speed for a few seconds, as on the drive)
+  r = _red_then_green(Car(45, dash_offset_mph=0.0, decel=0.8))
+  assert r["min"] <= 25, r["min"]
+  first_hold = min([f for f in r["holds"] if f > 700] or [10**9])
+  taps_before = [f for f, b in r["presses"] if b == cs.SET_PLUS and 700 < f < first_hold]
+  assert first_hold < 900 and taps_before == [], (first_hold, taps_before)    # the long press first, no taps
+  back = next(k for k, x in enumerate(r["sets"]) if k > 700 and abs(x / MPH - 45) < 0.01)
+  assert (back - 700) * T.DT <= 6.3, (back - 700) * T.DT
+  assert r["max"] <= 45 + 1e-6 and not r["logic"].disabled
+
+
+def test_a_car_that_jumps_off_the_gas_is_still_safe():
+  # if the car did jump to the current speed on a SET+ off the gas after all: never above the driver's speed, the
+  # landing is booked as ours (not "more steps than our presses": switched off for the drive)
+  for jump_extra in (0, 1):
+    r = _red_then_green(Car(45, dash_offset_mph=0.0, plus_jumps="always", jump_extra=jump_extra))
+    assert r["min"] <= 25, r["min"]
+    assert r["max"] <= 45 + 1e-6, (jump_extra, r["max"])
+    assert not r["logic"].disabled and abs(r["final"] - 45) < 0.01, (jump_extra, r["final"])
+
+
+class _JumpHoldCar(Car):
+  """A car that jumps to the current speed on a hold's first SET+ frame off the gas (never seen on this car), its
+  SET+ holds landing a quantum up to `up_latency` s after the release."""
+  def __init__(self, *a, up_latency=0.0, **kw):
+    super().__init__(*a, **kw)
+    self.up_latency = up_latency
+
+  def hold_frame(self, button=cs.SET_MINUS):
+    first = self.hold_last is None or self.frame - self.hold_last > 15
+    self.hold_latency = self.up_latency if button == cs.SET_PLUS else 0.0
+    if first and button == cs.SET_PLUS and self.v_ego > self.set_speed + self.step:
+      self.hold_count += 1
+      self.hold_dir = 1
+      self.pending.append((self.frame + self.lag, round(self.v_ego / self.step) * self.step - self.set_speed))
+      self.hold_next = self.frame + int(self.hold_start * 100) + self.lag
+      self.hold_last = self.frame
+      return
+    super().hold_frame(button)
+
+
+def test_a_car_that_jumps_off_the_gas_never_overshoots_on_a_long_press():
+  # review: off the gas, coasting at about the driver's speed (downhill) with the set speed low: a hold's first frame
+  # that jumped to 45, then the quantum after the release, ended at 50; now a hold while the car is faster only
+  # starts when such a jump would land inside the hold's own margin
+  for v_mph in (33.0, 40.0, 44.0, 45.0):
+    for phase in (0, None):
+      car = _JumpHoldCar(45, dash_offset_mph=0.0, decel=0.8, up_latency=0.6)
+      tick = car.tick
+
+      def held(car=car, tick=tick, v=v_mph):
+        tick()
+        if car.frame < 1200:
+          car.v_ego = max(car.v_ego, v * MPH)      # coasting: the car does not slow below this
+      car.tick = held
+      nobody = StoppedLead(200.0, present=lambda f: False)
+      r = run(car, NO_CURVE, 2500, lead=nobody, stop_mode=2, max_drop=10, wheel_phase=phase,
+              model=lambda f: -0.7 if 100 <= f < 700 else 0.3, plan=lambda f: 100 <= f < 700)
+      assert r["max"] <= 45 + 1e-6, (v_mph, phase, r["max"])
+
+
+def test_a_cruise_gap_set_at_the_current_speed_is_the_drivers_not_a_jump_of_ours():
+  # review: a restore tap in flight at set 20, the driver brakes (cruise off) and sets again at 32 (= the current
+  # speed): that is the driver's new speed; it used to be claimed as our jump and tapped back down to 20
+  lg = cs.CurveSlowdownLogic(False)
+  from types import SimpleNamespace as N
+  p = cs.Press(direction=cs.SET_PLUS, frame=0)
+  lg.inflight.append(p)
+  lg.anchor, lg.last_set_speed = 45 * MPH, 20 * MPH
+  lg.cruise_gap = True
+  i = N(set_speed=32 * MPH, v_ego=32 * MPH, cruise_enabled=True, driver_button=None)
+  lg._observe_set_speed(i)
+  assert p in lg.inflight + lg.expired or p.landed == 0      # not booked as ours

@@ -32,7 +32,11 @@ class Car:
     self.lag, self.accel, self.ignore, self.step = lag, accel, ignore, step
     self.decel = decel
     self.hold_phase_window = hold_phase_window   # frames: a hold frame later than this after the wheel's reads as a tap
-    self.plus_jumps = plus_jumps      # SET+ while faster than the set speed sets the current speed (drive 4d)
+    # SET+ while faster than the set speed sets the current speed (drive 4d) on the gas only (drives 4c-4f: every jump
+    # had the gas pressed within 0.5 s; off the gas a normal step, drive 4f); "always": also off the gas (a car that
+    # did, for the fallback)
+    self.plus_jumps = plus_jumps
+    self.gas_frame = -10**9           # last frame the gas was pressed (set by run)
     self.jump_extra = jump_extra      # ... landing this many steps above it
     self.decel_fn = decel_fn          # decel_fn(gap_mph) -> m/s^2 the stock cruise slows at for that set speed gap
     self.min_set = min_set_mph * MPH if min_set_mph else None   # the car's own minimum set speed (clamp)
@@ -52,7 +56,11 @@ class Car:
     if self.hold_last is None or self.frame - self.hold_last > 15:
       self.hold_count += 1
       self.hold_dir = -1 if button == cs.SET_MINUS else 1
-      self.pending.append((self.frame + self.lag, self.hold_dir * self.step))   # the tap on button-down
+      d = self.hold_dir * self.step                                               # the tap on button-down ...
+      if (button == cs.SET_PLUS and self.v_ego > self.set_speed + self.step and
+          (self.plus_jumps == "always" or (self.plus_jumps and self.frame - self.gas_frame <= 50))):
+        d = (round(self.v_ego / self.step) + self.jump_extra) * self.step - self.set_speed   # ... or a jump
+      self.pending.append((self.frame + self.lag, d))
       self.hold_next = self.frame + int(self.hold_start * 100) + self.lag
     self.hold_last = self.frame
 
@@ -85,7 +93,9 @@ class Car:
       self.driver_button_until = self.frame + 10      # the stock switch reports the tap for one 10 Hz frame
       self.driver_button = button
     d = -self.step if button == cs.SET_MINUS else self.step
-    if self.plus_jumps and button == cs.SET_PLUS and self.v_ego > self.set_speed + self.step:
+    on_gas = self.frame - self.gas_frame <= 50
+    if (self.plus_jumps == "always" or (self.plus_jumps and on_gas)) and button == cs.SET_PLUS and \
+       self.v_ego > self.set_speed + self.step:
       d = (round(self.v_ego / self.step) + self.jump_extra) * self.step - self.set_speed
     lag = self.lag_fn(self.op_presses) if (who == "op" and self.lag_fn is not None) else self.lag
     self.pending.append((self.frame + lag, d))
@@ -187,6 +197,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
     hist.append((csc.active, csc.speed))
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
     stop_active, stop_target, stop_urgent, restore_now, hold_restore = False, 0.0, False, False, False
+    if st["gas"]:
+      car.gas_frame = car.frame
     r_has = False
     if lead is not None:
       status, prob, d, v, y = lead.state(f, car)

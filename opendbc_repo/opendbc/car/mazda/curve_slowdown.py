@@ -161,6 +161,12 @@ GAS_JUMP_ENABLED = True
 JUMP_STEPS = 2                           # the car this much faster than the set speed: a SET+ jumps
 JUMP_UNCERT = 0                          # steps: the jump may land this much above round(vEgo) (drive 4d: 0)
 GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= the driver's speed
+# ... but only on the gas (drive 4f, tag 3, t 185.5-188.4: off the gas, 8 SET+ taps of ours 12-14 mph slower than
+# the car each landed +1 mph; booked as possible jumps they were taps only, no hold: 20 -> 45 took 8.8 s). Every jump
+# on drives 4c, 4d and 4f (7) had the gas pressed within 0.5 s before it landed; none without. Off the gas a SET+ is
+# a normal step, holds allowed. Still never a SET+ that could land above the driver's speed if it did jump, and a
+# landing on the current speed from a SET+ of ours off the gas is still booked as ours (JUMP_OFF_GAS_CLAIM).
+GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed during which a SET+ may still jump
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -246,6 +252,7 @@ class CurveSlowdownLogic:
     self.driver_taps = []            # [(direction, frame)] of the driver's own recent taps, not yet seen on the set speed
     self.prev_driver_button = None
     self.last_driver_edge = {SET_MINUS: -10_000, SET_PLUS: -10_000}
+    self.last_gas_frame = -10_000    # last frame the gas was pressed (GAS_JUMP_RECENT)
     self.blocked_frame = None        # frame the current block started (DRIVER_REARM)
     self.rearms = 0                  # blocks lifted by DRIVER_REARM (logs)
     self.no_effect = 0
@@ -528,6 +535,17 @@ class CurveSlowdownLogic:
     driver_recent = (driver_k is not None or self.prev_driver_button == direction or
                      self.frame - self.last_driver_edge[direction] <= _frames(DRIVER_RECENT))
     jp = next((p for p in self.inflight + self.expired if p.jump and p.direction == direction), None)
+    # (review: after a cruise gap the driver's SET at the current speed is theirs, as is anything past their speed)
+    jump_ok = (not after_gap and self.anchor is not None and i.set_speed <= self.anchor + self.half_step)
+    if not jump_ok:
+      jp = None
+    if jp is None and jump_ok and direction == SET_PLUS and driver_k is None and not driver_recent and steps > 1.25 and \
+       abs(i.set_speed / self.step - round(i.v_ego / self.step)) <= 1.0:
+      # a SET+ of ours off the gas that jumped to the current speed after all (not seen on drives 4c-4f): ours, not
+      # "more steps than our presses" (which switches everything off for the drive)
+      jp = next((p for p in self.inflight + self.expired if p.direction == SET_PLUS and not p.hold), None)
+      if jp is not None:
+        jp.reserve = max(jp.reserve, int(math.ceil(steps - 0.25)))
     if jp is not None and direction == SET_PLUS and driver_k is None and steps <= jp.reserve + 0.25:
       # our SET+ jump (to the current speed), on time or late, a whole number of steps or not (from the car's 30 km/h
       # minimum): all of it is ours, up to the driver's speed
@@ -701,6 +719,8 @@ class CurveSlowdownLogic:
         self.hold = None   # the driver is on the buttons: do not keep holding
       self.last_driver_edge[i.driver_button] = self.frame     # kept fresh while held
     self.prev_driver_button = i.driver_button
+    if i.gas_pressed:
+      self.last_gas_frame = self.frame
     self.driver_taps = [(d, f) for d, f in self.driver_taps if self.frame - f <= self._in_flight_window()]
     self._watch_driver_hold(i.driver_button if cruise_ok else None)
 
@@ -912,10 +932,13 @@ class CurveSlowdownLogic:
     # a SET+ while the car is faster than the set speed jumps to the current speed (see GAS_JUMP_*)
     v_hi = int(round(i.v_ego / self.step)) + JUMP_UNCERT
     faster = button == SET_PLUS and v_hi >= int(round(i.set_speed / self.step)) + JUMP_STEPS
+    may_jump = faster and (i.gas_pressed or self.frame - self.last_gas_frame <= _frames(GAS_JUMP_RECENT))
     jump = False
-    if faster:
-      if self.inflight or v_hi + (GAS_JUMP_MARGIN if i.gas_pressed else 0) > int(round(driver_speed / self.step)):
-        return None, None              # it could land above the driver's speed (or on top of a press in flight)
+    if faster and v_hi + (GAS_JUMP_MARGIN if may_jump else 0) > int(round(driver_speed / self.step)):
+      return None, None                # if it did jump it could land above the driver's speed
+    if may_jump:
+      if self.inflight:
+        return None, None              # (or on top of a press in flight)
       jump = True
     gas_ok = GAS_JUMP_ENABLED and button == SET_PLUS and gas_restore and offset > 0
     if button is None or (i.gas_pressed and not gas_ok) or i.other_button_active:
@@ -966,6 +989,10 @@ class CurveSlowdownLogic:
         bound_steps = ((driver_steps - margin) // q) * q     # a multiple of the quantum, that far below
         first = ((set_steps + 1 + q) // q) * q               # where the hold's first jump lands (after its tap)
         hold = first <= bound_steps and bound_steps - set_steps >= RESTORE_HOLD_MIN_GAIN * q
+        # the car faster than the set speed: if the hold's first frame did jump to the current speed (not seen off
+        # the gas), it must still land at or below the hold's bound (review: coasting at the driver's speed, a jump
+        # to 45 and the quantum after the release: 50)
+        hold = hold and (not faster or v_hi <= bound_steps)
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True
