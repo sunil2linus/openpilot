@@ -121,6 +121,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   curveSlowdownOffset @31 :Int8;     # Mazda set speed slowdown: steps below the driver's set speed
   curveSlowdownInFlight @32 :Int8;   # our SET presses not yet seen on the set speed
   mazdaStockLkasOff @33 :Bool;       # Mazda + TI: the camera reports its LKAS off at speed (only the TI steers)
+  mazdaStopSlowdownActive @34 :Bool; # Mazda stopped car / stop ahead slowdown (On) is lowering the set speed
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {

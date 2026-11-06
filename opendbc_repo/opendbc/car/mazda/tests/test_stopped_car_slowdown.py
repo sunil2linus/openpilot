@@ -1346,7 +1346,10 @@ def test_warning_gates_match_the_planner_warning():
   assert scs.PLAN_STOP_RATIO == sw.STOP_SLOWDOWN and scs.PLAN_STOP_DECEL == sw.STOP_DECEL
 
 
-def test_stop_ahead_warning_alone_starts_a_floor_hold_after_one_second():
+def test_stop_ahead_warning_alone_starts_a_floor_hold_before_the_warning_shows():
+  # owner (Nov 5): "first start reducing the speed and then display the warning": we start after 0.5 s of the
+  # warning's condition, the warning shows after 1.0 s
+  assert scs.WARN_START_DEBOUNCE + 0.5 - 1e-9 <= scs.WARN_DEBOUNCE
   tr = scs.StoppedCarTrigger()
   for _ in range(60):
     tr.update(_latched_inputs(lead_status=False, plan_stop=False))
@@ -1354,9 +1357,9 @@ def test_stop_ahead_warning_alone_starts_a_floor_hold_after_one_second():
   while not tr.update(_latched_inputs(lead_status=False)):
     n += 1
     assert n < 200
-    if 20 < n < 95:
+    if 10 < n < 45:
       assert any("warning held" in b for b in tr.blockers(_latched_inputs(lead_status=False)))
-  assert 98 <= n <= 102, n
+  assert 48 <= n <= 52, n
   assert tr.kind == scs.STOP_AHEAD and tr.warn_start and tr.urgent and tr.floor_mode
   assert near(tr.target / MPH, 20)
 
@@ -1386,18 +1389,23 @@ def test_stop_ahead_hands_over_to_the_car_when_it_appears():
   assert near(tr.target / MPH, 20)
 
 
-def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
-  tr = scs.StoppedCarTrigger()
+def _started_past_the_warning(tr):
   while not tr.update(_latched_inputs(lead_status=False)):
     pass
+  for _ in range(int((scs.WARN_DEBOUNCE - scs.WARN_START_DEBOUNCE) / scs.DT_CTRL) + 5):   # the warning shows too
+    assert tr.update(_latched_inputs(lead_status=False))
+
+
+def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
   for _ in range(99):
     assert tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
   assert not tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
   assert tr.release_reason.startswith("stop ahead cleared") and tr.restore_now
   # the model stays a little negative: released once the latch runs out (LATCH_HOLD)
   tr = scs.StoppedCarTrigger()
-  while not tr.update(_latched_inputs(lead_status=False)):
-    pass
+  _started_past_the_warning(tr)
   n = 0
   while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
     n += 1
@@ -1675,3 +1683,42 @@ def test_an_overridden_car_counts_again_once_it_slows_a_lot_or_the_gas_is_off_a_
   tr = overridden()
   slower = dict(kw, lead_v=5 * MPH)                               # 13 -> 5 mph: it is slowing for something
   assert any(tr.update(_sw(**slower)) for _ in range(100))
+
+
+def _warn_episode(plan_frames, then_frames=300, **kw):
+  """A stop ahead (no car) planned for plan_frames, then not: (trigger, frame it started, frame it released)."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_latched_inputs(lead_status=False, plan_stop=False))
+  started = released = None
+  for n in range(plan_frames + then_frames):
+    on = tr.update(_latched_inputs(lead_status=False, plan_stop=n < plan_frames, **kw))
+    if on and started is None:
+      started = n
+    if started is not None and not on and released is None:
+      released = n
+      tr.restore_at_release = tr.restore_now
+  return tr, started, released
+
+
+def test_a_planned_stop_that_goes_away_before_the_warning_is_released_at_once():
+  # review of the 0.5 s start: a 0.7 s plan dip (never a warning) started a floor hold that lasted until the stop
+  # "cleared" (1.6-4.6 s); now it is released with the set speed restored within the warning's dropout
+  tr, started, released = _warn_episode(70)
+  assert started is not None and abs(started - 50) <= 2
+  assert released is not None and released <= 70 + int(scs.WARN_DROPOUT / scs.DT_CTRL) + 2, released
+  assert tr.release_reason == scs.STOP_AHEAD_UNCONFIRMED and tr.restore_at_release
+
+
+def test_a_planned_stop_that_lasts_past_the_warning_is_not_released_by_the_dip_rule():
+  tr, started, released = _warn_episode(130, then_frames=50)
+  assert started is not None and released is None and tr.active        # the normal release rules from here
+  # our own slowdown (the car slowing at -1.0 after the start) does not count as "the stop went away"
+  tr, started, released = _warn_episode(300, then_frames=0, a_ego=-1.0)
+  assert started is None                                                 # (already slowing before: no start)
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_latched_inputs(lead_status=False, plan_stop=False))
+  for n in range(300):
+    tr.update(_latched_inputs(lead_status=False, a_ego=-1.0 if n > 55 else 0.0))
+  assert tr.active and tr.kind == scs.STOP_AHEAD

@@ -58,7 +58,13 @@ LEAD_DECEL = 1.5                # m/s^2: required deceleration to stop behind it
 LEAD_BUFFER = 5.0               # m
 LEAD_DEBOUNCE = 0.5             # s
 
-NOT_SLOWING_ACCEL = -0.5        # m/s^2: slower than this means the car is already braking
+NOT_SLOWING_ACCEL = -0.5        # m/s^2: slower than this means the car is already braking ...
+# ... but not when it is our own stop slowdown (Mazda: the set speed lowered for this stop, starpilotCarState.
+# mazdaStopSlowdownActive) that slows the car: it starts before the warning (stopped_car_slowdown.WARN_START_DEBOUNCE)
+# and the warning must still show after it (owner: "first start reducing the speed and then display the warning").
+# A lowered set speed slows the car ~0.9-1.6 m/s^2; harder than OWN_SLOWDOWN_ACCEL is the radar cruise braking for a
+# car it tracks (up to ~3.8) or the driver: already handled.
+OWN_SLOWDOWN_ACCEL = -2.0       # m/s^2
 ACCEL_FILTER_TAU = 0.5          # s: low-pass on aEgo so noise does not reset the debounce
 REARM_TIME = 3.0                # s the condition must be gone before the same warning can fire again
 MIN_GAP = 10.0                  # s between two warnings of the same kind
@@ -107,6 +113,7 @@ class StopWarningInputs:
   lead_y: float = 0.0
   lead_relevant: bool = False
   lane_change: bool = False     # modelV2.meta.laneChangeState is laneChangeStarting / laneChangeFinishing
+  own_slowdown: bool = False    # starpilotCarState.mazdaStopSlowdownActive
 
 
 @dataclass
@@ -178,7 +185,7 @@ class StopWarningLogic:
   def not_slowing(self, i):
     alpha = DT / (ACCEL_FILTER_TAU + DT)
     self.a_filtered = i.a_ego if self.a_filtered is None else self.a_filtered + alpha * (i.a_ego - self.a_filtered)
-    return not i.brake_pressed and self.a_filtered > NOT_SLOWING_ACCEL
+    return not i.brake_pressed and self.a_filtered > (OWN_SLOWDOWN_ACCEL if i.own_slowdown else NOT_SLOWING_ACCEL)
 
   @staticmethod
   def plan_slowdown(i, fraction=STOP_SLOWDOWN):
@@ -242,8 +249,9 @@ class StopWarningLogic:
       out.append("standstill")
     if i.brake_pressed:
       out.append("brake pressed")
-    if self.a_filtered is not None and self.a_filtered <= NOT_SLOWING_ACCEL:
-      out.append(f"already slowing aEgo {self.a_filtered:.2f} <= {NOT_SLOWING_ACCEL}")
+    limit = OWN_SLOWDOWN_ACCEL if i.own_slowdown else NOT_SLOWING_ACCEL
+    if self.a_filtered is not None and self.a_filtered <= limit:
+      out.append(f"already slowing aEgo {self.a_filtered:.2f} <= {limit}")
     return out
 
   def stop_ahead_blockers(self, i, mode):
@@ -427,7 +435,7 @@ class StopWarning:
   EVENT_COLUMNS = ["t_wall", "vEgo_mph", "aEgo", "aEgo_filtered", "brake", "gas", "cruise", "set_mph",
                    "lead_status", "lead_prob", "lead_d", "lead_v", "lead_y", "lead_relevant",
                    "plan_min_mps", "plan_ratio", "plan_decel", "csc_active", "csc_mph",
-                   "curve_offset", "curve_in_flight", "stop_ahead_cond", "stopped_lead_cond"]
+                   "curve_offset", "curve_in_flight", "stop_ahead_cond", "stopped_lead_cond", "own_slowdown"]
   NEAR_MISS_STOP_AHEAD_RATIO = 0.80
   NEAR_MISS_STOP_AHEAD_SPEED = 20 * MS_PER_MPH
   NEAR_MISS_LEAD_SPEED = 3.0
@@ -487,6 +495,7 @@ class StopWarning:
       lead_y=float(lead.yRel),
       lead_relevant=self._lead_relevant(planner, lead, cs),
       lane_change=self._lane_change(model),
+      own_slowdown=self._own_slowdown(sm),
     )
     alerts = []
     fired = self.logic.update(inputs, self.modes)
@@ -504,6 +513,13 @@ class StopWarning:
     except Exception:
       pass
     return alerts
+
+  @staticmethod
+  def _own_slowdown(sm):
+    try:
+      return bool(sm["starpilotCarState"].mazdaStopSlowdownActive)
+    except Exception:
+      return False
 
   @staticmethod
   def _lane_change(model):
@@ -548,7 +564,7 @@ class StopWarning:
       f"{time.time():.2f}", i.v_ego / MS_PER_MPH, i.a_ego, logic.a_filtered if logic.a_filtered is not None else 0.0,
       i.brake_pressed, False, i.cruise_enabled, float(sm["carState"].cruiseState.speed) / MS_PER_MPH,
       i.lead_status, i.lead_prob, i.lead_d, i.lead_v, i.lead_y, i.lead_relevant,
-      plan_min, ratio, decel, csc_active, csc_speed, curve_offset, curve_in_flight, sa, sl))
+      plan_min, ratio, decel, csc_active, csc_speed, curve_offset, curve_in_flight, sa, sl, i.own_slowdown))
     fired_kinds = {det.kind for det, _ in fired}
     for det, mode in fired:
       self.recorder.record(det.kind, t, {
@@ -556,7 +572,7 @@ class StopWarning:
         "distance_m": det.distance, "required_decel": det.required_decel, "time_s": det.time,
         "lead_status": det.lead_status, "lead_d": det.lead_d, "lead_v": det.lead_speed, "lead_prob": det.lead_prob,
         "lead_y": det.lead_y, "lead_relevant": det.lead_relevant, "plan_min_mps": plan_min, "plan_ratio": ratio,
-        "gps": self._gps()})
+        "own_slowdown": i.own_slowdown, "gps": self._gps()})
     # near-misses: a candidate was seen but the warning did not fire
     if self.modes[STOP_AHEAD] != OFF:
       cand = (not i.standstill and i.v_ego >= self.NEAR_MISS_STOP_AHEAD_SPEED and plan is not None and

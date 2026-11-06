@@ -199,7 +199,16 @@ LEAVE_BACK = 0.5            # m
 # exists while StopWarningRedLight is On, is a one-frame pulse re-published at 1 Hz, and the plan rule itself is
 # already replicated (plan_stop).
 WARNING_START_ENABLED = True
-WARN_DEBOUNCE = 1.0            # s the warning condition must hold (STOP_DEBOUNCE)
+WARN_DEBOUNCE = 1.0            # s the warning condition must hold for the warning to show (STOP_DEBOUNCE) ...
+# ... but the lowering starts sooner (owner, Nov 5: "first start reducing the speed and then display the warning,
+# every second lost is valuable"; drive 4d: the warning and our start were 14 ms apart). Drive 44 replayed (27 min, 8
+# times the plan said stop): a 0.5 s start adds one start that never became a warning, and the driver braked for
+# that one 2.1 s later.
+WARN_START_DEBOUNCE = 0.5      # s
+# A start before the warning would have shown is released (and the set speed restored) when the planned stop goes
+# away before WARN_DEBOUNCE (the plan dipped for a moment): a dip that never became a warning costs ~0.5 s of SET-,
+# not a hold until the stop "clears" (review: 1.6-4.6 s, 5-15 mph).
+STOP_AHEAD_UNCONFIRMED = "stop ahead gone before the warning"
 WARN_DROPOUT = 0.25            # s (STOP_DROPOUT)
 WARN_MIN_SPEED = 25 * MS_PER_MPH   # (STOP_MIN_SPEED)
 WARN_NOT_SLOWING_ACCEL = -0.5  # m/s^2 on the filtered aEgo: the MRCC / driver is not already slowing (NOT_SLOWING_ACCEL)
@@ -384,9 +393,12 @@ class StoppedCarTrigger:
     self.warn_gap = 0
     self.warn_off_frames = _frames(WARN_REARM)
     self.warn_cond = False
-    self.warning = False             # the warning condition has held WARN_DEBOUNCE
+    self.warning = False             # the warning condition has held WARN_START_DEBOUNCE (we start on it)
     self.warn_latched = False        # an episode started on the warning: the condition must be gone WARN_REARM first
     self.warn_start = False          # this episode started on the warning alone (logs)
+    self.warn_pending = False        # ... before the warning shows: released if the planned stop goes away first
+    self.warn_plan_frames = 0
+    self.warn_plan_gap = 0
     self.gas_frames = 0
     self.overridden = False          # the driver went on the gas for the current lead: it does not start one again
     self.overridden_v = 0.0          # its speed at the release
@@ -490,7 +502,7 @@ class StoppedCarTrigger:
         self.warn_frames = 0
       if self.warn_off_frames >= _frames(WARN_REARM):
         self.warn_latched = False
-    self.warning = self.warn_cond and self.warn_frames >= _frames(WARN_DEBOUNCE)
+    self.warning = self.warn_cond and self.warn_frames >= _frames(WARN_START_DEBOUNCE)
 
   def _slower_car_ahead(self, i):
     v = self.lead_v_f
@@ -585,7 +597,7 @@ class StoppedCarTrigger:
       if self.warn_latched:
         out.append("stop ahead: already started for this stop")
       elif self.warn_cond and not self.warning:
-        out.append(f"stop ahead: warning held {self.warn_frames * DT_CTRL:.2f} s < {WARN_DEBOUNCE}")
+        out.append(f"stop ahead: warning held {self.warn_frames * DT_CTRL:.2f} s < {WARN_START_DEBOUNCE}")
     if not out and not self.active:
       out.append(f"held {self.hold_frames * DT_CTRL:.2f} s < {HOLD_TIME}")
     return out
@@ -635,6 +647,10 @@ class StoppedCarTrigger:
         self.floor_mode = self.warn_start and WARN_FLOOR
         if self.warn_start:
           self.warn_latched = True
+          self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
+          self.warn_plan_frames, self.warn_plan_gap = self.warn_frames, 0
+        else:
+          self.warn_pending = False
         self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
         self.leave_frames = 0
         self.clear_release = False
@@ -657,6 +673,8 @@ class StoppedCarTrigger:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
+      elif self.warn_pending and not self._warn_still_planned(i):
+        self._release(STOP_AHEAD_UNCONFIRMED)
       elif self.go_frames >= _frames(GO_TIME) or not self.latched:
         self._release("stop ahead cleared (no stop planned)")
     elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
@@ -764,6 +782,19 @@ class StoppedCarTrigger:
     self.pulling_away = self.pull_frames >= _frames(PULL_AWAY_TIME)
     return self.active
 
+  def _warn_still_planned(self, i):
+    """A start before the warning: the planned stop (the model's plan alone: our own slowdown makes the "not
+    slowing" gate false) must last until the warning would show, with the warning's dropout."""
+    if i.plan_stop:
+      self.warn_plan_frames += 1
+      self.warn_plan_gap = 0
+    else:
+      self.warn_plan_gap += 1
+    if self.warn_plan_frames >= _frames(WARN_DEBOUNCE):
+      self.warn_pending = False
+      return True
+    return self.warn_plan_gap <= _frames(WARN_DROPOUT)
+
   def _release(self, reason, restore_now=True):
     self.active = False
     self.hold_frames = 0
@@ -774,6 +805,7 @@ class StoppedCarTrigger:
     self.clear_release = reason in CLEAR_RELEASE_REASONS
     self.left_car = reason == "lead leaving the lane"
     self.overridden = reason == "driver on the gas"
+    self.warn_pending = False
     self.overridden_v = self.lead_v_f
     self.leave_frames = 0
     self.radar_flicker = False

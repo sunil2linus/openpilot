@@ -396,3 +396,49 @@ def test_no_stop_ahead_during_a_lane_change_or_2_s_after():
   assert [k for _, k, _ in out] == [sw.STOP_AHEAD], out           # still warns once the lane change is over ...
   first = out[0][0] - sw._frames(2.0)
   assert first >= sw._frames(sw.LANE_CHANGE_HOLD) + sw._frames(sw.STOP_DEBOUNCE) - 2, first   # ... 2 s + debounce later
+
+
+def test_our_own_stop_slowdown_does_not_hide_the_warning():
+  # Mazda: the set speed is lowered 0.5 s before the warning shows (stopped_car_slowdown.WARN_START_DEBOUNCE); the car
+  # slowing for that must not count as "already slowing" (owner: "first start reducing the speed and then display
+  # the warning")
+  model = model_stop(40 * MPH, 60)
+  ours = [inputs(40, a_ego=-1.2, model=model) for _ in range(40)]
+  for i in ours:
+    i.own_slowdown = True
+  assert run(ours) != []
+  assert run([inputs(40, a_ego=-1.2, model=model) for _ in range(40)]) == []     # someone else slowing: no warning
+  harder = [inputs(40, a_ego=-2.5, model=model) for _ in range(40)]
+  for i in harder:
+    i.own_slowdown = True
+  assert run(harder) == []                     # braking harder than a lowered set speed does: the radar cruise / driver
+
+
+def test_own_slowdown_still_respects_the_brake_and_reports_the_applied_limit():
+  model = model_stop(40 * MPH, 60)
+  braked = [inputs(40, a_ego=-1.2, brake=True, model=model) for _ in range(40)]
+  for i in braked:
+    i.own_slowdown = True
+  assert run(braked) == []
+  logic = sw.StopWarningLogic()
+  i = inputs(40, a_ego=-1.2, model=model)
+  i.own_slowdown = True
+  for _ in range(40):
+    logic.update(i, BOTH_ON)
+  assert not any("already slowing" in b for b in logic.common_blockers(i, sw.ON))
+  i.own_slowdown = False
+  assert any(f"<= {sw.NOT_SLOWING_ACCEL}" in b for b in logic.common_blockers(i, sw.ON))
+
+
+def test_the_warning_follows_our_start_as_the_car_begins_to_slow():
+  # time-sequenced: our set speed drops at 0.5 s (flag up), the car slows from ~1.0 s at -1.2 m/s^2; the warning
+  # still shows at 1.0 s
+  model = model_stop(40 * MPH, 60)
+  seq = []
+  for n in range(60):
+    t = n * sw.DT
+    i = inputs(40, a_ego=-1.2 if t >= 0.8 else 0.0, model=model)
+    i.own_slowdown = t >= 0.5
+    seq.append(i)
+  out = run(seq)
+  assert [k for _, k, _ in out] == [sw.STOP_AHEAD] and out[0][0] == sw._frames(sw.STOP_DEBOUNCE) - 1, out
