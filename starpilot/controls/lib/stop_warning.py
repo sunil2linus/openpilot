@@ -10,7 +10,9 @@ Two independent warnings, each with its own setting (0 = off, 1 = test, 2 = on):
     plan does not reach a full stop inside its horizon before the driver brakes (seen on the
     road), so a full-stop criterion would never fire; the slowdown fraction does.
   * Stopped car ahead: the lead car is stopped or nearly stopped, we are closing in fast,
-    and the car is not slowing down.
+    and the car is not slowing down. While our own stop slowdown runs (or a stop ahead
+    warning just showed), it comes as soon as stopping needs more than the stock cruise
+    gives (OWN_*), whatever the time to collision.
 
 Test mode never makes a sound: it only appends a line to LOG_PATH each time the warning would
 have fired, so false alarms (e.g. at green lights) can be reviewed before turning sound on.
@@ -57,6 +59,16 @@ LEAD_MAX_TTC = 4.0              # s
 LEAD_DECEL = 1.5                # m/s^2: required deceleration to stop behind it
 LEAD_BUFFER = 5.0               # m
 LEAD_DEBOUNCE = 0.5             # s
+# Our own stop slowdown under way (Mazda, drive 50 t 315-322, 45 mph): with the set speed at the floor and no radar lock
+# the stock cruise slows only ~0.8-1.0 m/s^2, so once stopping behind a stopped car needs more than that, only the driver
+# can do it, and the time to collision rule (LEAD_MAX_TTC) only delays the word. The stopped queue car was 57-65 % a car
+# at 107-84 m (318.0-319.5, required 1.6-1.9 m/s^2, TTC 5.2 s) and 87 % at 73.5 m (320.5, TTC 4.8 s); the warning came at
+# 321.8 (94 %, 54 m) and the driver braked at 322.5 (32.4 mph, ~4 m/s^2). While our slowdown is active (own_slowdown) or
+# a STOP AHEAD showed within OWN_STOP_RECENT, the stopped car warning skips the TTC rule and takes a car of
+# OWN_LEAD_MIN_PROB (the other rules stay: stopped, in our lane, closing, LEAD_DECEL, LEAD_DEBOUNCE): on drive 50 it
+# fires at ~319-319.5 s (85-96 m) instead of 321.8. Everything else is unchanged.
+OWN_STOP_RECENT = 10.0          # s
+OWN_LEAD_MIN_PROB = 0.6
 
 NOT_SLOWING_ACCEL = -0.5        # m/s^2: slower than this means the car is already braking ...
 # ... but not when it is our own stop slowdown (Mazda: the set speed lowered for this stop, starpilotCarState.
@@ -226,15 +238,21 @@ class StopWarningLogic:
     required = closing ** 2 / (2 * max(i.lead_d - LEAD_BUFFER, 1.0)) if closing > 0 else 0.0
     return closing, ttc, required
 
+  def own_stop(self, i):
+    """Our own stop slowdown is slowing the car, or a STOP AHEAD showed in the last OWN_STOP_RECENT s: the stock cruise
+    cannot brake harder than ~1 m/s^2 for the stopped car, so the stopped car warning comes as soon as more is needed."""
+    return bool(i.own_slowdown or self.frame - self.gates[STOP_AHEAD].last_fire <= _frames(OWN_STOP_RECENT))
+
   def stopped_lead(self, i):
-    if not i.lead_status or i.lead_prob < LEAD_MIN_PROB or i.v_ego < LEAD_MIN_SPEED:
+    own = self.own_stop(i)
+    if not i.lead_status or i.lead_prob < (OWN_LEAD_MIN_PROB if own else LEAD_MIN_PROB) or i.v_ego < LEAD_MIN_SPEED:
       return None
     if i.lead_v > LEAD_STOPPED_SPEED or i.lead_d <= 0 or abs(i.lead_y) > LEAD_MAX_LATERAL:
       return None
     closing, ttc, required = self.lead_metrics(i)
     if closing < LEAD_MIN_CLOSING:
       return None
-    if ttc > LEAD_MAX_TTC or required < LEAD_DECEL:
+    if (ttc > LEAD_MAX_TTC and not own) or required < LEAD_DECEL:
       return None
     return Detection(STOPPED_LEAD, i.lead_d, required, ttc, i.lead_v, i.lead_prob)
 
@@ -276,11 +294,13 @@ class StopWarningLogic:
 
   def stopped_lead_blockers(self, i, mode):
     out = self.common_blockers(i, mode)
+    own = self.own_stop(i)
     if not i.lead_status:
       out.append("no lead")
     else:
-      if i.lead_prob < LEAD_MIN_PROB:
-        out.append(f"prob {i.lead_prob:.2f} < {LEAD_MIN_PROB}")
+      min_prob = OWN_LEAD_MIN_PROB if own else LEAD_MIN_PROB
+      if i.lead_prob < min_prob:
+        out.append(f"prob {i.lead_prob:.2f} < {min_prob}")
       if abs(i.lead_y) > LEAD_MAX_LATERAL:
         out.append(f"yRel {i.lead_y:.1f} > {LEAD_MAX_LATERAL}")
       if i.lead_v > LEAD_STOPPED_SPEED:
@@ -288,7 +308,7 @@ class StopWarningLogic:
       closing, ttc, required = self.lead_metrics(i)
       if closing < LEAD_MIN_CLOSING:
         out.append(f"closing {closing:.1f} < {LEAD_MIN_CLOSING} m/s")
-      if ttc > LEAD_MAX_TTC:
+      if ttc > LEAD_MAX_TTC and not own:
         out.append(f"ttc {ttc:.1f} > {LEAD_MAX_TTC} s")
       if required < LEAD_DECEL:
         out.append(f"required decel {required:.2f} < {LEAD_DECEL}")

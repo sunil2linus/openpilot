@@ -442,3 +442,97 @@ def test_the_warning_follows_our_start_as_the_car_begins_to_slow():
     seq.append(i)
   out = run(seq)
   assert [k for _, k, _ in out] == [sw.STOP_AHEAD] and out[0][0] == sw._frames(sw.STOP_DEBOUNCE) - 1, out
+
+
+# ---------------- our own stop slowdown under way: the stopped car warning comes as soon as more braking is needed ----------------
+
+def _own(i):
+  i.own_slowdown = True
+  return i
+
+
+def test_own_slowdown_warns_as_soon_as_stopping_needs_more_than_the_cruise_gives():
+  # 45 mph, a stopped car 95 m ahead: 4.7 s away (the TTC rule says not yet) but 2.2 m/s^2 needed; 65 % a car
+  lead = (95, 0, 0.65)
+  assert run(repeat(inputs(45, lead=lead), 3)) == []                               # without our slowdown: as before
+  out = run(repeat(_own(inputs(45, lead=lead)), 3))
+  assert [k for _, k, _ in out] == [sw.STOPPED_LEAD] and out[0][0] == sw._frames(sw.LEAD_DEBOUNCE) - 1, out
+  # the other rules stay: a moving car, the next lane, barely closing, far (little braking needed), too unsure
+  for kw in (dict(lead=(95, 8, 0.65)), dict(lead=(95, 0, 0.65), lead_y=1.5), dict(lead=(95, 37, 0.9)), dict(lead=(220, 0, 0.9)),
+             dict(lead=(95, 0, 0.5))):
+    assert run(repeat(_own(inputs(45, **kw)), 3)) == [], kw
+  # the brake and the car already braking hard (the radar cruise / driver) still silence it; a lowered set speed does not
+  assert run(repeat(_own(inputs(45, brake=True, lead=lead)), 3)) == []
+  assert run(repeat(_own(inputs(45, a_ego=-2.5, lead=lead)), 3)) == []
+  assert run(repeat(_own(inputs(45, a_ego=-1.0, lead=lead)), 3)) != []
+  # the blockers say why
+  logic = sw.StopWarningLogic()
+  i = inputs(45, lead=(95, 0, 0.5))
+  logic.update(i, BOTH_ON)
+  assert any("prob 0.50 < 0.8" in b for b in logic.stopped_lead_blockers(i, sw.ON))
+  assert any("ttc" in b for b in logic.stopped_lead_blockers(i, sw.ON))
+  _own(i)
+  assert any("prob 0.50 < 0.6" in b for b in logic.stopped_lead_blockers(i, sw.ON))
+  assert not any("ttc" in b for b in logic.stopped_lead_blockers(i, sw.ON))
+
+
+def test_a_recent_stop_ahead_warning_also_relaxes_the_stopped_car_rule():
+  # the stop ahead showed at 1 s; the queue car (stopped, 5 s away, 90 %) appears 4 s later: warned at once (+ debounce)
+  red = inputs(45, model=model_stop(45 * MPH, 90))
+  lead = inputs(45, lead=(100, 0, 0.9))
+  out = run(repeat(red, 2) + repeat(inputs(45), 3) + repeat(lead, 2))
+  kinds = [(n, k) for n, k, _ in out]
+  assert [k for _, k in kinds] == [sw.STOP_AHEAD, sw.STOPPED_LEAD], kinds
+  assert kinds[1][0] == 5 * 20 + sw._frames(sw.LEAD_DEBOUNCE) - 1, kinds
+  # more than OWN_STOP_RECENT after it: the usual rules (5 s away: not yet)
+  out = run(repeat(red, 2) + repeat(inputs(45), sw.OWN_STOP_RECENT + 0.5) + repeat(lead, 2))
+  assert [k for _, k, _ in out] == [sw.STOP_AHEAD], out
+
+
+# drive 50 (t = s after redLight at 307.5): our stop ahead start at 7.5 s (own slowdown from there), the stopped queue car
+# (radarState leadOne, qlog samples): (t, vEgo mph, aEgo, lead status, dRel m, vLead mph, yRel m, modelProb)
+DRIVE_50_LEAD = [
+  (9.2, 44.4, -0.4, 1, 110.1, 10.5, 0.32, 0.3), (9.45, 43.9, -0.75, 1, 117.5, 9.4, 0.42, 0.29),
+  (9.7, 43.4, -0.88, 1, 117.1, 6.9, 0.79, 0.38), (9.95, 43.0, -0.84, 1, 106.7, 8.6, 0.63, 0.41),
+  (10.2, 42.3, -1.13, 1, 108.5, 7.6, 0.52, 0.35), (10.45, 41.7, -0.77, 1, 106.7, 4.6, 1.48, 0.57),
+  (10.7, 41.3, -1.05, 1, 101.0, 4.1, 1.42, 0.7), (10.95, 40.8, -0.96, 1, 96.7, 4.5, 0.95, 0.65),
+  (11.2, 40.2, -0.99, 1, 98.2, 1.5, 1.85, 0.53), (11.45, 39.6, -1.08, 1, 96.0, 3.8, 1.97, 0.62),
+  (11.7, 38.9, -1.23, 1, 100.8, 1.3, 2.66, 0.43), (11.95, 38.6, -0.91, 1, 84.1, 2.4, 1.57, 0.65),
+  (12.2, 37.9, -0.95, 1, 80.8, 3.6, 1.24, 0.72), (12.45, 37.5, -0.89, 1, 80.0, 2.6, 1.13, 0.71),
+  (12.7, 36.8, -1.0, 1, 77.2, 2.4, 0.95, 0.85), (12.95, 36.6, -0.7, 1, 73.5, 2.2, 0.93, 0.87),
+  (13.21, 35.9, -0.98, 1, 72.1, 1.8, 0.66, 0.86), (13.46, 35.6, -0.8, 1, 64.9, 3.0, 0.62, 0.93),
+  (13.7, 34.9, -1.0, 1, 63.8, 1.9, 0.31, 0.93), (13.95, 34.5, -1.03, 1, 54.2, 2.1, 0.44, 0.94),
+  (14.2, 33.9, -0.99, 1, 52.2, 2.5, 0.3, 0.97), (14.45, 33.5, -0.92, 1, 45.3, 2.0, 0.33, 0.98),
+  (14.71, 32.9, -0.8, 1, 40.0, 2.8, 0.18, 0.98), (14.95, 32.5, -1.07, 1, 38.4, 2.7, 0.22, 0.98),
+  (15.2, 31.9, -0.98, 1, 30.4, 2.9, 0.17, 0.99), (15.45, 31.0, -2.13, 1, 26.9, 2.5, 0.1, 0.99),
+]
+
+
+def _drive_50(own, a_ego=None):
+  """20 Hz from 5 s to 15.5 s, the lead samples held until the next: the frame the stopped car warning fired (t s)."""
+  logic = sw.StopWarningLogic()
+  fired = []
+  for n in range(int(5.0 / sw.DT), int(15.5 / sw.DT)):
+    t = n * sw.DT
+    row = max((r for r in DRIVE_50_LEAD if r[0] <= t), key=lambda r: r[0], default=None)
+    v = row[1] if row else 45.0
+    i = sw.StopWarningInputs(cruise_enabled=True, v_ego=v * MPH, a_ego=(a_ego if a_ego is not None else (row[2] if row else 0.0)),
+                             brake_pressed=False, standstill=False, own_slowdown=own and t >= 7.5)
+    if row:
+      i.lead_status, i.lead_d, i.lead_v, i.lead_y, i.lead_prob = True, row[4], row[5] * MPH, row[6], row[7]
+    for det, _ in logic.update(i, {sw.STOP_AHEAD: sw.OFF, sw.STOPPED_LEAD: sw.ON}):
+      fired.append((round(t, 2), det.kind, round(det.distance, 1), round(det.lead_prob, 2)))
+  return fired
+
+
+def test_drive_50_replay_the_brake_warning_comes_1_4_s_sooner_with_our_slowdown_under_way():
+  # on the drive: "STOPPED CAR AHEAD - BRAKE" at 321.8 (14.3 s, 94 %, 54 m), the driver braked at 322.5 at 32.4 mph.
+  # Now 320.4 (77 m, 85 %): the car was still 1.4-2.7 m off our line (raw yRel) at 318.7-319.7, hence not 319.5
+  fired = _drive_50(own=True)
+  assert len(fired) == 1 and fired[0][1] == sw.STOPPED_LEAD, fired
+  assert 12.7 <= fired[0][0] <= 13.0 and fired[0][2] >= 73.0, fired
+  # without our slowdown the car's own slowing (aEgo -0.8..-1.1) hides it; with the usual rules (the car not slowing) it
+  # would have come where it did on the drive, at ~54 m
+  assert _drive_50(own=False) == []
+  fired = _drive_50(own=False, a_ego=0.0)
+  assert len(fired) == 1 and fired[0][0] >= 14.2 and fired[0][2] <= 55.0, fired
