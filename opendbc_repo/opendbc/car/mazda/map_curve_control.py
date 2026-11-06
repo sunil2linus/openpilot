@@ -100,6 +100,7 @@ class MapOutput:
   track: bool = False           # a road curve's follower command: the controller tracks it both ways (SET+ when it comes back up)
   plan: float = NO_CURVE        # m/s, the plan the follower works under (logs)
   curve_speed: float = NO_CURVE # m/s, the speed the governing road curve is taken at (its shape, sign, max drop floor)
+  settled: bool = False         # the follower is (nearly) at the curve's speed: its command is the curve's speed
 
 
 class MapCurveControl:
@@ -192,6 +193,7 @@ class MapCurveControl:
     out.active = a or na or capped
     out.speed = speed
     out.track = track
+    out.settled = track and self.follower.settled
     if ramp_curve or na or capped:
       out.floor, out.budget = RAMP_FLOOR, RAMP_BUDGET
     elif track:
@@ -205,3 +207,40 @@ class MapCurveControl:
     self.on_street_exit = (exit_to_street and (progress or f.road_class != 0)) or (self.on_street_exit and f.on_ramp)
     out.why = why
     return out
+
+
+class CurveMix:
+  """The wrapper's combination of the camera curve target with the map control's output (CurveSlowdown.update; the
+  offline tests drive it too). Returns (active, speed, floor, budget, track, raise_ok) for SlowdownInputs.
+
+  Without a followed road curve: the camera's target, or the map's when it is lower, as before the follower (the
+  controller adds its margin, the driver's Curve Max Drop is the floor).
+  While the follower runs, the camera's target counts at the lowest it has been since the follower started, with the
+  margin and the Max Drop floor the controller gives it (`drop_floor`). The camera's target is the least demanding
+  curvature of the last second, so it pops up for a second at a time (review sC: a camera target alternating 27 /
+  38 inside a 32 mph map curve made the step back up follow it, 3-4 SET+ then 3-4 SET- over and over). Counted at
+  its lowest it can only lower the target, as it always could, and never raise it: the only SET+ in the curve is
+  the follower's own undershoot being taken back, up to the lower of the follower's command and that camera target
+  (review: with the camera governing and no step back up at all, the undershoot stayed 4 mph below the Max Drop
+  floor through the whole curve). The governing target is passed with its margin already in (track: no margin
+  added), the camera's with the Max Drop floor (floor 0), the follower's with its undershoot floor.
+  raise_ok: the follower has settled at the curve's speed; the only other way its command goes up is a restart
+  (another curve governs, or its speed changed), which is no reason to raise (review s4c: a radius re-matched 91 ->
+  100 m mid-approach raised 32 -> 33 at 38 mph, then three SET- again)."""
+
+  def __init__(self, margin):
+    self.margin = margin
+    self.cam_low = NO_CURVE       # the camera's lowest target (margin and Max Drop floor in) while the follower runs
+
+  def update(self, cam_active, cam_speed, mo, drop_floor=0.0):
+    if not (mo.active and mo.track):
+      self.cam_low = NO_CURVE
+      active, speed, floor, budget = cam_active, cam_speed, 0.0, 0
+      if mo.active and (not cam_active or mo.speed < cam_speed):
+        speed, floor, budget = mo.speed, mo.floor, mo.budget
+      return active or mo.active, speed, floor, budget, False, False
+    if cam_active:
+      self.cam_low = min(self.cam_low, max(cam_speed + self.margin, drop_floor))
+    if mo.speed <= self.cam_low:
+      return True, mo.speed, mo.floor, mo.budget, True, mo.settled
+    return True, self.cam_low, 0.0, mo.budget, True, mo.settled

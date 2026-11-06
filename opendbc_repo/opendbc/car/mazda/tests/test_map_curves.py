@@ -444,6 +444,7 @@ def drive_map(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, lengt
   car.set_speed = car.v_ego = set_mph * MPH
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   ctl = CTL.MapCurveControl(3.0, decel if decel is not None else CTL.MAP_DECEL)
+  mix = CTL.CurveMix(cs.CURVE_MARGIN)
   md = logic.max_drop_steps * logic.step
   x = start_d
   st = dict(gas=False, brake=False, enabled=True, cruise=True)
@@ -464,18 +465,14 @@ def drive_map(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, lengt
     mo = ctl.update(fld, driver, 0, v_ego=car.v_ego if follow else 0.0, max_drop=md if follow else 0.0)
     # the wrapper's combination with the camera curve target (curve_slowdown.CurveSlowdown.update)
     cam = camera(x) if camera is not None else None
-    active, speed, floor, budget = cam is not None, cam if cam is not None else CTL.NO_CURVE, 0.0, 0
-    if mo.active and (not active or mo.speed < speed):
-      speed, floor, budget = mo.speed, mo.floor, mo.budget
-    elif mo.active and mo.track:
-      speed += cs.CURVE_MARGIN
-    active = active or mo.active
+    active, speed, floor, budget, track, raise_ok = mix.update(cam is not None, cam if cam is not None else CTL.NO_CURVE, mo,
+                                                               drop_floor=max(driver - md, cs.MIN_SET_SPEED))
     stop_t = stop(x) if stop is not None else None
     inp = cs.SlowdownInputs(enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed, v_ego=car.v_ego,
                             gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=False, plan_alive=True,
                             csc_active=active, csc_speed=min(speed, 100.0), other_button_active=False,
                             driver_button=car.driver_button_now(), curve_floor=floor, curve_budget=budget,
-                            curve_track=mo.active and mo.track, fast_restore=mo.fast_restore,
+                            curve_track=track, curve_raise=raise_ok, fast_restore=mo.fast_restore,
                             stop_active=stop_t is not None, stop_target=stop_t or 0.0, stop_urgent=False)
     btn, off = logic.update(inp)
     if btn is not None:
@@ -596,13 +593,14 @@ def test_follower_in_km_h():
 
 
 def test_follower_lowest_target_wins_camera_and_stopped_car():
-  # max drop 15 (floor 30): the camera sees the curve a little tighter (29.8 mph true) near it: the step back up stops
-  # at the camera's target (31 with its 0.3 m/s margin), never at the map's 32; the undershoot still happened first
+  # max drop 15 (floor 30): the camera sees the curve a little tighter (29.8 mph true, 30.5 with its 0.3 m/s margin)
+  # near it: the step back up stops at the highest step not above the camera's target (30), never at the map's 32
+  # (it used to round up to 31); the undershoot still happened first
   def cam(x):
     return 29.8 * MPH if x < 120 else None
   r = drive_map(max_drop=15, camera=cam)
   in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
-  assert max(in_curve_sets) <= 31 + 1e-6 and min(in_curve_sets) >= 31 - 1e-6, (min(in_curve_sets), max(in_curve_sets))
+  assert max(in_curve_sets) <= 30 + 1e-6 and min(in_curve_sets) >= 30 - 1e-6, (min(in_curve_sets), max(in_curve_sets))
   assert 26 <= r["min_set"] <= 28, r["min_set"]
 
   # max drop 10 (floor 35): a camera target below the floor is held at the floor, as today
@@ -699,6 +697,180 @@ def test_a_road_curve_stops_governing_after_its_apex_when_the_camera_slowdown_is
     m.update(la, lo, brg, 2, True)
     assert (m.curve is None) == release, (release, m.curve)
   assert "apex" in c
+
+
+# ---------------- the follower with the stopped car trigger and the camera (review of the follower) ----------------
+# The real stopped car trigger (red light head start, false stop guard, unsure car) and the camera curve target in the
+# loop with the map control and the controller, on the measured cruise. Each case broke before the fix: a restore
+# asked for at once ping-ponged through the curve and climbed past it, the step back up ran during a stop episode,
+# followed the camera's noisy target up, jumped after the gas, rounded above the curve's speed and ran after a
+# follower restart.
+
+def drive_follow(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, length=80.0, frames=6000, fields=None,
+                 camera=None, red=None, plan_stop=None, model=None, lead=None, lead_from=0, events=None):
+  """drive_map with the stopped car trigger: red(f) / plan_stop(f) / model(f): the stop-light detector, the model's
+  planned stop and desired acceleration at frame f; lead: a StoppedLead that starts moving at frame lead_from;
+  fields(f, x): the map fields instead of one curve of `radius`. Returns presses as (frame, x, button, action, set
+  mph before, v mph, trigger active, trigger kind) and the run's set speeds / speeds / positions."""
+  car = T.Car(set_mph, dash_offset_mph=0.0, lag=10, accel=0.6, step=MPH, **MEASURED_CRUISE)
+  car.set_speed = car.v_ego = set_mph * MPH
+  logic = cs.CurveSlowdownLogic(False, max_drop)
+  ctl = CTL.MapCurveControl(3.0, CTL.MAP_DECEL)
+  mix = CTL.CurveMix(cs.CURVE_MARGIN)
+  trig = T.scs.StoppedCarTrigger()
+  md = logic.max_drop_steps * logic.step
+  x, a_ego = start_d, 0.0
+  st = dict(gas=False, brake=False, enabled=True, cruise=True)
+  presses, sets, vs, xs = [], [], [], []
+  for f in range(frames):
+    if events and f in events:
+      events[f](st, car)
+    if fields is not None:
+      fld = fields(f, x)
+    else:
+      fld = F(status=1, radius=radius, distance=max(x, 0.0)) if x > -length else F(status=0)
+    driver = car.set_speed + logic.offset * logic.step
+    mo = ctl.update(fld, driver, 0, v_ego=car.v_ego, max_drop=md)
+    cam = camera(f, x) if camera is not None else None
+    active, speed, floor, budget, track, raise_ok = mix.update(cam is not None, cam if cam is not None else CTL.NO_CURVE, mo,
+                                                               drop_floor=max(driver - md, cs.MIN_SET_SPEED))
+    ls, lp, ld, lv, ly = lead.state(f, car) if (lead is not None and f >= lead_from) else (False, 0.0, 0.0, 0.0, 0.0)
+    si = T.scs.StoppedCarInputs(enabled=True, cruise_enabled=True, brake_pressed=st["brake"], v_ego=car.v_ego, lead_alive=True,
+                                lead_status=ls, lead_prob=lp, lead_d=ld, lead_v=lv, lead_y=ly, model_alive=True,
+                                model_accel=model(f) if model else 0.0, plan_stop=plan_stop(f) if plan_stop else False,
+                                a_ego=a_ego, model_length=200.0, gas_pressed=st["gas"], set_speed=car.set_speed,
+                                red_light=red(f) if red else False)
+    stop = trig.update(si)
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=st["gas"],
+                            brake_pressed=st["brake"], standstill=car.v_ego < 0.3, plan_alive=True, csc_active=active,
+                            csc_speed=min(speed, 100.0), other_button_active=False, driver_button=car.driver_button_now(),
+                            curve_floor=floor, curve_budget=budget, curve_track=track, curve_raise=raise_ok,
+                            fast_restore=mo.fast_restore, stop_active=stop, stop_target=trig.target, stop_urgent=trig.urgent,
+                            stop_restore_now=trig.restore_now, hold_restore=trig.hold_restore, radar_lead=trig.radar_stable,
+                            stop_clear_ahead=trig.clear_ahead, stop_pulling_away=trig.pulling_away)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      presses.append((f, round(x), btn, logic.last_action, round(car.set_speed / MPH), car.v_ego / MPH,
+                      stop or trig.hold_restore, trig.kind))
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    if st["gas"]:
+      car.gas_frame = car.frame
+    v_before = car.v_ego
+    car.tick()
+    if lead is not None and f >= lead_from:
+      lead.tick(car)
+    a_ego = (car.v_ego - v_before) / T.DT
+    x -= car.v_ego * T.DT
+    sets.append(car.set_speed / MPH)
+    vs.append(car.v_ego / MPH)
+    xs.append(x)
+  seq = "".join("M" if p[2] == cs.SET_MINUS else "P" for p in presses)
+  return dict(presses=presses, seq=seq, sets=sets, vs=vs, xs=xs, trig=trig, logic=logic)
+
+
+def _max_set(r, lo, hi):
+  return max(sp for sp, xx in zip(r["sets"], r["xs"], strict=True) if lo < xx <= hi)
+
+
+def test_red_light_gone_inside_a_followed_curve_restores_only_up_to_the_curve():
+  # settled at 35 in a long 35 mph curve (max drop 10 from 45): the red light head start taps once (or four times),
+  # then the light goes and the trigger asks for the speed back at once. It came back only to 35 and the curve kept
+  # governing; before the fix the restore went 35 <-> 37 every 0.2 s through the curve (~50 presses) and, once the
+  # curve's 40 SET- were spent, on up to 44 inside it (review sB)
+  for lo, hi in ((3000, 3350), (3000, 3600)):
+    r = drive_follow(length=600.0, frames=9000, red=lambda f, lo=lo, hi=hi: lo <= f < hi)
+    assert r["trig"].release_reason == T.scs.RED_GONE, r["trig"].release_reason
+    assert _max_set(r, -600, 0) <= 35 + 1e-6, (lo, hi, _max_set(r, -600, 0))
+    in_curve = "".join("M" if p[2] == cs.SET_MINUS else "P" for p in r["presses"] if -600 < p[1] <= 0)
+    assert in_curve.count("PM") == 0 and len(in_curve) <= 10, (lo, hi, in_curve)
+    assert abs(r["sets"][-1] - 45) < 1e-6, r["sets"][-1]        # the curve's own restore after it
+
+
+def test_red_light_gone_while_slowing_for_a_followed_curve_never_ping_pongs():
+  # the head start before the curve, the light gone while the follower slows for it (review sG): before the fix the
+  # restore and the follower's SET- took turns all the way into the curve
+  for lo, hi in ((1600, 2100), (1700, 2400), (1800, 2600)):
+    r = drive_follow(frames=5000, red=lambda f, lo=lo, hi=hi: lo <= f < hi)
+    assert r["trig"].release_reason == T.scs.RED_GONE
+    assert r["seq"].count("PM") == 0 and r["seq"].count("P") <= 16, (lo, hi, r["seq"])
+    assert _max_set(r, -80, 0) <= 35 + 1e-6, (lo, hi, _max_set(r, -80, 0))
+
+
+def test_a_guarded_stop_ahead_clearing_inside_a_followed_curve_stays_at_the_curve():
+  # the model plans a stop for 2.5 s with no red light (the false stop guard: taps), then clears; settled in a 35 mph
+  # curve. Before the fix the restore asked for at once ping-ponged and then climbed to 44-45 in the curve (review sI)
+  r = drive_follow(length=700.0, frames=6000, plan_stop=lambda f: 3100 <= f < 3350,
+                   model=lambda f: 0.5 if f >= 3350 else 0.0)
+  assert any(p[7] == T.scs.STOP_AHEAD and p[6] for p in r["presses"]), r["presses"]
+  assert _max_set(r, -700, -60) <= 35 + 1e-6, _max_set(r, -700, -60)
+  after = "".join("M" if p[2] == cs.SET_MINUS else "P" for p in r["presses"] if p[0] > 3350)
+  assert after.count("PM") == 0 and len(after) <= 6, after
+
+
+def test_an_unsure_car_holding_the_speed_inside_a_followed_curve_sees_no_set_plus():
+  # settled in a long 35 mph curve; an unsure (60 %) slower car at 125 m: 1 mph taps, and while it is not seen the
+  # trigger publishes target 100 ("hold, do not lower further"), leaving the curve the lowest target. The follower's
+  # step back up must not run then: a stop episode never sees our SET+ (review sH: 31 -> 33 / 34 while closing on it)
+  for gaps in ((), ((3700, 3800),), ((3700, 3800), (4000, 4150))):
+    lead = T.StoppedLead(125.0, v_mph=15.0, prob=0.6, y=0.1, present=lambda f, gaps=gaps: not any(a <= f < b for a, b in gaps))
+    r = drive_follow(length=900.0, frames=4600, lead=lead, lead_from=3100)
+    episode = [p for p in r["presses"] if p[6]]
+    assert any(p[7] == T.scs.SLOW_UNSURE for p in episode), (gaps, r["presses"])
+    assert not any(p[2] == cs.SET_PLUS for p in episode), (gaps, [p for p in episode if p[2] == cs.SET_PLUS])
+    assert not any(p[2] == cs.SET_PLUS for p in r["presses"] if p[0] > 3100), gaps
+
+
+def test_camera_target_noise_inside_a_followed_curve_never_raises_the_set_speed():
+  # the camera sees the curve tighter (26.5 mph true) from 120 m out, but its least demanding curvature of the last
+  # second pops up to 38 for one second every three: before the fix the step back up followed it (3-4 SET+, then 3-4
+  # SET- again, over and over: review sC). The camera's target counts at its lowest: down only, as before the follower
+  def cam(f, x):
+    if x >= 120 or x < -400:
+      return None
+    return 38 * MPH if (f // 100) % 3 == 2 else 26.5 * MPH
+  r = drive_follow(length=400.0, max_drop=20, frames=6000, camera=cam)
+  in_view = [p for p in r["presses"] if -400 < p[1] < 120]
+  assert in_view and not any(p[2] == cs.SET_PLUS for p in in_view), in_view
+  assert _max_set(r, -400, 100) <= 28 + 1e-6, _max_set(r, -400, 100)     # 26.5 + its margin, the step at or below
+  assert len(r["presses"]) <= 20, r["seq"]
+
+
+def test_the_step_back_up_is_taps_never_a_jump_after_the_gas():
+  # the driver on the gas for 0.4-0.6 s just before the follower steps back up: a SET+ then jumps to the current speed
+  # (31 -> 37 in a 35 mph curve, review sF). It waits out the gas jump window and taps
+  def on(st, car):
+    st["gas"] = True
+
+  def off(st, car):
+    st["gas"] = False
+  for g0, g1 in ((2690, 2730), (2700, 2760)):
+    r = drive_follow(frames=5000, events={g0: on, g1: off})
+    assert not any(p[3] == "jump" for p in r["presses"]), (g0, [p for p in r["presses"] if p[3] == "jump"])
+    assert max(sp for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= 60) <= 35 + 1e-6
+    assert r["seq"].count("PM") == 0, r["seq"]
+
+
+def test_the_step_back_up_stops_at_the_highest_step_not_above_the_curve_speed():
+  # a 120 m curve is 36.3 mph at 2.2 m/s^2 (max drop 15): the step back up ends at 36, never 37 (it used to round up,
+  # review sE), and not a step lower either
+  r = drive_map(radius=120.0, max_drop=15)
+  in_curve = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
+  assert max(in_curve) <= 36 + 1e-6 and min(in_curve) >= 36 - 1e-6, (min(in_curve), max(in_curve))
+  assert any(p[3] == "raise" for p in r["presses"])
+
+
+def test_the_step_back_up_waits_for_the_follower_to_settle():
+  # the curve's radius re-matched mid-approach (91 -> 100 m 120 m out, max drop 15): the follower starts over and its
+  # fresh command is above the one it had; that is no reason to raise (review s4c: 32 -> 33 at 38 mph, then three
+  # SET- again). Only once the car is nearly at the curve's speed does the set speed step back up
+  v_c = math.sqrt(2.2 * 100.0) / MPH
+
+  def fields(f, x):
+    return F(status=1, radius=91.0 if x > 120 else 100.0, distance=max(x, 0.0)) if x > -80 else F(status=0)
+  r = drive_follow(max_drop=15, frames=5000, fields=fields)
+  raises = [p for p in r["presses"] if p[3] == "raise"]
+  assert raises and all(p[5] <= v_c + (CT.MAP_SETTLE + CT.MAP_SETTLE_HYST) / MPH for p in raises), raises
+  assert r["seq"].count("PM") == 0, r["seq"]
 
 
 # ---------------- curve memory ----------------
