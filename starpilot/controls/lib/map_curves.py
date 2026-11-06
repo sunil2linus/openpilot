@@ -651,6 +651,13 @@ class MapCurveStore:
 MEMORY_PATH = "/data/media/0/curve_memory.json"
 MEMORY_MATCH = 20.0        # m between a curve's apex and a remembered one to be the same curve (curve files rebuilt)
 MEMORY_SAME_PASS = 60.0    # s: passes this close in time are one pass (a divided road is two curve records ~20 m apart)
+# A curve is remembered per direction of travel (drive 50, West Utica, map 91 m, ~35 mph both ways: the left turn one
+# way kept up with the steering, 2.1 m/s^2 desired; the right turn the other way maxed the steering for 3.5 s at
+# 2.5 m/s^2 desired, "Turn Exceeds Steering Limit". One shared record capped the right turn and the next clean left
+# turn lifted the cap straight back). The direction is the bearing from the curve's entry to its exit as driven: it
+# flips by 180 deg for the other way and barely moves when the curve files are rebuilt (apex matching's reason).
+MEMORY_DIR_MATCH = 90.0    # deg: a record counts for a direction of travel within this of its own
+MEMORY_DIR_MIN_CHORD = 5.0  # m: entry and exit closer than this (a full loop) give no direction (the record is shared)
 MEMORY_MIN_PASSES = 2      # clean passes before the measured radius is used
 MEMORY_AGREE = 1.35        # ... and the last ones must agree within this factor
 MEMORY_KEEP = 6            # passes kept per curve
@@ -755,11 +762,38 @@ def curve_pass_speed(samples):
   return vs[len(vs) // 2] if vs else 0.0
 
 
+def curve_direction(c, increasing):
+  """Direction of travel through curve dict `c` for the curve memory: the bearing (deg) from its entry to its exit as
+  driven, or None when unknown. The curve files hold one record per curve for both ways (a -> b and b -> a;
+  `increasing` says which, as MapCurves._curves_ahead sees it from the road match), so the record itself says
+  nothing about the way; the bearing does, and it is the same from a rebuilt file (the entry and exit move a few m,
+  a reversed chain swaps a and b and `increasing` together)."""
+  try:
+    if increasing is None or "a" not in c or "b" not in c:
+      return None
+    entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
+    if dist_m(entry[0], entry[1], exit_[0], exit_[1]) < MEMORY_DIR_MIN_CHORD:
+      return None
+    return round(bearing_to(entry[0], entry[1], exit_[0], exit_[1]), 1)
+  except (KeyError, TypeError, ValueError, IndexError):
+    return None
+
+
+def same_direction(a, b):
+  """Directions of travel a and b (deg) agree: within MEMORY_DIR_MATCH (the other way is 180 deg off)."""
+  return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0) <= MEMORY_DIR_MATCH
+
+
 class CurveMemory:
-  """Per map curve (by its apex position, so it survives rebuilt curve files), kept in MEMORY_PATH (a small JSON list):
+  """Per map curve (by its apex position, so it survives rebuilt curve files) and direction of travel (curve_direction;
+  the other way through the same curve is another record), kept in MEMORY_PATH (a small JSON list):
     * the radius the car actually drove: used instead of the map's once MEMORY_MIN_PASSES clean passes agree;
     * a speed cap ("cap", m/s) after a pass where the steering maxed out: SAT_FACTOR of that speed, never below the
-      curve's yellow sign or CAP_FLOOR. Each clean pass near the cap raises it by CAP_RISE (searching back up)."""
+      curve's yellow sign or CAP_FLOOR. Each clean pass near the cap raises it by CAP_RISE (searching back up).
+  Records written before directions were kept (no "dir") hold passes of both ways: such a record stands in for a
+  direction only until a pass that way is recorded (which starts a record of its own, without the old passes), and
+  is never written to again; it stays in the file. `direction` None (the offline tests and tools: unknown) reads
+  and writes the record without a direction, as before."""
 
   def __init__(self, path=MEMORY_PATH):
     self.path = path
@@ -773,20 +807,36 @@ class CurveMemory:
     self.saving = False
     self.dirty = False
 
-  def _find(self, lat, lon):
+  def _find(self, lat, lon, direction=None):
+    """The record for the curve at (lat, lon) driven in `direction` (deg), or None: the nearest record within
+    MEMORY_MATCH whose direction agrees (same_direction); with none, the nearest record without a direction.
+    direction None: a record without a direction, else the nearest with one (the offline tools' view)."""
     best, best_d = None, MEMORY_MATCH
+    undirected, undirected_d = None, MEMORY_MATCH
     for e in self.entries:
-      d = dist_m(lat, lon, e["lat"], e["lon"])
-      if d <= best_d:
-        best, best_d = e, d
-    return best
+      try:
+        d = dist_m(lat, lon, e["lat"], e["lon"])
+        e_dir = e.get("dir")
+        if d > MEMORY_MATCH:
+          continue
+        if e_dir is None:
+          if d <= undirected_d:
+            undirected, undirected_d = e, d
+        elif (direction is None or same_direction(e_dir, direction)) and d <= best_d:
+          best, best_d = e, d
+      except (KeyError, TypeError, ValueError):
+        continue
+    if direction is None:
+      return undirected if undirected is not None else best
+    return best if best is not None else undirected
 
-  def radius(self, c):
-    """Learned radius for curve dict `c`, or None: the middle of the last passes when MEMORY_MIN_PASSES or more
-    agree; else the newest pass alone when it was a trusted gentle pass (one_pass_ok). A sharper newest pass
-    therefore goes back to the map's radius by itself, and a later gentle pass earns it again."""
+  def radius(self, c, direction=None):
+    """Learned radius for curve dict `c` driven in `direction` (curve_direction), or None: the middle of the last
+    passes when MEMORY_MIN_PASSES or more agree; else the newest pass alone when it was a trusted gentle pass
+    (one_pass_ok). A sharper newest pass therefore goes back to the map's radius by itself, and a later gentle pass
+    earns it again."""
     try:
-      e = self._find(*c["apex"])
+      e = self._find(*c["apex"], direction)
       if e is None:
         return None
       passes = [p for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 2]
@@ -814,27 +864,31 @@ class CurveMemory:
     except (TypeError, ValueError, KeyError):
       return False
 
-  def speed_cap(self, c):
-    """Speed cap (m/s) for curve dict `c` from passes where the steering maxed out, or None."""
+  def speed_cap(self, c, direction=None):
+    """Speed cap (m/s) for curve dict `c` driven in `direction` from passes where the steering maxed out, or None."""
     try:
-      e = self._find(*c["apex"])
+      e = self._find(*c["apex"], direction)
       cap = None if e is None else e.get("cap")
       return float(cap) if cap else None
     except (KeyError, TypeError, ValueError):
       return None
 
-  def _entry(self, c):
-    e = self._find(*c["apex"])
-    if e is None:
+  def _entry(self, c, direction=None):
+    """The record to write a pass through `c` in `direction` to: made when there is none, also when only a record
+    without a direction stands in (its passes mix both ways: it is never written to again)."""
+    e = self._find(*c["apex"], direction)
+    if e is None or (direction is None) != (e.get("dir") is None):
       e = {"lat": round(c["apex"][0], 6), "lon": round(c["apex"][1], 6), "r_map": c.get("r"),
            "name": c.get("name", ""), "passes": []}
+      if direction is not None:
+        e["dir"] = round(float(direction), 1)
       self.entries.append(e)
     return e
 
-  def add_saturated_pass(self, c, v, t=None):
-    """A pass through curve `c` where the steering maxed out at speed v (m/s): cap the curve's speed."""
+  def add_saturated_pass(self, c, v, t=None, direction=None):
+    """A pass through curve `c` in `direction` where the steering maxed out at speed v (m/s): cap the curve's speed."""
     t = time.time() if t is None else t   # noqa: TID251  wall time, as add_pass
-    e = self._entry(c)
+    e = self._entry(c, direction)
     if abs(t - float(e.get("cap_t", -1e12))) < MEMORY_SAME_PASS:
       return                                  # the same pass again (the other carriageway's record)
     floor = max(CAP_FLOOR, float(c.get("adv", 0.0) or 0.0))
@@ -844,11 +898,11 @@ class CurveMemory:
     e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
     self.save()
 
-  def add_pass(self, c, r, t=None, v=None, flags=None):
-    """A clean pass through curve `c` that measured radius r (m), at wall time t (s) and median speed v (m/s).
-    flags: "full" (through the apex to the exit), "vetoed" (the camera check ignored the curve: audit only)."""
+  def add_pass(self, c, r, t=None, v=None, flags=None, direction=None):
+    """A clean pass through curve `c` in `direction` that measured radius r (m), at wall time t (s) and median speed
+    v (m/s). flags: "full" (through the apex to the exit), "vetoed" (the camera check ignored the curve: audit only)."""
     t = time.time() if t is None else t   # noqa: TID251  wall time: passes are compared across drives and reboots
-    e = self._entry(c)
+    e = self._entry(c, direction)
     if v is not None and e.get("cap") and v >= float(e["cap"]) - CAP_NEAR and \
        abs(t - float(e.get("cap_t", -1e12))) >= MEMORY_SAME_PASS:
       # it took the curve cleanly near the cap (try a bit faster), or well above it (up to that speed)
@@ -862,9 +916,9 @@ class CurveMemory:
     e["passes"] = (passes + [new])[-MEMORY_KEEP:]
     self.save()
 
-  def note_veto(self, c):
-    """The camera check ignored curve `c` (counted for the record only, never read)."""
-    e = self._entry(c)
+  def note_veto(self, c, direction=None):
+    """The camera check ignored curve `c` driven in `direction` (counted for the record only, never read)."""
+    e = self._entry(c, direction)
     e["veto_hits"] = int(e.get("veto_hits", 0)) + 1
     self.save()
 
@@ -880,7 +934,8 @@ class CurveMemory:
       try:
         while self.dirty:
           self.dirty = False
-          data = {"version": 1, "curves": [dict(e) for e in self.entries]}
+          # version 2: records carry "dir" (deg); older code never reads the version and matches by position alone
+          data = {"version": 2, "curves": [dict(e) for e in self.entries]}
           tmp = self.path + ".tmp"
           with open(tmp, "w") as f:
             json.dump(data, f)
@@ -1024,8 +1079,10 @@ class CurveVeto:
       return True
     if c.get("ramp") or float(c.get("adv", 0.0) or 0.0) > 0:
       return False
-    if mc.memory is not None and (mc.memory.speed_cap(c) is not None or mc.memory.radius(c) is not None):
-      return False
+    if mc.memory is not None:
+      d = mc.direction(c)
+      if mc.memory.speed_cap(c, d) is not None or mc.memory.radius(c, d) is not None:
+        return False
     return True
 
   def filter(self, mc, cid, cands, camera, shaky=False):
@@ -1117,7 +1174,9 @@ class MapCurves:
     self.nav_side = 0
     self.data_here = False
     self.chain_id = 0
+    self.increasing = None       # driving the matched road chain towards higher s (curve memory: the direction of travel)
     self.inside = None           # the road curve we are driving through (also after its apex), for curve memory
+    self.inside_dir = None       # ... and our direction of travel through it (curve_direction), kept with the pass
     self.inside_exit = float("inf")  # m to its exit
     self.next_entry = float("inf")   # m to the start of the nearest road curve ahead (curve memory: where a pass ends) ...
     self.next_curve = None           # ... and that curve
@@ -1170,6 +1229,7 @@ class MapCurves:
           # the curve we are in is the one we leave first (the next one may already match up to 60 m before it)
           self.inside, inside_exit = c, d_exit
           self.inside_exit = d_exit
+          self.inside_dir = curve_direction(c, increasing)
         if self.release_after_apex and not c.get("ramp") and "apex" in c:
           ap_ahead, d_apex = ahead(lat, lon, bearing, *c["apex"])
           if not ap_ahead and d_apex > APEX_PASSED:
@@ -1177,16 +1237,22 @@ class MapCurves:
         out.append((c, 0.0))      # in the curve
     return out
 
+  def direction(self, c):
+    """Our direction of travel through curve `c` on the matched road (curve_direction), for the curve memory: the same
+    quantity MapCurvesPlanner records a pass under (inside_dir), so what was learned one way is planned that way."""
+    return curve_direction(c, self.increasing)
+
   def _radius(self, c):
     """The curve's radius: what the car measured on clean passes (curve memory) if known, else the map's; made
     tighter when the memory caps the curve's speed (steering maxed out there), so that the curve's speed at PLAN_LAT
     is the cap. The car side plans at PLAN_LAT or less, so it never goes faster than the cap."""
     r = c["r"]
     if self.memory is not None and not c.get("ramp"):
-      learned = self.memory.radius(c)
+      d = self.direction(c)
+      learned = self.memory.radius(c, d)
       if learned is not None:
         r = learned
-      cap = self.memory.speed_cap(c)
+      cap = self.memory.speed_cap(c, d)
       if cap is not None:
         r = min(r, cap * cap / PLAN_LAT)
     return r
@@ -1195,8 +1261,9 @@ class MapCurves:
     """Where the curve's radius comes from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap."""
     if self.memory is None or c.get("ramp"):
       return 0
-    learned = self.memory.radius(c)
-    cap = self.memory.speed_cap(c)
+    d = self.direction(c)
+    learned = self.memory.radius(c, d)
+    cap = self.memory.speed_cap(c, d)
     r = learned if learned is not None else c["r"]
     if cap is not None and cap * cap / PLAN_LAT < r:
       return 2
@@ -1225,7 +1292,7 @@ class MapCurves:
     road = self._road(way_id, is_forward) if way_id else None
     if road is not None:
       cid, increasing, s0, s1 = road
-      self.chain_id = cid
+      self.chain_id, self.increasing = cid, increasing
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
         cands = self.veto.filter(self, cid, cands, camera, shaky)
@@ -1438,7 +1505,7 @@ class MapCurvesPlanner:
           self.recorder_failed = True
       for ev in events:
         if ev["what"] == "veto" and mc.memory is not None:
-          mc.memory.note_veto(ev["curve"])
+          mc.memory.note_veto(ev["curve"], mc.direction(ev["curve"]))
       rec = self.recorder
       if rec is None:
         return
@@ -1492,6 +1559,8 @@ class MapCurvesPlanner:
         self.pass_curve, self.pass_x_exit, self.pass_x_next = inside, float("inf"), float("inf")
         self.pass_apex, self.pass_exit, self.pass_vetoed, self.pass_shaky = float("inf"), float("inf"), False, False
         self.pass_exits, self.pass_exit_seen = [], None
+        # the direction of travel the pass is remembered under: as MapCurves plans this curve now (direction(c))
+        self.pass_dir = getattr(self.mc, "inside_dir", None)
       c = self.pass_curve
       if c is None:
         return
@@ -1559,14 +1628,15 @@ class MapCurvesPlanner:
       self.pass_drops = getattr(self, "pass_drops", []) + [{"reason": reason, "name": c.get("name", "") or "",
                                                              "map_turn": turn_c, "driven_turn": round(driven, 1)}]
       return
+    direction = getattr(self, "pass_dir", None)
     v_sat = curve_pass_saturation(samples)
     if v_sat is not None:
-      self.mc.memory.add_saturated_pass(c, v_sat)
+      self.mc.memory.add_saturated_pass(c, v_sat, direction=direction)
       return
     r = curve_pass_radius(samples)
     if r is not None:
       flags = (["full"] if self.pass_exit <= PASS_EXIT_NEAR else []) + (["vetoed"] if self.pass_vetoed else [])
-      self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags)
+      self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
 
   def publish(self, plan):
     mc = self.mc

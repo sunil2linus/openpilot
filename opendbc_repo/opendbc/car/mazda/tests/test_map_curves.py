@@ -846,6 +846,194 @@ def test_an_old_memory_file_still_loads(tmp_path):
   assert len(mem._find(42.6, -83.1)["passes"]) == 3 and mem.radius(c) in (165.0, 170.0)
 
 
+# ---------------- curve memory per direction of travel (drive 50) ----------------
+
+def _wait_saved(mem):
+  import time as _t
+  for _ in range(200):
+    if not mem.saving:
+      break
+    _t.sleep(0.01)
+
+
+def _two_way_curve(dx=0.0, dy=0.0, reversed_=False):
+  """A curve record as the files hold it (one for both ways): entry a 40 m south-west of the apex, exit b 40 m
+  north-east of it, shifted by (dx, dy) m (a rebuild) and with a and b swapped (a reversed chain)."""
+  def p(x, y):
+    return (42.6 + (y + dy) / 111195.0, -83.1 + (x + dx) / (111195.0 * math.cos(math.radians(42.6))))
+  c = {"a": p(-30, -30), "b": p(30, 30), "apex": p(0, 0), "r": 91.0, "len": 95.0, "name": "West Utica", "s_a": 0.0}
+  if reversed_:
+    c["a"], c["b"] = c["b"], c["a"]
+  return c
+
+
+def test_the_direction_of_travel_is_the_curves_entry_to_exit_bearing():
+  c = _two_way_curve()
+  fwd, back = MC.curve_direction(c, True), MC.curve_direction(c, False)
+  assert abs(fwd - 45.0) < 1.0 and abs(back - 225.0) < 1.0, (fwd, back)         # a -> b north-east, b -> a south-west
+  assert MC.same_direction(fwd, 10.0) and MC.same_direction(fwd, 100.0) and not MC.same_direction(fwd, back)
+  assert MC.same_direction(350.0, 10.0) and not MC.same_direction(90.0, 271.0)  # around north; just over 90 deg apart
+  # a rebuilt file: the points a few m off and the chain the other way round give the same direction
+  rebuilt = _two_way_curve(dx=4.0, dy=-3.0, reversed_=True)
+  assert abs(MC.curve_direction(rebuilt, False) - fwd) < 10.0 and abs(MC.curve_direction(rebuilt, True) - back) < 10.0
+  # unknown: no road match, a curve dict without its ends (the offline tests), a full loop (entry on its exit)
+  assert MC.curve_direction(c, None) is None and MC.curve_direction({"apex": c["apex"], "r": 91.0}, True) is None
+  assert MC.curve_direction({**c, "b": c["a"]}, True) is None
+
+
+def test_drive_50_a_cap_from_one_direction_does_not_limit_the_other(tmp_path):
+  # West Utica (map 91 m), ~35.4 mph both ways: the right turn (one way) maxed the steering for 3.5 s; the left turn
+  # (the usual way) kept up. One shared record capped the usual way too, and the next clean pass that way lifted the
+  # cap the right turn had earned.
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = _two_way_curve()
+  usual, other = MC.curve_direction(c, True), MC.curve_direction(c, False)
+  mem.add_saturated_pass(c, 35.4 * MPH, t=1000.0, direction=other)
+  cap = mem.speed_cap(c, other)
+  assert abs(cap - 0.9 * 35.4 * MPH) < 0.01
+  assert mem.speed_cap(c, usual) is None                                # the usual way is not capped
+  mem.add_pass(c, 119.0, t=5000.0, v=35.0 * MPH, direction=usual)      # a clean pass the usual way ...
+  mem.add_pass(c, 121.0, t=9000.0, v=35.0 * MPH, direction=usual)
+  assert mem.speed_cap(c, other) == cap                                 # ... leaves the other way's cap alone
+  assert mem.radius(c, usual) in (119.0, 121.0) and mem.radius(c, other) is None   # and its radius is its own
+  mem.add_pass(c, 102.0, t=13000.0, v=0.9 * 35.4 * MPH, direction=other)   # clean at the cap the other way: searching up
+  assert abs(mem.speed_cap(c, other) - (cap + MC.CAP_RISE)) < 0.01
+  assert mem.radius(c, usual) in (119.0, 121.0)
+  # the planner looks the curve up the same way MapCurves plans it: a rebuilt file (apex 4 m off, chain reversed)
+  rebuilt = _two_way_curve(dx=4.0, dy=-3.0, reversed_=True)
+  assert mem.radius(rebuilt, MC.curve_direction(rebuilt, False)) in (119.0, 121.0)
+  assert abs(mem.speed_cap(rebuilt, MC.curve_direction(rebuilt, True)) - (cap + MC.CAP_RISE)) < 0.01
+  assert mem.speed_cap(rebuilt, MC.curve_direction(rebuilt, False)) is None
+  assert len(mem.entries) == 2 and sorted(e["dir"] for e in mem.entries) == sorted((usual, other))
+
+
+def test_a_record_without_a_direction_stands_in_until_that_way_is_driven_and_is_never_changed(tmp_path):
+  path = tmp_path / "old.json"
+  c = _two_way_curve()
+  usual, other = MC.curve_direction(c, True), MC.curve_direction(c, False)
+  old = {"lat": c["apex"][0], "lon": c["apex"][1], "r_map": 91.0, "name": "West Utica",
+         "passes": [[118.0, 1000.0, 15.7, ["full"]], [104.0, 5000.0, 15.8, ["full"]], [120.0, 9000.0, 15.7, ["full"]]],
+         "cap": 14.15, "cap_t": 3000.0, "cap_hits": 1}
+  path.write_text(json.dumps({"version": 1, "curves": [old]}))
+  mem = MC.CurveMemory(str(path))
+  assert mem.radius(c, usual) == 118.0 and mem.radius(c, other) == 118.0 and mem.speed_cap(c, usual) == 14.15
+  mem.add_pass(c, 119.0, t=13000.0, v=35.0 * MPH, direction=usual)        # the first pass kept per direction
+  assert mem.radius(c, usual) is None and mem.speed_cap(c, usual) is None  # that way starts afresh (one pass: nothing yet)
+  assert mem.radius(c, other) == 118.0 and mem.speed_cap(c, other) == 14.15   # the old record still stands in the other way
+  mem.add_saturated_pass(c, 35.0 * MPH, t=17000.0, direction=other)
+  assert abs(mem.speed_cap(c, other) - 0.9 * 35.0 * MPH) < 0.01 and mem.radius(c, other) is None
+  mem.note_veto(c, usual)
+  legacy = [e for e in mem.entries if "dir" not in e]
+  assert len(legacy) == 1 and legacy[0] == old                           # never written to, still in the file
+  assert len(mem.entries) == 3
+  _wait_saved(mem)
+  data = json.loads(path.read_text())
+  assert data["version"] == 2 and old in data["curves"]
+  assert all("lat" in e and "lon" in e and isinstance(e.get("passes", []), list) for e in data["curves"])  # old readers
+  again = MC.CurveMemory(str(path))
+  assert again.radius(c, other) is None and abs(again.speed_cap(c, other) - 0.9 * 35.0 * MPH) < 0.01
+  assert again.radius(c, usual) is None and again._find(*c["apex"], usual)["veto_hits"] == 1
+  assert again._find(*c["apex"]) == old                                  # no direction (the tools): the old record
+
+
+def test_a_divided_road_is_still_one_pass_per_direction(tmp_path):
+  # two curve records ~15 m apart, one per carriageway; the car's pass matches both in turn. Both are driven the
+  # car's way (the road matcher never puts the car on the oncoming one-way carriageway; a two-way one is matched by
+  # heading), so both carry the car's direction and the second is the same pass again
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  east, west = _two_way_curve(), _two_way_curve(dy=15.0)
+  d = MC.curve_direction(east, True)
+  assert abs(MC.curve_direction(west, True) - d) < 1.0
+  mem.add_pass(east, 120.0, t=1000.0, v=15.0, direction=d)
+  mem.add_pass(west, 125.0, t=1010.0, v=15.0, direction=MC.curve_direction(west, True))
+  assert len(mem.entries) == 1 and len(mem.entries[0]["passes"]) == 1 and mem.entries[0]["passes"][0][0] == 125.0
+  mem.add_saturated_pass(east, 16.0, t=2000.0, direction=d)
+  mem.add_saturated_pass(west, 15.0, t=2010.0, direction=d)
+  assert len(mem.entries) == 1 and mem.entries[0]["cap_hits"] == 1
+  # coming back the other way is another record, 15 m from the first: not this one
+  back = MC.curve_direction(west, False)
+  mem.add_pass(west, 110.0, t=3000.0, v=15.0, direction=back)
+  assert len(mem.entries) == 2 and len(mem._find(*west["apex"], back)["passes"]) == 1
+  assert len(mem._find(*east["apex"], d)["passes"]) == 1
+
+
+def test_the_planner_plans_and_records_a_curve_under_the_same_direction(tmp_path):
+  ways = G.curve_road(r=115, turn=40, split=True)
+  root, curves, _ = write_files(ways)
+  c = curves[0]
+  fwd, back = MC.curve_direction(c, True), MC.curve_direction(c, False)
+  assert fwd is not None and not MC.same_direction(fwd, back)
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  for k, r in enumerate((160.0, 165.0)):
+    mem.add_pass(c, r, t=1000.0 * (k + 1), direction=fwd)              # learned northbound (way 1 forward)
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
+  la, lo = pos(0, -250)
+  m.update(la, lo, 0.0, 1, True)
+  assert m.curve is not None and m.radius in (160.0, 165.0) and m.source == 1 and m.direction(m.curve) == fwd
+  # southbound (way 2 against its node order, as test_other_direction...): the map's radius, nothing learned that way
+  ex = -115 + 115 * math.cos(math.radians(40)) - math.sin(math.radians(40)) * 200
+  ey = 115 * math.sin(math.radians(40)) + math.cos(math.radians(40)) * 200
+  m.update(*pos(ex, ey), 140.0, 2, False)
+  assert m.curve is not None and abs(m.radius - c["r"]) < 1e-6 and m.source == 0 and m.direction(m.curve) == back
+  # in the curve northbound: the pass is recorded under the direction it is planned with
+  ang = math.radians(20)
+  m.update(*pos(-115 + 115 * math.cos(ang), 115 * math.sin(ang)), 340.0, 2, True)
+  assert m.inside is not None and m.inside_dir == fwd == m.direction(m.inside)
+  # the curve files rebuilt with the road's nodes the other way round (and 3 m east): the same record northbound
+  pts = [((lo_ - G.LON0) / G.M_LON + 3.0, (la_ - G.LAT0) / G.M_LAT) for w in (ways[1], ways[2]) for la_, lo_ in zip(w.lat, w.lon, strict=True)]
+  pts = pts[:len(ways[1].lat)] + pts[len(ways[1].lat) + 1:]             # way 2 starts on way 1's last node
+  root2, curves2, _ = write_files({1: G.way(1, pts[::-1])})
+  assert len(curves2) == 1 and abs(MC.curve_direction(curves2[0], False) - fwd) < 15.0, (curves2[0], fwd)
+  m2 = MC.MapCurves(MC.MapCurveStore(root2, background=False), memory=mem)
+  m2.update(la, lo, 0.0, 1, False)                                       # northbound is now against the node order
+  assert m2.curve is not None and m2.radius in (160.0, 165.0) and m2.source == 1
+  # a pass recorded through the planner's own path carries the planned direction
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mc, mp.pass_curve, mp.pass_samples, mp.pass_dir = m, c, _pass(150.0), back
+  mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = False, 5.0, 16.0, False, False
+  mp._finish_pass()
+  assert len(mem._find(*c["apex"], back)["passes"]) == 1 and len(mem._find(*c["apex"], fwd)["passes"]) == 2
+
+
+def test_a_pass_driven_one_way_is_not_planned_the_other_way(tmp_path):
+  # the whole path, as on the road: MapCurves finds the curve we are in, the planner measures the pass and records
+  # it, and the next plan uses it northbound only (the old shared record made the curve gentler both ways)
+  from types import SimpleNamespace as N
+  r_map, turn = 115.0, 40.0
+  root, curves, _ = write_files(G.curve_road(r=r_map, turn=turn))
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mc, mp.trust, mp.pass_curve, mp.pass_samples = m, N(shaky=False), None, []
+  arc = math.radians(turn) * r_map
+  v, dt, s, frame = 18.0, MC.PASS_DT, 0.0, 0
+  while s < 300 + arc + 200:                                              # north up the straight, through the curve, on
+    if s < 300:
+      x, y, bearing, k = 0.0, -300 + s, 0.0, 0.0
+    elif s < 300 + arc:
+      a = (s - 300) / r_map
+      x, y, bearing, k = -r_map + r_map * math.cos(a), r_map * math.sin(a), (360.0 - math.degrees(a)) % 360.0, 1 / 200.0
+    else:
+      ex, ey = -r_map + r_map * math.cos(math.radians(turn)), r_map * math.sin(math.radians(turn))
+      d = s - 300 - arc
+      x, y, bearing, k = ex - math.sin(math.radians(turn)) * d, ey + math.cos(math.radians(turn)) * d, 360.0 - turn, 0.0
+    la, lo = pos(x, y)
+    m.update(la, lo, bearing, 1, True)
+    sm = {"carState": N(vEgo=v, steeringPressed=False, leftBlinker=False, rightBlinker=False),
+          "carControl": N(latActive=True, actuators=N(torque=0.4)), "controlsState": N(curvature=k)}
+    mp.counter = frame
+    mp._measure_pass(sm, m.inside, la, lo, dt=dt)                        # the car drove the curve at 200 m (gentler)
+    s, frame = s + v * dt, frame + 1
+  assert len(mem.entries) == 1 and len(mem.entries[0]["passes"]) == 1, (mem.entries, getattr(mp, "pass_drops", []))
+  assert abs(mem.entries[0]["passes"][0][0] - 200.0) < 10.0
+  m.update(*pos(0, -250), 0.0, 1, True)                                  # northbound again: the gentler radius
+  assert m.curve is not None and abs(m.radius - 200.0) < 10.0 and m.source == 1, (m.radius, m.source)
+  ex = -r_map + r_map * math.cos(math.radians(turn)) - math.sin(math.radians(turn)) * 200
+  ey = r_map * math.sin(math.radians(turn)) + math.cos(math.radians(turn)) * 200
+  m.update(*pos(ex, ey), 180.0 - turn, 1, False)                         # southbound: never driven that way: the map's
+  assert m.curve is not None and abs(m.radius - curves[0]["r"]) < 1e-6 and m.source == 0, (m.radius, m.source)
+
+
 def test_a_pass_with_the_turn_signal_or_off_the_apex_counts_for_nothing(tmp_path):
   class P:
     def get(self, key, encoding=None):
