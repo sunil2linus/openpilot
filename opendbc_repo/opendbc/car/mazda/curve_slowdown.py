@@ -1223,7 +1223,9 @@ class CurveSlowdown:
       model_alive=self._alive('modelV2'), model_accel=float(self.sm['modelV2'].action.desiredAcceleration),
       plan_stop=p_stop, plan_ratio=p_ratio, plan_stop_d=p_d, a_ego=float(CS.out.aEgo), lead_y_path=lead_y_path,
       model_length=model_length, lane_change=lane_change, gas_pressed=bool(CS.out.gasPressed),
-      set_speed=float(CS.out.cruiseState.speed) if cruise_enabled else 0.0)
+      set_speed=float(CS.out.cruiseState.speed) if cruise_enabled else 0.0,
+      # the stop-light detector (the red light head start / the false stop guard); False while the plan is not alive
+      red_light=bool(getattr(plan, "redLight", False)) if self._alive('starpilotPlan') else False)
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -1529,7 +1531,10 @@ class CurveSlowdown:
         "lead_y": si.lead_y, "target_mph": self.trigger.target / MS_PER_MPH, "required_decel": self.trigger.required,
         "ttc": min(self.trigger.ttc, 99.0), "urgent": self.trigger.urgent, "early": self.trigger.early,
         "latched": self.trigger.latched, "latch_age_s": round(self.trigger.latch_age, 2), "plan_ratio_at_start": si.plan_ratio,
-        "plan_stop_d": si.plan_stop_d, "anchor_mph": ((lg.anchor or i.set_speed) / MS_PER_MPH), **self._profile_summary()})
+        "plan_stop_d": si.plan_stop_d, "anchor_mph": ((lg.anchor or i.set_speed) / MS_PER_MPH),
+        # the stop-light detector: on now, and for how long (the red light head start's reason); a guarded stop ahead
+        "red_light": si.red_light, "red_on_s": round(self.trigger.red_frames * DT_CTRL, 2),
+        "warn_guarded": self.trigger.warn_guarded, **self._profile_summary()})
       self.stop_presses_at_start = lg.stop_presses
       self.stop_brake = False
       self.stop_holds_at_start = len(lg.hold_log)
@@ -1557,7 +1562,8 @@ class CurveSlowdown:
           "anchor_mph_end": (lg.anchor or 0.0) / MS_PER_MPH,
           "radar_hold_s": round(getattr(self, "radar_hold_frames", 0) * DT_CTRL, 2),
           "warn_start": self.trigger.warn_start, "clear_release": self.trigger.clear_release,
-          "unsure_from": bool(getattr(self.trigger, "unsure_from", False))})
+          "unsure_from": bool(getattr(self.trigger, "unsure_from", False)),
+          "warn_guarded": self.trigger.warn_guarded, "confirmed": self.trigger.confirmed})
         self.stop_event = None
     if self.near_miss is not None and self.stop_mode in (1, 2):
       cand = self.trigger.near_miss_candidate(si)

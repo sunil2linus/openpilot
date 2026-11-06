@@ -174,9 +174,10 @@ class CSC:
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
-        limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0):
+        limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
-  plan(f): True while the model plans a stop ahead (the red light check)."""
+  plan(f): True while the model plans a stop ahead (the red light check).
+  red(f): starpilotPlan.redLight (the stop-light detector) at frame f."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -209,7 +210,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                                 radar_has_lead=r_has, radar_lead_distance=r_dist,
                                 model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f),
                                 a_ego=a_ego, lead_y_path=lead.y_path(f, car) if (status and hasattr(lead, "y_path")) else None,
-                                model_length=model_length(f), lane_change=lane_change(f), gas_pressed=st["gas"])
+                                model_length=model_length(f), lane_change=lane_change(f), gas_pressed=st["gas"],
+                                set_speed=car.set_speed if st["cruise"] else 0.0, red_light=red(f))
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent

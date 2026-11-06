@@ -22,6 +22,10 @@ Two ways in:
     to keep the gap, so the car ahead must be much slower. Checked on drives 31/33/35/36: this fired 17 times, every
     time the car really came to a stop within 12 s, 0.5-4 s before the driver braked; never while just following.
     It is released when traffic moves again (the model stops slowing and the car ahead is no longer much slower).
+  * "stop ahead": the planned stop alone (the red light warning's check), the floor hold at once (WARN_*); without the
+    stop-light detector (starpilotPlan.redLight) backing it, 1 mph taps until it is confirmed (WARN_GUARD_*).
+  * "red light (head start)": the stop-light detector alone, on for 2 s: 1 mph taps, at most 5 mph, until one of the
+    above takes over or the light goes (RED_*). "slow car (unsure)": a low-confidence slower car, the same taps (UNSURE_*).
 
 This module holds the triggers (conservative, to avoid phantom slowdowns), the target and the
 urgency; it has no openpilot dependencies so it can be unit tested. Settings
@@ -262,6 +266,45 @@ WARN_LANE_CHANGE_HOLD = 2.0    # s (LANE_CHANGE_HOLD)
 WARN_REARM = 3.0               # s the condition must be gone before another start on the warning (REARM_TIME)
 WARN_FLOOR = True              # a warning-only start aims at the floor (20 mph) with a SET- hold at once (owner)
 STOP_AHEAD = "stop ahead"      # kind: the planned stop alone, no car seen yet
+# ... and while one of our own tap episodes (the unsure car, the red light head start) slows the car, "not slowing" is
+# judged against OWN_SLOWING_ACCEL instead (stop_warning.OWN_SLOWDOWN_ACCEL): a lowered set speed slows the car
+# ~0.5-1.0 m/s^2, which must not keep the stop ahead start from taking the episode over
+WARN_OWN_SLOWING_ACCEL = -2.0  # m/s^2
+
+# Red light first, from the stop-light detector (starpilotPlan.redLight: the model predicts a stop within a few seconds).
+# Drive 50 (t 307-322, 45 mph, a stopped car in the queue): redLight came on at 307.5, our stop ahead start only at 315.0
+# (45 -> 20 within 2.5 s), the stopped car was first seen at 317.0 (118 m, 29 % a car), sure (94 %) at 321.5 / 54 m; the
+# driver braked at 322.5 at 32.4 mph (~4 m/s^2). With the set speed at the floor and no radar lock the stock cruise slows
+# only ~0.8-1.0 m/s^2, so every second of head start counts (a cruise model: 1 mph steps from 2 s after redLight ~29.8
+# mph at the brake instead of 32.6). Drives 4f and 50: in all 7 genuine STOP AHEAD warnings redLight came on 3.4-12 s
+# before the warning and stayed on ~4-7 s; redLight alone also has 1-9 s episodes at speed with no stop (drive 4f:
+# 154-160 s at 37 mph, 397-402 s at 50 mph, several 1-3 s blips), so on its own it only earns a head start: once on for
+# RED_ON_TIME (gaps up to RED_START_DROPOUT), SET- taps 1 mph every RED_STEP_TIME, at most RED_MAX_DROP below
+# max(our speed, the set speed), silent (no alert; the stop event log has the kind). The stopped car / stop with car /
+# stop ahead starts take the episode over as soon as they hold; redLight off for RED_DROPOUT with nothing else
+# releases it and the speed comes back (at once unless a slower car is in our lane). After any release the light must
+# go off before another head start (the driver on the gas: their override).
+RED_START_ENABLED = True
+RED_ON_TIME = 2.0            # s
+RED_START_DROPOUT = 0.25     # s (the flag is a 20 Hz signal; qlogs show it at ~2 Hz)
+RED_DROPOUT = 1.0            # s off before the head start is released
+RED_STEP_TIME = 1.0          # s between the 1 mph steps (the false episodes above cost 2-5 mph)
+RED_MAX_DROP = 5 * MS_PER_MPH
+RED_MIN_SPEED = WARN_MIN_SPEED
+RED_LIGHT = "red light (head start)"
+RED_GONE = "red light gone"
+
+# False stop ahead guard (drive 50, t 107-114, 42 mph: a green light with a car turning across; the plan said stop, the
+# set speed went 45 -> 19 and the car lost ~12 mph before the restore; redLight had been on for only ~0.5 s and was off
+# ~2.0-2.5 s before our start). A stop ahead start with redLight neither on nor on within WARN_RED_RECENT, and no slower
+# car confirmed (STOP_CAR_MIN_PROB), taps 1 mph at a time, at most UNSURE_MAX_DROP (the unsure car's cap), instead of
+# the floor hold; the warning itself shows as before (stop_warning.py). It becomes the full drop when redLight comes on,
+# a car confirms the stop (the early start's EARLY_CONFIRM_* rule) or the plan has shown the stop WARN_GUARD_PLAN_HOLD
+# continuously (LATCH_DROPOUT gaps). All 7 genuine warnings (drives 4f, 50) had redLight on at our start: unchanged.
+WARN_GUARD_ENABLED = True
+WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
+WARN_GUARD_PLAN_HOLD = 4.0   # s
+TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
 # FrogPilot's lead relevance (stop_warning.lead_is_relevant), duplicated so this module stays dependency free
 REL_STOP_DISTANCE, REL_LEAD_STOP_MARGIN, REL_MAX_T_FOLLOW, REL_PLANNER_TIME, REL_CRUISING_SPEED = 6.0, 4.0, 3.0, 10.0, 5.0
 
@@ -302,6 +345,7 @@ class StoppedCarInputs:
   lane_change: bool = False         # modelV2.meta.laneChangeState starting / finishing
   gas_pressed: bool = False
   set_speed: float = 0.0            # m/s: the cruise set speed (0 unknown), the unsure car's cap is below it
+  red_light: bool = False           # starpilotPlan.redLight (the stop-light detector), False when the plan is not alive
 
 
 def _interp(x, xp, fp):
@@ -462,6 +506,34 @@ class StoppedCarTrigger:
     self.lead_a_f = 0.0
     self.moving_match_frames = 0
     self.floor_committed = False
+    # the red light head start (RED_*)
+    self.red_frames = 0              # frames redLight has been on (gaps up to RED_START_DROPOUT)
+    self.red_gap = 0
+    self.last_red_frame = -10_000
+    self.red_latched = False         # an episode was released while the light was on: it must go off before a head start
+    self.red_base = 0.0              # the head start's reference speed (max(ours, set)) and its cap
+    self.red_cap = 0.0
+    # the false stop ahead guard (WARN_GUARD_*)
+    self.warn_unsure = False         # this stop ahead episode is not confirmed yet: taps only (the unsure cap)
+    self.warn_guarded = False        # ... it started that way (logs)
+
+  def _update_red_light(self, i):
+    if i.red_light:
+      self.red_frames += 1
+      self.red_gap = 0
+      self.last_red_frame = self.frame
+    else:
+      self.red_gap += 1
+      if self.red_gap > _frames(RED_START_DROPOUT):
+        self.red_frames = 0
+      if self.red_gap > _frames(RED_DROPOUT):
+        self.red_latched = False
+
+  def _red_start(self, i, start_gates):
+    """The stop-light detector alone, long enough: the head start (nothing else active)."""
+    return (RED_START_ENABLED and not self.red_latched and self.red_frames >= _frames(RED_ON_TIME) and start_gates and
+            i.v_ego >= RED_MIN_SPEED and self.since_lane_change >= _frames(WARN_LANE_CHANGE_HOLD) and
+            self.a_f is not None and self.a_f > WARN_NOT_SLOWING_ACCEL)   # (not when the car is already slowing)
 
   def _filter_lead_v(self, i):
     if i.lead_alive and i.lead_status:
@@ -546,7 +618,9 @@ class StoppedCarTrigger:
     self.since_lane_change = 0 if i.lane_change else self.since_lane_change + 1
     relevant = lead_relevant(i.lead_alive and i.lead_status, i.lead_d, i.lead_v, i.lead_a, i.v_ego < EGO_STOPPED_SPEED,
                              i.v_ego, i.model_length)
-    self.warn_cond = bool(i.plan_stop and i.cruise_enabled and not i.brake_pressed and self.a_f > WARN_NOT_SLOWING_ACCEL and
+    # our own taps (unsure car, red light head start) slow the car: not "already slowing" (as the planner's warning)
+    not_slowing = self.a_f > (WARN_OWN_SLOWING_ACCEL if (self.active and self.kind in TAP_KINDS) else WARN_NOT_SLOWING_ACCEL)
+    self.warn_cond = bool(i.plan_stop and i.cruise_enabled and not i.brake_pressed and not_slowing and
                           i.v_ego >= WARN_MIN_SPEED and not relevant and
                           self.since_lane_change >= _frames(WARN_LANE_CHANGE_HOLD))
     if self.warn_cond:
@@ -656,6 +730,11 @@ class StoppedCarTrigger:
         out.append("stop ahead: already started for this stop")
       elif self.warn_cond and not self.warning:
         out.append(f"stop ahead: warning held {self.warn_frames * DT_CTRL:.2f} s < {WARN_START_DEBOUNCE}")
+    if i.red_light and not self.active:
+      if self.red_latched:
+        out.append("red light: an episode was released while it was on")
+      elif self.red_frames < _frames(RED_ON_TIME):
+        out.append(f"red light: on {self.red_frames * DT_CTRL:.2f} s < {RED_ON_TIME}")
     if not out and not self.active:
       out.append(f"held {self.hold_frames * DT_CTRL:.2f} s < {HOLD_TIME}")
     return out
@@ -670,6 +749,7 @@ class StoppedCarTrigger:
     self.prev_radar_has_lead = i.radar_has_lead
     self._filter_lead_v(i)
     self._update_latch(i)
+    self._update_red_light(i)
     self._update_warning(i)
     self._update_radar(i)
     self._update_leaving(i)
@@ -682,8 +762,9 @@ class StoppedCarTrigger:
     self.required, self.ttc = urgency(i.v_ego, i.lead_d, self.lead_v_f) if (i.lead_status and i.lead_alive) else (0.0, float("inf"))
     self.urgent = self.ttc <= URGENT_TTC or self.required >= URGENT_DECEL
 
-    if not self.active or self.kind == SLOW_UNSURE:
-      unsure_on = self.active
+    if not self.active or self.kind in TAP_KINDS:
+      unsure_on = self.active and self.kind == SLOW_UNSURE
+      red_on = self.active and self.kind == RED_LIGHT
       self.hold_frames = self.hold_frames + 1 if ((lead_ok or stop_with_car) and start_gates and i.v_ego >= START_SPEED) else 0
       if self._early_stop_with_car(i) and start_gates and i.v_ego >= START_SPEED:
         self.early_frames += 1
@@ -707,9 +788,13 @@ class StoppedCarTrigger:
         self._start(i, lead_ok, early_start, warn_start)
       elif unsure_on:
         self._update_unsure(i, gates)
+      elif red_on:
+        self._update_red(i, gates)
       elif (UNSURE_ENABLED and self.unsure_frames >= _frames(UNSURE_HOLD) and
             self.frame - self.unsure_release_frame >= _frames(UNSURE_REARM)):
         self._start_unsure(i)
+      elif self._red_start(i, start_gates):
+        self._start_red(i)
     elif self.gas_frames >= _frames(GAS_RELEASE_TIME):
       self._release("driver on the gas", False)
     elif self.kind == STOP_AHEAD and not self._slow_car(i, min_prob=STOP_CAR_EARLY_MIN_PROB):
@@ -793,13 +878,26 @@ class StoppedCarTrigger:
         self._release("lead left the lane", False)
       elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
         self._release("lead lost (vision)", False)
-    if self.active and self.early and not self.confirmed and self.kind != SLOW_UNSURE:
-      sure = i.lead_alive and i.lead_status and i.lead_prob >= EARLY_CONFIRM_PROB
+    if self.active and self.early and not self.confirmed and self.kind == STOP_WITH_CAR:
+      # (the early start's car; a guarded stop ahead becomes a stop with car once a slower car is seen, not before, and
+      # that car only confirms it while the model wants to slow down now: drive 50 t 109.7, the turning car was 89 %
+      # a car and 10 mph slower, the model's desired acceleration -0.05)
+      sure = (i.lead_alive and i.lead_status and i.lead_prob >= EARLY_CONFIRM_PROB and
+              (not self.warn_unsure or self._model_slowing(i)))
       self.confirm_frames = self.confirm_frames + 1 if sure else 0
       if self.confirm_frames >= _frames(EARLY_CONFIRM_TIME) or self.urgent:
         self.confirmed = True
         self.confirm_frame = self.frame
-    if self.active and i.lead_status and self.kind != SLOW_UNSURE:
+    if self.active and self.warn_unsure:
+      # the guarded stop ahead: the stop-light detector agreeing or the plan holding the stop long enough confirms it
+      # (a car confirming it: the early start rule above)
+      if not self.confirmed and (i.red_light or self.latch_frames >= _frames(WARN_GUARD_PLAN_HOLD)):
+        self.confirmed = True
+        self.confirm_frame = self.frame
+      if self.confirmed:
+        self.warn_unsure = False
+        self.floor_mode = self.floor_mode or (self.kind == STOP_AHEAD and WARN_FLOOR)
+    if self.active and i.lead_status and self.kind not in TAP_KINDS:
       self.target = stopped_car_target(i.lead_d)
       self.floor_mode = self.floor_mode or (FLOOR_MODE_ENABLED and self.confirmed and 0 < i.lead_d <= FLOOR_DISTANCE)
       if self.floor_mode:
@@ -815,7 +913,12 @@ class StoppedCarTrigger:
           self.floor_committed = True          # it slowed, brakes or a stop is planned: the floor from now on
         self.target = min(self.target, floor)
     if self.active and self.kind == STOP_AHEAD:
-      self.target = FLOOR_SPEED if WARN_FLOOR else stopped_car_target(max(i.plan_stop_d, 0.0))
+      if self.warn_unsure:
+        self.target = self.unsure_target     # the guarded stop ahead: 1 mph taps, the unsure car's cap
+      else:
+        self.target = FLOOR_SPEED if WARN_FLOOR else stopped_car_target(max(i.plan_stop_d, 0.0))
+    if self.active and self.kind == STOP_WITH_CAR and self.warn_unsure:
+      self.target = max(self.target, self.unsure_target)   # ... its car, until it confirms the stop: the same cap
     if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
       self.target = 100.0            # not confirmed and the car is not seen now: hold the speed, do not lower further
     if self.active and self.kind == STOP_WITH_CAR:
@@ -823,9 +926,16 @@ class StoppedCarTrigger:
       self.urgent = self.confirmed
     if self.active and self.floor_mode:
       self.urgent = True             # fast pace and holds, both kinds
+    if self.active and self.kind == STOP_AHEAD and self.warn_unsure:
+      self.urgent = False
     if self.active and self.kind == SLOW_UNSURE:
       # 1 mph taps, at most UNSURE_MAX_DROP; none while the car is not seen (as an unconfirmed early start)
       self.target = self.unsure_target if self.lost_frames <= _frames(EARLY_DROPOUT) else 100.0
+      self.urgent = False
+    if self.active and self.kind == RED_LIGHT:
+      # the head start: one 1 mph step at the start and one more every RED_STEP_TIME, down to the cap
+      steps = (self.frame - self.start_frame) // _frames(RED_STEP_TIME) + 1
+      self.target = max(self.red_base - steps * MS_PER_MPH, self.red_cap)
       self.urgent = False
     closing_f = i.v_ego - self.lead_v_f
     handles = (RADAR_FOLLOW_ENABLED and self.radar_follow and i.lead_status and
@@ -843,15 +953,27 @@ class StoppedCarTrigger:
 
   def _start(self, i, lead_ok, early_start, warn_start):
     """A stopped car / stop with car / stop ahead episode starts (or takes over an unsure car episode)."""
-    took_over = self.active and self.kind == SLOW_UNSURE
+    took_over = self.active and self.kind in TAP_KINDS
+    from_red = took_over and self.kind == RED_LIGHT
     self.active = True
     self.early = self.hold_frames < _frames(HOLD_TIME)
     self.warn_start = not (self.hold_frames >= _frames(HOLD_TIME) or early_start)
     self.kind = STOPPED_CAR if (lead_ok and not self.early) else (STOP_AHEAD if self.warn_start else STOP_WITH_CAR)
-    self.confirmed = not self.early or self.warn_start     # the warning start: holds and the fast pace at once
+    # the false stop guard: a stop ahead start the stop-light detector does not back (redLight not on within
+    # WARN_RED_RECENT) and no slower car confirmed: taps only until it is confirmed (WARN_GUARD_*)
+    self.warn_unsure = bool(WARN_GUARD_ENABLED and self.warn_start and
+                            self.frame - self.last_red_frame > _frames(WARN_RED_RECENT) and not self._slow_car(i))
+    self.warn_guarded = self.warn_unsure
+    if self.warn_unsure:
+      # the cap: the taps so far stay (an unsure car / head start taken over), otherwise the unsure car's
+      if from_red:
+        self.unsure_target = self.red_cap
+      elif not took_over:
+        self.unsure_target = max(max(i.v_ego, i.set_speed) - UNSURE_MAX_DROP, FLOOR_SPEED)
+    self.confirmed = not self.early or (self.warn_start and not self.warn_unsure)   # the warning start: holds and the fast pace at once
     self.confirm_frames = 0
     self.confirm_frame = self.frame if self.confirmed else -1
-    self.floor_mode = self.warn_start and WARN_FLOOR
+    self.floor_mode = self.warn_start and WARN_FLOOR and not self.warn_unsure
     if self.warn_start:
       self.warn_latched = True
       self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
@@ -882,10 +1004,45 @@ class StoppedCarTrigger:
             self.lead_v_f > -STOPPED_SPEED and          # not an oncoming car (review)
             i.v_ego >= UNSURE_MIN_SPEED and i.lead_prob < MIN_PROB)
 
+  def _start_red(self, i):
+    """The red light head start: 1 mph steps while only the stop-light detector says stop (RED_*)."""
+    self.active = True
+    self.kind = RED_LIGHT
+    self.early, self.confirmed, self.warn_start, self.warn_pending = False, False, False, False
+    self.warn_unsure = self.warn_guarded = False
+    self.confirm_frames, self.confirm_frame = 0, -1
+    self.floor_mode = False
+    self.unsure_from = False
+    self.red_base = max(i.v_ego, i.set_speed)
+    self.red_cap = max(self.red_base - RED_MAX_DROP, FLOOR_SPEED)
+    self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
+    self.leave_frames = 0
+    self.clear_release = False
+    self.moving_target = None
+    self.floor_committed = False
+    self.moving_match_frames = 0
+    self.gas_frames = 0
+    self.start_frame = self.frame
+    self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
+    self.release_reason = None
+
+  def _update_red(self, i, gates):
+    """A red light head start that no stop start has taken over (yet)."""
+    if self.gas_frames >= _frames(GAS_RELEASE_TIME):
+      self._release("driver on the gas", False)
+    elif not gates:
+      self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
+    elif i.v_ego < EGO_STOPPED_SPEED:
+      self._release("ego stopped behind the lead")
+    elif self.red_gap > _frames(RED_DROPOUT):
+      # the light is gone (green, or the detector changed its mind): the speed back at once unless a slower car is ahead
+      self._release(RED_GONE, not self._slower_car_ahead(i))
+
   def _start_unsure(self, i):
     self.active = True
     self.kind = SLOW_UNSURE
     self.early, self.confirmed, self.warn_start, self.warn_pending = True, False, False, False
+    self.warn_unsure = self.warn_guarded = False
     self.confirm_frames, self.confirm_frame = 0, -1
     self.floor_mode = False
     self.unsure_from = False
@@ -960,6 +1117,8 @@ class StoppedCarTrigger:
     self.left_car = reason == "lead leaving the lane"
     self.overridden = reason == "driver on the gas"
     self.warn_pending = False
+    self.warn_unsure = False
+    self.red_latched = self.red_gap <= _frames(RED_DROPOUT)   # the light must go off before a red light head start
     self.unsure_release_frame = self.frame     # no unsure car start for UNSURE_REARM after any release
     self.pull_accel_frames = 0
     self.overridden_v = self.lead_v_f

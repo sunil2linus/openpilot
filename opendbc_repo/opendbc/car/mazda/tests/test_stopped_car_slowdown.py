@@ -669,8 +669,10 @@ def test_the_planned_stop_check_matches_the_red_light_warning():
 
 
 def _latched_inputs(**kw):
+  # a genuine red light: the stop-light detector (redLight) agrees, as in all 7 genuine warnings on drives 4f / 50
   base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=45 * MPH, lead_alive=True, lead_status=True,
-              lead_prob=0.26, lead_d=118.0, lead_v=13 * MPH, lead_y=-0.8, model_alive=True, model_accel=-0.6, plan_stop=True)
+              lead_prob=0.26, lead_d=118.0, lead_v=13 * MPH, lead_y=-0.8, model_alive=True, model_accel=-0.6, plan_stop=True,
+              red_light=True)
   base.update(kw)
   return scs.StoppedCarInputs(**base)
 
@@ -735,9 +737,9 @@ def test_the_early_start_still_needs_a_slow_car_near_our_lane_and_the_model_slow
                dict(model_accel=-0.2), dict(lead_prob=0.15)):
       tr = scs.StoppedCarTrigger()
       for _ in range(40):
-        tr.update(_latched_inputs(lead_status=False))
+        tr.update(_latched_inputs(lead_status=False, red_light=False))
       for _ in range(300):
-        tr.update(_latched_inputs(**kw))
+        tr.update(_latched_inputs(red_light=False, **kw))     # (no stop-light detector: its head start is not the point here)
       if "model_accel" in kw or "lead_prob" in kw:              # a slower car in our path: only the unsure taps
         assert not tr.active or tr.kind == scs.SLOW_UNSURE, kw
       else:
@@ -1108,7 +1110,7 @@ def test_a_single_noisy_lead_speed_frame_does_not_start_a_stop():
   with _NoWarningStart():
     tr = scs.StoppedCarTrigger()
     for f in range(400):
-      tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=cycle[(f // 10) % len(cycle)] * MPH))
+      tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=cycle[(f // 10) % len(cycle)] * MPH, red_light=False))
       assert not tr.active, f
     tr = scs.StoppedCarTrigger()                  # sanity: a car really at 13 mph does start it
     assert any(tr.update(_latched_inputs(lead_prob=0.9, lead_d=100.0, lead_v=13 * MPH)) for _ in range(400))
@@ -1392,7 +1394,7 @@ def test_stop_ahead_start_is_blocked_by_a_relevant_lead_lane_change_braking_or_l
            dict(v_ego=22 * MPH), dict(brake_pressed=True), dict(plan_stop=False))
   for kw in cases:
     tr = scs.StoppedCarTrigger()
-    base = dict(lead_status=False)
+    base = dict(lead_status=False, red_light=False)   # (the detector alone would start its head start after 2 s)
     base.update(kw)
     for _ in range(300):
       tr.update(_latched_inputs(**base))
@@ -1459,9 +1461,10 @@ class _Tag4(SlowingLead):
 
 
 def test_tag4_replay_lowering_starts_on_the_warning_before_the_car_is_seen():
+  # (the stop-light detector agrees from the plan on, as in every genuine warning on drives 4f / 50)
   def go():
     return run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1200, lead=_Tag4(150, 27, decel=1.5, v_end=0.0), max_drop=10,
-               model=lambda f: -0.7, plan=lambda f: f >= 100)
+               model=lambda f: -0.7, plan=lambda f: f >= 100, red=lambda f: f >= 100)
   r = go()
   first = first_frame(r)
   assert r["holds"] and r["holds"][0] == first and first <= 215, (first, r["holds"][:2])
@@ -1481,8 +1484,10 @@ class _NoCar(StoppedLead):
 
 
 def test_false_stop_ahead_warning_costs_a_few_mph_and_comes_back_fast():
+  # a stop the detector backed (redLight on) that goes away after 3 s (the light turned green): the floor hold, then back
   r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10,
-                                 model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400))
+                                 model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400,
+                                 red=lambda f: 100 <= f < 400))
   assert rel and rel[0][1].startswith("stop ahead cleared") and rel[0][2]
   assert [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS], "restored with a SET+ hold"
   assert r["logic"].holds_allowed                                   # the cut-short SET- hold did not switch holds off
@@ -1503,7 +1508,7 @@ def test_stop_ahead_then_a_radar_followed_car_is_left_to_the_mrcc():
       return (True, 0.9, self.d, self.v, 0.1) if f >= 250 else (False, 0.0, 0.0, 0.0, 0.0)
   lead = Appears(150, 30, decel=0.5, v_end=5.0, radar_from=1000, follow_from=80)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=lead, max_drop=10, model=lambda f: -0.7,
-          plan=lambda f: f >= 100)
+          plan=lambda f: f >= 100, red=lambda f: f >= 100)
   assert r["holds"] and r["holds"][0] <= 215
   rh = r["radar_hold"]
   first_rh = rh.index(True)
@@ -1889,7 +1894,7 @@ def _red_then_green(car, frames=2500):
   plan = lambda f: 100 <= f < 700  # noqa: E731
   model = lambda f: -0.7 if 100 <= f < 700 else 0.3  # noqa: E731
   nobody = StoppedLead(200.0, present=lambda f: False)
-  return run(car, NO_CURVE, frames, lead=nobody, stop_mode=2, max_drop=10, model=model, plan=plan)
+  return run(car, NO_CURVE, frames, lead=nobody, stop_mode=2, max_drop=10, model=model, plan=plan, red=plan)
 
 
 def test_drive_4f_tag3_restore_after_a_green_light_uses_the_long_press_off_the_gas():
@@ -2046,3 +2051,329 @@ def test_driver_hold_to_the_minimum_is_not_booked_as_our_tap():
   lg.prev_driver_button = cs.SET_MINUS
   lg._observe_set_speed(N(set_speed=cs.CAR_MIN_SET_SPEED, v_ego=15 * MPH, cruise_enabled=True, driver_button=cs.SET_MINUS))
   assert all(p.landed == 0 for p in lg.inflight + lg.expired)
+
+
+# ---- drive 50: the red light head start (RED_*) and the false stop ahead guard (WARN_GUARD_*) ----
+
+class _Flag:
+  """Flip a module constant for one test."""
+  def __init__(self, name, value):
+    self.name, self.value = name, value
+
+  def __enter__(self):
+    self.old = getattr(scs, self.name)
+    setattr(scs, self.name, self.value)
+
+  def __exit__(self, *a):
+    setattr(scs, self.name, self.old)
+
+
+def _no_car(**kw):
+  base = dict(lead_status=False, plan_stop=False, model_accel=-0.1, red_light=True)
+  base.update(kw)
+  return _latched_inputs(**base)
+
+
+def _red_started(red_frames=350):
+  """Cruise on, nothing ahead, the light detector on from frame 60: (trigger, frame the head start began)."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car(red_light=False))
+  started = None
+  for n in range(red_frames):
+    if tr.update(_no_car()) and started is None:
+      started = n
+  return tr, started
+
+
+def test_red_light_head_start_after_2_s_steps_1_mph_a_second_to_5_below():
+  tr, started = _red_started()
+  assert started is not None and abs(started - scs.RED_ON_TIME / scs.DT_CTRL) <= 2, started
+  assert tr.kind == scs.RED_LIGHT and not tr.urgent and not tr.floor_mode and not tr.confirmed
+  assert near(tr.target / MPH, 45 - 2)                      # 1.5 s in: the 2nd step
+  for _ in range(400):
+    tr.update(_no_car())
+  assert tr.active and near(tr.target / MPH, 45 - 5)        # the cap
+  # the cap is below the set speed when the car is slower than it
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car(red_light=False))
+  for _ in range(260):
+    tr.update(_no_car(v_ego=30 * MPH, set_speed=45 * MPH))
+  assert tr.active and near(tr.target / MPH, 44)
+  # with the flag off (the old code): nothing
+  with _Flag("RED_START_ENABLED", False):
+    tr, started = _red_started()
+  assert started is None and not tr.active
+
+
+def test_red_light_head_start_in_the_car_taps_once_a_second_silently():
+  # the harness: 45 mph, the detector on from 1 s, nothing else; one SET- tap a second, never a hold, at most 5 mph
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1200, lead=_NoCar(200), max_drop=10, model=lambda f: -0.1,
+          red=lambda f: f >= 100)
+  ch = _sets_changes(r)
+  assert r["holds"] == [] and all(b == cs.SET_MINUS for _, b in r["presses"])
+  assert ch and 300 <= ch[0][0] <= 340, ch                   # 2 s of red light, then the first tap
+  assert all(abs(a[1] - b[1]) <= 1.0 + 1e-6 for a, b in zip([(0, 45.0)] + ch[:-1], ch, strict=True)), ch   # 1 mph steps
+  assert all(90 <= b[0] - a[0] <= 115 for a, b in zip(ch[:-1], ch[1:], strict=True)), ch                  # ~1 s apart
+  assert r["min"] >= 45 - 5 - 1e-6 and near(r["final"], 40)
+  assert r["trigger"].kind == scs.RED_LIGHT and r["ever_active"]
+
+
+def test_red_light_head_start_needs_cruise_speed_no_lane_change_and_not_already_slowing():
+  for kw in (dict(v_ego=22 * MPH), dict(lane_change=True), dict(a_ego=-0.8), dict(brake_pressed=True), dict(gas_pressed=True),
+             dict(cruise_enabled=False)):
+    tr = scs.StoppedCarTrigger()
+    for _ in range(60):
+      tr.update(_no_car(red_light=False))
+    for _ in range(400):
+      tr.update(_no_car(**kw))
+    assert not tr.active, kw
+  # ... and a continuous light: 1.5 s on, 0.5 s off, again, never starts; 0.2 s blinks are tolerated
+  tr = scs.StoppedCarTrigger()
+  for n in range(800):
+    tr.update(_no_car(red_light=(n % 200) < 150))
+  assert not tr.active
+  tr = scs.StoppedCarTrigger()
+  for n in range(400):
+    tr.update(_no_car(red_light=(n % 100) < 85))
+  assert tr.active and tr.kind == scs.RED_LIGHT
+
+
+def test_red_light_gone_releases_after_1_s_and_the_speed_comes_back():
+  tr, _ = _red_started()
+  for _ in range(int(scs.RED_DROPOUT / scs.DT_CTRL) - 5):   # a dropout shorter than RED_DROPOUT: still on
+    assert tr.update(_no_car(red_light=False))
+  for _ in range(100):
+    assert tr.update(_no_car())
+  n = 0
+  while tr.update(_no_car(red_light=False)):
+    n += 1
+    assert n < 200
+  assert abs(n - scs.RED_DROPOUT / scs.DT_CTRL) <= 3 and tr.release_reason == scs.RED_GONE and tr.restore_now
+  # a slower car in our lane at the release: the restore stays gentle
+  tr, _ = _red_started()
+  slower = dict(red_light=False, lead_status=True, lead_prob=0.6, lead_d=90.0, lead_v=20 * MPH, lead_y=0.2, model_accel=0.1)
+  for _ in range(150):
+    tr.update(_no_car(**slower))
+  assert not tr.active and tr.release_reason == scs.RED_GONE and not tr.restore_now
+  # the harness: 45 -> 42 for a 3 s light, then back to 45 within a few seconds
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1800, lead=_NoCar(200), max_drop=10,
+                                 model=lambda f: -0.1, red=lambda f: 100 <= f < 600))
+  assert rel and rel[0][1] == scs.RED_GONE and rel[0][2]
+  assert r["min"] >= 45 - 5 - 1e-6 and near(r["final"], 45)
+  back = next(k for k, s in enumerate(r["sets"]) if k > rel[0][0] and near(s / MPH, 45))
+  assert (back - rel[0][0]) * T.DT <= 6.0, back
+
+
+def test_red_light_head_start_driver_overrides_and_does_not_start_again_for_the_same_light():
+  tr, _ = _red_started()
+  for _ in range(int(scs.GAS_RELEASE_TIME / scs.DT_CTRL) + 2):
+    tr.update(_no_car(gas_pressed=True))
+  assert not tr.active and tr.release_reason == "driver on the gas"
+  for _ in range(600):                                        # the light still on: no new head start
+    assert not tr.update(_no_car())
+  for _ in range(int(scs.RED_DROPOUT / scs.DT_CTRL) + 5):     # off for RED_DROPOUT ...
+    tr.update(_no_car(red_light=False))
+  for _ in range(int(scs.RED_ON_TIME / scs.DT_CTRL) + 5):     # ... on again: the next light
+    tr.update(_no_car())
+  assert tr.active and tr.kind == scs.RED_LIGHT
+  # the brake, too
+  tr, _ = _red_started()
+  tr.update(_no_car(brake_pressed=True))
+  assert not tr.active and tr.release_reason == "cruise off / brake" and tr.clear_release
+  for _ in range(300):
+    assert not tr.update(_no_car())
+
+
+def test_red_light_head_start_hands_over_to_the_planned_stop_with_the_full_drop():
+  # drive 50: redLight at 307.5, the head start at 309.5 (45 -> 40 by 313.5), the plan says stop at 315.0: the floor hold
+  tr, _ = _red_started()
+  n = 0
+  while tr.kind == scs.RED_LIGHT:
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6))
+    n += 1
+    assert n < 200
+  assert tr.active and tr.kind == scs.STOP_AHEAD and tr.confirmed and tr.urgent and tr.floor_mode and not tr.warn_unsure
+  assert abs(n - scs.WARN_START_DEBOUNCE / scs.DT_CTRL) <= 2 and near(tr.target / MPH, FLOOR_MPH)
+  assert tr.unsure_from                                       # (the episode began with the head start's taps)
+  # ... also while our own taps already slow the car a little (-0.7 m/s^2 is not "already slowing" here)
+  tr, _ = _red_started()
+  for _ in range(100):
+    tr.update(_no_car(a_ego=-0.7))
+  n = 0
+  while tr.kind == scs.RED_LIGHT:
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6, a_ego=-0.7))
+    n += 1
+    assert n < 200
+  assert tr.kind == scs.STOP_AHEAD and tr.floor_mode
+
+
+def test_red_light_head_start_hands_over_to_a_stopped_car():
+  tr, _ = _red_started()
+  n = 0
+  while tr.kind == scs.RED_LIGHT:
+    tr.update(_no_car(lead_status=True, lead_prob=0.95, lead_d=90.0, lead_v=0.0, lead_y=0.1, model_accel=0.0))
+    n += 1
+    assert n < 200
+  assert tr.active and tr.kind == scs.STOPPED_CAR and tr.confirmed and abs(n - scs.HOLD_TIME / scs.DT_CTRL) <= 2
+  # ... and to a stop with a much slower car (the model slowing); an unsure car does not take it over
+  tr, _ = _red_started()
+  for _ in range(100):
+    tr.update(_no_car(lead_status=True, lead_prob=0.3, lead_d=110.0, lead_v=10 * MPH, lead_y=0.1, model_accel=0.0))
+  assert tr.active and tr.kind == scs.RED_LIGHT
+  for _ in range(60):
+    tr.update(_no_car(lead_status=True, lead_prob=0.6, lead_d=100.0, lead_v=10 * MPH, lead_y=0.1, model_accel=-0.6))
+  assert tr.active and tr.kind == scs.STOP_WITH_CAR and tr.urgent
+
+
+class _Drive50(StoppedLead):
+  """Drive 50 (t = seconds after redLight came on at 307.5): the stopped queue car first seen at 9.5 s (118 m, 29 %),
+  57-65 % from 10.5 s, 87 % from 13 s, 94 % from 14 s; in our lane."""
+  def state(self, f, car):
+    t = f * T.DT
+    if t < 9.5:
+      return (False, 0.0, 0.0, 0.0, 0.0)
+    p = 0.29 if t < 10.5 else (0.6 if t < 13.0 else (0.87 if t < 14.0 else 0.95))
+    return (True, p, self.d, 0.0, 0.3)
+
+
+def _drive_50(head_start=True):
+  # redLight from 0, the plan says stop from 7.5 s (315.0), the driver braked at 15 s (322.5); the measured cruise decel
+  car = Car(45, dash_offset_mph=0.0, decel_fn=MEASURED_DECEL)
+  lead = _Drive50(118.0 + 45 * MPH * 9.5)
+  with _Flag("RED_START_ENABLED", head_start):
+    r = run(car, NO_CURVE, 1500, lead=lead, max_drop=10, setup=MEASURED, model=lambda f: -0.6 if f >= 750 else -0.2,
+            plan=lambda f: f >= 750, red=lambda f: True)
+  return r
+
+
+def test_drive_50_replay_the_head_start_takes_speed_off_before_the_stop_and_the_full_drop_is_not_later():
+  with_hs, without = _drive_50(True), _drive_50(False)
+  at_floor = lambda r: next(k for k, s in enumerate(r["sets"]) if s <= 20 * MPH + 1e-6)  # noqa: E731
+  assert at_floor(with_hs) <= at_floor(without) + 5, (at_floor(with_hs), at_floor(without))
+  assert at_floor(without) <= 1120                                          # ~318.5 s (the drive: set 20 at 317.95)
+  first_hs = first_frame(with_hs)
+  assert 190 <= first_hs <= 230 and first_frame(without) >= 780, (first_hs, first_frame(without))   # 2 s of red light
+  assert with_hs["sets"][740] / MPH <= 40 + 1e-6 and without["sets"][740] / MPH >= 45 - 1e-6     # 5 mph off before the plan
+  v_brake_hs, v_brake = with_hs["vs"][1500 - 1] / MPH, without["vs"][1500 - 1] / MPH
+  assert v_brake_hs <= v_brake - 2.0, (v_brake_hs, v_brake)                 # slower where the driver had to brake
+  assert with_hs["min"] >= FLOOR_MPH - 1e-6 and with_hs["holds"]            # the floor hold still happened
+
+
+# ---- the false stop ahead guard ----
+
+def _guarded(frames=200, **kw):
+  """A planned stop with no car and no red light: (trigger, frame started)."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car(red_light=False))
+  started = None
+  for n in range(frames):
+    if tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False, **kw)) and started is None:
+      started = n
+  return tr, started
+
+
+def test_a_planned_stop_without_the_light_detector_only_taps_and_the_warning_timing_is_unchanged():
+  tr, started = _guarded()
+  assert started is not None and abs(started - scs.WARN_START_DEBOUNCE / scs.DT_CTRL) <= 2   # the start itself: as today
+  assert tr.active and tr.kind == scs.STOP_AHEAD and tr.warn_start and tr.warn_unsure and tr.warn_guarded
+  assert not tr.urgent and not tr.floor_mode and not tr.confirmed
+  assert near(tr.target / MPH, 40)                            # the unsure car's cap, taps
+  assert tr.warn_frames * scs.DT_CTRL >= scs.WARN_DEBOUNCE - 1e-9    # (the warning's own gate is the planner's)
+  with _Flag("WARN_GUARD_ENABLED", False):                    # the old code: the floor hold at once
+    tr, _ = _guarded()
+  assert tr.active and tr.urgent and tr.floor_mode and near(tr.target / MPH, FLOOR_MPH)
+  # redLight on within WARN_RED_RECENT before the start: not guarded
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car())
+  for _ in range(int((scs.WARN_RED_RECENT - scs.WARN_START_DEBOUNCE) / scs.DT_CTRL) - 20):
+    tr.update(_no_car(red_light=False))
+  for _ in range(60):
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False))
+  assert tr.active and tr.kind == scs.STOP_AHEAD and not tr.warn_unsure and tr.floor_mode
+  # drive 50 t 108.4: redLight off ~2.0-2.5 s before the start: guarded
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car())
+  for _ in range(200):
+    tr.update(_no_car(red_light=False))
+  for _ in range(60):
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False))
+  assert tr.active and tr.warn_unsure
+
+
+def test_a_guarded_stop_ahead_costs_at_most_5_mph_and_comes_back_when_the_plan_clears():
+  # drive 50, t 107-114 (a green light, a car turning across): 45 -> 19 and ~12 mph lost; now 1 mph taps to 40
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2000, lead=_NoCar(200), max_drop=10,
+                                 model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400))
+  assert rel and rel[0][1].startswith("stop ahead cleared") and rel[0][2]
+  assert r["holds"] == [] or all(h >= rel[0][0] for h in r["holds"]), r["holds"]     # no SET- hold
+  assert r["min"] >= 45 - 5 - 1e-6 and near(r["final"], 45) and min(r["vs"]) / MPH >= 45 - 6
+  back = next(k for k, s in enumerate(r["sets"]) if k > rel[0][0] and near(s / MPH, 45))
+  assert (back - rel[0][0]) * T.DT <= 7.0, back
+  # a dip that never became a warning: released at once, as before
+  tr, started, released = _warn_episode(70, red_light=False)
+  assert started is not None and released is not None and tr.release_reason == scs.STOP_AHEAD_UNCONFIRMED
+
+
+def test_a_guarded_stop_ahead_becomes_the_full_drop_when_the_light_detector_agrees():
+  tr, _ = _guarded()
+  tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=True))
+  assert tr.active and tr.kind == scs.STOP_AHEAD and not tr.warn_unsure and tr.confirmed and tr.urgent and tr.floor_mode
+  assert near(tr.target / MPH, FLOOR_MPH) and tr.warn_guarded
+
+
+def test_a_guarded_stop_ahead_becomes_the_full_drop_once_the_plan_has_held_4_s():
+  tr, started = _guarded(frames=int(scs.WARN_GUARD_PLAN_HOLD / scs.DT_CTRL) - 10)
+  assert tr.active and tr.warn_unsure
+  for _ in range(12):
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False))
+  assert tr.active and not tr.warn_unsure and tr.floor_mode and tr.urgent and near(tr.target / MPH, FLOOR_MPH)
+  # short plan dropouts (LATCH_DROPOUT) do not restart that clock
+  tr, _ = _guarded(frames=300)
+  for n in range(130):
+    tr.update(_no_car(plan_stop=(n % 50) >= 10, model_accel=-0.6, red_light=False))
+  assert tr.active and not tr.warn_unsure and tr.floor_mode
+
+
+def test_a_guarded_stop_ahead_becomes_the_full_drop_when_a_slower_car_confirms_it():
+  # the car for the stop appears (prob >= 0.4 for 0.3 s, the model slowing): the stop with car, the floor
+  tr, _ = _guarded()
+  car = dict(plan_stop=True, model_accel=-0.6, red_light=False, lead_status=True, lead_prob=0.5, lead_d=130.0, lead_v=10 * MPH,
+             lead_y=0.2)                                          # (not urgent yet: required ~1.1 m/s^2, 8 s away)
+  tr.update(_no_car(**car))
+  assert tr.kind == scs.STOP_WITH_CAR and tr.warn_unsure and not tr.urgent
+  assert tr.target >= tr.unsure_target - 1e-6                  # the cap still holds until it is confirmed
+  for _ in range(int(scs.EARLY_CONFIRM_TIME / scs.DT_CTRL) + 1):
+    tr.update(_no_car(**car))
+  assert tr.confirmed and not tr.warn_unsure and tr.urgent and tr.floor_mode and near(tr.target / MPH, FLOOR_MPH)
+  # drive 50 t 109.7: a slower car (89 %) while the model does not want to slow (-0.05): not a confirmation; a car at
+  # our speed neither
+  tr, _ = _guarded()
+  for _ in range(100):
+    tr.update(_no_car(**dict(car, model_accel=-0.05, lead_prob=0.89, lead_d=100.0, lead_v=29 * MPH, v_ego=41 * MPH)))
+  assert tr.active and tr.kind == scs.STOP_WITH_CAR and tr.warn_unsure and not tr.urgent
+  tr, _ = _guarded()
+  for _ in range(100):
+    tr.update(_no_car(**dict(car, lead_prob=0.9, lead_v=44 * MPH)))
+  assert tr.active and tr.kind == scs.STOP_AHEAD and tr.warn_unsure and not tr.urgent
+  # a slower car already there at the start (prob >= 0.4): not guarded at all, as today
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_no_car(red_light=False))
+  for _ in range(60):
+    tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False, lead_status=True, lead_prob=0.5, lead_d=140.0,
+                      lead_v=20 * MPH, lead_y=0.2))
+  assert tr.active and tr.confirmed and not tr.warn_guarded
+
+
+def test_a_guarded_stop_ahead_is_released_by_the_driver_and_the_light_latch_holds():
+  tr, _ = _guarded()
+  tr.update(_no_car(plan_stop=True, model_accel=-0.6, red_light=False, brake_pressed=True))
+  assert not tr.active and tr.clear_release and not tr.warn_unsure
+  # the planner's own gates are untouched: the warning condition is the same as before
+  sw = _stop_warning()
+  assert scs.WARN_OWN_SLOWING_ACCEL == sw.OWN_SLOWDOWN_ACCEL
