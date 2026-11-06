@@ -9,6 +9,7 @@ _spec.loader.exec_module(T)
 cs, scs, MPH = T.cs, T.scs, T.MPH
 Car, StoppedLead, run, near, between = T.Car, T.StoppedLead, T.run, T.near, T.between
 NO_CURVE = lambda f: None  # noqa: E731
+FLOOR_MPH = 30 / 3.6 / 0.44704   # the stopped car floor: the car's own 30 km/h minimum (the dash shows 19)
 CAR_MIN_MPH = 30 / 1.609344   # the car's own minimum set speed
 
 
@@ -31,10 +32,10 @@ def first_frame(r, what="any"):
 # ---------------- trigger and target ----------------
 
 def test_target_formula():
-  assert near(scs.stopped_car_target(15.0) / MPH, 20.0)
-  assert near(scs.stopped_car_target(0.0) / MPH, 20.0)
+  assert near(scs.stopped_car_target(15.0) / MPH, FLOOR_MPH)
+  assert near(scs.stopped_car_target(0.0) / MPH, FLOOR_MPH)
   v = scs.stopped_car_target(120.0)
-  assert abs(v - (((20 * MPH) ** 2 + 2 * 1.0 * 105) ** 0.5)) < 1e-9
+  assert abs(v - (((FLOOR_MPH * MPH) ** 2 + 2 * 1.0 * 105) ** 0.5)) < 1e-9
   assert 35 < v / MPH < 40
 
 
@@ -109,7 +110,7 @@ def test_approach_45_mph_from_120_m_lowers_towards_20_and_restores():
   lead = StoppedLead(120)
   car = Car(45, dash_offset_mph=0.0)
   r = run(car, NO_CURVE, 2500, lead=lead, stop_mode=2, max_drop=10)
-  assert r["min"] >= 20 - 1e-6, r["min"]
+  assert r["min"] >= FLOOR_MPH - 1e-6, r["min"]
   assert r["min"] <= 30, r["min"]                      # well on the way to the floor (lead still there)
   assert r["max"] <= 45 + 1e-6
   assert r["holds"] and r["holds"][0] < (r["presses"][0][0] if r["presses"] else 10**9), "120 m: floor mode, a hold first"
@@ -118,13 +119,13 @@ def test_approach_45_mph_from_120_m_lowers_towards_20_and_restores():
   lead2 = StoppedLead(120, present=lambda f: f < 2000)
   r2 = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 6500, lead=lead2, stop_mode=2, max_drop=10)
   assert near(r2["final"], 45), r2["final"]
-  assert r2["max"] <= 45 + 1e-6 and r2["min"] >= 20 - 1e-6
+  assert r2["max"] <= 45 + 1e-6 and r2["min"] >= FLOOR_MPH - 1e-6
 
 
 def test_urgent_approach_uses_holds_and_reaches_floor_fast():
   r = approach(45, 60, frames=1500)
   assert r["holds"], r
-  assert r["min"] >= 20 - 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6
   assert r["min"] <= 21, r["min"]                      # reached the floor
   assert first_frame(r) is not None and first_frame(r) < 150
 
@@ -137,7 +138,7 @@ def test_relaxed_approach_taps_follow_the_target():
   assert r["presses"] and r["presses"][0][0] < 200, r["presses"][:3]     # taps first (trigger 0.5 s + cruise settle)
   # 70 m closer at ~20 m/s is ~3.5 s: no SET- hold before the lead is within 130 m
   assert minus_holds and minus_holds[0]["frame"] > 300, minus_holds[:1]
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
   gaps = [b - a for (a, _), (b, _) in zip(r["presses"], r["presses"][1:])]
   assert min(gaps[:3]) >= cs.RELAXED_GAP_FRAMES, gaps[:3]          # relaxed pace while not urgent (it gets urgent closer in)
 
@@ -146,7 +147,7 @@ def test_confirmed_stopped_car_with_room_holds_from_the_start():
   # 55 mph, stopped car at 120 m: the target (38 mph) leaves 17 steps of room: a hold, not taps, first.
   r = approach(55, 120, frames=2500)
   assert r["holds"] and (not r["presses"] or r["holds"][0] < r["presses"][0][0]), (r["holds"][:3], r["presses"][:3])
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 55 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 55 + 1e-6
   log = r["logic"].hold_log
   assert log[0]["landed"] >= 5, log
 
@@ -168,7 +169,7 @@ def test_driver_brakes_mid_approach_pauses_then_resumes_restore():
     s["cruise"], s["brake"] = True, False
   lead = StoppedLead(120, present=lambda f: f < 700)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 6000, events={700: brake, 1500: resume}, lead=lead, max_drop=10)
-  assert r["max"] <= 45 + 1e-6 and r["min"] >= 20 - 1e-6
+  assert r["max"] <= 45 + 1e-6 and r["min"] >= FLOOR_MPH - 1e-6
   assert near(r["final"], 45), r["final"]
 
 
@@ -177,14 +178,14 @@ def test_curve_and_stopped_car_together_min_wins_no_fighting():
   r = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 40), 7000, lead=lead, max_drop=5)
   seq = "".join("M" if b == cs.SET_MINUS else "P" for _, b in r["presses"])
   assert "PM" not in seq or seq.count("PM") <= 1, seq     # no SET+/SET- fighting while both reasons are on
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
   assert near(r["final"], 45), r["final"]
   assert r["min"] < 40 - 1e-6                              # went below the curve's 5 mph cap: the stopped car won
 
 
 def test_presses_ignored_still_safe():
   r = approach(45, 60, frames=4000, car_kw=dict(lose=lambda n: n % 3 == 0, hold_ignored=True))
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
   assert r["presses"]                                     # taps carry on after the hold is ignored
   assert r["logic"].hold_misses >= 1
 
@@ -208,8 +209,8 @@ def test_hold_rates_and_latencies_never_cross_floor_or_target():
     for latency in (0.0, 0.5, 1.0):
       for d0 in (60, 150):
         r = approach(45, d0, frames=3000, car_kw=dict(hold_rate=rate, hold_latency=latency, min_set_mph=CAR_MIN_MPH))
-        # phase-locked stop holds aim at 20 with no overrun margin: a car that keeps stepping lands on its minimum
-        assert r["min"] >= (CAR_MIN_MPH if latency else 20) - 1e-6, (rate, latency, d0, r["min"])
+        # the floor is the car's own minimum (the hold to 20, then one tap); a car that keeps stepping lands there too
+        assert r["min"] >= CAR_MIN_MPH - 1e-6, (rate, latency, d0, r["min"])
         assert r["max"] <= 45 + 1e-6, (rate, latency, d0, r["max"])
         assert not r["logic"].disabled, (rate, latency, d0)
 
@@ -218,7 +219,7 @@ def test_hold_landing_as_1_3_10_steps_is_safe():
   # a car that answers a hold with a single tap, a 3 mph step or 10 mph at once
   for rate, start in ((1.0, 0.1), (5.0, 0.5), (16.6, 0.1)):
     r = approach(45, 80, frames=3000, car_kw=dict(hold_rate=rate, hold_start=start))
-    assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6, (rate, r["min"], r["max"])
+    assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6, (rate, r["min"], r["max"])
     assert not r["logic"].disabled
 
 
@@ -244,7 +245,7 @@ def test_brake_during_hold_aborts():
     s["cruise"], s["brake"] = False, True
   r = approach(45, 60, frames=1200, events={h0 + 30: brake})
   assert max(r["holds"]) < h0 + 35
-  assert r["min"] >= 20 - 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6
 
 
 def test_lead_departs_during_hold_aborts_then_restores():
@@ -258,7 +259,7 @@ def test_lead_departs_during_hold_aborts_then_restores():
 
 def test_hold_ignored_falls_back_to_taps():
   r = approach(45, 60, frames=3000, car_kw=dict(hold_ignored=True))
-  assert r["presses"] and r["min"] >= 20 - 1e-6
+  assert r["presses"] and r["min"] >= FLOOR_MPH - 1e-6
   assert r["logic"].hold_misses >= 1
   first = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS][0]
   assert first["frames_sent"] <= cs.HOLD_NO_EFFECT_SECONDS * 10 + 1, first        # given up after ~1 s
@@ -275,13 +276,15 @@ def test_hold_log_records_each_hold():
 
 def test_45_mph_one_hold_straight_to_the_floor():
   # drive 45: two holds with a 1.5 s pause (45 -> 35, 34 -> 25), because the release kept two quanta of margin and
-  # the target followed the car ahead. Phase-locked now: one hold, released as 20 lands; nothing left for taps.
+  # the target followed the car ahead. Phase-locked now: one hold, released as 20 lands; then one tap to the car's
+  # minimum (owner, Nov 6: "one more 1 mph step down to 19").
   r = approach(45, 60, frames=3000)
   log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
   assert len(log) == 1 and log[0]["phase_lock"], log
-  assert near(log[0]["bound_mph"], 20) and log[0]["landed"] >= 20, log
-  assert near(r["min"], 20) and r["max"] <= 45 + 1e-6
-  assert [f for f, b in r["presses"] if b == cs.SET_MINUS] == []
+  assert near(log[0]["bound_mph"], FLOOR_MPH) and log[0]["landed"] >= 20, log
+  assert abs(r["min"] - FLOOR_MPH) < 0.5 and r["max"] <= 45 + 1e-6
+  taps = [f for f, b in r["presses"] if b == cs.SET_MINUS]
+  assert len(taps) == 1 and taps[0] > log[0]["frame"], taps
   first = log[0]["frame"]
   assert r["sets"][first + 400] <= 20 * MPH + 1e-6          # 45 -> 20 in one go, within 4 s
 
@@ -391,7 +394,7 @@ def test_lost_release_restores_gently_and_the_retrigger_wins():
   plus_before = [f for f in _plus_frames(r) if f < stop_f]
   assert len(plus_before) <= 2, plus_before          # (the one hold to 20 may still be settling: then none)
   assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] < stop_f], "no SET+ hold"
-  assert near(r["min"], 20), r["min"]
+  assert abs(r["min"] - FLOOR_MPH) < 0.5, r["min"]
   plus_after = [f for f in _plus_frames(r) if f >= stop_f]
   assert plus_after and plus_after[0] >= stop_f + 100 - 5, (stop_f, plus_after[:1])   # ~1 s into the stop
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
@@ -588,7 +591,7 @@ def test_approach_45_mph_to_a_slow_car_at_a_red_light_drops_at_once_never_below_
   # first SET- within 0.6 s of the trigger (0.3 s cruise settle at the start of the run + 0.5 s hold)
   assert first is not None and first <= 90, first
   assert r["holds"] and r["holds"][0] <= 90                  # urgent: a long press straight away
-  assert r["min"] >= 20 - 1e-6 and r["min"] <= 33, r["min"]
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["min"] <= 33, r["min"]
   # the same car with the model not slowing (just a slow car, no stop ahead): only the unsure car's taps (owner, Nov
   # 5: the yellow triangle), 1 mph each, at most UNSURE_MAX_DROP, no long press
   lead = StoppedLead(95, v_mph=13.0, prob=0.7, y=1.0)
@@ -820,7 +823,7 @@ def test_2112_replay_starts_earlier_and_lower_than_on_the_drive():
   assert [f for f in r["holds"] if f < F(24.5 + scs.WARN_START_DEBOUNCE)] == []
   i = F(29.5)
   assert r["sets"][i] / MPH <= 38 + 1e-6, r["sets"][i] / MPH   # on the drive: 40 at t 29.5
-  assert r["min"] >= 20 - 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6
   assert [f for f, b in r["presses"] if b == cs.SET_PLUS] == []
 
 
@@ -885,7 +888,7 @@ def test_episode_a_replay_floor_hold_slows_faster_than_taps():
   start = tr.start_frame
   assert r["holds"] and r["holds"][0] - start <= 30, (start, r["holds"][:2], r["presses"][:2])
   assert r["sets"][start + 350] <= 25 * MPH + 1e-6, r["sets"][start + 350] / MPH      # <= 25 mph 3.5 s in
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
   v_new = car.v_ego
   # the same approach by taps along the distance target (floor mode off, no holds)
   scs.FLOOR_MODE_ENABLED = False
@@ -906,9 +909,9 @@ def test_measured_car_one_hold_to_the_floor_then_taps():
   r = run(Car(45, dash_offset_mph=0.0, decel_fn=MEASURED_DECEL), NO_CURVE, 2500, lead=T.StoppedLead(100),
           stop_mode=2, max_drop=10, setup=MEASURED)
   log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS]
-  assert len(log) >= 1 and near(log[0]["bound_mph"], 20), log
+  assert len(log) >= 1 and near(log[0]["bound_mph"], FLOOR_MPH), log
   assert r["sets"][log[0]["frame"] + 350] <= 25 * MPH + 1e-6
-  assert near(r["min"], 20) and r["max"] <= 45 + 1e-6
+  assert abs(r["min"] - FLOOR_MPH) < 0.5 and r["max"] <= 45 + 1e-6
 
 
 def test_stop_with_a_car_rolling_at_25_mph_goes_to_the_floor_and_comes_back():
@@ -917,7 +920,7 @@ def test_stop_with_a_car_rolling_at_25_mph_goes_to_the_floor_and_comes_back():
   lead = T.StoppedLead(90, v_mph=25.0, prob=0.9, y=0.1)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2000, lead=lead, stop_mode=2, max_drop=10, model=lambda f: -0.6)
   assert r["ever_active"] and r["trigger"].floor_mode
-  assert near(r["min"], 20), r["min"]
+  assert abs(r["min"] - 20) < 0.5, r["min"]            # the moving car guard: its 25 mph less 5
 
 
 def test_floor_target_respects_a_braking_lead_guard():
@@ -936,8 +939,9 @@ def _guard_check():
     tr.update(scs.StoppedCarInputs(**base))
   assert tr.active and tr.floor_mode
   assert near(tr.target / MPH, 11.0 / MPH)                                      # 25 mph car ahead, not braking
-  tr.update(scs.StoppedCarInputs(**dict(base, lead_a=-2.5)))
-  assert near(tr.target, scs.FLOOR_SPEED)                                       # braking hard: it will be slow soon
+  for _ in range(150):                                                          # braking hard: it will be slow soon
+    tr.update(scs.StoppedCarInputs(**dict(base, lead_a=-2.5)))
+  assert near(tr.target, scs.FLOOR_SPEED)
 
 
 def test_far_confirmed_stop_is_not_floor_mode_yet():
@@ -978,7 +982,7 @@ def test_hold_fallback_when_the_wheel_frames_stop():
   assert log and sum(h["fallbacks"] for h in log) > 0, log
   gaps = [b - a for a, b in zip(r["holds"], r["holds"][1:], strict=False) if b - a < 50 and a >= 120]
   assert gaps and min(gaps) >= cs.HOLD_FALLBACK_FRAMES, gaps
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
 
 
 def test_phase_strict_car_sees_a_long_press_only_when_locked():
@@ -986,7 +990,7 @@ def test_phase_strict_car_sees_a_long_press_only_when_locked():
           max_drop=10, wheel_phase=4)
   log = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_MINUS and h["done"]]
   assert log and log[0]["pattern"] == "quantum", log[:1]
-  assert r["min"] >= 20 - 1e-6 and r["max"] <= 45 + 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["max"] <= 45 + 1e-6
   cs.HOLD_PHASE_LOCK = False
   try:
     r2 = run(Car(45, dash_offset_mph=0.0, hold_phase_window=1), NO_CURVE, 2500, lead=T.StoppedLead(70), stop_mode=2,
@@ -994,7 +998,7 @@ def test_phase_strict_car_sees_a_long_press_only_when_locked():
   finally:
     cs.HOLD_PHASE_LOCK = True
   log2 = [h for h in r2["logic"].hold_log if h["direction"] == cs.SET_MINUS and h["done"]]
-  assert r2["min"] >= 20 - 1e-6 and r2["max"] <= 45 + 1e-6       # taps answers keep the limits too
+  assert r2["min"] >= FLOOR_MPH - 1e-6 and r2["max"] <= 45 + 1e-6       # taps answers keep the limits too
   assert all(not h["phase_lock"] for h in log2)
 
 
@@ -1076,7 +1080,7 @@ def test_radar_flicker_during_the_approach_keeps_lowering_and_never_restores():
   # (a) a stopped car the radar blinks on and off for: never trusted (it was never seen moving): today's floor hold
   r = approach(lead_kw=dict(radar_from=1000, radar_present=lambda f: (f // 60) % 2 == 0))
   stop = next(k for k, v in enumerate(r["vs"]) if v < 0.3)
-  assert near(r["min"], 20)
+  assert abs(r["min"] - FLOOR_MPH) < 0.5
   assert all(f > stop for f in _plus_frames(r))
   # (b) drive 4b: the radar dropped the car at 42 m for a second: the follow ends at once and we lower (floor hold)
 
@@ -1313,7 +1317,7 @@ def test_tag2_replay_suv_turning_right_releases_within_a_second_and_restores_fas
   assert not [f for f in _minus_frames(r) if f > rel[0][0]]           # never lowered for that car again
   ups = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
   assert ups, "fast restore"
-  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6 and r["min"] >= 20 - 1e-6
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6 and r["min"] >= FLOOR_MPH - 1e-6
 
 
 class _CurveAhead(StoppedLead):
@@ -1329,7 +1333,7 @@ class _CurveAhead(StoppedLead):
 def test_stopped_car_straight_ahead_in_a_curve_is_not_released():
   r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 3000, lead=_CurveAhead(100), max_drop=10))
   assert [x[1] for x in rel][:1] == ["ego stopped behind the lead"], rel
-  assert near(r["min"], 20)
+  assert abs(r["min"] - FLOOR_MPH) < 0.5
 
 
 def test_a_car_that_left_our_lane_does_not_start_it_again_until_it_comes_back():
@@ -1379,7 +1383,7 @@ def test_stop_ahead_warning_alone_starts_a_floor_hold_before_the_warning_shows()
       assert any("warning held" in b for b in tr.blockers(_latched_inputs(lead_status=False)))
   assert 48 <= n <= 52, n
   assert tr.kind == scs.STOP_AHEAD and tr.warn_start and tr.urgent and tr.floor_mode
-  assert near(tr.target / MPH, 20)
+  assert near(tr.target / MPH, FLOOR_MPH)
 
 
 def test_stop_ahead_start_is_blocked_by_a_relevant_lead_lane_change_braking_or_low_speed():
@@ -1404,7 +1408,7 @@ def test_stop_ahead_hands_over_to_the_car_when_it_appears():
   assert tr.kind == scs.STOP_AHEAD
   tr.update(_latched_inputs(lead_prob=0.4, lead_d=113.0, lead_v=27 * MPH, lead_y=0.3))
   assert tr.active and tr.kind == scs.STOP_WITH_CAR and tr.urgent and tr.floor_mode
-  assert near(tr.target / MPH, 20)
+  assert near(tr.target / MPH, FLOOR_MPH)
 
 
 def _started_past_the_warning(tr):
@@ -1462,7 +1466,7 @@ def test_tag4_replay_lowering_starts_on_the_warning_before_the_car_is_seen():
   first = first_frame(r)
   assert r["holds"] and r["holds"][0] == first and first <= 215, (first, r["holds"][:2])
   at20 = next(k for k, s in enumerate(r["sets"]) if near(s / MPH, 20))
-  assert (at20 - first) * T.DT <= 3.5 and r["min"] >= 20 - 1e-6
+  assert (at20 - first) * T.DT <= 3.5 and r["min"] >= FLOOR_MPH - 1e-6
   with _NoWarningStart():
     r2 = go()
   assert first_frame(r2) >= first + 100, (first_frame(r2), first)
@@ -1504,7 +1508,7 @@ def test_stop_ahead_then_a_radar_followed_car_is_left_to_the_mrcc():
   rh = r["radar_hold"]
   first_rh = rh.index(True)
   assert all(f < first_rh for f in _minus_frames(r)), (first_rh, _minus_frames(r)[-3:])
-  assert r["min"] >= 20 - 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6
 
 
 # ---------------- drive 4d: a slower car that keeps moving, restores at any speed, the driver on the gas ----------------
@@ -1519,10 +1523,10 @@ def test_moving_slower_car_target_stays_above_its_speed_until_it_brakes():
   assert tr.active and tr.floor_mode and 25 <= tr.target / MPH <= 27, tr.target / MPH
   for _ in range(300):                              # it brakes for the light: the floor from now on
     tr.update(_sw(**dict(kw, lead_a=-1.5)))
-  assert near(tr.target / MPH, 20) and tr.floor_committed
+  assert near(tr.target / MPH, FLOOR_MPH) and tr.floor_committed
   for _ in range(300):                              # and stays there even if it eases off again
     tr.update(_sw(**kw))
-  assert near(tr.target / MPH, 20)
+  assert near(tr.target / MPH, FLOOR_MPH)
 
 
 class _Tag4Lead(StoppedLead):
@@ -1785,7 +1789,7 @@ def test_unsure_car_hands_over_to_the_stopped_car_at_085():
   assert [f for f in r["holds"] if f < 300] == []        # taps only while unsure
   assert r["trigger"].kind == scs.STOPPED_CAR and r["trigger"].confirmed
   assert [f for f in r["holds"] if f >= 300], r["holds"]  # then the stopped car's long press
-  assert r["min"] >= 20 - 1e-6
+  assert r["min"] >= FLOOR_MPH - 1e-6
 
 
 def test_unsure_car_false_alarm_gives_the_speed_back():
@@ -1964,3 +1968,81 @@ def test_a_cruise_gap_set_at_the_current_speed_is_the_drivers_not_a_jump_of_ours
   i = N(set_speed=32 * MPH, v_ego=32 * MPH, cruise_enabled=True, driver_button=None)
   lg._observe_set_speed(i)
   assert p in lg.inflight + lg.expired or p.landed == 0      # not booked as ours
+
+
+def test_floor_is_the_cars_own_minimum_one_tap_below_20():
+  # owner (Nov 6): "when we drop the speed by holding the button it's only going down to 20, let's do one more 1 mph
+  # step down to 19": the long press stops at 20, one SET- tap lands on the car's 30 km/h minimum (18.6 mph, a
+  # short step: booked as ours, not "a fraction of a step": switched off for the drive), then the restore
+  class MinCar(Car):
+    """The real levels at the bottom: the 30 km/h minimum (18.6 mph), then 20, 21 ... (no 19)."""
+    def tick(self):
+      super().tick()
+      if CAR_MIN_MPH * MPH + 1e-6 < self.set_speed < 20 * MPH - 1e-6:
+        self.set_speed = CAR_MIN_MPH * MPH
+  lead = StoppedLead(60, prob=0.95, y=0.1, present=lambda f: f < 1500)
+  r = run(MinCar(45, dash_offset_mph=0.0, min_set_mph=CAR_MIN_MPH), NO_CURVE, 3500, lead=lead, stop_mode=2, max_drop=10)
+  assert abs(r["min"] - CAR_MIN_MPH) < 1e-6, r["min"]
+  assert not r["logic"].disabled and near(r["final"], 45) and r["max"] <= 45 + 1e-6, (r["logic"].disabled, r["final"])
+
+
+def _pull_away_trigger(radar=True):
+  # drive 4f, tag 6: a stop with a car (the model slowing), the car ahead 30 -> 15 m away at 6 mph, the radar following
+  # it (it was tracked while moving), we slowing from 30 to 8 mph
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_sw(lead_status=False))
+  for n in range(300):
+    tr.update(_sw(v_ego=(30 - n * 0.073) * MPH, lead_prob=0.95, lead_d=30.0 - n * 0.05, lead_v=6 * MPH, lead_y=0.1,
+                  model_accel=-0.8, radar_has_lead=radar))
+  assert tr.active and tr.kind in (scs.STOP_WITH_CAR, scs.STOPPED_CAR)
+  assert tr.radar_follow == radar
+  return tr
+
+
+def _pull(tr, frames=200, radar=True, **kw):
+  base = dict(v_ego=8 * MPH, lead_prob=0.95, lead_d=14.0, lead_v=8.2 * MPH, lead_a=1.0, lead_y=0.1, model_accel=0.3,
+              radar_has_lead=radar)
+  base.update(kw)
+  n = 0
+  while n < frames and tr.update(_sw(**base)):
+    n += 1
+  return n
+
+
+def test_drive_4f_tag6_car_ahead_pulling_away_releases_at_once():
+  # it pulled away at 0.9-1.5 m/s^2 from our speed (8 mph) at t 800.8; our restore landed only at 802.5 (the radar
+  # match release's 2 s). Now: released after PULL_AWAY_ACCEL_TIME
+  tr = _pull_away_trigger()
+  n = _pull(tr)
+  assert tr.release_reason == scs.PULLING_AWAY and n <= 80, (tr.release_reason, n)     # tag 6: ~801.5, not 802.5
+
+
+def test_pulling_away_needs_a_sure_same_car_the_model_going_and_the_radar_or_a_faster_car():
+  # review: an untracked car that may stop again, the model still braking, a low-confidence car, a cut-in
+  cases = (dict(model_accel=-1.0), dict(plan_stop=True), dict(lead_prob=0.5), dict(lead_v=6 * MPH, v_ego=12 * MPH))
+  for kw in cases:
+    tr = _pull_away_trigger()
+    _pull(tr, 150, **kw)
+    assert tr.release_reason != scs.PULLING_AWAY, kw
+  tr = _pull_away_trigger()                                      # a cut-in: another car 8 m ahead
+  n = _pull(tr, 150, lead_d=6.0)
+  assert tr.release_reason != scs.PULLING_AWAY or n >= int(scs.PULL_AWAY_SAME_CAR / scs.DT_CTRL), n
+  tr = _pull_away_trigger(radar=False)                           # no radar: at our speed is not enough ...
+  _pull(tr, 150, radar=False)
+  assert tr.release_reason != scs.PULLING_AWAY
+  tr = _pull_away_trigger(radar=False)                           # ... it must be faster than us
+  _pull(tr, 150, radar=False, lead_v=12 * MPH)
+  assert tr.release_reason == scs.PULLING_AWAY
+
+
+def test_driver_hold_to_the_minimum_is_not_booked_as_our_tap():
+  # review: our SET- tap in flight (dropped by the car), the driver holds SET- down to the minimum: theirs
+  from types import SimpleNamespace as N
+  lg = cs.CurveSlowdownLogic(False)
+  lg.inflight.append(cs.Press(direction=cs.SET_MINUS, frame=0))
+  lg.anchor, lg.last_set_speed = 45 * MPH, 20 * MPH
+  lg.last_driver_edge[cs.SET_MINUS] = lg.frame
+  lg.prev_driver_button = cs.SET_MINUS
+  lg._observe_set_speed(N(set_speed=cs.CAR_MIN_SET_SPEED, v_ego=15 * MPH, cruise_enabled=True, driver_button=cs.SET_MINUS))
+  assert all(p.landed == 0 for p in lg.inflight + lg.expired)

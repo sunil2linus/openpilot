@@ -83,7 +83,9 @@ DRIVER_QUIET = 1.0                    # s: none of our frames while the driver i
 EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
 # Stopped car ahead (shares this controller with the curve slowdown)
-STOP_MIN_SET_SPEED = 20.0 * MS_PER_MPH   # floor for a stopped car: one step above the car's own 30 km/h minimum
+# floor for a stopped car: the car's own 30 km/h minimum (18.6 mph, the dash shows 19); the long press stops at 20
+# and one SET- tap lands on the minimum (owner, Nov 6: "one more 1 mph step down to 19, every mph matters")
+STOP_MIN_SET_SPEED = 30.0 / 3.6
 MAX_STOP_PRESSES = 30                    # SET- budget (taps + holds) per stopped car
 RELAXED_GAP_FRAMES = 50                  # 0.5 s between taps when the stopped car is not urgent
 # Long press. Measured from the owner's own holds in the logs (5 holds, routes 31/32): on button-down
@@ -573,7 +575,14 @@ class CurveSlowdownLogic:
           self.holds_ok = False
         self._consume_ours(direction, int(math.ceil(steps)))
         return
+      if (ours_k is not None and not hold_open and direction == SET_MINUS and steps < 1.75 and
+          driver_k is None and not driver_recent and
+          abs(i.set_speed - CAR_MIN_SET_SPEED) < self.half_step):
+        # our SET- tap from the whole step above onto the car's 30 km/h minimum: one press, one (short) step
+        self._consume_ours(direction, 1)
+        return
       if (ours_k is not None and direction == SET_PLUS and self.prev_set_speed is not None and
+          driver_k is None and not driver_recent and
           abs(self.prev_set_speed - CAR_MIN_SET_SPEED) < self.half_step):
         # our first SET+ from the car's 30 km/h minimum lands on the next whole step: one press, one (short) step
         self._consume_ours(direction, 1)
