@@ -173,8 +173,9 @@ UNSURE_SLOWER = 4.5          # m/s (10 mph): the car is at least this much slowe
 UNSURE_MIN_SPEED = 25 * MS_PER_MPH
 UNSURE_HOLD = 0.5            # s (cumulative, EARLY_DROPOUT gaps) before the taps start
 UNSURE_MAX_DROP = 5 * MS_PER_MPH
-UNSURE_LOST_TIME = 1.0       # s out of our path or no longer much slower (and not stopping): released, speed back;
-                             # not seen: RELEASE_LOST_TIME, speed not back at once (a far low-confidence lead blinks)
+# out of our path or no longer much slower (and not stopping) this long: released, the speed back; not seen:
+# RELEASE_LOST_TIME, the speed not back at once (a far low-confidence lead blinks)
+UNSURE_LOST_TIME = 1.0       # s
 UNSURE_SURE_TIME = 1.0       # s sure (MIN_PROB) without a stop start taking over: a slower moving car, the MRCC's
 UNSURE_REARM = 3.0           # s after an unsure release before another
 SLOW_UNSURE = "slow car (unsure)"
