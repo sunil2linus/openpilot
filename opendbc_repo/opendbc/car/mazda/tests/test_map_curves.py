@@ -1136,3 +1136,167 @@ def test_the_planner_says_map_curves_paused_once_per_drive(monkeypatch):
   assert drive(100, -400, MC.LOST_TIME + 1) == []                        # once per drive
   clock[0] += 60.0                                                       # next drive
   assert drive(100, -400, MC.LOST_TIME + 1) == ["paused"]
+
+
+# ---------------- the pass window (drive 44, Dobry Drive) ----------------
+
+class _FakeMC:
+  """What _measure_pass reads from MapCurves: the curve we are in and the metres to its exit, as MapCurves finds
+  them (from NEAR past the start to NEAR before the end) on a GPS position that moves once a second and lags."""
+
+  def __init__(self, memory):
+    from types import SimpleNamespace as N
+    self.memory, self.chain_id, self.inside, self.inside_exit = memory, 1, None, float("inf")
+    self.next_entry, self.next_curve = float("inf"), None
+    self.veto = N(is_vetoed=lambda key: False)
+
+
+def _curve(k, start, length, turn, r_map):
+  return {"apex": (42.6 + 0.01 * k, -83.1), "r": r_map, "s_a": float(start), "len": float(length), "turn": float(turn),
+          "name": f"c{k}", "x0": float(start), "x1": float(start + length)}
+
+
+def _drive_road(road, curves, tmp_path, v=18.0, lag_m=None, gap_at=None, speed=None, rebuild_at=None, bad_fix_at=None,
+                stall_at=None):
+  """road: [(metres, signed curvature)]; curves: map curves placed at x0..x1 (m along the road). speed(x): m/s (else
+  v); rebuild_at: the curve files are rebuilt there (new dicts, same curves); bad_fix_at: one GPS fix 60 m off there;
+  stall_at: one 0.5 s pause of the planner there. Returns the planner (its memory has the passes)."""
+  from types import SimpleNamespace as N
+
+  class P:
+    def get(self, key, encoding=None):
+      return None
+
+  mp = MC.MapCurvesPlanner(P(), P())
+  mp.mc = _FakeMC(MC.CurveMemory(str(tmp_path / f"pw{len(curves)}{lag_m}{gap_at}{rebuild_at}{bad_fix_at}{stall_at}.json")))
+  mp.trust = N(shaky=False)
+  mp.pass_curve, mp.pass_samples = None, []
+  lag_m = v * MC.PASS_GPS_LAG if lag_m is None else lag_m
+  x, frame, gps_x = 0.0, 0, -1e9
+  segs, s0 = [], 0.0
+  for length, k in road:
+    segs.append((s0, s0 + length, k))
+    s0 += length
+  done = set()
+  while x < s0:
+    k = next(kk for a, b, kk in segs if a <= x < b)
+    vx = speed(x) if speed is not None else v
+    if rebuild_at is not None and x >= rebuild_at and "rebuild" not in done:
+      done.add("rebuild")
+      curves = [dict(c) for c in curves]
+    if frame % 20 == 0:
+      gps_x = x - lag_m                                   # a new fix, already lagging
+      if bad_fix_at is not None and x >= bad_fix_at and "bad" not in done:
+        done.add("bad")
+        gps_x += 60.0
+    inside = None
+    for c in curves:
+      if c["x0"] + MC.NEAR < gps_x < c["x1"] - MC.NEAR:
+        inside = c
+        break
+    mp.mc.inside = inside
+    mp.mc.inside_exit = (inside["x1"] - gps_x) if inside is not None else float("inf")
+    ahead = [c for c in curves if c is not inside and (c["x0"] - gps_x > 0 or abs(c["x0"] - gps_x) < MC.NEAR)]
+    nxt = min(ahead, key=lambda c: c["x0"], default=None)
+    mp.mc.next_curve, mp.mc.next_entry = nxt, (abs(nxt["x0"] - gps_x) if nxt is not None else float("inf"))
+    near = min(curves, key=lambda c: abs((c["x0"] + c["x1"]) / 2 - gps_x))
+    lat = near["apex"][0] + (gps_x - (near["x0"] + near["x1"]) / 2) / 111320.0
+    mp.counter = frame + (5 if gap_at is not None and x >= gap_at else 0)
+    sm = {"carState": N(vEgo=vx, steeringPressed=False, leftBlinker=False, rightBlinker=False),
+          "carControl": N(latActive=True, actuators=N(torque=0.4)), "controlsState": N(curvature=k)}
+    dt = MC.PASS_DT
+    if stall_at is not None and x >= stall_at and "stall" not in done:
+      done.add("stall")
+      dt = 0.5
+      x += vx * (dt - MC.PASS_DT)
+    mp._measure_pass(sm, inside, lat, near["apex"][1], dt=dt)
+    x += vx * MC.PASS_DT
+    frame += 1
+  return mp
+
+
+def _learned(mp, c):
+  e = mp.mc.memory._find(*c["apex"])
+  return [p[0] for p in e["passes"]] if e else []
+
+
+def test_drive_44_a_short_curve_is_measured_from_before_its_start_to_past_its_end(tmp_path):
+  # Dobry Drive: the map says 131 m, 64 m long, 20 deg; the road is ~165 m and turns 21 deg. Counting only the
+  # stretch the car was "inside" (15 m in from each end, on a once-a-second GPS 13-18 m behind) measured 6-8 deg
+  # and dropped every pass as "did not turn".
+  arc = math.radians(21) * 165
+  for lag in (8.0, 12.6, 18.0):
+    c = _curve(0, 150, 64, 20, 131.0)
+    mp = _drive_road([(150 - (arc - 64) / 2, 0.0), (arc, 1 / 165), (300, 0.0)], [c], tmp_path, lag_m=lag)
+    got = _learned(mp, c)
+    assert len(got) == 1 and abs(got[0] - 165) < 8, (lag, got, getattr(mp, "pass_drops", []))
+    assert not getattr(mp, "pass_drops", [])
+
+
+def test_a_parallel_road_still_does_not_count(tmp_path):
+  c = _curve(0, 150, 64, 20, 131.0)
+  mp = _drive_road([(500, 0.0)], [c], tmp_path)                       # the map's curve, but the car drove straight
+  assert _learned(mp, c) == [] and mp.pass_drops[0]["reason"] == "turn"
+
+
+def test_back_to_back_curves_do_not_share_their_stretch(tmp_path):
+  # a gentle left (400 m, 20 deg) straight into a tight right (100 m, 35 deg): the gentle one must not take the tight
+  # one's start (its 1 s tightest stretch would read ~100 m), nor the tight one the gentle one's end
+  la, lb = math.radians(20) * 400, math.radians(35) * 100
+  a, b = _curve(0, 150, la, 20, 380.0), _curve(1, 150 + la, lb, 35, 100.0)
+  mp = _drive_road([(150, 0.0), (la, 1 / 400), (lb, -1 / 100), (300, 0.0)], [a, b], tmp_path)
+  ra, rb = _learned(mp, a), _learned(mp, b)
+  assert len(ra) == 1 and ra[0] > 300, ra
+  assert len(rb) == 1 and abs(rb[0] - 100) < 5, rb
+
+
+def test_a_gap_in_the_calls_starts_the_pass_over(tmp_path):
+  arc = math.radians(21) * 165
+  c = _curve(0, 150, 64, 20, 131.0)
+  # the calls stop for a moment in the middle of the curve (no GPS): the distance travelled is unknown, nothing learned
+  mp = _drive_road([(150 - (arc - 64) / 2, 0.0), (arc, 1 / 165), (300, 0.0)], [c], tmp_path, gap_at=180.0)
+  assert _learned(mp, c) == []
+
+
+def test_a_one_frame_steering_blip_does_not_spoil_a_clean_pass():
+  blip = int(MC.PASS_SAT_BLIP / 0.05)
+  assert abs(MC.curve_pass_radius(_pass(150)[:60] + _pass(150, cmd=0.99)[:blip] + _pass(150)[:60]) - 150) < 0.5
+  assert MC.curve_pass_radius(_pass(150)[:60] + _pass(150, cmd=0.99)[:blip + 1] + _pass(150)[:60]) is None
+
+
+def _dobry(tmp_path, **kw):
+  arc = math.radians(21) * 165
+  c = _curve(0, 150, 64, 20, 131.0)
+  return c, _drive_road([(150 - (arc - 64) / 2, 0.0), (arc, 1 / 165), (300, 0.0)], [c], tmp_path, **kw)
+
+
+def test_a_slow_pass_through_a_sharp_curve_is_not_read_from_the_road_around_it(tmp_path):
+  # review: a 40 m, 90 deg bend at 7 m/s with a 12 m/s approach; only the straight road before and after it was fast
+  # enough to measure, which read as "never turned" (2000 m): the curve would have been planned at 47 mph, not 21
+  arc = math.radians(90) * 40
+  c = _curve(0, 150, arc, 90, 40.0)
+  mp = _drive_road([(150, 0.0), (arc, 1 / 40), (300, 0.0)], [c], tmp_path,
+                   speed=lambda x: 7.0 if 140 <= x <= 160 + arc else 12.0)
+  assert _learned(mp, c) == []
+
+
+def test_curve_files_rebuilt_in_the_middle_of_a_pass_do_not_cut_it(tmp_path):
+  # a curve that starts gentle (100 m at 400 m) and tightens (40 m at 120 m); the files are rebuilt in the gentle part
+  # (new dicts for the same curves): cut there, the pass would read the gentle part only (~400 m, too gentle)
+  c = _curve(0, 150, 140, 33, 150.0)
+  mp = _drive_road([(150, 0.0), (100, 1 / 400), (40, 1 / 120), (300, 0.0)], [c], tmp_path, rebuild_at=215.0)
+  got = _learned(mp, c)
+  assert len(got) == 1 and abs(got[0] - 120) < 6, (got, getattr(mp, "pass_drops", []))
+
+
+def test_one_gps_fix_far_off_does_not_move_the_pass(tmp_path):
+  c, mp = _dobry(tmp_path, bad_fix_at=160.0)
+  got = _learned(mp, c)
+  assert len(got) == 1 and abs(got[0] - 165) < 8, (got, getattr(mp, "pass_drops", []))
+
+
+def test_a_stalled_planner_starts_the_pass_over(tmp_path):
+  c, mp = _dobry(tmp_path, stall_at=180.0)                            # half a second without a planner cycle, mid-curve
+  assert _learned(mp, c) == []
+  c, mp = _dobry(tmp_path, stall_at=20.0)                             # well before the curve: the pass is still whole
+  assert len(_learned(mp, c)) == 1

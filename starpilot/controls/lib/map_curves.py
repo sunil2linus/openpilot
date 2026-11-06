@@ -95,6 +95,23 @@ TIMER_EPS = 1e-6                # s: timers summed from dt steps reach their lim
 NEAREST_SEARCH = 220.0          # m: the nearest road is measured this far (logs: how far off the GPS is)
 PASS_TURN_SHARE = 0.5      # a pass that turned less than this share of the curve's turn did not drive the curve
 PASS_TURN_MIN = 10.0       # deg: ... checked for curves that turn at least this much
+# The pass is the car's own driving from PASS_PRE before the curve's start to PASS_POST past its end, placed by the
+# distance the car travelled (not by the moments it counted as inside the curve). Drive 44, Dobry Drive (map 131 m,
+# 64 m long, 20 deg): "inside" starts once the start is NEAR behind and ends NEAR before the end, on a GPS position
+# that moves once a second (~18 m at 40 mph) and lags, so only 2 s right after the tightest part were measured: 6-8
+# deg of the 21 deg the car turned, and every pass was dropped as "did not turn" (drives 3e to 4c, the speed never
+# learned). The end is placed from the distance to the curve's exit (the smallest estimate: the freshest GPS fix),
+# less the distance driven in PASS_GPS_LAG (drive 44: the car's own turn was centred 0.6-0.9 s before the map curve's
+# middle as placed from the GPS, 4-17 m on 7 passes).
+PASS_GPS_LAG = 0.7         # s
+PASS_PRE = 25.0            # m before the curve's start ...
+PASS_POST = 25.0           # m ... and after its end (what is left of the GPS and map error)
+PASS_DT = 0.05             # s per planner cycle (the pass functions assume it too)
+PASS_MAX_DT = 0.2          # s: a longer pause between planner cycles starts the pass over
+# a pass counts for its radius only with this share of it at PASS_MIN_SPEED or more (review of the window: a 40 m bend at
+# 7 m/s with a 12 m/s approach left only the straight road around it, "2000 m")
+PASS_FAST_SHARE = 0.9
+PASS_BUFFER = 2400         # planner cycles of driving kept for the pass window (120 s)
 # frogpilotPlan.mapNavExit
 NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
 
@@ -641,7 +658,10 @@ MEMORY_RANGE = (0.7, 5.0)  # measured radius used within this factor of the map'
 MEMORY_MAX_R = 2000.0      # m: a pass that never really turned counts as this
 PASS_MIN_SPEED = 8.0       # m/s
 PASS_MIN_TIME = 2.0        # s of samples in the curve
-PASS_SATURATED = 0.98      # |steer command|: the car could not follow (it goes wide): the pass does not count
+PASS_SATURATED = 0.98      # |steer command|: the car could not follow (it goes wide): the pass does not count ...
+# ... unless at the limit only this long in all (drive 44, Dobry Drive: one frame at 0.987 entering the curve at 40 mph,
+# the car followed the curve fine)
+PASS_SAT_BLIP = 0.1        # s
 PASS_FILTER = 1.0          # s moving average of the measured curvature
 # Steering at its limit: the Torque Interceptor could not steer this curve at that speed (drive 3d: the 30 mph West
 # Utica curve maxed the steering at 37 mph on every pass, FrogPilot's too). Such a pass caps the curve's speed.
@@ -683,9 +703,13 @@ def curve_pass_radius(samples, dt=0.05, max_r=MEMORY_MAX_R):
   |steer command|) per planner cycle while in the curve."""
   if not samples or len(samples) * dt < PASS_MIN_TIME:
     return None
-  if any((not lat) or driver or cmd >= PASS_SATURATED for _, _, lat, driver, cmd in samples):
+  if any((not lat) or driver for _, _, lat, driver, _ in samples):
+    return None
+  if sum(1 for _, _, _, _, cmd in samples if cmd >= PASS_SATURATED) * dt > PASS_SAT_BLIP + 1e-9:
     return None
   ks = [abs(k) for v, k, _, _, _ in samples if v >= PASS_MIN_SPEED]
+  if len(ks) < PASS_FAST_SHARE * len(samples):
+    return None     # slow through (part of) the curve: the fast part left may be only the road before and after it
   n = max(int(round(PASS_FILTER / dt)), 1)
   if len(ks) < n:
     return None
@@ -713,6 +737,11 @@ def curve_pass_saturation(samples, dt=0.05):
         best_len, best_start = k - run_start, run_start
       run_start = None
   return samples[best_start][0]
+
+
+def same_curve(a, b):
+  """The same map curve (curve files rebuilt by a rescan give new dicts for it)."""
+  return a.get("s_a") == b.get("s_a") and a.get("apex") == b.get("apex") and a.get("len") == b.get("len")
 
 
 def driven_turn(samples, dt=0.05):
@@ -1090,6 +1119,8 @@ class MapCurves:
     self.chain_id = 0
     self.inside = None           # the road curve we are driving through (also after its apex), for curve memory
     self.inside_exit = float("inf")  # m to its exit
+    self.next_entry = float("inf")   # m to the start of the nearest road curve ahead (curve memory: where a pass ends) ...
+    self.next_curve = None           # ... and that curve
     self.geom = {}               # id(curve) -> (m to its apex, negative when behind; m to its exit) this frame
     self.veto_status = 0         # starpilotPlan.mapCurveVeto
     self.veto_radius = 0.0
@@ -1132,6 +1163,8 @@ class MapCurves:
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
           out.append((c, d_entry))
+          if not c.get("ramp") and d_entry < self.next_entry:
+            self.next_entry, self.next_curve = d_entry, c
       elif ex_ahead and d_exit > NEAR and d_exit <= c["len"] + 60:
         if not c.get("ramp") and d_exit < inside_exit:
           # the curve we are in is the one we leave first (the next one may already match up to 60 m before it)
@@ -1311,7 +1344,8 @@ class MapCurvesPlanner:
       self.trust.reset_drive()
       self.pause_announced, self.prev_slowing = False, False
       self.held_logged = set()
-    dt = min(max(now - getattr(self, "last_call", now - 0.05), 0.01), 0.2)
+    self.call_dt = now - getattr(self, "last_call", now - 0.05)   # unclamped: curve memory's distance travelled
+    dt = min(max(self.call_dt, 0.01), 0.2)
     self.prev_started = started
     self.last_call = now
     self.counter += 1
@@ -1357,7 +1391,7 @@ class MapCurvesPlanner:
       self.pause_announced = True
       self.notice = "paused"     # once per drive, and whenever a pause ends a slowdown (the speed comes back)
     self._feature_log(mc, v_ego, set_speed, now, gps_position)
-    self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"])
+    self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"], dt=self.call_dt)
     self.prev_slowing = mc.curve is not None and set_speed > 0 and \
       plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel) < set_speed - 2 * MPH
     # notices: once per curve that would need a slowdown, once per announced exit
@@ -1429,28 +1463,86 @@ class MapCurvesPlanner:
     except Exception:
       pass
 
-  def _measure_pass(self, sm, inside, lat=None, lon=None):
-    """Curve memory: collect the car's own path through the road curve we are in; when we leave it, a clean pass
-    adds its measured radius (never raises into the planner). A pass counts for nothing when the turn signal was
-    on in it (a lane change) or the car never came within PASS_APEX_NEAR of the apex (another road)."""
+  def _measure_pass(self, sm, inside, lat=None, lon=None, dt=PASS_DT):
+    """Curve memory: keep the car's own driving (with the distance travelled); once past the end of the road curve
+    we were in, the stretch from PASS_PRE before its start to PASS_POST past its end is the pass, and a clean pass
+    adds its measured radius (never raises into the planner). A pass counts for nothing when the turn signal was on
+    in it (a lane change) or the car never came within PASS_APEX_NEAR of the apex (another road)."""
     try:
-      if inside is not self.pass_curve:
-        if self.pass_curve is not None and self.mc.memory is not None:
-          self._finish_pass()
-        self.pass_curve, self.pass_samples = inside, []
-        self.pass_blinker, self.pass_apex, self.pass_exit, self.pass_vetoed = False, float("inf"), float("inf"), False
-        self.pass_shaky = False
-      if inside is not None and len(self.pass_samples) < 2400:
-        cs, cc = sm["carState"], sm["carControl"]
-        self.pass_samples.append((float(cs.vEgo), float(sm["controlsState"].curvature), bool(cc.latActive),
-                                  bool(cs.steeringPressed), abs(float(cc.actuators.torque))))
-        self.pass_blinker |= bool(cs.leftBlinker or cs.rightBlinker)
-        if lat is not None and "apex" in inside:
-          self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *inside["apex"]))
-        self.pass_exit = self.mc.inside_exit
-        self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, inside["s_a"]))
-        self.pass_shaky |= bool(self.trust.shaky)
+      counter = getattr(self, "counter", 0)
+      if counter - getattr(self, "pass_frame", counter) > 1 or not hasattr(self, "pass_buf") or not 0.0 <= dt <= PASS_MAX_DT:
+        # a gap in the calls (no GPS, a pause between drives, a stalled planner): the distance travelled is unknown
+        self.pass_buf, self.pass_x, self.pass_prev_end = [], 0.0, -float("inf")
+        self.pass_curve = None
+      self.pass_frame = counter
+      cs, cc = sm["carState"], sm["carControl"]
+      v = max(float(cs.vEgo), 0.0)
+      self.pass_x += v * dt
+      x = self.pass_x
+      self.pass_buf.append((x, (v, float(sm["controlsState"].curvature), bool(cc.latActive), bool(cs.steeringPressed),
+                                abs(float(cc.actuators.torque))), bool(cs.leftBlinker or cs.rightBlinker)))
+      if len(self.pass_buf) > PASS_BUFFER + 200:
+        del self.pass_buf[:200]
+      if inside is not None and self.pass_curve is not None and inside is not self.pass_curve and \
+         same_curve(inside, self.pass_curve):
+        self.pass_curve = inside              # the same curve from rebuilt curve files (a rescan): carry on
+      if inside is not None and inside is not self.pass_curve:
+        if self.pass_curve is not None:
+          self._end_pass(self._pass_end())    # in the next curve already: this pass ends where that one starts
+        self.pass_curve, self.pass_x_exit, self.pass_x_next = inside, float("inf"), float("inf")
+        self.pass_apex, self.pass_exit, self.pass_vetoed, self.pass_shaky = float("inf"), float("inf"), False, False
+        self.pass_exits, self.pass_exit_seen = [], None
+      c = self.pass_curve
+      if c is None:
+        return
+      if inside is c:
+        if self.mc.inside_exit != self.pass_exit_seen:
+          # a new GPS fix (the distance only changes with one): its estimate of the exit; the middle of them all, so
+          # one fix far off does not move the pass
+          self.pass_exit_seen = self.mc.inside_exit
+          self.pass_exits.append(x + self.mc.inside_exit - v * PASS_GPS_LAG)
+          ex = sorted(self.pass_exits)
+          self.pass_x_exit = ex[(len(ex) - 1) // 2]
+        self.pass_exit = min(self.pass_exit, self.mc.inside_exit)
+      nxt = getattr(self.mc, "next_curve", None)
+      if nxt is not None and nxt is not c and not same_curve(nxt, c):
+        # where the next curve starts: a back-to-back curve (an S-bend) must not end up in this pass (its opposite
+        # turn cancels this one's, its tighter stretch reads as this curve's radius)
+        self.pass_x_next = min(self.pass_x_next, x + self.mc.next_entry - v * PASS_GPS_LAG)
+      if lat is not None and "apex" in c:
+        self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *c["apex"]))
+      self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, c["s_a"]))
+      self.pass_shaky |= bool(self.trust.shaky)
+      if not self._same(inside, c) and x >= self._pass_end():
+        self._end_pass(self._pass_end())
     except Exception:
+      self.pass_curve, self.pass_buf = None, []
+
+  @staticmethod
+  def _same(a, b):
+    return a is b or (a is not None and b is not None and same_curve(a, b))
+
+  def _pass_end(self):
+    """m travelled where the pending pass ends: PASS_POST past its curve's end, or where the next curve starts
+    (never before this curve's own end)."""
+    return min(self.pass_x_exit + PASS_POST, max(self.pass_x_next, self.pass_x_exit))
+
+  def _end_pass(self, x_end):
+    """The pass through self.pass_curve ends at x_end (m travelled): its samples, then _finish_pass."""
+    c = self.pass_curve
+    self.pass_curve = None
+    x_start = max(self.pass_x_exit - float(c.get("len", 0.0)) - PASS_PRE, self.pass_prev_end)
+    self.pass_prev_end = x_end              # the next pass never takes this one's stretch (an S-bend)
+    if self.mc.memory is None or not (x_start < x_end < float("inf")):
+      return
+    if not self.pass_buf or self.pass_buf[0][0] > x_start + 1.0:
+      return                                # the kept driving does not reach back to its start (a gap): not a pass
+    window = [(s, b) for xx, s, b in self.pass_buf if x_start <= xx <= x_end]
+    self.pass_curve, self.pass_samples = c, [s for s, _ in window]
+    self.pass_blinker = any(b for _, b in window)
+    try:
+      self._finish_pass()
+    finally:
       self.pass_curve, self.pass_samples = None, []
 
   def _finish_pass(self):
