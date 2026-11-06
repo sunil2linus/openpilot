@@ -88,8 +88,13 @@ def test_trigger_rejects_phantom_adjacent_and_slow_ego():
     assert not tr.update(inp(lead_y=1.5))         # adjacent lane
   assert any("yRel" in b for b in tr.blockers(inp(lead_y=1.5)))
   for _ in range(100):
-    assert not tr.update(inp(lead_prob=0.8))
+    tr.update(inp(lead_prob=0.8))
+  # not sure enough for the stopped car start; the unsure car taps instead (owner, Nov 5: the yellow triangle)
+  assert tr.kind == scs.SLOW_UNSURE and not tr.urgent
   assert any("prob" in b for b in tr.blockers(inp(lead_prob=0.8)))
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(inp(lead_status=False))
   for _ in range(100):
     assert not tr.update(inp(v_ego=15 * MPH))
   for _ in range(100):
@@ -584,10 +589,12 @@ def test_approach_45_mph_to_a_slow_car_at_a_red_light_drops_at_once_never_below_
   assert first is not None and first <= 90, first
   assert r["holds"] and r["holds"][0] <= 90                  # urgent: a long press straight away
   assert r["min"] >= 20 - 1e-6 and r["min"] <= 33, r["min"]
-  # the same car with the model not slowing (just a slow car, no stop ahead): nothing happens
+  # the same car with the model not slowing (just a slow car, no stop ahead): only the unsure car's taps (owner, Nov
+  # 5: the yellow triangle), 1 mph each, at most UNSURE_MAX_DROP, no long press
   lead = StoppedLead(95, v_mph=13.0, prob=0.7, y=1.0)
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 800, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0)
-  assert not r["ever_active"] and r["presses"] == [] and r["holds"] == []
+  assert r["holds"] == [] and all(b == cs.SET_MINUS for _, b in r["presses"])
+  assert r["min"] >= 45 - scs.UNSURE_MAX_DROP / MPH - 1 - 1e-6, r["min"]
 
 
 def test_restore_at_a_stop_holds_most_of_the_way_up():
@@ -695,11 +702,17 @@ def test_a_low_confidence_slow_car_starts_the_slowdown_only_after_a_planned_stop
   while not tr.update(_latched_inputs(lead_status=(n % 15 != 0))):   # the car blinks out now and then
     n += 1
     assert n < 200
+  for _ in range(100):
+    if tr.kind == scs.STOP_WITH_CAR:
+      break
+    tr.update(_latched_inputs(lead_status=True))
   assert tr.kind == scs.STOP_WITH_CAR and tr.early and not tr.urgent      # taps until it is confirmed
-  # without a planned stop first: nothing (the near-miss log says why)
+  # without a planned stop first: only the unsure car taps (at most UNSURE_MAX_DROP), not the stop with car
   tr = scs.StoppedCarTrigger()
   for _ in range(300):
-    assert not tr.update(_latched_inputs(plan_stop=False))
+    tr.update(_latched_inputs(plan_stop=False))
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and not tr.urgent
+  assert abs(tr.target - (45 * MPH - scs.UNSURE_MAX_DROP)) < 0.6
   assert any("not latched" in b for b in tr.blockers(_latched_inputs(plan_stop=False)))
 
 
@@ -722,15 +735,18 @@ def test_the_early_start_still_needs_a_slow_car_near_our_lane_and_the_model_slow
         tr.update(_latched_inputs(lead_status=False))
       for _ in range(300):
         tr.update(_latched_inputs(**kw))
-      assert not tr.active, kw
+      if "model_accel" in kw or "lead_prob" in kw:              # a slower car in our path: only the unsure taps
+        assert not tr.active or tr.kind == scs.SLOW_UNSURE, kw
+      else:
+        assert not tr.active, kw
 
 
 def test_an_early_start_is_confirmed_when_the_car_is_sure_and_then_slows_fast():
   tr = scs.StoppedCarTrigger()
   for _ in range(40):
     tr.update(_latched_inputs(lead_status=False))
-  while not tr.update(_latched_inputs()):
-    pass
+  while tr.kind != scs.STOP_WITH_CAR or not tr.active:      # (the unsure car taps first, then the early start)
+    tr.update(_latched_inputs())
   assert not tr.urgent
   for _ in range(int(scs.EARLY_CONFIRM_TIME / scs.DT_CTRL) + 1):
     tr.update(_latched_inputs(lead_prob=0.5, lead_d=100.0))
@@ -799,7 +815,9 @@ def test_2112_replay_starts_earlier_and_lower_than_on_the_drive():
   r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, F(30.5), lead=lead, stop_mode=2, max_drop=10, model=model, plan=plan)
   first = first_frame(r)
   assert first is not None and first <= F(26.0), (first, F(26.0))
-  assert r["sets"][F(28.0)] / MPH >= 40 - 1e-6        # unsure until t 28: gentle taps only
+  # unsure until t 28: taps only (the unsure car from t 23) until the planned stop has held WARN_START_DEBOUNCE, then
+  # the stop ahead start's long press (the car ahead no longer "relevant" once the taps slowed us)
+  assert [f for f in r["holds"] if f < F(24.5 + scs.WARN_START_DEBOUNCE)] == []
   i = F(29.5)
   assert r["sets"][i] / MPH <= 38 + 1e-6, r["sets"][i] / MPH   # on the drive: 40 at t 29.5
   assert r["min"] >= 20 - 1e-6
@@ -1722,3 +1740,141 @@ def test_a_planned_stop_that_lasts_past_the_warning_is_not_released_by_the_dip_r
   for n in range(300):
     tr.update(_latched_inputs(lead_status=False, a_ego=-1.0 if n > 55 else 0.0))
   assert tr.active and tr.kind == scs.STOP_AHEAD
+
+
+# ---- the unsure car (owner, Nov 5: "when we see the yellow triangle start slowing down 1 mph at a time until the
+# confidence score reaches 0.85") ----
+
+class _Unsure(StoppedLead):
+  """A stopped car in our lane, seen from 120 m at a low confidence that rises to `sure_prob` at `sure_at` (s)."""
+  def __init__(self, d0=120.0, v_mph=0.0, prob=0.3, sure_at=None, sure_prob=0.95, gone_at=None, y=0.2):
+    super().__init__(d0, v_mph=v_mph, prob=prob, y=y)
+    self.sure_at, self.sure_prob, self.gone_at, self.p0 = sure_at, sure_prob, gone_at, prob
+
+  def state(self, f, car):
+    t = f * T.DT
+    if self.gone_at is not None and t >= self.gone_at:
+      return (False, 0.0, 0.0, 0.0, 0.0)
+    p = self.sure_prob if (self.sure_at is not None and t >= self.sure_at) else self.p0
+    return (True, p, self.d, self.v, self.y)
+
+
+def _sets_changes(r):
+  s = r["sets"]
+  return [(k, round(s[k] / MPH, 1)) for k in range(1, len(s)) if abs(s[k] - s[k - 1]) > 1e-6]
+
+
+def test_unsure_car_taps_1_mph_at_a_time_at_most_5_mph():
+  # no planned stop (the model is not slowing) and the confidence never reaches 0.85: taps only, 1 mph each
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 900, lead=_Unsure(125.0, v_mph=15.0), stop_mode=2, max_drop=10,
+          model=lambda f: 0.0)
+  ch = _sets_changes(r)
+  assert r["holds"] == [] and all(b == cs.SET_MINUS for _, b in r["presses"])
+  assert ch and ch[0][0] <= 100, ch                      # 0.3 s cruise settle + 0.5 s hold, then the first tap
+  assert all(abs(a[1] - b[1]) <= 1.0 + 1e-6 for a, b in zip([(0, 45.0)] + ch[:-1], ch, strict=True)), ch      # 1 mph steps
+  assert all(b[0] - a[0] >= 45 for a, b in zip(ch[:-1], ch[1:], strict=True)), ch                             # ~0.5 s apart
+  assert r["min"] >= 45 - 5 - 1e-6, r["min"]
+  assert r["trigger"].kind == scs.SLOW_UNSURE
+
+
+def test_unsure_car_hands_over_to_the_stopped_car_at_085():
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1000, lead=_Unsure(150.0, sure_at=3.0), stop_mode=2, max_drop=10,
+          model=lambda f: 0.0)
+  before = [f for f, b in r["presses"] if f < 300]
+  assert before and all(b == cs.SET_MINUS for f, b in r["presses"] if f < 300)
+  assert [f for f in r["holds"] if f < 300] == []        # taps only while unsure
+  assert r["trigger"].kind == scs.STOPPED_CAR and r["trigger"].confirmed
+  assert [f for f in r["holds"] if f >= 300], r["holds"]  # then the stopped car's long press
+  assert r["min"] >= 20 - 1e-6
+
+
+def test_unsure_car_false_alarm_gives_the_speed_back():
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=_Unsure(120.0, v_mph=10.0, gone_at=2.5), stop_mode=2,
+          max_drop=10, model=lambda f: 0.0)
+  assert r["trigger"].release_reason == scs.UNSURE_GONE
+  assert r["min"] >= 45 - 5 - 1e-6 and abs(r["final"] - 45) < 0.01, (r["min"], r["final"])
+
+
+def test_unsure_car_not_for_the_next_lane_our_speed_or_the_radar():
+  for kw, lead in ((dict(), _Unsure(120.0, y=2.0)),                 # next lane
+                   (dict(), _Unsure(120.0, v_mph=40.0)),            # only 5 mph slower: a car we follow
+                   (dict(), _Unsure(140.0, v_mph=44.0))):                          # (and not slower)
+    r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 400, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0, **kw)
+    assert r["presses"] == [] and r["holds"] == [], lead.__dict__
+  tr = scs.StoppedCarTrigger()
+  i = _sw(lead_prob=0.3, lead_d=110.0, lead_v=0.0, lead_y=0.2, model_accel=0.0)
+  tr.lead_v_f = 0.0
+  assert tr._unsure_car(i)
+  tr.radar_follow = True                                            # the MRCC already follows a car: its job
+  assert not tr._unsure_car(i)
+  tr.radar_follow = False
+  assert not tr._unsure_car(_sw(lead_prob=0.9, lead_d=110.0, lead_v=0.0, lead_y=0.2))   # sure: the normal starts
+
+
+def test_unsure_car_sure_but_moving_releases_and_rearms_after_3_s():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_sw(lead_status=False))
+  n = 0
+  while not tr.update(_sw(lead_prob=0.3, lead_d=110.0, lead_v=25 * MPH, lead_y=0.2, model_accel=0.0)):
+    n += 1
+    assert n < 200
+  assert tr.kind == scs.SLOW_UNSURE
+  for _ in range(int(scs.UNSURE_SURE_TIME / scs.DT_CTRL) + 2):     # sure, still 20 mph slower, no stop planned
+    tr.update(_sw(lead_prob=0.95, lead_d=100.0, lead_v=25 * MPH, lead_y=0.2, model_accel=0.0))
+  assert not tr.active and tr.release_reason == scs.UNSURE_NOT_STOP
+  for _ in range(int(2.5 / scs.DT_CTRL)):                         # unsure again, but within UNSURE_REARM
+    assert not tr.update(_sw(lead_prob=0.3, lead_d=100.0, lead_v=25 * MPH, lead_y=0.2, model_accel=0.0))
+  for _ in range(100):
+    tr.update(_sw(lead_prob=0.3, lead_d=100.0, lead_v=25 * MPH, lead_y=0.2, model_accel=0.0))
+  assert tr.active and tr.kind == scs.SLOW_UNSURE
+
+
+def _u(**kw):
+  base = dict(lead_prob=0.3, lead_d=110.0, lead_v=0.0, lead_y=0.2, model_accel=0.0)
+  base.update(kw)
+  return _sw(**base)
+
+
+def _unsure_started(**kw):
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_sw(lead_status=False))
+  for _ in range(100):
+    if tr.update(_u(**kw)):
+      break
+  return tr
+
+
+def test_unsure_car_cap_is_below_the_set_speed_and_not_for_oncoming_cars():
+  # review: v_ego 30 mph under a 45 set speed (after a stop) aimed at 25: 13 taps; now 5 below the set speed
+  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and abs(tr.target / MPH - 40) < 0.01
+  tr = _unsure_started(lead_v=-15.0)                            # an oncoming car is not "slower"
+  assert not tr.active
+
+
+def test_unsure_car_sure_and_stopped_is_kept_and_a_stopping_car_is_not_a_false_alarm():
+  # a stopped car on a curve: raw yRel 1.4 (the stopped car start's lane check fails), on our path; sure now
+  tr = _unsure_started(lead_y=1.4, lead_y_path=0.2)
+  assert tr.kind == scs.SLOW_UNSURE
+  for _ in range(300):
+    assert tr.update(_u(lead_prob=0.95, lead_y=1.4, lead_y_path=0.2))
+  # matched speed but the car is braking (or a stop planned): not "it sped up"
+  tr = _unsure_started(lead_v=10 * MPH)
+  for _ in range(300):
+    assert tr.update(_u(lead_v=44 * MPH, lead_a=-2.0, v_ego=45 * MPH))
+
+
+def test_unsure_car_blinking_far_lead_does_not_go_up_and_down():
+  # review: a real stopped car that blinks out 1.2 s every 3 s: 45 -> 42 -> 45 -> 42 with the 1 s "gone" release
+  lead = _Unsure(125.0, v_mph=0.0)
+  lead.present = lambda f: (f % 300) < 180
+  orig = lead.state
+
+  def state(f, car):
+    return orig(f, car) if lead.present(f) else (False, 0.0, 0.0, 0.0, 0.0)
+  lead.state = state
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 900, lead=lead, stop_mode=2, max_drop=10, model=lambda f: 0.0)
+  assert [f for f, b in r["presses"] if b == cs.SET_PLUS] == [] and r["holds"] == [], r["presses"]
+  assert r["min"] >= 45 - 5 - 1e-6

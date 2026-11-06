@@ -158,6 +158,29 @@ EARLY_CONFIRM_PROB = 0.4    # an early start is confirmed (holds, fast pace) onc
 EARLY_CONFIRM_TIME = 0.3    # ... for this long, or the stop is urgent
 RELEASE_LOST_TIME_LATCHED = 5.0  # s without the car before "lead lost" while the plan still shows a stop
 
+# A car the camera is not sure of yet (owner, Nov 5: "when we see the yellow triangle let's start slowing down 1 mph at
+# a time until the confidence score reaches 0.85, this way we are not slowing down too much but have a head start").
+# The UI draws the lead triangle for any vision lead (radarState.leadOne.status), at 0.25-0.40 confidence at ~120 m;
+# the stopped car start needs MIN_PROB (0.85), which came 1.2-5.8 s later (drives 4c / 4d: 4c t 584, the confidence
+# stayed 0.25-0.32 all the way, our slowdown 2.4 s and the driver's brake 3.5 s after the triangle). Drives 4c, 4d and
+# 44: 19 such starts, 15 followed by a stop or the driver braking within 12 s, 4 slower moving cars the MRCC followed.
+# SET- taps only (1 mph each, the relaxed pace), at most UNSURE_MAX_DROP below our speed at the start; the stopped car
+# / stop with car / stop ahead starts take the episode over as soon as they hold (confidence, planned stop).
+UNSURE_ENABLED = True
+UNSURE_LATERAL = 1.0         # m: |lead offset from our path|
+UNSURE_MAX_DISTANCE = 130.0  # m
+UNSURE_SLOWER = 4.5          # m/s (10 mph): the car is at least this much slower than us (filtered)
+UNSURE_MIN_SPEED = 25 * MS_PER_MPH
+UNSURE_HOLD = 0.5            # s (cumulative, EARLY_DROPOUT gaps) before the taps start
+UNSURE_MAX_DROP = 5 * MS_PER_MPH
+UNSURE_LOST_TIME = 1.0       # s out of our path or no longer much slower (and not stopping): released, speed back;
+                             # not seen: RELEASE_LOST_TIME, speed not back at once (a far low-confidence lead blinks)
+UNSURE_SURE_TIME = 1.0       # s sure (MIN_PROB) without a stop start taking over: a slower moving car, the MRCC's
+UNSURE_REARM = 3.0           # s after an unsure release before another
+SLOW_UNSURE = "slow car (unsure)"
+UNSURE_GONE = "unsure car gone"
+UNSURE_NOT_STOP = "car confirmed, not a stop"
+
 # Restore after a release where the car may still be ahead (drive 4c, tag 3 / t 778): cruise re-engaged 2 s after the
 # driver braked at a red light; the only car ahead was 79 m away at 36 mph against our 27, yet the set speed came back
 # 35 -> 45 by 0.5 s taps (the "cruise off / brake" release restores gently). Now such a release (CLEAR_RELEASE_REASONS)
@@ -256,6 +279,7 @@ class StoppedCarInputs:
   model_length: float = 0.0         # m: modelV2.position.x[-1] (the planner's model_length), for the lead relevance
   lane_change: bool = False         # modelV2.meta.laneChangeState starting / finishing
   gas_pressed: bool = False
+  set_speed: float = 0.0            # m/s: the cruise set speed (0 unknown), the unsure car's cap is below it
 
 
 def _interp(x, xp, fp):
@@ -362,6 +386,12 @@ class StoppedCarTrigger:
     self.confirm_frame = -1
     self.early_frames = 0
     self.early_gap = 0
+    self.unsure_frames = 0           # the unsure car condition (UNSURE_*)
+    self.unsure_gap = 0
+    self.unsure_off_frames = 0       # in an unsure episode: the car gone / out of path / not slower
+    self.unsure_sure_frames = 0
+    self.unsure_target = 0.0
+    self.unsure_release_frame = -10_000
     self.hold_restore = False        # latched and not active: keep the lowered set speed (no SET+) for now
     # the car ahead's speed, filtered (VLEAD_*)
     self.lead_v_hist = []            # [(frame, vLead)]
@@ -397,6 +427,7 @@ class StoppedCarTrigger:
     self.warn_latched = False        # an episode started on the warning: the condition must be gone WARN_REARM first
     self.warn_start = False          # this episode started on the warning alone (logs)
     self.warn_pending = False        # ... before the warning shows: released if the planned stop goes away first
+    self.unsure_from = False         # this episode began as an unsure car (taps) and a stop start took it over
     self.warn_plan_frames = 0
     self.warn_plan_gap = 0
     self.gas_frames = 0
@@ -624,7 +655,8 @@ class StoppedCarTrigger:
     self.required, self.ttc = urgency(i.v_ego, i.lead_d, self.lead_v_f) if (i.lead_status and i.lead_alive) else (0.0, float("inf"))
     self.urgent = self.ttc <= URGENT_TTC or self.required >= URGENT_DECEL
 
-    if not self.active:
+    if not self.active or self.kind == SLOW_UNSURE:
+      unsure_on = self.active
       self.hold_frames = self.hold_frames + 1 if ((lead_ok or stop_with_car) and start_gates and i.v_ego >= START_SPEED) else 0
       if self._early_stop_with_car(i) and start_gates and i.v_ego >= START_SPEED:
         self.early_frames += 1
@@ -636,32 +668,21 @@ class StoppedCarTrigger:
       early_start = self.early_frames >= _frames(EARLY_HOLD)
       warn_start = (WARNING_START_ENABLED and self.warning and not self.warn_latched and start_gates and
                     i.v_ego >= WARN_MIN_SPEED)
+      unsure = self._unsure_car(i) and start_gates
+      if unsure:
+        self.unsure_frames += 1
+        self.unsure_gap = 0
+      else:
+        self.unsure_gap += 1
+        if self.unsure_gap > _frames(EARLY_DROPOUT):
+          self.unsure_frames = 0
       if self.hold_frames >= _frames(HOLD_TIME) or early_start or warn_start:
-        self.active = True
-        self.early = self.hold_frames < _frames(HOLD_TIME)
-        self.warn_start = not (self.hold_frames >= _frames(HOLD_TIME) or early_start)
-        self.kind = STOPPED_CAR if (lead_ok and not self.early) else (STOP_AHEAD if self.warn_start else STOP_WITH_CAR)
-        self.confirmed = not self.early or self.warn_start     # the warning start: holds and the fast pace at once
-        self.confirm_frames = 0
-        self.confirm_frame = self.frame if self.confirmed else -1
-        self.floor_mode = self.warn_start and WARN_FLOOR
-        if self.warn_start:
-          self.warn_latched = True
-          self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
-          self.warn_plan_frames, self.warn_plan_gap = self.warn_frames, 0
-        else:
-          self.warn_pending = False
-        self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
-        self.leave_frames = 0
-        self.clear_release = False
-        self.moving_target = None
-        self.floor_committed = False
-        self.moving_match_frames = 0
-        self.gas_frames = 0
-        self.start_frame = self.frame
-        self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
-        self.early_frames = self.early_gap = 0
-        self.release_reason = None
+        self._start(i, lead_ok, early_start, warn_start)
+      elif unsure_on:
+        self._update_unsure(i, gates)
+      elif (UNSURE_ENABLED and self.unsure_frames >= _frames(UNSURE_HOLD) and
+            self.frame - self.unsure_release_frame >= _frames(UNSURE_REARM)):
+        self._start_unsure(i)
     elif self.gas_frames >= _frames(GAS_RELEASE_TIME):
       self._release("driver on the gas", False)
     elif self.kind == STOP_AHEAD and not self._slow_car(i, min_prob=STOP_CAR_EARLY_MIN_PROB):
@@ -738,13 +759,13 @@ class StoppedCarTrigger:
         self._release("lead left the lane", False)
       elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
         self._release("lead lost (vision)", False)
-    if self.active and self.early and not self.confirmed:
+    if self.active and self.early and not self.confirmed and self.kind != SLOW_UNSURE:
       sure = i.lead_alive and i.lead_status and i.lead_prob >= EARLY_CONFIRM_PROB
       self.confirm_frames = self.confirm_frames + 1 if sure else 0
       if self.confirm_frames >= _frames(EARLY_CONFIRM_TIME) or self.urgent:
         self.confirmed = True
         self.confirm_frame = self.frame
-    if self.active and i.lead_status:
+    if self.active and i.lead_status and self.kind != SLOW_UNSURE:
       self.target = stopped_car_target(i.lead_d)
       self.floor_mode = self.floor_mode or (FLOOR_MODE_ENABLED and self.confirmed and 0 < i.lead_d <= FLOOR_DISTANCE)
       if self.floor_mode:
@@ -768,6 +789,10 @@ class StoppedCarTrigger:
       self.urgent = self.confirmed
     if self.active and self.floor_mode:
       self.urgent = True             # fast pace and holds, both kinds
+    if self.active and self.kind == SLOW_UNSURE:
+      # 1 mph taps, at most UNSURE_MAX_DROP; none while the car is not seen (as an unconfirmed early start)
+      self.target = self.unsure_target if self.lost_frames <= _frames(EARLY_DROPOUT) else 100.0
+      self.urgent = False
     closing_f = i.v_ego - self.lead_v_f
     handles = (RADAR_FOLLOW_ENABLED and self.radar_follow and i.lead_status and
                (closing_f <= RADAR_FOLLOW_CLOSING or i.a_ego <= RADAR_BRAKING_ACCEL or self.required < RADAR_YIELD_DECEL))
@@ -781,6 +806,92 @@ class StoppedCarTrigger:
     self.pull_frames = self.pull_frames + 1 if pull else 0
     self.pulling_away = self.pull_frames >= _frames(PULL_AWAY_TIME)
     return self.active
+
+  def _start(self, i, lead_ok, early_start, warn_start):
+    """A stopped car / stop with car / stop ahead episode starts (or takes over an unsure car episode)."""
+    took_over = self.active and self.kind == SLOW_UNSURE
+    self.active = True
+    self.early = self.hold_frames < _frames(HOLD_TIME)
+    self.warn_start = not (self.hold_frames >= _frames(HOLD_TIME) or early_start)
+    self.kind = STOPPED_CAR if (lead_ok and not self.early) else (STOP_AHEAD if self.warn_start else STOP_WITH_CAR)
+    self.confirmed = not self.early or self.warn_start     # the warning start: holds and the fast pace at once
+    self.confirm_frames = 0
+    self.confirm_frame = self.frame if self.confirmed else -1
+    self.floor_mode = self.warn_start and WARN_FLOOR
+    if self.warn_start:
+      self.warn_latched = True
+      self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
+      self.warn_plan_frames, self.warn_plan_gap = self.warn_frames, 0
+    else:
+      self.warn_pending = False
+    self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
+    self.leave_frames = 0
+    self.clear_release = False
+    self.moving_target = None
+    self.floor_committed = False
+    self.moving_match_frames = 0
+    self.gas_frames = 0
+    if not took_over:
+      self.start_frame = self.frame            # (an unsure car start: the episode began with its taps)
+    self.unsure_from = took_over
+    self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
+    self.early_frames = self.early_gap = 0
+    self.unsure_frames = self.unsure_gap = 0
+    self.release_reason = None
+
+  def _unsure_car(self, i):
+    """The triangle: a car the camera shows (any confidence) in our path, much slower than us (UNSURE_*)."""
+    return (UNSURE_ENABLED and not self.left_car and not self.overridden and not self.radar_follow and
+            i.lead_alive and i.lead_status and 0 < i.lead_d <= UNSURE_MAX_DISTANCE and
+            abs(self._y_path(i)) <= UNSURE_LATERAL and i.v_ego - self.lead_v_f >= UNSURE_SLOWER and
+            self.lead_v_f > -STOPPED_SPEED and          # not an oncoming car (review)
+            i.v_ego >= UNSURE_MIN_SPEED and i.lead_prob < MIN_PROB)
+
+  def _start_unsure(self, i):
+    self.active = True
+    self.kind = SLOW_UNSURE
+    self.early, self.confirmed, self.warn_start, self.warn_pending = True, False, False, False
+    self.confirm_frames, self.confirm_frame = 0, -1
+    self.floor_mode = False
+    self.unsure_from = False
+    # below the set speed (review: v_ego 30 mph under a 45 set gave 13 taps), never below our speed less the cap
+    self.unsure_target = max(max(i.v_ego, i.set_speed) - UNSURE_MAX_DROP, FLOOR_SPEED)
+    self.unsure_off_frames = self.unsure_sure_frames = 0
+    self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
+    self.leave_frames = 0
+    self.clear_release = False
+    self.moving_target = None
+    self.floor_committed = False
+    self.moving_match_frames = 0
+    self.gas_frames = 0
+    self.start_frame = self.frame
+    self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
+    self.release_reason = None
+
+  def _update_unsure(self, i, gates):
+    """An unsure car episode that no stop start has taken over (yet)."""
+    seen = i.lead_alive and i.lead_status and 0 < i.lead_d <= UNSURE_MAX_DISTANCE
+    self.lost_frames = 0 if seen else self.lost_frames + 1
+    stopping = i.plan_stop or self._model_slowing(i) or i.lead_a <= -RADAR_MATCH_LEAD_DECEL
+    away = seen and (abs(self._y_path(i)) > UNSURE_LATERAL + 0.5 or
+                     (i.v_ego - self.lead_v_f < GO_SLOWER and not stopping))
+    self.unsure_off_frames = self.unsure_off_frames + 1 if away else 0
+    # sure and moving: a slower moving car (the MRCC follows it); sure and stopped: keep the taps' target until a
+    # stop start takes over (review: a stopped car on a curve, raw yRel 1.4, was released and the speed restored)
+    sure = seen and i.lead_prob >= MIN_PROB and self.lead_v_f > STOPPED_SPEED
+    self.unsure_sure_frames = self.unsure_sure_frames + 1 if sure else 0
+    if self.gas_frames >= _frames(GAS_RELEASE_TIME):
+      self._release("driver on the gas", False)
+    elif not gates:
+      self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
+    elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
+      self._release("radar following the car ahead at our speed")
+    elif self.unsure_off_frames >= _frames(UNSURE_LOST_TIME):
+      self._release(UNSURE_GONE)                 # a false alarm (it left our path / sped up): the speed back at once
+    elif self.lost_frames >= _frames(RELEASE_LOST_TIME):
+      self._release(UNSURE_GONE, False)          # not seen: a far low-confidence lead blinks; no SET+ hold at once
+    elif self.unsure_sure_frames >= _frames(UNSURE_SURE_TIME):
+      self._release(UNSURE_NOT_STOP, False)      # a slower moving car: the MRCC follows it
 
   def _warn_still_planned(self, i):
     """A start before the warning: the planned stop (the model's plan alone: our own slowdown makes the "not
@@ -806,6 +917,7 @@ class StoppedCarTrigger:
     self.left_car = reason == "lead leaving the lane"
     self.overridden = reason == "driver on the gas"
     self.warn_pending = False
+    self.unsure_release_frame = self.frame     # no unsure car start for UNSURE_REARM after any release
     self.overridden_v = self.lead_v_f
     self.leave_frames = 0
     self.radar_flicker = False
