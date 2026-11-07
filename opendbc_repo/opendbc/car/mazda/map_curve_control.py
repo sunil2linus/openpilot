@@ -13,19 +13,22 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
     own follower since drive 53 (their old 0.5 m/s^2 staircase sat only 5-9 mph under the speed and the car entered
     an 85 m exit curve at 38-39 mph for 31), with the ramp floor and budget below instead of the Max Drop.
   * Ramps (we are on an exit / entrance / interchange ramp and the curve is on it): may go past the
-    driver's Max Drop, down to 25 mph, with a bigger SET- budget. On a link road (the map match's road class, also
-    while its curve is held or not matched yet) the camera curve slowdown gets the same floor and budget (CurveMix;
-    drive 53: an on-ramp loop held at the Max Drop floor 11 mph above the car's speed).
+    driver's Max Drop, down to 25 mph, with a bigger SET- budget. On a link road connected to a highway (the map
+    match's road class, also while its curve is held or not matched yet; HIGHWAY_LINK_CLASSES) the camera curve
+    slowdown gets the same floor and budget (CurveMix; drive 53: an on-ramp loop held at the Max Drop floor 11 mph
+    above the car's speed); a street to street slip lane keeps the Max Drop.
   * Navigation exit before the split: never on navigation alone. Once the driver signals toward the exit's side
     (any side if navigation does not say) while navigation announces it (up to 1500 m ahead), the exit is
     remembered: the signal may go off again after moving into the exit lane. The exit's tightest curve is then
     planned the same way (so the slowdown starts only as late as that curve allows). When the announcement clears
     close to the split (the GPS match is doubtful there, and navigation moves on to the next maneuver), the exit and
-    its curve are carried on by the distance driven: on the link the plan holds until the ramp's own curve is
-    matched and trusted (or the carried curve is well behind); past the exit point by EXIT_PASS_MARGIN still on the
-    motorway, it is dropped and the speed comes back. Forgotten when the car is on the ramp (the ramp's own curves
-    take over), when navigation no longer shows that exit for NAV_GRACE while still far from it (rerouted), or
-    when the driver signals the other way.
+    its curve are carried on by the distance driven (also through a planner gap: drive()): on the link the plan
+    holds until the ramp's own curve is matched and trusted (or the carried curve is well behind); past the exit point
+    on the motorway with the match not doubtful it holds (no further SET-) and EXIT_STAY_MARGIN past it it is dropped
+    and the speed comes back (at once with his foot on the gas; EXIT_PASS_MARGIN while the match stays doubtful).
+    The intent ends when the carry starts: another exit needs a new signal. Forgotten when the car is on the ramp
+    (the ramp's own curves take over), when navigation no longer shows that exit for NAV_GRACE while still far from it
+    (rerouted), or when the driver signals the other way.
   * Ramp rules (ramp curves, fast restore, street cap) only start after the car has been on the ramp for
     RAMP_HOLD, and the street rules only after STREET_PROGRESS along the exit, so a short wrong ramp match
     (passing an exit in the right lane) changes nothing.
@@ -62,6 +65,10 @@ LINK_CLASSES = (2, 4, 6, 8, 10)  # motorway / trunk / primary / secondary / tert
 # holds its curve (the GPS match is doubtful near a split: drive 53 held every ramp curve there for 2-4 s) or has not
 # matched one yet (the on-ramp loop at 1019: class 2 one second before the loop, its curve matched 8 m before it)
 LINK_HOLD = 0.5                 # s
+# ... but only a link connected to a highway (review: street to street slip lanes, primary / secondary links, took the
+# ramp floor and CURVE_NO_ACCEL too): one that leads to a highway (mapRampToHighway), one entered from a highway, or a
+# motorway / trunk link (these only join a motorway or a trunk). A street slip lane keeps the Max Drop floor.
+HIGHWAY_LINK_CLASSES = (2, 4)
 # Navigation exit carried on after its announcement clears (drive 53, both exits): the GPS match turns doubtful at the
 # split (the exit is not computed then) and navigation moves on to the next maneuver; the exit dropped 46 m and 9 m
 # before the exit point. The restore that followed took the set speed 49 -> 70 while the car took the exit at 1165
@@ -69,9 +76,20 @@ LINK_HOLD = 0.5                 # s
 NAV_CLOSE = 200.0               # m: an exit cleared this close is the split being reached (farther: a reroute, NAV_GRACE)
 # Past the exit point by this, still not on a link: the car stayed on the motorway. The map match sees an exit taken
 # only once the ramp is MATCH_STAY away from the main road (drive 53: the link was matched 34 m past the exit point at
-# 400 and 137 m past it at 1168), so this is well over that; the price of staying on is a few seconds at the exit's
-# speed.
+# 400 and 137 m past it at 1168, the match doubtful, GPS trust 2, from the split until then at both), so this is well
+# over that. It is the last resort, for a match that stays doubtful (another road close by).
 EXIT_PASS_MARGIN = 250.0        # m
+# Staying on (review: the carried plan went on slowing toward the exit's 32 mph curve to EXIT_PASS_MARGIN, 30-50 s far
+# under the traffic's speed): past the exit point, not on a link, the match on a highway and not doubtful (GPS trust
+# below TRUST_LOW: no other road close enough to be the one we are on), the slowdown holds (no further SET-), and
+# EXIT_STAY_MARGIN past the exit point the exit is dropped and the speed comes back. The margin is for the first tens
+# of meters after the split, where the ramp only starts (a road that only starts here does not make the match doubtful)
+# and the car can be on it with the main road still matched: twice drive 53's 34 m (42 m with LINK_HOLD) at 400, about
+# 4 s at 50 mph. While the match is doubtful the slowdown goes on (drive 53 at 1168: trust 2 from the split to the link
+# match 137 m past the exit point; holding there put the car into the 95 m curve at 35.7 mph instead of 32.4). The
+# driver's foot on the gas past the exit point, not on a link, also drops it at once.
+EXIT_STAY_MARGIN = 90.0         # m
+TRUST_LOW = 2                   # starpilotPlan.mapGpsTrust (map_curves.TRUST_LOW): another road close by, or worse
 # m past the carried curve's entry on the link: it is behind us (drive 53: the 95 m ramp curve took ~127 m), the ramp's
 # own rules from there
 EXIT_CURVE_PAST = 150.0
@@ -149,54 +167,91 @@ class MapCurveControl:
     self.last_side = 0            # its side
     self.since_nav = 0.0          # m driven since then
     self.carry = None             # [m to the exit point, m to its curve] after the announcement cleared at the split
+    self.carry_hold = None        # m/s: past the exit point on the motorway (not doubtful): the exit command is held here
+    self.signal_wait = False      # the signal that was on when the carry began: a new exit needs it off first
     self.ramp_frames = 0          # consecutive updates on a ramp
     self.ramp_end_first = 0.0     # distance to the ramp's end when it was first matched
     self.link_frames = 0          # consecutive updates matched to a link road
+    self.road_before = 0          # the last road class matched that is not a link (0 unknown): where a link was entered
+    self.link_hwy = False         # the link we are on is connected to a highway (HIGHWAY_LINK_CLASSES)
 
   def _forget_exit(self):
     self.exit_intent = False
     self.carry = None
+    self.carry_hold = None
 
-  def _exit_intent(self, f, signal, ramp_held=True, on_link=False, step=0.0):
-    """signal: -1 left, 1 right, 0 none; step: m driven since the last update. Returns (radius, distance, advisory) of
-    the exit curve to plan, or zeros."""
+  def drive(self, step):
+    """m driven (the car's own speed x dt) while the planner is missing (the wrapper calls update only while it is
+    alive): a carried exit, or one waiting to be carried, is counted on by it so a planner gap does not stretch the
+    slowdown past the exit point."""
+    if self.carry is not None:
+      self.carry[0] -= step
+      self.carry[1] -= step
+    elif self.exit_intent:
+      self.since_nav += step
+
+  def _exit_intent(self, f, signal, ramp_held=True, on_link=False, step=0.0, gas=False):
+    """signal: -1 left, 1 right, 0 none; step: m driven since the last update; gas: the driver is on the gas. Returns
+    (radius, distance, advisory) of the exit curve to plan, or zeros."""
     nav_ok = f.nav_exit == 1 and f.nav_curve_radius > 0 and not f.on_ramp
     side = f.nav_exit_side or (0 if nav_ok else self.last_side)
+    if signal == 0:
+      self.signal_wait = False
     if signal != 0 and side != 0 and signal == -side and not on_link:
       self._forget_exit()         # signalling the other way: not this exit
-    elif nav_ok and signal != 0:
+    elif nav_ok and signal != 0 and not self.signal_wait:
       self.exit_intent = True
-    if not self.exit_intent:
-      self.carry = None
-      return 0.0, 0.0, 0.0
-    if nav_ok:
-      self.nav_grace, self.since_nav, self.carry = 0, 0.0, None
+    if self.exit_intent and nav_ok:
+      self.nav_grace, self.since_nav, self.carry, self.carry_hold = 0, 0.0, None, None
       self.last_nav = (f.nav_curve_radius, f.nav_curve_distance, f.nav_curve_advisory)
       self.last_exit, self.last_side = f.nav_exit_distance, f.nav_exit_side
       return self.last_nav
-    self.since_nav += step
-    if self.carry is None and self.last_exit - self.since_nav <= NAV_CLOSE:
-      # cleared at the split: carry the exit and its curve on by the distance driven
-      self.carry = [self.last_exit - self.since_nav, self.last_nav[1] - self.since_nav]
-    elif self.carry is not None:
+    if self.carry is None and self.exit_intent:
+      self.since_nav += step
+      if self.last_exit - self.since_nav <= NAV_CLOSE:
+        # cleared at the split: carry the exit and its curve on by the distance driven. The intent ends here (review:
+        # navigation's next maneuver, another exit after a reroute, was taken on with no signal for it): a new exit
+        # needs a new signal, one that comes on after this
+        self.carry = [self.last_exit - self.since_nav, self.last_nav[1] - self.since_nav]
+        self.exit_intent, self.signal_wait = False, signal != 0
+        step = 0.0
+    if self.carry is not None:
       self.carry[0] -= step
       self.carry[1] -= step
-    if self.carry is not None:
       ramp_curve = f.on_ramp and ramp_held and f.status == STATUS_RAMP_CURVE
-      if ramp_curve or (on_link and self.carry[1] < -EXIT_CURVE_PAST) or (not on_link and self.carry[0] < -EXIT_PASS_MARGIN):
+      past = self.carry[0] < 0 and not on_link
+      # on the highway, the match not doubtful: no other road close by, so not the ramp (EXIT_STAY_MARGIN)
+      motorway = past and f.road_class in HIGHWAY_CLASSES and f.gps_trust < TRUST_LOW
+      stayed = past and (self.carry[0] < -EXIT_PASS_MARGIN or gas or (motorway and self.carry[0] < -EXIT_STAY_MARGIN))
+      if ramp_curve or (on_link and self.carry[1] < -EXIT_CURVE_PAST) or stayed:
         # the ramp's own curve is matched and trusted / the carried curve is behind us / we stayed on the motorway
+        # (on it past EXIT_STAY_MARGIN, his foot on the gas, or past EXIT_PASS_MARGIN still doubtful)
         self._forget_exit()
         return 0.0, 0.0, 0.0
+      # on the motorway past the exit point: hold (no further SET-) until EXIT_STAY_MARGIN, or a link is matched
+      self.carry_hold = (self.carry_hold if self.carry_hold is not None else NO_CURVE) if motorway else None
       return self.last_nav[0], max(self.carry[1], 0.0), self.last_nav[2]
+    if not self.exit_intent:
+      return 0.0, 0.0, 0.0
     self.nav_grace += 1
     if (f.on_ramp and ramp_held) or self.nav_grace > NAV_GRACE / DT_CTRL:
       self._forget_exit()
       return 0.0, 0.0, 0.0
     return self.last_nav          # brief drop-out: keep the last plan (a ceiling, the ramp curve is lower)
 
-  def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0):
+  def _hold(self, cmd):
+    """A carried exit past its exit point, on the motorway (not doubtful): its command never goes below what it was
+    when that began."""
+    if self.carry_hold is None:
+      return cmd
+    if self.carry_hold >= NO_CURVE:
+      self.carry_hold = cmd
+    return max(cmd, self.carry_hold)
+
+  def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0, gas=False):
     """signal: turn signal side, -1 left, 1 right, 0 none. v_ego: the true speed (m/s) for the followers (0: plan
-    only). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan)."""
+    only). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan). gas: the driver is on the
+    gas (ends a carried exit past its exit point while not on a link)."""
     out = MapOutput()
     if f.on_ramp:
       if self.ramp_frames == 0:
@@ -207,6 +262,11 @@ class MapCurveControl:
     ramp_held = self.ramp_frames >= RAMP_HOLD / DT_CTRL
     self.link_frames = self.link_frames + 1 if f.road_class in LINK_CLASSES else 0
     on_link = (f.on_ramp and ramp_held) or self.link_frames >= LINK_HOLD / DT_CTRL
+    if f.road_class and f.road_class not in LINK_CLASSES and not f.on_ramp:
+      self.road_before, self.link_hwy = f.road_class, False
+    elif (f.road_class in LINK_CLASSES or f.on_ramp) and (f.ramp_to_highway or f.road_class in HIGHWAY_LINK_CLASSES or
+                                                          self.road_before in HIGHWAY_CLASSES):
+      self.link_hwy = True
     if f.mode == OFF or driver_speed <= 0:
       self.curve.active = self.nav.active = False
       self.follower.reset()
@@ -214,7 +274,7 @@ class MapCurveControl:
       self._forget_exit()
       self.on_street_exit = f.on_ramp and self.on_street_exit
       return out
-    out.link = on_link
+    out.link = on_link and self.link_hwy
     # only 1 and 2 are curves to act on: 4 (paused, GPS not trusted) and 5 (held, road match not trusted) are "no
     # curve" on purpose, so the speed comes back as for any curve that ends (a carried navigation exit is the exception)
     radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
@@ -224,7 +284,7 @@ class MapCurveControl:
     floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
-    nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held, on_link, max(v_ego, 0.0) * DT_CTRL)
+    nav_r, nav_d, nav_adv = self._exit_intent(f, int(signal), ramp_held, on_link, max(v_ego, 0.0) * DT_CTRL, gas)
     na, nsp = self.nav.update(nav_r, nav_d, driver_speed, nav_adv)
     speed, why = NO_CURVE, ""
     if a:
@@ -243,11 +303,13 @@ class MapCurveControl:
       # left the set speed 5-9 mph under the speed and the car 7-8 mph too fast at the entry)
       nav_speed = map_curve_target(nav_r, self.lat_accel, nav_adv)
       cmd = self.nav_follower.update(v_ego, nav_speed, nav_d, nsp)
+      cmd = self._hold(cmd)
       if cmd < speed:
         speed, why, track, settled = cmd, "nav exit", True, self.nav_follower.settled
         out.plan, out.curve_speed = nsp, nav_speed
     else:
       self.nav_follower.reset()
+      nsp = self._hold(nsp) if na else nsp
       if na and nsp < speed:
         speed, why, track, settled = nsp, "nav exit", False, False
     exit_to_street = f.on_ramp and ramp_held and f.ramp_type == RAMP_EXIT and not f.ramp_to_highway

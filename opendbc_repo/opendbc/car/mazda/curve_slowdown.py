@@ -186,8 +186,9 @@ CURVE_NO_ACCEL = True
 # driver's 50 while he drove onto M-59 on the gas (27 -> 49 mph); the curve's "over" timer is frozen on the gas, so the
 # restore only came at 1060.9, 11 s after the loop, and when he lifted at 1056 the car slowed toward 29 (-0.8 m/s^2).
 # Our own curve target does not depend on the pedal, so once it has been off for RESTORE_DELAY (counted on the gas
-# too) the restore goes on the gas as well: SET+ jumps to the current speed (never one that could land above the
-# driver's speed, see GAS_JUMP_*), then taps.
+# too; FLICKER_RESTORE_DELAY when the camera's target was the last one on, as it flickers) the restore goes on the gas
+# as well: SET+ jumps to the current speed (never one that could land above the driver's speed, see GAS_JUMP_*), then
+# taps.
 CURVE_GAS_RESTORE = True
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
@@ -280,6 +281,7 @@ class CurveSlowdownLogic:
     self.cruise_on_frames = 0
     self.curve_free_frames = _frames(RESTORE_DELAY)
     self.curve_free_gas = _frames(RESTORE_DELAY)       # the same, counted on the gas too (CURVE_GAS_RESTORE)
+    self.curve_gas_camera = False                      # the last curve target on was the camera's (not a followed map curve)
     self.reason_free_frames = _frames(RESTORE_DELAY)   # frames with neither the curve nor a stopped car active
 
     # The driver's speed: the set speed they had before our presses moved it (None: we are not managing it).
@@ -842,6 +844,8 @@ class CurveSlowdownLogic:
       self.reason_free_frames = 0 if (i.csc_active or i.stop_active or i.hold_restore) else self.reason_free_frames + 1
     if i.plan_alive:
       self.curve_free_gas = 0 if i.csc_active else self.curve_free_gas + 1
+      if i.csc_active:
+        self.curve_gas_camera = not i.curve_track
     # The posted limit back down soon after our raise (speed_limit_follow.py rule 4, review: a raise for a wrong road's
     # limit, 60 on a 45 road, was never taken back): if the driver has not touched his speed since our raise and no stop
     # / curve slowdown owns the set speed, his speed goes back to what it was before and the restore below lowers the set
@@ -1054,8 +1058,10 @@ class CurveSlowdownLogic:
 
     # on the gas the stop reasons' "over" timer is frozen (reason_free_frames): a clear stop restore still may go
     # a curve's restore on the gas (CURVE_GAS_RESTORE): the curve target off for RESTORE_DELAY, on the gas too, and
-    # nothing of a stop in it
-    curve_gas = (CURVE_GAS_RESTORE and self.curve_free_gas >= _frames(RESTORE_DELAY) and not self.stop_episode and
+    # nothing of a stop in it. A camera curve waits FLICKER_RESTORE_DELAY (review: its target flickers off and on, and
+    # the flicker is not tracked on the gas: a SET+ jump mid-curve, then SET- again); a followed map curve does not
+    gas_delay = FLICKER_RESTORE_DELAY if self.curve_gas_camera else RESTORE_DELAY
+    curve_gas = (CURVE_GAS_RESTORE and self.curve_free_gas >= _frames(gas_delay) and not self.stop_episode and
                  not i.hold_restore and self.stop_presses == 0)
     gas_restore = (GAS_JUMP_ENABLED and i.gas_pressed and not i.csc_active and not i.stop_active and
                    (self.restore_pending or i.stop_clear_ahead or curve_gas))
@@ -1459,7 +1465,7 @@ class CurveSlowdown:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
       signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
       mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal, v_ego=v_ego,
-                                                  max_drop=lg.max_drop_steps * lg.step)
+                                                  max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed))
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
@@ -1469,6 +1475,10 @@ class CurveSlowdown:
           curve_active, curve_speed, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step, MIN_SET_SPEED))
         curve_no_accel = self.curve_mix.no_accel
         fast_restore = mo.fast_restore
+    elif self.map_control is not None:
+      # a planner gap: a carried exit is still counted on by the car's own speed (review: counted only while the
+      # planner was alive, a gap stretched the slowdown past the exit point)
+      self.map_control.drive(max(v_ego, 0.0) * DT_CTRL)
 
     # Posted limit (speed_limit_follow.py; Test: logged only). The driver's speed is the anchor itself, else the set
     # speed: set_speed + offset above mixes this frame's set speed with last frame's offset, a one-step blip on every

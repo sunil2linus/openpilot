@@ -23,7 +23,7 @@ _spec.loader.exec_module(W)
 MPH = W.MPH
 
 
-def _make(tmp_path, monkeypatch, limit_mode=2, stop_mode=2):
+def _make(tmp_path, monkeypatch, limit_mode=2, stop_mode=2, map_mode=0):
   sm = W.FakeSM()
   plan = sm.msgs["starpilotPlan"]
   plan.slcSpeedLimit, plan.slcSpeedLimitSource, plan.mapGpsTrust = 45 * MPH, "Map Data", 0
@@ -34,7 +34,7 @@ def _make(tmp_path, monkeypatch, limit_mode=2, stop_mode=2):
   CP = SimpleNamespace(flags=MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR, carFingerprint="MAZDA_CX5",
                        maxLateralAccel=1.09)
   c = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False}), curve_enabled=False, stop_mode=stop_mode, learning=False,
-                       map_mode=0, limit_mode=limit_mode)
+                       map_mode=map_mode, limit_mode=limit_mode)
   records = []
   if c.recorder is not None:
     c.recorder.root = str(tmp_path / "events")
@@ -196,3 +196,23 @@ def test_wrapper_gives_the_provisional_ceiling_in_on_mode_only_and_logs_it(tmp_p
     assert (abs(seen[-1] / MPH - 40) < 1e-6) if mode == 2 else seen[-1] == 0.0, (mode, seen[-1])
     hold = [d for k, d in records if k == "speedLimitHold"]
     assert len(hold) == 1 and abs(hold[0]["limit_mph"] - 40) < 1e-6 and hold[0]["mode"] == ("on" if mode == 2 else "test")
+
+
+def test_wrapper_counts_a_carried_exit_on_through_a_planner_gap_and_passes_the_gas(tmp_path, monkeypatch):
+  # review: the carried exit distance was counted only while starpilotPlan was alive (a gap stretched the slowdown):
+  # now by the car's own speed (vEgo x dt) meanwhile
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  c.map_control.carry = [30.0, 300.0]
+  sm.alive["starpilotPlan"] = False
+  _drive(c, 100, v_mph=44)
+  moved = 44 * MPH * 100 * cs.DT_CTRL
+  assert abs(c.map_control.carry[0] - (30.0 - moved)) < 1e-3 and abs(c.map_control.carry[1] - (300.0 - moved)) < 1e-3
+  # planner back, past the exit point on the motorway (not yet EXIT_STAY_MARGIN), his foot on the gas: the exit is dropped
+  sm.alive["starpilotPlan"] = True
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust = 2, 1, 0
+  c.map_control.carry = [-20.0, 250.0]
+  c.update(W.CC, W.car_state(44, 45), None, None, False)
+  assert c.map_control.carry is not None
+  c.update(W.CC, W.car_state(44, 45, gas=True), None, None, False)
+  assert c.map_control.carry is None
