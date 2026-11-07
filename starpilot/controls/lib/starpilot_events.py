@@ -98,6 +98,12 @@ class StarPilotEvents:
       self.events.add(StarPilotEventName.mapExitCurveBrake)
     self.prev_exit_brake = exit_brake
 
+    # Mazda: slowing for a lower posted limit (speed_limit_follow rule 9): once when it starts
+    limit_slow = float(getattr(sm["starpilotCarState"], "mazdaLimitSlowLimit", 0.0) or 0.0)
+    if limit_slow > 0 and not getattr(self, "prev_limit_slow", 0.0):
+      self.events.add(StarPilotEventName.mazdaLimitSlowing)
+    self.prev_limit_slow = limit_slow
+
     if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
       self.mazda_lkas_off_shown = True
       self.events.add(StarPilotEventName.mazdaStockLkasOff)

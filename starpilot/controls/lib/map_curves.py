@@ -76,6 +76,11 @@ MATCH_STAY = 12.0         # m: the car stays on the road it is on until that roa
 LINK_CLASSES = (2, 4, 6, 8, 10)   # ramps and other link roads (highwayClass)
 MATCH_CELL = 500          # grid cells of 1/500 deg (~220 m) for the road shape index
 NAV_EXIT_TYPES = ("off ramp", "fork")
+# The car side's street speed (speed_limit_follow rules 8 / 9): navigation's posted limit (Mapbox) as a second opinion.
+# Drive 55: 91 messages with 50 / 70 / 45 / 25 mph, 9 with 5 mph (junk) and 0. Fresh this long only.
+NAV_LIMIT_MIN = 15 * 0.44704   # m/s (24 km/h): under this it is no limit
+NAV_FRESH = 3.0                # s
+NAV_TURN_TYPES = ("turn", "end of road", "roundabout", "rotary", "exit roundabout", "exit rotary")
 NAV_EXIT_RANGE = 1500.0   # m: exits matched from this far
 NAV_MATCH_TOL = 0.25      # match tolerance as a share of the announced distance (at least NAV_MATCH_MIN)
 NAV_MATCH_MIN = 150.0
@@ -1847,7 +1852,7 @@ class MapCurvesPlanner:
     # The car side reads the setting once when a drive starts, so read it here only then too (first call, after
     # a pause in calls, or while not started): the screen never says "Slowing" when the car would not act.
     import time
-    now = time.monotonic()
+    now = self.now = time.monotonic()
     try:
       started = bool(sm["deviceState"].started)
     except Exception:
@@ -1898,6 +1903,11 @@ class MapCurvesPlanner:
           nav = (str(ni.maneuverType), str(ni.maneuverModifier), float(ni.maneuverDistance))
     except Exception:
       nav = None
+    try:
+      if sm.alive["navInstruction"] and sm.valid["navInstruction"] and sm.updated["navInstruction"]:
+        self._nav_street(sm["navInstruction"], now)
+    except Exception:
+      pass                         # (the street speed's second opinion only: never the exits' navigation)
     camera = camera_view(sm)
     was_paused = self.trust.paused
     floor = self._floor(set_speed)
@@ -2095,11 +2105,20 @@ class MapCurvesPlanner:
       flags = (["full"] if self.pass_exit <= PASS_EXIT_NEAR else []) + (["vetoed"] if self.pass_vetoed else [])
       self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
 
+  def _nav_street(self, ni, now):
+    """Navigation's limit and next maneuver for the car side's street speed (mapNavSpeedLimit, mapNavManeuver*)."""
+    lim = float(ni.speedLimit or 0.0)
+    self.nav_street = (lim if lim >= NAV_LIMIT_MIN else 0.0, float(ni.maneuverDistance or 0.0),
+                       str(ni.maneuverType or "") in NAV_TURN_TYPES and str(ni.maneuverModifier or "") != "straight", now)
+
   def publish(self, plan):
     mc = self.mc
     plan.mapCurveMode = self.mode
     if mc is None or self.mode == 0:
       return
+    ns = getattr(self, "nav_street", None)
+    if ns is not None and getattr(self, "now", ns[3]) - ns[3] <= NAV_FRESH:
+      plan.mapNavSpeedLimit, plan.mapNavManeuverDistance, plan.mapNavManeuverTurn = ns[0], ns[1], ns[2]
     if not mc.data_here:
       plan.mapCurveStatus = STATUS_NO_DATA
     elif mc.paused:

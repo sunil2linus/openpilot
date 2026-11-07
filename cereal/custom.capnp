@@ -123,6 +123,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaStockLkasOff @33 :Bool;       # Mazda + TI: the camera reports its LKAS off at speed (only the TI steers)
   mazdaStopSlowdownActive @34 :Bool; # Mazda stopped car / stop ahead slowdown (On) is lowering the set speed
   mazdaExitCurveBrake @35 :Bool;     # Mazda navigation exit: the cruise cannot slow enough for the exit's curve, brake (On)
+  mazdaLimitSlowLimit @36 :Float32;  # Mazda: slowing for a lower posted limit (speed_limit_follow rule 9), the limit m/s; 0 none
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -211,6 +212,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mazdaStockLkasOff @46;
     mapCurvesPaused @47;
     mapExitCurveBrake @48;
+    mazdaLimitSlowing @49;
   }
 }
 
@@ -300,6 +302,10 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapExitLinkBend @79 :Float32;      # deg: the exit link's heading 80 m ahead along it, from the highway's here
   mapExitBendValid @80 :Bool;        # both bends known
   mapCurveTarget @81 :Float32;       # m/s, the governing curve's speed as the car side takes it (Max Drop floor for a road curve), 0 none
+  # navigation's view for the Mazda street speed (speed_limit_follow rules 8 / 9): only while navInstruction is fresh
+  mapNavSpeedLimit @82 :Float32;     # m/s, navInstruction.speedLimit (Mapbox), 0 none (junk under 15 mph / 24 km/h, stale > 3 s)
+  mapNavManeuverDistance @83 :Float32;  # m to navigation's next maneuver, 0 none
+  mapNavManeuverTurn @84 :Bool;      # that maneuver is a turn (turn, end of road, roundabout)
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

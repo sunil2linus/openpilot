@@ -63,8 +63,13 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
     with GPS trust ok, the exit's last target is the street's steady limit plus the setting's offset (STREET_OFFSETS),
     or STREET_FALLBACK when the map has none: the set speed is taken there by our presses (SET- taps down, or a
     pending restore only up to it) and becomes his speed. Only under EXIT_STREET_MAX_V, once per exit; his gas or his
-    SET buttons end it (what it reached is his). His RES within EXIT_STREET_TIME of the street (the stock cruise brings
-    back his highway speed) with the set speed more than EXIT_STREET_RES_MARGIN above that target: the same.
+    SET buttons end it (what it reached is his). His RES later on the street (the stock cruise brings back his highway
+    speed): speed_limit_follow rule 8 (the match on engage), carried out here (limit_lower).
+  * The speed limit follower's street speed (speed_limit_follow rules 8 and 9: the match on engage, a lower limit):
+    limit_lower, the speed to take the set speed down to, paced so the cruise slows at most ~0.5 m/s^2 (the set speed
+    kept LOWER_GAP under the car's speed: the stock cruise slows ~0.19 m/s^2 per m/s of gap), never a hold; then his
+    speed. A pending restore goes only up to it. Curves, stops and the car ahead still win (the lowest target); his gas
+    held (GAS_OVERTURN_*) or his SET buttons end it (what it reached is his); cruise off ends it.
 
 Pure logic (no openpilot imports) so it can be unit tested; the wrapper in curve_slowdown.py feeds it.
 """
@@ -105,7 +110,9 @@ EXIT_STREET_STEADY = 2.0        # s matched to a street (GPS trust ok) before th
 EXIT_STREET_LIMIT_STEADY = 2.0  # s the street's posted limit is reported unchanged before it is its target
 EXIT_STREET_MAX_V = 55 * MPH    # m/s: only below this (a wrong street match on the highway is at highway speed)
 EXIT_STREET_TIME = 60.0         # s after the street was matched: his RES may still be capped
-EXIT_STREET_RES_MARGIN = 10     # mph (km/h x 1.6 when metric): RES above the street target by more than this
+# Speed limit follow's street speed (limit_lower): the set speed this far under the car's speed at most while it slows
+# (the stock cruise ~0.19 m/s^2 per m/s of gap after ~1 s: ~0.46 m/s^2; drives 4f-53 measured): 45 -> 30 mph in ~14 s
+LOWER_GAP = 2.4                 # m/s
 EXIT_STREET_DONE = 0.6 * MPH    # m/s: the set speed this close to the target: it is his speed
 HWY_RESET = 1.0                 # s matched to a highway: the exit sequence starts over
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
@@ -579,7 +586,6 @@ class MapCurveControl:
     self.street_add = STREET_OFFSETS[m][street_mode] * self.unit      # m/s added to a posted street limit
     self.street_fallback = STREET_FALLBACK[m] * self.unit
     self.street_limit_max = STREET_LIMIT_MAX[m] * self.unit
-    self.res_margin = EXIT_STREET_RES_MARGIN * (1.609344 if metric else 1.0) * self.unit
     self.curve = MapCurveTarget(lat_accel, decel)
     self.follower = MapCurveFollower(firm=True)          # (firm only for a ramp curve, see update)
     self.road_follower = MapCurveFollower(undershoot=MAP_ROAD_UNDERSHOOT, lead_time=MAP_ROAD_LEAD_TIME, closed_loop=True)
@@ -617,7 +623,9 @@ class MapCurveControl:
     self.xs_lim, self.xs_lim_s = 0.0, 0.0   # the street's posted limit as reported, and s unchanged
     self.xs_on = False              # the street target is being applied
     self.xs_done = False            # applied once on this street (his RES may still open it again)
-    self.xs_off = False             # cruise was off (his RES next)
+    self.ll_on = False              # limit_lower (speed_limit_follow rules 8 / 9) being carried out
+    self.ll_gas_s, self.ll_gas_v0 = 0.0, 0.0
+    self.lower_event = None         # "done" / "cancel: ..." when it ended (the wrapper tells the follower)
     self.xs_target = NO_CURVE
 
   @property
@@ -965,6 +973,11 @@ class MapCurveControl:
       if p.confirmed and on_link:
         self._end("on the ramp, no curve", adopt=True)
         return none
+      if p.confirmed and p.exit_at - self.odo < -EXIT_PASS_MARGIN:
+        # (review of merge-f: confirmed by the shapes, the link never matched: held for good, no caps nor raises) far
+        # enough past the split: what it reached is his (the shapes saying "highway" overturn it before, at once)
+        self._end("confirmed, no link match", adopt=True)
+        return none
       held = p.last_cmd if p.last_cmd is not None else p.hold
       return (held, held, held, "exit hold", None, False) if held is not None else none
     a, sp = self.nav.update(r, max(d, 0.0), driver_speed, adv)
@@ -978,12 +991,12 @@ class MapCurveControl:
     return cmd, sp, v_c, "nav exit", self.nav_follower, self.nav_follower.firm
 
   def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0, gas=False, a_ego=None,
-             set_speed=None, driver_set=False):
+             set_speed=None, driver_set=False, limit_lower=0.0):
     """signal: turn signal side, -1 left, 1 right, 0 none. v_ego: the true speed (m/s) for the followers (0: plan
     only). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan). gas: the driver is on the
     gas (his decision near an exit). a_ego: the car's acceleration (m/s^2; None: the road follower runs open loop).
     set_speed: the cruise's set speed (m/s; None: the driver's speed), driver_set: he is on SET-/SET+ (the exit's
-    street target: _exit_street)."""
+    street target: _exit_street). limit_lower: speed_limit_follow's street speed (m/s, 0 none: _limit_lower)."""
     out = MapOutput()
     if a_ego is None:
       self.a_f = None
@@ -1011,8 +1024,12 @@ class MapCurveControl:
                                                           self.road_before in HIGHWAY_CLASSES):
       self.link_hwy = True
     if f.mode == OFF or driver_speed <= 0:
-      self.xs_off = self.xs_off or driver_speed <= 0
-      self.xs_on = False
+      if self.ll_on:
+        self.ll_on, self.lower_event = False, "cancel: cruise off"
+      if self.xs_on:
+        # (review of merge-f: his brake mid-way, then RES brought back what it had reached, 60 for 50, and nothing took
+        # it on: his highway 75 stayed the restore's target on the street) it goes on after his RES, no margin
+        self.xs_on, self.xs_done = False, False
       self.curve.active = self.nav.active = False
       self.follower.reset()
       self.road_follower.reset()
@@ -1088,6 +1105,10 @@ class MapCurveControl:
     if xs < NO_CURVE and xs < speed:
       speed, why, track, settled, firm = xs, "exit street", True, True, False
       capped, low = True, xs
+    ll, ll_raise = self._limit_lower(limit_lower, driver_speed, v_ego, set_speed, gas, driver_set)
+    if ll < NO_CURVE and ll < speed:
+      speed, why, track, settled, firm = ll, "limit", True, ll_raise, False
+      capped, low = True, ll
     out.active = a or na or capped
     out.speed = speed
     out.track = track
@@ -1132,7 +1153,9 @@ class MapCurveControl:
       return
     if self.xs_since is not None:
       self.xs_since += dt
-      if self.xs_since > EXIT_STREET_TIME:
+      if self.xs_since > EXIT_STREET_TIME and not self.xs_on and self.xs_done:
+        # (review of merge-f: never while it is taking the set speed down, nor before it could: a queue counted the
+        # 60 s while the taps waited for 25 mph, and the restore went back to his highway 75)
         self.xs_since, self.xs_exited, self.xs_on = None, False, False
     if not f.road_class:
       return                       # (unknown: nothing counts, nothing resets)
@@ -1140,7 +1163,8 @@ class MapCurveControl:
     self.xs_lim = f.limit
     if not self.xs_exited or self.xs_since is not None:
       return
-    self.xs_street_s = self.xs_street_s + dt if f.gps_trust < TRUST_LOW else 0.0
+    # (review of merge-f: a wrong street match beside a congested highway at trust 1) GPS trust 0 only
+    self.xs_street_s = self.xs_street_s + dt if f.gps_trust == 0 else 0.0
     if self.xs_street_s >= EXIT_STREET_STEADY - 1e-6:
       self.xs_since, self.xs_done = 0.0, False      # the exit's street: its target applies (_exit_street)
       if self.plan is not None:
@@ -1150,7 +1174,9 @@ class MapCurveControl:
     """m/s: the exit's street target now (the street's steady limit plus the setting's offset, else STREET_FALLBACK),
     NO_CURVE while a limit is reported but not steady yet, or not a street's."""
     if self.xs_lim <= 0:
-      return self.street_fallback
+      # (review of merge-f: a one-frame dropout of the street's limit took the target 50 -> 43 -> 50) "no limit" itself
+      # steady EXIT_STREET_LIMIT_STEADY first
+      return self.street_fallback if self.xs_lim_s >= EXIT_STREET_LIMIT_STEADY - 1e-6 else NO_CURVE
     if self.xs_lim_s < EXIT_STREET_LIMIT_STEADY - 1e-6 or self.xs_lim > self.street_limit_max + 0.1:
       return NO_CURVE
     return self.xs_lim + self.street_add
@@ -1158,18 +1184,14 @@ class MapCurveControl:
   def _exit_street(self, f, driver_speed, v_ego, set_speed, gas, driver_set):
     """The exit's last target on the street (m/s, NO_CURVE: none): the set speed is taken to it (down by SET- taps, or a
     pending restore only up to it), then it becomes his speed (adopt)."""
-    res = self.xs_off
     if self.xs_since is None:
-      self.xs_on = self.xs_off = False
+      self.xs_on = False
       return NO_CURVE
     set_v = driver_speed if set_speed is None else set_speed
     tgt = self.street_target()
     if not self.xs_on:
       if tgt >= NO_CURVE:
-        return NO_CURVE                            # (its limit not steady yet: wait for it; his RES kept until then)
-      self.xs_off = False
-      if res and self.xs_done and set_v > tgt + self.res_margin:
-        self.xs_done = False                       # his RES brought back the highway's speed
+        return NO_CURVE                            # (its limit not steady yet: wait for it)
       if self.xs_done or v_ego >= EXIT_STREET_MAX_V:
         return NO_CURVE
       self.xs_done = True
@@ -1187,6 +1209,29 @@ class MapCurveControl:
       self.adopt_frames = 10
       return NO_CURVE
     return self.xs_target
+
+  def _limit_lower(self, target, driver_speed, v_ego, set_speed, gas, driver_set):
+    """(m/s command, raise ok) for speed_limit_follow's street speed (rules 8 / 9), NO_CURVE: none. Paced: never more
+    than LOWER_GAP under the car's speed; done (his speed) at it, ended by his gas held or his buttons."""
+    if target <= 0:
+      self.ll_on = False
+      return NO_CURVE, False
+    set_v = driver_speed if set_speed is None else set_speed
+    if not self.ll_on:
+      self.ll_on, self.ll_gas_s = True, 0.0
+    if gas and self.ll_gas_s <= 0.0:
+      self.ll_gas_v0 = v_ego
+    self.ll_gas_s = self.ll_gas_s + DT_CTRL if gas else 0.0
+    why = ("cancel: his SET" if driver_set else
+           "cancel: his gas" if gas and (self.ll_gas_s >= GAS_OVERTURN_TIME - 1e-6 or v_ego > self.ll_gas_v0 + GAS_OVERTURN_GAIN)
+           else "done" if (abs(set_v - target) <= EXIT_STREET_DONE or
+                           (set_v < target and driver_speed <= target + EXIT_STREET_DONE)) else "")
+    if why:
+      self.ll_on, self.lower_event = False, why
+      self.adopt_frames = 10                       # (what it reached is his speed)
+      return NO_CURVE, False
+    cmd = max(target, v_ego - LOWER_GAP)
+    return cmd, cmd <= target + 0.01
 
   def state(self):
     """The exit plan's state for the logs."""

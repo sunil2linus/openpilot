@@ -47,11 +47,29 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    until it is taken), any gap (drive 53: the floor 19 to 50). A lower limit within LIMIT_UNDO_TIME of that raise
    (a wrong first one) is rule 4's undo, down to the lower limit (never below his speed before our raise).
 
-7. After a turn onto another road (mapdOut's road name changes and stays TURN_NAME_STEADY, not on a highway or a link):
+7. After a turn onto another road (mapdOut's road name changes and stays TURN_NAME_STEADY, the car's heading changed
+   TURN_HEADING within TURN_HEADING_TIME (HeadingWatch), not on a highway or a link):
    the new road's first steady limit is handled as rule 6's: a restore never goes back above it (any band), and below it
    (with no SET press of his since the turn, cruise on since it appeared, GPS trust 0, at most LIMIT_FIRST_MAX above his
    speed) it becomes his speed. Never a SET- (it never slows him early); open TURN_TIME. The same limit as the old road's
    counts as the new road's once the name has changed.
+
+8. Match on engage (owner after drives 54 / 55: "if we know the road speed, irrespective of whether I canceled the
+   cruise to come to a stop at a red signal, if I set the cruise we should either reduce or increase the speed to the
+   road's speed limit"): cruise turned on (SET or RES) on a street, the road class steady ENGAGE_ROAD_STEADY with GPS
+   trust 0: the steady limit plus the Street Speed offset becomes his speed (up: an offer the controller raises to, down:
+   `lower`, the map control's paced slowdown, then his). No limit known: only down, to STREET_FALLBACK. His SET within
+   ENGAGE_WINDOW first: his. This also covers his RES after an exit (map_curve_control's street rule while cruise is on).
+9. Slow for a lower limit (setting MazdaSlowLowerLimit, default on): on a street a lower limit steady LOWER_STEADY
+   (LOWER_BIG_STEADY for a drop of more than LOWER_BIG_DROP) with GPS trust 0 on every frame, the road name unchanged
+   since it appeared (or a turn onto a new road), his speed above it plus the offset: `lower` (the map control's paced
+   slowdown, ~0.5 m/s^2 at most, then his speed). His gas held or his SET buttons end it (his speed what it reached); the
+   limit back up within LOWER_UNDO_TIME: his speed before it comes back (an "unlower" offer).
+   Navigation's limit (LimitInputs.nav_limit, Mapbox; under NAV_LIMIT_MIN junk) is a second opinion: the two agree
+   (NAV_AGREE): LOWER_NAV_STEADY / LOWER_NAV_BIG_STEADY; they disagree: never past either one (the engage match only
+   into [lower, higher] + offset, the slowdown only down to the higher one + offset). A lower limit that appears with
+   navigation's next turn within NAV_TURN_NEAR is the cross road's: not slowed for (rule 7 after the turn). Navigation's
+   next maneuver farther than NAV_STRAIGHT: a road name change at a junction must stay TURN_NAME_STEADY_STRAIGHT.
 
 Street Speed (MazdaStreetSpeedOffset, STREET_OFFSETS): on a street (the matched road class known and not a highway nor a
 link; after an exit or a turn always) every target set from a posted limit is the limit plus the setting's offset: rules
@@ -206,10 +224,60 @@ TURN_TIME = EXIT_TIME        # s the turn's window stays open on the new road
 # metric 0, +5, +8, +13 km/h
 STREET_OFFSETS = ((0, 3, 5, 8), (0, 5, 8, 13))
 STREET_OFFSET_DEFAULT = 2
+STREET_FALLBACK = (43, 70)   # mph / km/h: no limit known (map_curve_control.STREET_FALLBACK)
+# Rule 8, match on engage
+ENGAGE_ROAD_STEADY = 2.0     # s the road class known (a street) and GPS trust 0 before it decides
+ENGAGE_WINDOW = 15.0         # s after cruise came on it may still decide (the road / trust becoming steady)
+ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "his SET after it"
+# the limit itself steady this long with GPS trust 0 on every frame of it (drive 55, t 627: his RES at a junction while the
+# cross road's 35 had been reported 3 s; it went after 4 s)
+ENGAGE_LIMIT_STEADY = 5.0    # s
+# Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
+LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
+LOWER_BIG_DROP = (20, 32)    # mph / km/h
+LOWER_BIG_STEADY = 8.0       # s
+LOWER_NAV_STEADY = 2.5       # s with navigation's limit agreeing
+LOWER_NAV_BIG_STEADY = 5.0   # s
+LOWER_UNDO_TIME = 30.0       # s: the limit back up this soon after it slowed him: his speed before comes back
+NAV_LIMIT_MIN = (15, 24)     # mph / km/h: navigation's limit below this is no limit (drive 55: 9 messages of 5 mph)
+NAV_AGREE = (1, 2)           # mph / km/h
+# Navigation's limit is its route step's: drive 55 kept the highway's 70 along the whole Dobry Drive step (a 45 street,
+# t 552-622), which as a "disagreeing" opinion kept his RES at 75 there. On a street a navigation limit above this is
+# a highway's: no limit.
+NAV_STREET_MAX = (55, 90)    # mph / km/h
+NAV_TURN_NEAR = 80.0         # m: navigation's next turn this close when a lower limit appears: the cross road's
+NAV_STRAIGHT = 300.0         # m: navigation's next maneuver farther: we go straight through this junction
+TURN_NAME_STEADY_STRAIGHT = 5.0  # s a road name change must last then
+# (review of merge-f: road names change along the same road, and the highway's name became the street's after the exit)
+# a name change is a turn (rule 7) only with the car's heading changed this much within this long
+TURN_HEADING = 30.0          # deg
+TURN_HEADING_TIME = 10.0     # s
+NAV_TURN_TYPES = ("turn", "end of road", "roundabout", "rotary", "exit roundabout", "exit rotary")
 
 
 def _frames(seconds):
   return int(round(seconds / DT_CTRL))
+
+
+class HeadingWatch:
+  """The car's heading change within the last TURN_HEADING_TIME from its yaw (the wrapper: speed and steering angle):
+  turned() for rule 7 (a turn, not a road name changing along the same road)."""
+  SAMPLE = 0.5                   # s between the kept samples
+
+  def __init__(self):
+    self.yaw = 0.0                 # deg, integrated
+    self.hist = []                 # (s, yaw) samples
+    self.t = 0.0
+
+  def update(self, dt, yaw_rate_deg):
+    self.t += dt
+    self.yaw += yaw_rate_deg * dt
+    if not self.hist or self.t - self.hist[-1][0] >= self.SAMPLE:
+      self.hist.append((self.t, self.yaw))
+      self.hist = [h for h in self.hist if self.t - h[0] <= TURN_HEADING_TIME]
+
+  def turned(self):
+    return any(abs(self.yaw - y) >= TURN_HEADING for _, y in self.hist)
 
 
 @dataclass
@@ -226,6 +294,10 @@ class LimitInputs:
   v_ego: float = 0.0        # m/s, the true speed
   driver_set: bool = False  # the driver is on the SET-/SET+ switch this frame (cruise on or off)
   road_name: str = ""       # mapdOut.roadName (rule 7: a turn onto another road)
+  nav_limit: float = 0.0    # m/s, navigation's posted limit (starpilotPlan.mapNavSpeedLimit: fresh, 0 none)
+  nav_dist: float = 0.0     # m to navigation's next maneuver (0 none)
+  nav_turn: bool = False    # that maneuver is a turn
+  turned: bool = False      # the car's heading changed TURN_HEADING within TURN_HEADING_TIME (the wrapper: the yaw)
 
 
 @dataclass
@@ -251,8 +323,13 @@ class Offer:
 
 
 class SpeedLimitFollower:
-  def __init__(self, is_metric, street_mode=STREET_OFFSET_DEFAULT):
+  def __init__(self, is_metric, street_mode=STREET_OFFSET_DEFAULT, slow_lower=True):
     self.step = MS_PER_KPH if is_metric else MS_PER_MPH
+    m = 1 if is_metric else 0
+    self.slow_lower = bool(slow_lower)
+    self.fallback = STREET_FALLBACK[m]
+    self.big_drop = LOWER_BIG_DROP[m]
+    self.nav_min, self.nav_agree, self.nav_street_max = NAV_LIMIT_MIN[m], NAV_AGREE[m], NAV_STREET_MAX[m]
     offs = STREET_OFFSETS[1 if is_metric else 0]
     self.street_add = offs[street_mode] if street_mode in range(len(offs)) else offs[STREET_OFFSET_DEFAULT]  # steps
     self.multiple = LIMIT_MULTIPLE_KPH if is_metric else LIMIT_MULTIPLE_MPH
@@ -301,6 +378,18 @@ class SpeedLimitFollower:
     self.turn_check = False        # rule 7: the steady limit as the new road's once (the same value as the old road's)
     self.last_next = (0.0, -1.0)   # the next limit (m/s) and its distance (m) when the last offer was made (logs)
     self.undo_frame = -1_000_000   # the last rule 4 undo (LIMIT_QUICK_AFTER_UNDO)
+    # rules 8 / 9: the engage match, the slowdown for a lower limit (`lower`: an Offer the map control carries out)
+    self.lower = None              # Offer: kind "match" or "lower", tgt the speed (steps), driver his speed before
+    self.lowered = None            # the last finished slowdown for a lower limit (LOWER_UNDO_TIME)
+    self.lower_skip = None         # the limit a slowdown ended for by his decision: not again for it
+    self.engage_frame = None       # cruise came on (rule 8 not decided yet)
+    self.trust0_frames = 0         # consecutive frames with GPS trust 0
+    self.unknown_frames = 0        # consecutive frames with no posted limit reported
+    self.cand_name = ""            # the road name when the candidate limit first appeared ...
+    self.cand_turn = False         # ... and navigation's turn was within NAV_TURN_NEAR then
+    self.turn_frame = -1_000_000   # rule 7's last turn (the name changed)
+    self.nav = None                # navigation's limit (steps, None: none usable) this frame
+    self.stable_before = None      # the steady limit before the current one
 
   def _steps(self, v):
     return v / self.step
@@ -380,6 +469,8 @@ class SpeedLimitFollower:
       self.candidate_trust = max(self.candidate_trust, trust)
     else:
       self.candidate, self.candidate_frames, self.candidate_trust = reported, 0, trust
+      self.cand_name = self.name
+      self.cand_turn = bool(i.nav_turn and 0 < i.nav_dist <= NAV_TURN_NEAR)
     if self.candidate is not None and self.candidate != self.stable and self.candidate_frames >= _frames(self._stable_time()):
       self._new_limit(i, d)
     if self.rise is not None:
@@ -388,10 +479,14 @@ class SpeedLimitFollower:
         (self.turn_check or self.exit_retry == reported) and self.rise is None and
         not self._plausible(None, reported, i.source, i.gps_trust)):
       # rule 7: the new road's limit the same as the old road's; rule 6 / 7: one refused only for the GPS trust, again
+      # (review of merge-f: the retry kept the old trust 2 in candidate_trust and never raised) with a fresh steady time
+      if self.exit_retry == reported or self.candidate_trust > LIMIT_FIRM_TRUST_MAX:
+        self.candidate_frames, self.candidate_trust = 0, trust
       self.turn_check, self.exit_retry = False, None
       self._exit_limit(reported, None, d, i, self.frame)
     self._provisional(reported, d, i)
     self._merge(i, d)
+    self._street_speed(i, d, reported)
     return self._offered(d)
 
   # ---- road classes, the provisional ceiling, rules 5 (merge) and 6 (after an exit) ----
@@ -460,15 +555,155 @@ class SpeedLimitFollower:
     if n != self.name_cand:
       self.name_cand, self.name_frames = n, 0
     self.name_frames += 1
-    if self.name_frames < _frames(TURN_NAME_STEADY):
-      return
+    straight = i.nav_dist > NAV_STRAIGHT and not (i.nav_turn and i.nav_dist <= NAV_STRAIGHT)
+    if self.name_frames < _frames(TURN_NAME_STEADY_STRAIGHT if straight else TURN_NAME_STEADY):
+      return                         # (navigation says straight on through here: a short name change is a flap)
     old, self.name, self.name_cand = self.name, n, ""
-    if old and self._street() and (self.exit_start is None or self.exit_kind == "turn"):
+    if old and i.turned:
+      self.turn_frame = self.frame
+    if old and i.turned and self._street() and (self.exit_start is None or self.exit_kind == "turn"):
       self.exit_start = self.frame - self.name_frames - _frames(TURN_EARLY)
       self.exit_street, self.exit_kind, self.exit_retry, self.turn_check = self.frame, "turn", None, True
       if self.rise is not None and self.rise[0] == "exit":
         self.rise = None             # (the old road's pending raise: the new road decides)
     self.name_frames = 0
+
+  # ---- rules 8 (match on engage) and 9 (slow for a lower limit) ----
+
+  def _log(self, kind, why, limit, target, d, sources=""):
+    self.events.append((kind, {"old": None, "new": limit if limit is not None else 0, "source": sources or "Map Data",
+                               "reason": why, "log": {"target_mph": target * self.step / MS_PER_MPH,
+                                                      "driver_before_mph": (d or 0) * self.step / MS_PER_MPH,
+                                                      "sources": sources}}))
+
+  def _nav_limit(self, i):
+    """Navigation's limit (steps) when usable (fresh: the planner's; not junk under NAV_LIMIT_MIN), else None."""
+    if i.nav_limit <= 0:
+      return None
+    x = self._steps(i.nav_limit)
+    if self._street() and x > self.nav_street_max + 0.5:
+      return None                      # (its route step's highway limit on a street: drive 55, Dobry Drive)
+    return int(round(x)) if x >= self.nav_min - 0.5 else None
+
+  def _street_speed(self, i, d, reported):
+    """Rules 8 and 9 (no limit follow on a highway, a link or an unknown road)."""
+    self.nav = self._nav_limit(i)
+    self.trust0_frames = self.trust0_frames + 1 if i.gps_trust <= LIMIT_FIRM_TRUST_MAX else 0
+    self.unknown_frames = self.unknown_frames + 1 if reported is None else 0
+    if d is None:
+      self.engage_frame = None
+      if self.lower is not None:
+        self._log("speedLimitSlow" if self.lower.kind == "lower" else "speedLimitMatch", "cancel: cruise off",
+                  self.lower.new, self.lower.target, None)
+        self.lower = None
+      return
+    if self.cruise_off_frame == self.frame - 1:
+      self.engage_frame = self.frame
+    lw = self.lower
+    if lw is not None:
+      if not self._street():
+        self.lower = None
+        self._log("speedLimitSlow", "cancel: not on a street", lw.new, lw.target, d)
+      elif lw.kind == "lower" and reported != lw.new and reported is not None and reported > lw.new:
+        self.lower = None              # the limit back up before he got there: his speed (the anchor) comes back
+        self._log("speedLimitSlow", "undo: the limit back up before it got there", reported, lw.driver, d)
+      return
+    if self.engage_frame is not None:
+      self._engage(i, d, reported)
+    elif self.slow_lower:
+      self._slow_lower(i, d, reported)
+
+  def _engage(self, i, d, reported):
+    """Rule 8: cruise came on; decided once on a street with the road and GPS trust 0 steady ENGAGE_ROAD_STEADY."""
+    if self.frame - self.engage_frame > _frames(ENGAGE_WINDOW) or (
+        self.driver_set_frame > self.engage_frame + _frames(ENGAGE_SET_QUIET)):
+      self.engage_frame = None         # (too late, or his own SET since: his)
+      return
+    steady = _frames(ENGAGE_ROAD_STEADY)
+    if not self._street() or self.frame - self.road_since < steady or self.trust0_frames < steady:
+      return
+    nav = self.nav
+    if (reported is not None and reported == self.stable and reported == self.candidate and
+        self.candidate_frames >= _frames(ENGAGE_LIMIT_STEADY) and self.candidate_trust <= LIMIT_FIRM_TRUST_MAX):
+      lo = hi = reported
+      sources = "map"
+      if nav is not None:
+        if abs(nav - reported) <= self.nav_agree:
+          sources = "map+nav"
+        else:
+          lo, hi = min(nav, reported), max(nav, reported)
+          sources = f"map {reported}, nav {nav}: between"
+      add = self._add()
+      if d > hi + add + 0.5:
+        tgt, limit = hi + add, hi
+      elif d < lo + add - 0.5:
+        tgt, limit = lo + add, lo
+      else:
+        self.engage_frame = None
+        return
+    elif reported is None and self.unknown_frames >= steady:
+      # no limit known: only down, to the fallback (navigation's alone: down to it plus the offset, never under 43 ... the
+      # higher of the two)
+      tgt, limit = self.fallback, None
+      sources = "none: fallback"
+      if nav is not None:
+        tgt, limit, sources = max(nav + self._add(), self.fallback), nav, "nav only"
+      if d <= tgt + 0.5:
+        self.engage_frame = None
+        return
+    else:
+      return                           # (a limit not steady yet, or not with trust 0: wait for it)
+    self.engage_frame = None
+    if tgt > d:
+      self.offer = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt)
+    else:
+      self.lower = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt)
+    self._log("speedLimitMatch", "start: cruise on, " + ("up" if tgt > d else "down"), limit, tgt, d, sources)
+
+  def _slow_lower(self, i, d, reported):
+    """Rule 9: a lower limit steady LOWER_STEADY (navigation agreeing: LOWER_NAV_STEADY) with GPS trust 0 throughout."""
+    c = self.candidate
+    if (c is None or reported != c or c == self.lower_skip or not self._street() or self.candidate_trust > 0 or
+        self.cand_turn or self.name_cand):
+      return
+    if self.cand_name != self.name and self.turn_frame < self.frame - self.candidate_frames - _frames(TURN_EARLY):
+      return                           # (the name changed since it appeared and not by a turn: wait)
+    old = self.stable_before if self.stable == c else self.stable
+    if old is None or c >= old:
+      return
+    nav = self.nav
+    agree = nav is not None and abs(nav - c) <= self.nav_agree
+    big = old - c > self.big_drop
+    need = (LOWER_NAV_BIG_STEADY if big else LOWER_NAV_STEADY) if agree else (LOWER_BIG_STEADY if big else LOWER_STEADY)
+    if self.candidate_frames < _frames(need):
+      return
+    limit, sources = c, ("map+nav" if agree else "map")
+    if nav is not None and not agree:
+      limit, sources = max(nav, c), f"map {c}, nav {nav}: the higher"
+    tgt = limit + self._add()
+    self.lower_skip = c                # (once for this limit)
+    if d <= tgt + 0.5:
+      return
+    self.lower = Offer(old, limit, i.source or "Map Data", self.frame, "lower", d, tgt=tgt)
+    self.cap = None
+    self._log("speedLimitSlow", f"start: {old} -> {c}", limit, tgt, d, sources)
+
+  def lower_finished(self, why, d_now=None):
+    """The map control finished `lower` (why: "done", or "cancel: ..." by his gas / buttons / cruise off): his speed is
+    what it reached; a finished slowdown for a lower limit may still be undone (LOWER_UNDO_TIME)."""
+    lw = self.lower
+    if lw is None:
+      return
+    self.lower = None
+    if why == "done" and lw.kind == "lower":
+      self.lowered = Offer(lw.old, lw.new, lw.source, self.frame, "lower", lw.driver, tgt=lw.tgt)
+    self._log("speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch", why, lw.new, lw.target,
+              d_now if d_now is not None else lw.driver)
+
+  @property
+  def lower_speed(self):
+    """m/s: rules 8 / 9's speed for the map control's paced slowdown (0: none)."""
+    return self.lower.target * self.step if self.lower is not None else 0.0
 
   def _provisional(self, reported, d, i):
     """A lower limit reported now, not steady yet, with the driver's speed in rule 1's band of the limit before (the
@@ -566,7 +801,17 @@ class SpeedLimitFollower:
 
   def _new_limit(self, i, d):
     new, start = self.candidate, self.frame - self.candidate_frames    # start: the new limit's first frame
+    lw = self.lowered
+    if (lw is not None and self.frame - lw.frame <= _frames(LOWER_UNDO_TIME) and new > lw.new and d is not None and
+        abs(d - lw.target) < 0.5 and self.driver_set_frame < lw.frame):
+      # rule 9's undo: the limit back up soon after it slowed him (a wrong lower limit): his speed before comes back
+      self.lowered = None
+      self.stable, self.stable_last_seen = new, self.frame
+      self.offer, self.cap, self.rise = Offer(lw.new, new, i.source, self.frame, "unlower", d, tgt=lw.driver), None, None
+      self._log("speedLimitSlow", "undo: the limit back up", new, lw.driver, d)
+      return
     old, old_seen = self.stable, self.stable_last_seen
+    self.stable_before = self.stable
     if (self.matched is not None and self.matched != old and self.matched < new and
         self.frame - self.matched_seen <= _frames(LIMIT_MATCH_MAX_AGE)):
       old, old_seen = self.matched, self.frame        # the limit the driver was at, before a short detour (4d)
