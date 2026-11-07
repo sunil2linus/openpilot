@@ -267,6 +267,17 @@ def _map_curve_target(sp) -> float:
   return target if target > 0 else _map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory)
 
 
+def limit_slowing_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                        personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  # Mazda: the set speed is lowered for a lower posted limit (speed_limit_follow rule 9), paced, ~0.5 m/s^2 at most
+  limit = float(getattr(sm["starpilotCarState"], "mazdaLimitSlowLimit", 0.0) or 0.0)
+  return Alert(
+    f"Speed limit {get_display_speed(limit, metric)} · slowing",
+    "",
+    StarPilotAlertStatus.starpilot, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlert.none, 5.)
+
+
 def stopped_lead_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                        personality, starpilot_toggles: SimpleNamespace) -> Alert:
   # the stopped car warning also warns for a much slower moving car (stop_warning.SLOW_LEAD_*): "CAR AHEAD - BRAKE" then,
@@ -1308,6 +1319,10 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Cruise cannot slow enough for the ramp curve",
       AlertStatus.userPrompt, AlertSize.mid,
       Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stopChime, 3.),
+  },
+
+  StarPilotEventName.mazdaLimitSlowing: {
+    ET.PERMANENT: limit_slowing_alert,
   },
 
   StarPilotEventName.mazdaStockLkasOff: {

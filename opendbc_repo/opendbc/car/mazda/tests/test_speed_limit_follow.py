@@ -1142,8 +1142,9 @@ def test_after_an_exit_the_offer_ends_with_cruise_off():
   # review: a rule 6 offer survived cruise off and was taken 0.3 s after RES; cruise must stay on from when the limit
   # appeared until it is taken (his brake held the offer at 3650, cancel at 3750, RES at 3950)
   r, c = _exit_wrong_first(50, 50, 6, extra={3650: _brake_held, 3750: _cruise_off, 3950: _resume_now})
-  assert c.raises == [] and abs(r["final"] - 25) < 0.01, (c.raises, r["final"])
   assert any("after the exit: cruise off" in x for x in _reasons(c)), _reasons(c)
+  # (rule 8, owner after drives 54 / 55: his RES on the known 50 street matches its limit: a "match", not rule 6's)
+  assert c.kinds == ["match"] and abs(r["final"] - 50) < 0.01, (c.kinds, r["final"])
   # cruise on throughout: taken
   r, c = _exit_wrong_first(50, 50, 6)
   assert c.kinds == ["exit"] and abs(r["final"] - 50) < 0.01
@@ -1191,10 +1192,10 @@ def test_a_short_lower_limit_while_restoring_only_pauses_it():
 
 # ---------------- Street Speed (MazdaStreetSpeedOffset), rule 7 (after a turn), owner after drives 54 / 55 ----------------
 
-def _lis(limit_mph, driver_mph=45.0, road_class=5, name="A Road", trust=0, cruise=True, source="Map Data"):
+def _lis(limit_mph, driver_mph=45.0, road_class=5, name="A Road", trust=0, cruise=True, source="Map Data", turned=False):
   return slf.LimitInputs(limit=limit_mph * MPH, source=source, gps_trust=trust,
                          driver_speed=driver_mph * MPH if cruise else 0.0, cruise_enabled=cruise, road_class=road_class,
-                         road_name=name)
+                         road_name=name, turned=turned)
 
 
 def _on_street(mode=2, limit=45, driver=50, road_class=5, name="A Road"):
@@ -1204,6 +1205,7 @@ def _on_street(mode=2, limit=45, driver=50, road_class=5, name="A Road"):
   for _ in range(5):
     f.update(_lis(limit, driver, road_class=road_class, name=name))
   f.events = []
+  f.engage_frame, f.offer, f.lower = None, None, None   # (settled: his speed set long ago, not a fresh engage: rule 8)
   return f
 
 
@@ -1253,12 +1255,13 @@ def test_street_speed_rule_3_cap_and_rule_2_first_limit():
   assert abs(out[-1] / MPH - 50) < 1e-6 and f.offer.kind == "first"
 
 
-def _turned(mode=2, old=45, new=50, driver=75, trust=lambda k: 0, cruise_off=False):
-  """On A Road (old) at his `driver`, a turn onto B Road (new): the name changes, the new limit from the same moment."""
+def _turned(mode=2, old=45, new=50, driver=75, trust=lambda k: 0, cruise_off=False, turned=True, frames=RAISE + 600):
+  """On A Road (old) at his `driver`, a turn onto B Road (new): the name changes, the new limit from the same moment;
+  turned: the heading changed (HeadingWatch) through it."""
   f = _on_street(mode, old, driver)
   outs = []
-  for k in range(RAISE + 600):
-    outs.append(f.update(_lis(new, driver, name="B Road", trust=trust(k), cruise=not cruise_off)))
+  for k in range(frames):
+    outs.append(f.update(_lis(new, driver, name="B Road", trust=trust(k), cruise=not cruise_off, turned=turned and k < 500)))
   return f, outs
 
 
@@ -1277,6 +1280,29 @@ def test_rule_7_after_a_turn_a_restore_never_goes_back_above_the_new_roads_limit
   f = _on_street(2, 45, 75)
   _run(f, RAISE + 600, 50, 75)
   assert f.cap is None and f.offer is None
+
+
+def test_rule_7_needs_a_heading_change_and_the_trust_retry_raises():
+  # review of merge-f: the name changing along the same road (or the highway's name becoming the street's after an exit)
+  # is no turn: without the heading change rule 7 does not open
+  f, outs = _turned(2, 45, 50, 75, turned=False)
+  assert f.cap is None and f.exit_kind != "turn" and all(x == 0.0 for x in outs)
+  # review of merge-f (drive 55, Mound Road): the new road's 50 steady while GPS trust was 2, then 0: at 40 it raises to
+  # 55 on a fresh steady time with trust 0 (the retry kept the old trust 2 and never raised)
+  f, outs = _turned(2, 45, 50, 40, trust=lambda k: 2 if k < 900 else 0, frames=900 + RAISE + 300)
+  got = [k for k, x in enumerate(outs) if x > 0]
+  assert got and abs(outs[got[0]] / MPH - 55) < 1e-6 and got[0] >= 900 + RAISE - 5, (got[:1], f.events)
+  # the heading watch: 90 deg in 6 s is a turn, a lane change's few degrees are not, an old turn is forgotten
+  h = slf.HeadingWatch()
+  for _ in range(600):
+    h.update(0.01, 15.0)
+  assert h.turned()
+  for _ in range(1100):
+    h.update(0.01, 0.0)
+  assert not h.turned()
+  for k in range(400):
+    h.update(0.01, 3.0 if k < 200 else -3.0)
+  assert not h.turned()
 
 
 def test_rule_7_a_first_known_limit_on_the_new_road_raises_him_never_slows_him():

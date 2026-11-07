@@ -230,6 +230,29 @@ def _lane_model(m, right_edge=True):
   m.roadEdgeStds = [0.3, 0.3]
 
 
+def test_wrapper_reads_slow_for_lower_limits_and_raises_its_alert_flag(monkeypatch):
+  # MazdaSlowLowerLimit (default on; typed params give a bool)
+  for raw, want in ((None, True), ("0", False), ("1", True), (False, False), (True, True), ("x", True)):
+    sm = W.FakeSM()
+    monkeypatch.setattr(messaging, "SubMaster", lambda services, sm=sm: sm)
+    CP = SimpleNamespace(flags=MazdaSafetyFlags.GEN1, carFingerprint="MAZDA_CX5", maxLateralAccel=1.09)
+    c = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False, "MazdaSlowLowerLimit": raw}), curve_enabled=False,
+                         map_mode=2, limit_mode=2)
+    assert c.limit_follow.slow_lower is want, (raw, want)
+  # starpilotCarState.mazdaLimitSlowLimit: the limit while the map control carries out a slowdown for it
+  from opendbc.car.mazda.speed_limit_follow import Offer
+  c.limit_follow.lower = Offer(45, 25, "Map Data", 0, "lower", 50, tgt=30)
+  assert c.limit_slow_limit == 0.0
+  c.map_control.ll_on = True
+  assert abs(c.limit_slow_limit - 25 * MPH) < 1e-6
+  c.limit_follow.lower.kind = "match"
+  assert c.limit_slow_limit == 0.0
+  # the heading watch for rule 7 (a turn): the steering angle and the speed
+  CS = SimpleNamespace(out=SimpleNamespace(steeringAngleDeg=150.0))
+  turned = [c._heading_turned(CS, SimpleNamespace(steerRatio=15.5, wheelbase=2.7), 6.0) for _ in range(500)]
+  assert not turned[0] and turned[-1]
+
+
 def test_wrapper_reads_the_street_speed_setting_for_the_map_control_and_the_limit_follower(monkeypatch):
   # MazdaStreetSpeedOffset 0..3: the legal limit, +3, +5 (default; also an unknown or bad value), +8 mph
   for raw, mph in ((None, 5), ("0", 0), ("1", 3), ("2", 5), ("3", 8), ("x", 5), ("9", 5)):

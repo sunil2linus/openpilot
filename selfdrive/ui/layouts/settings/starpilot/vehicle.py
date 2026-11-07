@@ -523,6 +523,12 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_value": get_value,
       "on_click": on_click,
     })
+    tiles.append({
+      "title": tr("Slow for Lower Limits"),
+      "subtitle": tr("On a street: a lower posted limit steady 5 s (8 s for big drops) slows the cruise gently to it."),
+      "get_state": lambda: params.get_bool("MazdaSlowLowerLimit"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaSlowLowerLimit"),
+    })
     get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
     tiles.append({
       "title": tr("Model Follow (Test)"),

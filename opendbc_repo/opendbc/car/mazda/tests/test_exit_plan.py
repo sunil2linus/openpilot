@@ -1443,13 +1443,14 @@ def test_exit_street_target_res_gas_and_metric():
   exited(c)
   outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH, gas=lambda k: k >= 150)
   assert set_v > 60 * MPH and any(o.adopt for o in outs) and not outs[-1].active
-  # RES later than EXIT_STREET_TIME: nothing
+  # RES later than EXIT_STREET_TIME: still (review of merge-f: the window never ends before the exit's street speed
+  # was applied, so his highway speed is never left the target on the street)
   c = CTL.MapCurveControl(3.0)
   exited(c)
   for _ in range(int(CTL.EXIT_STREET_TIME / CTL.DT_CTRL) + 10):
     c.update(F(road_class=7, limit=45 * MPH), 0.0, 0, v_ego=10.0)
-  outs, set_v = street_run(c, 200, 75 * MPH, 75 * MPH)
-  assert not any(o.active for o in outs)
+  outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH)
+  assert outs[0].active and abs(set_v - 50 * MPH) < 1e-6
   # his own lower speed at RES (40 on the 45 street): his
   c = CTL.MapCurveControl(3.0)
   exited(c)
@@ -1514,3 +1515,50 @@ def test_drive_54_exit_2_no_set_plus_from_the_exit_wait_on_the_real_ramp():
   r = drive_exit(fields, 9000, 70, signal=lambda x: 1 if ex - 350 <= x < ex - 330 else 0)
   conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
   assert conf > ex + 250 and _plus(r, ex, conf) == [], (conf, _plus(r, ex, conf))
+
+
+def test_review_an_exit_without_curves_confirmed_but_never_matched_to_its_link_ends():
+  # review of merge-f: confirmed by the shapes, the road match never on the link (still class 1, trust 2): the plan held
+  # "exit hold" for good (no caps, no raises). EXIT_PASS_MARGIN past the split: what it reached is his
+  ex = 1500.0
+
+  def fields(x):
+    hwy = dict(road_class=1, limit=70 * MPH)
+    if x < ex - 1300:
+      return F(**hwy)
+    if x < ex - 30:
+      return F(nav_exit=2, nav_exit_distance=ex - x, nav_exit_side=1, exit_shape=1, **hwy)
+    return F(exit_shape=2 if x > ex + 60 else 0, **{**hwy, "gps_trust": 2})
+  r = drive_exit(fields, 9000, 75, signal=lambda x: 1 if ex - 300 <= x < ex - 280 else 0,
+                 lead=lambda x: 50 * MPH if x > ex + 100 else None)
+  assert r["ctl"].plan is None and r["ctl"].last_plan.why == "confirmed, no link match", r["ctl"].last_plan.why
+  assert r["logic"].anchor is None and r["sets"][-1] <= 70 + 1e-6 and _plus(r, ex, 10 ** 9) == [], r["sets"][-1]
+
+
+def test_planner_navigations_limit_for_the_street_speed():
+  # the car side's second opinion (mapNavSpeedLimit): Mapbox's limit fresh (NAV_FRESH), junk under 15 mph none
+  from types import SimpleNamespace
+  p = _FakePlanner(object())
+  ni = lambda lim, d=200.0, t="turn", m="right": SimpleNamespace(speedLimit=lim * MPH, maneuverDistance=d,  # noqa: E731
+                                                                 maneuverType=t, maneuverModifier=m)
+  for lim, want in ((25, 25), (5, 0), (0, 0), (50, 50)):
+    MC.MapCurvesPlanner._nav_street(p, ni(lim), 100.0)
+    p.now = 101.0
+    plan = _plan_ns(mapNavSpeedLimit=0.0, mapNavManeuverDistance=0.0, mapNavManeuverTurn=False)
+    p.mc = SimpleNamespace(data_here=False, paused=False, curve=None, held=None)
+    try:
+      MC.MapCurvesPlanner.publish(p, plan)
+    except AttributeError:
+      pass                                                       # (the rest of the fake planner: not needed here)
+    assert abs(plan.mapNavSpeedLimit - want * MPH) < 1e-6 and plan.mapNavManeuverTurn and plan.mapNavManeuverDistance == 200.0
+  # stale (more than NAV_FRESH): none
+  p.now = 100.0 + MC.NAV_FRESH + 0.5
+  plan = _plan_ns(mapNavSpeedLimit=0.0, mapNavManeuverDistance=0.0, mapNavManeuverTurn=False)
+  try:
+    MC.MapCurvesPlanner.publish(p, plan)
+  except AttributeError:
+    pass
+  assert plan.mapNavSpeedLimit == 0.0
+  # straight on is no turn
+  MC.MapCurvesPlanner._nav_street(p, ni(45, t="continue", m="straight"), 100.0)
+  assert not p.nav_street[2]

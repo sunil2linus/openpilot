@@ -1338,9 +1338,16 @@ class CurveSlowdown:
     except (TypeError, ValueError, AttributeError):
       street_mode = STREET_OFFSET_DEFAULT  # (an older params build without the key: the default, +5)
     self.street_mode = street_mode
+    # Slow for Lower Limits (MazdaSlowLowerLimit, default on: speed_limit_follow rule 9)
+    try:
+      raw = params.get("MazdaSlowLowerLimit", encoding="utf8")
+      slow_lower = True if raw is None or raw == "" else (raw if isinstance(raw, bool) else bool(int(raw)))
+    except (TypeError, ValueError, AttributeError):
+      slow_lower = True
+    self.slow_lower = slow_lower
     if limit_mode:
       from opendbc.car.mazda.speed_limit_follow import SpeedLimitFollower
-      self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"), street_mode=street_mode)
+      self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"), street_mode=street_mode, slow_lower=slow_lower)
     self.limit_want = 0.0
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
@@ -1600,7 +1607,14 @@ class CurveSlowdown:
                                                   a_ego=float(CS.out.aEgo),
                                                   max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed),
                                                   set_speed=set_speed if (cruise_enabled and set_speed > 0) else None,
-                                                  driver_set=bool(CS.crz_set_minus or CS.crz_set_plus))
+                                                  driver_set=bool(CS.crz_set_minus or CS.crz_set_plus),
+                                                  limit_lower=self._limit_lower())
+      if self.map_control.lower_event is not None:
+        # the street speed (speed_limit_follow rules 8 / 9) carried out or ended by him: the follower knows
+        if self.limit_follow is not None:
+          self.limit_follow.lower_finished(self.map_control.lower_event,
+                                           (set_speed / self.limit_follow.step) if set_speed > 0 else None)
+        self.map_control.lower_event = None
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
@@ -1644,8 +1658,14 @@ class CurveSlowdown:
                        ramp_to_highway=bool(plan_alive and getattr(plan, "mapOnRamp", False) and
                                             getattr(plan, "mapRampToHighway", False)),
                        next_limit=next_limit, next_distance=next_dist, v_ego=v_ego,
-                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus), road_name=self._road_name())
+                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus), road_name=self._road_name(),
+                       nav_limit=float(getattr(plan, "mapNavSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
+                       nav_dist=float(getattr(plan, "mapNavManeuverDistance", 0.0) or 0.0) if plan_alive else 0.0,
+                       nav_turn=bool(plan_alive and getattr(plan, "mapNavManeuverTurn", False)),
+                       turned=self._heading_turned(CS, CP, v_ego))
       self.limit_want = self.limit_follow.update(li)
+      if self.limit_mode != LIMIT_ON and self.limit_follow.lower is not None:
+        self.limit_follow.lower_finished("test: logged only")      # (Test: nothing carried out)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
     limit_ceiling = self.limit_follow.ceiling_speed if self.limit_follow is not None else 0.0
@@ -1968,6 +1988,35 @@ class CurveSlowdown:
       pass
 
   # ---- map curve logs ----
+  def _heading_turned(self, CS, CP, v_ego):
+    """speed_limit_follow rule 7: the car's heading changed TURN_HEADING within TURN_HEADING_TIME (its yaw from the
+    speed and the steering angle: v tan(angle / steer ratio) / wheelbase)."""
+    import math
+    from opendbc.car.mazda.speed_limit_follow import HeadingWatch
+    if getattr(self, "heading", None) is None:
+      self.heading = HeadingWatch()
+    ratio = float(getattr(CP, "steerRatio", 0.0) or 15.5)
+    wheelbase = float(getattr(CP, "wheelbase", 0.0) or 2.7)
+    angle = float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0)
+    rate = max(v_ego, 0.0) * math.tan(math.radians(angle) / ratio) / wheelbase
+    self.heading.update(DT_CTRL, math.degrees(rate))
+    return self.heading.turned()
+
+  def _limit_lower(self):
+    """m/s: speed_limit_follow's street speed for the map control to carry out (On only), 0 none."""
+    from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
+    if self.limit_follow is None or self.limit_mode != LIMIT_ON:
+      return 0.0
+    return self.limit_follow.lower_speed
+
+  @property
+  def limit_slow_limit(self):
+    """starpilotCarState.mazdaLimitSlowLimit: the lower posted limit we are slowing for (rule 9, On), m/s; 0 none."""
+    lf = self.limit_follow
+    if lf is None or lf.lower is None or lf.lower.kind != "lower" or self.map_control is None or not self.map_control.ll_on:
+      return 0.0
+    return float(lf.lower.new or 0) * lf.step
+
   @property
   def exit_brake_alert(self):
     """starpilotCarState.mazdaExitCurveBrake: up for EXIT_CHIME_HOLD after each "Exit curve - brake" chime (On)."""
@@ -2206,11 +2255,15 @@ class CurveSlowdown:
       if self.recorder is not None:
         import time
         for kind, data in lf.events[-3:]:
+          own = kind in ("speedLimitMatch", "speedLimitSlow")      # (rules 8 / 9: start, done, cancel, undo each)
           self.recorder.record(kind, time.monotonic(), {"old_mph": data["old"] * unit if data["old"] is not None else None,
                                                         "new_mph": data["new"] * unit, "source": data["source"],
                                                         "reason": data["reason"],
-                                                        "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH},
-                               min_gap=10.0, signals=False)
+                                                        "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH,
+                                                        **({"mode": "on" if self.limit_mode == 2 else "test",
+                                                            "vEgo_mph": i.v_ego / MS_PER_MPH, **data.get("log", {})}
+                                                           if own else {})},
+                               min_gap=0.0 if own else 10.0, signals=False)
       lf.events = []
 
   def _log(self, i, si, stop_active, button, a_ego, plan=None):
