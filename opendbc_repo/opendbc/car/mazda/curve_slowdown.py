@@ -141,8 +141,9 @@ CAR_MIN_SET_SPEED = 30.0 * MS_PER_KPH    # the car's own minimum set speed (18.6
 # left / leaving the lane, cruise off / brake or disengaged while a slower car is still in our lane (drive 4c: with
 # nothing slower in our lane those restore with the hold, stop_clear_ahead), unless the radar follows a car.
 RESTORE_HOLD_MIN_GAIN = 1
-# Speed limit follow (speed_limit_follow.py, drive 4c): a higher posted limit becomes the driver's speed (the anchor);
-# the restore rule above then brings the set speed up: 5 mph or less by taps, more by one hold to 5 below, then taps.
+# Speed limit follow (speed_limit_follow.py, drives 4c, 52): a higher posted limit becomes the driver's speed (the
+# anchor); the restore rule above then brings the set speed up: 5 mph or less by taps, more by one hold to 5 below, then
+# taps. A lower one only stops a pending restore there (never a SET-).
 LIMIT_DRIVER_QUIET = 3.0                 # s after the driver's last SET edge before a higher limit is adopted
 # Fast restores at any speed (drive 4d, t 2017-2022 and 1825-1829): after a stop the restore waited until we were
 # back at KEEP_SPEED (12 mph) while the car ahead was already driving off; the radar keeps the gap and the set speed
@@ -207,9 +208,12 @@ class SlowdownInputs:
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
   radar_lead: bool = False        # the stock radar follows a lead (CRZ_CTRL.RADAR_HAS_LEAD, debounced: trigger.radar_stable)
-  # the posted limit rose to this (m/s) and the driver's speed matched the old one (speed_limit_follow.py): make it
-  # the driver's speed
+  # the posted limit rose to this (m/s) with the driver's speed at the old one or up to 5 above, or a first limit
+  # (speed_limit_follow.py rules 1, 2): make it the driver's speed
   limit_raise: float = 0.0
+  # the posted limit fell to this (m/s) with the driver's speed at the old one (speed_limit_follow.py rule 3): a pending
+  # restore stops here, or at the set speed if that is higher (never a SET- for it)
+  limit_cap: float = 0.0
   # stopped car trigger: released by brake / disengage / lane exit and no slower car is in our lane: the restore may
   # use SET+ holds (stopped_car_slowdown CLEAR_*)
   stop_clear_ahead: bool = False
@@ -301,6 +305,8 @@ class CurveSlowdownLogic:
     self.standstill_frames = 0
     self.last_action = None          # "tap" / "hold" / "restore" of the last frame sent (for logs)
     self.limit_adopted = None        # (driver's speed before, new limit) on the frame a higher limit was adopted
+    self.limit_cap = None            # a lower limit (m/s): no SET+ of ours above it until the driver's speed comes down
+    self.limit_capped = None         # (driver's speed before, the cap) on the frame a lower limit capped it
     # What the car profile (car_profile.py) remembers across drives: every hold whose landing after the release was
     # measured, ours (_finish_hold) and the driver's own (a held SET-/SET+ on the stock switch, watched below, so
     # Test mode learns the car too), is counted here with its quanta after the release.
@@ -359,6 +365,7 @@ class CurveSlowdownLogic:
   def _forget(self):
     """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
     self.anchor = None
+    self.limit_cap = None
     self.restoring = False
     self.no_effect = 0
     self.no_effect_trips = 0
@@ -701,6 +708,7 @@ class CurveSlowdownLogic:
     self.frame += 1
     self.last_action = None
     self.limit_adopted = None
+    self.limit_capped = None
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
     if self.new_wheel:
       self.wheel_frame = self.frame
@@ -778,6 +786,25 @@ class CurveSlowdownLogic:
       self.prev_csc_active = i.csc_active
       self.curve_free_frames = 0 if i.csc_active else self.curve_free_frames + 1
       self.reason_free_frames = 0 if (i.csc_active or i.stop_active or i.hold_restore) else self.reason_free_frames + 1
+    # A lower posted limit (speed_limit_follow.py rule 3; drive 52, tag 450: after a stop our restore took the set back
+    # up to 50 on a new 45 road). From now on no SET+ of ours above it; once none of our presses can still land (and no
+    # curve / stopped car is on: their limits count from the driver's speed) the driver's speed comes down to it, or
+    # to the set speed if that is higher. Never a SET- for a lower limit. If the lower limit goes first (the cross road
+    # matched while stopped at a light, drives 4c / 4d) the restore goes on to the driver's speed.
+    if i.limit_cap > 0:
+      if (self.anchor is not None and i.limit_cap < self.anchor - self.half_step and
+          (self.limit_cap is None or abs(i.limit_cap - self.limit_cap) > self.half_step)):
+        self.limit_cap = i.limit_cap
+        self.limit_capped = (self.anchor, i.limit_cap)
+    else:
+      self.limit_cap = None
+    if self.limit_cap is not None:
+      if self.anchor is None:
+        self.limit_cap = None
+      elif (cruise_ok and not self.inflight and self.pending is None and self.hold is None and
+            not any(p.direction == SET_PLUS for p in self.expired) and not i.csc_active and not i.stop_active):
+        self.anchor = max(min(self.anchor, self.limit_cap), self.last_set_speed)
+        self.limit_cap = None
     if self.offset == 0 and not self.inflight:
       self.flicker = False
       self.anchor = None             # back at the driver's speed: nothing left to restore
@@ -878,7 +905,8 @@ class CurveSlowdownLogic:
                    (i.set_speed + overrun > self.hold_bound + self.half_step))
       # a SET- hold also stops when the target rises above its bound (the radar took over the car ahead)
       target_rose = d == SET_MINUS and reason == "stop" and target > self.hold_bound + self.half_step
-      reason_gone = (reason != "stop" or target_rose) if d == SET_MINUS else (reason is not None or offset <= 0)
+      reason_gone = (reason != "stop" or target_rose) if d == SET_MINUS else \
+                    (reason is not None or offset <= 0 or self.limit_cap is not None)
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
@@ -928,6 +956,7 @@ class CurveSlowdownLogic:
         self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.anchor = i.limit_raise
+      self.limit_cap = None
       offset = self.offset
       driver_speed = set_speed + offset * self.step
 
@@ -950,6 +979,10 @@ class CurveSlowdownLogic:
     # lowest target, never above it (review sE: rounding up gave 37 for a 36.3 mph curve), whatever the SET- budget
     # left; and it waits out the curve's 1 s SET- settle like the curve's own restore does.
     up_ok = not i.csc_active or (target is not None and set_speed + self.step <= target + 1e-3)
+    # the highest a SET+ of ours may take the set speed: the driver's speed, or a lower limit's cap still pending
+    top = driver_speed if self.limit_cap is None else min(driver_speed, self.limit_cap)
+    if self.limit_cap is not None:
+      up_ok = up_ok and set_speed + self.step <= top + 1e-3
     if want_lower:
       self.restoring = False
       button = SET_MINUS
@@ -979,7 +1012,7 @@ class CurveSlowdownLogic:
     faster = button == SET_PLUS and v_hi >= int(round(i.set_speed / self.step)) + JUMP_STEPS
     may_jump = faster and (i.gas_pressed or self.frame - self.last_gas_frame <= _frames(GAS_JUMP_RECENT))
     jump = False
-    if faster and v_hi + (GAS_JUMP_MARGIN if may_jump else 0) > int(round(driver_speed / self.step)):
+    if faster and v_hi + (GAS_JUMP_MARGIN if may_jump else 0) > int(round(top / self.step)):
       return None, None                # if it did jump it could land above the driver's speed
     if may_jump and i.csc_active:
       # a jump lands on the current speed, which in a curve may be above its target (review sF: a raise 0.1 s after
@@ -1029,10 +1062,11 @@ class CurveSlowdownLogic:
             self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
-            (not self.stop_episode or fast_stop or i.fast_restore)):
+            (not self.stop_episode or fast_stop or i.fast_restore) and self.limit_cap is None):
         # one rule for every restore hold (RESTORE_HOLD_MIN_GAIN): a stop episode only when its car has clearly
-        # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins
-        driver_steps = int(round(driver_speed / self.step))
+        # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins (and
+        # taps while a lower limit's cap is pending: it releases a hold)
+        driver_steps = int(round(top / self.step))
         set_steps = int(round(set_speed / self.step))
         margin = self._up_overrun() * q                      # what may still land after the release
         bound_steps = ((driver_steps - margin) // q) * q     # a multiple of the quantum, that far below
@@ -1059,7 +1093,7 @@ class CurveSlowdownLogic:
       if jump and self.pending is not None and not self.pending.hold:
         p = self.pending                # lands as one jump up to the current speed, never past the driver's speed
         p.jump = True
-        p.reserve = p.remaining = max(1, int(round(driver_speed / self.step)) - int(round(i.set_speed / self.step)))
+        p.reserve = p.remaining = max(1, int(round(top / self.step)) - int(round(i.set_speed / self.step)))
     if button == SET_MINUS and want_lower:
       if reason == "curve":
         self.lower_presses += 1
@@ -1106,6 +1140,7 @@ class CurveSlowdown:
       from opendbc.car.mazda.speed_limit_follow import SpeedLimitFollower
       self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"))
     self.limit_want = 0.0
+    self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.curve_enabled = curve_enabled
     self.stop_mode = stop_mode
     self.has_ti = bool(CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
@@ -1308,16 +1343,20 @@ class CurveSlowdown:
           curve_active, curve_speed, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step, MIN_SET_SPEED))
         fast_restore = mo.fast_restore
 
-    # Posted limit rising (speed_limit_follow.py; Test: logged only)
+    # Posted limit (speed_limit_follow.py; Test: logged only). The driver's speed is the anchor itself, else the set
+    # speed: set_speed + offset above mixes this frame's set speed with last frame's offset, a one-step blip on every
+    # frame one of our presses lands, which the follower would take for the driver changing his speed.
     from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
     self.limit_want = 0.0
     if self.limit_follow is not None:
       from opendbc.car.mazda.speed_limit_follow import LimitInputs
+      limit_driver = (lg.anchor if lg.anchor is not None else set_speed) if (cruise_enabled and set_speed > 0) else 0.0
       li = LimitInputs(limit=float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
                        source=str(getattr(plan, "slcSpeedLimitSource", "") or ""),
-                       gps_trust=int(getattr(plan, "mapGpsTrust", 0) or 0), driver_speed=driver_speed,
+                       gps_trust=int(getattr(plan, "mapGpsTrust", 0) or 0), driver_speed=limit_driver,
                        cruise_enabled=cruise_enabled)
       self.limit_want = self.limit_follow.update(li)
+    limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
 
     inputs = SlowdownInputs(
       enabled=bool(CC.enabled),
@@ -1347,6 +1386,7 @@ class CurveSlowdown:
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
       stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
+      limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
     if self.limit_follow is not None:
@@ -1492,8 +1532,9 @@ class CurveSlowdown:
 
   # ---- per-event logs (never raises into the car controller: called inside try/except) ----
   def _limit_bookkeeping(self, i):
-    """Close the follower's offer once taken (On) or noted (Test), and log it."""
+    """Close the follower's offer once taken (On) or noted (Test), and log it; the same for a lower limit's cap."""
     lg, lf = self.logic, self.limit_follow
+    unit = lf.step / MS_PER_MPH
     adopted = lg.limit_adopted
     if adopted is None and self.limit_mode == 1 and self.limit_want > 0:
       adopted = (i.set_speed + lg.offset * lg.step, self.limit_want)
@@ -1504,19 +1545,45 @@ class CurveSlowdown:
         import time
         gap_steps = int(round((adopted[1] - i.set_speed) / lg.step))
         self.recorder.record("speedLimitAdopt", time.monotonic(), {
-          "mode": "on" if self.limit_mode == 2 else "test", "old_mph": (o.old * lf.step / MS_PER_MPH) if o else None,
+          "mode": "on" if self.limit_mode == 2 else "test",
+          "old_mph": (o.old * unit) if o and o.old is not None else None, "kind": o.kind if o else "",
           "new_mph": adopted[1] / MS_PER_MPH, "source": o.source if o else "", "set_mph": i.set_speed / MS_PER_MPH,
           "driver_mph_before": adopted[0] / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "gap_steps": gap_steps,
           "how": "taps" if gap_steps <= lg._quantum_steps() else "hold to 5 below, then taps",
           "offer_age_s": round((lf.frame - o.frame) * DT_CTRL, 2) if o else None, "clear_ahead": i.stop_clear_ahead,
           "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
+    c = lf.cap
+    if c is not None and c is not self.limit_cap_logged:
+      # a lower limit (rule 3), its first frame: On, the controller took it if a restore was pending above it; Test: the
+      # same check here (the set speed counted with our presses still in flight, which may still land)
+      self.limit_cap_logged = c
+      capped = lg.limit_capped
+      if self.limit_mode == 1 and lg.anchor is not None and c.new * lf.step < lg.anchor - lg.half_step:
+        capped = (lg.anchor, c.new * lf.step)
+      if self.recorder is not None:
+        import time
+        flying = sum(p.remaining if p.direction == SET_PLUS else -p.remaining for p in lg.inflight)
+        set_after = i.set_speed + flying * lg.step
+        if capped is not None:
+          self.recorder.record("speedLimitCap", time.monotonic(), {
+            "mode": "on" if self.limit_mode == 2 else "test", "old_mph": c.old * unit, "new_mph": c.new * unit,
+            "source": c.source, "driver_mph_before": capped[0] / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH,
+            "set_mph_with_in_flight": set_after / MS_PER_MPH,
+            "restore_to_mph": max(capped[1], set_after) / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
+            "cruise": i.cruise_enabled, "in_flight": len(lg.inflight), "stop_episode": lg.stop_episode},
+            min_gap=0.0, signals=False)
+        else:
+          why = "lower limit: no restore pending, the set speed stays (never SET- for a lower limit)"
+          lf.events.append(("speedLimitNotFollowed", {"old": c.old, "new": c.new, "source": c.source, "reason": why}))
+    if c is not None and (self.limit_mode != 2 or lg.limit_cap is None):
+      lf.mark_capped()               # nothing (more) to cap: nothing pending, the restore stopped there, or Test
     if lf.events:
       if self.recorder is not None:
         import time
         for kind, data in lf.events[-3:]:
-          unit = lf.step / MS_PER_MPH
-          self.recorder.record(kind, time.monotonic(), {"old_mph": data["old"] * unit, "new_mph": data["new"] * unit,
-                                                        "source": data["source"], "reason": data["reason"],
+          self.recorder.record(kind, time.monotonic(), {"old_mph": data["old"] * unit if data["old"] is not None else None,
+                                                        "new_mph": data["new"] * unit, "source": data["source"],
+                                                        "reason": data["reason"],
                                                         "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH},
                                min_gap=10.0, signals=False)
       lf.events = []

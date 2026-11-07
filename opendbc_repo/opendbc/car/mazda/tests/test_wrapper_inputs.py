@@ -71,6 +71,54 @@ def test_wrapper_feeds_the_limit_follower_and_logs_the_adoption(tmp_path, monkey
   assert c.limit_follow is None
 
 
+def _hold_brake(c, n, set_mph=45, v_mph=44):
+  return [c.update(W.CC, W.car_state(v_mph, set_mph, brake=True), None, None, False) for _ in range(n)]
+
+
+def test_wrapper_caps_a_pending_restore_at_a_lower_limit_and_logs_it(tmp_path, monkeypatch):
+  # drive 52, tag 450: on a 50 road the set was lowered to 45 (our anchor 50); the limit falls to 45: the restore stops
+  for mode in (2, 1):
+    c, sm, records = _make(tmp_path, monkeypatch, limit_mode=mode)
+    plan = sm.msgs["starpilotPlan"]
+    plan.slcSpeedLimit = 50 * MPH
+    c.logic.anchor, c.logic.last_set_speed = 50 * MPH, 45 * MPH
+    _hold_brake(c, 400)
+    plan.slcSpeedLimit = 45 * MPH
+    sent = _hold_brake(c, 400)
+    cap = [d for k, d in records if k == "speedLimitCap"]
+    assert len(cap) == 1 and cap[0]["mode"] == ("on" if mode == 2 else "test"), (mode, records)
+    assert abs(cap[0]["old_mph"] - 50) < 1e-6 and abs(cap[0]["new_mph"] - 45) < 1e-6
+    assert abs(cap[0]["driver_mph_before"] - 50) < 1e-6 and abs(cap[0]["restore_to_mph"] - 45) < 1e-6
+    assert not any(sent)
+    if mode == 2:
+      assert c.logic.anchor is None and c.logic.limit_cap is None          # nothing left to restore
+    else:
+      assert abs(c.logic.anchor / MPH - 50) < 1e-6                         # Test: logged only
+  # nothing pending (the set at the driver's speed): logged as left alone, nothing pressed
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.slcSpeedLimit = 50 * MPH
+  _drive(c, 400, set_mph=50, v_mph=49)
+  plan.slcSpeedLimit = 45 * MPH
+  sent = _drive(c, 400, set_mph=50, v_mph=49)
+  assert not any(sent) and not [d for k, d in records if k == "speedLimitCap"]
+  left = [d for k, d in records if k == "speedLimitNotFollowed"]
+  assert left and "no restore pending" in left[-1]["reason"]
+
+
+def test_wrapper_gives_the_follower_the_anchor_not_set_plus_last_frames_offset(tmp_path, monkeypatch):
+  # on the frame the set speed changes (our press landing) set + offset is a step off for a frame; the follower would
+  # take that for the driver changing his speed and drop its offer
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=2)
+  seen = []
+  orig = c.limit_follow.update
+  monkeypatch.setattr(c.limit_follow, "update", lambda li: (seen.append(li.driver_speed), orig(li))[1])
+  c.logic.anchor, c.logic.last_set_speed = 50 * MPH, 45 * MPH
+  _hold_brake(c, 10, set_mph=45)
+  _hold_brake(c, 10, set_mph=46)
+  assert all(abs(v / MPH - 50) < 1e-6 for v in seen), [round(v / MPH, 2) for v in seen]
+
+
 def test_wrapper_builds_the_new_trigger_inputs(tmp_path, monkeypatch):
   c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0)
   m = sm.msgs["modelV2"]

@@ -191,10 +191,12 @@ class CSC:
 
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
-        limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False):
+        limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False,
+        cap=lambda f: 0.0):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check).
-  red(f): starpilotPlan.redLight (the stop-light detector) at frame f."""
+  red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
+  limit(f) / cap(f): the speed limit follower's raise / lower limit cap (m/s, 0 none), called in that order."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -248,7 +250,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             radar_lead=bool(lead is not None and trigger.radar_stable),
                             stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
                             stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
-                            limit_raise=limit(f))
+                            limit_raise=limit(f), limit_cap=cap(f))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16
