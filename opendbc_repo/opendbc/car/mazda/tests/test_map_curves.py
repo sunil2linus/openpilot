@@ -192,7 +192,23 @@ def test_street_rules_need_progress_along_the_exit():
 
 
 def nav(d, side=1, **kw):
-  return F(nav_exit=1, nav_exit_distance=d, nav_curve_radius=45, nav_curve_distance=d + 100, nav_exit_side=side, **kw)
+  """Navigation's exit d m ahead; its 45 m curve 1500 m past the exit point (a long ramp: the split speed is the setting's)"""
+  return F(nav_exit=1, nav_exit_distance=d, nav_curve_radius=45, nav_curve_distance=d + 1500, nav_exit_side=side, **kw)
+
+
+def nav_drive(c, d0, d1, driver, v, signal=lambda d: 0, hw=None, step=10.0):
+  """Navigation's exit from d0 to d1 m ahead in steps (each one the frames the car needs for it at v, the odometer
+  agreeing): [(d, out of its last frame)]."""
+  hw = hw or {}
+  out = []
+  d = d0
+  while d >= d1:
+    o = None
+    for _ in range(max(int(round(step / (v * CTL.DT_CTRL))), 1)):
+      o = c.update(nav(d, **hw), driver, signal(d), v_ego=v)
+    out.append((d, o))
+    d -= step
+  return out
 
 
 def test_navigation_exit_is_planned_without_a_signal_slowed_for_only_in_an_exit_lane():
@@ -200,24 +216,23 @@ def test_navigation_exit_is_planned_without_a_signal_slowed_for_only_in_an_exit_
   # the split only the gentle slowdown to the exit speed at the split (the highway's limit here), only in an exit lane
   hw = dict(road_class=1, limit=70 * MPH)
   c = CTL.MapCurveControl(3.0)
-  for d in range(1400, 100, -10):                          # not in an exit lane: nothing before the split
-    assert not c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH).active
+  assert not any(o.active for _, o in nav_drive(c, 1500, 100, 80 * MPH, 80 * MPH, hw=hw))   # not in an exit lane
   assert c.plan is not None and not c.plan.confirmed
   c = CTL.MapCurveControl(3.0)
   c.lane.edge[1] = True                                    # the camera: next to the right road edge
-  acted = [c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH) for d in range(1400, 100, -10)]
-  on = [o for o in acted if o.active]
+  on = [o for _, o in nav_drive(c, 1500, 100, 80 * MPH, 80 * MPH, hw=hw) if o.active]
   assert on and all(o.why == "exit split" and o.speed >= 70 * MPH - 1e-6 for o in on), [o.speed / MPH for o in on][:5]
+  assert abs(c.plan.limit - 70 * MPH) < 1e-6
 
 
 def test_an_early_signal_is_remembered_after_it_goes_off():
   hw = dict(road_class=1, limit=70 * MPH)
   c = CTL.MapCurveControl(3.0)
-  assert not c.update(nav(1300, **hw), 80 * MPH, 1, v_ego=80 * MPH).active   # signal 0.8 mile before: too far to slow yet
-  acted = [c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH).active for d in range(1290, 0, -10)]
-  assert any(acted) and c.plan.signalled
-  first = 1290 - 10 * acted.index(True)
-  assert 350 <= first <= 600, first                         # only as far out as the gentle plan 80 -> 70 needs (~550 m)
+  run = nav_drive(c, 1500, 10, 80 * MPH, 80 * MPH, signal=lambda d: 1 if 1300 >= d > 1280 else 0, hw=hw)
+  acted = [(d, o.active) for d, o in run]
+  assert not any(a for d, a in acted if d >= 1280) and c.plan.signalled      # 0.8 mile before: too far to slow yet
+  first = next(d for d, a in acted if a)
+  assert 350 <= first <= 650, first                         # only as far out as the gentle plan 80 -> 70 needs (~550 m)
 
 
 def test_the_other_signal_near_the_exit_or_navigation_dropping_it_far_away_ends_the_plan():
@@ -236,13 +251,17 @@ def test_the_other_signal_near_the_exit_or_navigation_dropping_it_far_away_ends_
   assert c.plan is None and not out.active
 
 
-def test_unknown_side_takes_either_signal_and_the_ramp_takes_over():
+def test_unknown_side_a_signal_says_nothing_and_the_ramp_takes_over():
+  # review: with the exit's side unknown any signal counted as being in its lane; now only a known side counts (and the
+  # camera needs the side too)
   c = CTL.MapCurveControl(3.0)
   c.update(nav(500, side=0, road_class=1, limit=70 * MPH), 80 * MPH, -1, v_ego=33.0)
-  assert c.plan.signalled
+  assert not c.plan.signalled
+  c.update(nav(490, side=0, road_class=1, limit=70 * MPH), 80 * MPH, 1, v_ego=33.0)
+  assert not c.plan.signalled
   assert c.update(F(nav_exit=0, road_class=1), 80 * MPH, 0, v_ego=33.0) is not None and c.plan is not None   # cleared: kept
   c.odo = c.plan.exit_at + 5.0
-  for _ in range(60):                                      # the shapes: the link (EXIT_CONFIRM_TIME)
+  for _ in range(int(CTL.EXIT_CONFIRM_SHAPE_ONLY / CTL.DT_CTRL) + 5):   # the shapes alone (no model path): the link
     c.update(F(road_class=1, exit_shape=2, exit_curve_radius=45, exit_curve_distance=150), 60 * MPH, 0, v_ego=10.0)
   assert c.plan.confirmed
   out = on_ramp_for(c, HOLD + 1, 60 * MPH, status=2, radius=45, distance=140, on_ramp=True, ramp_type=1, road_class=2)

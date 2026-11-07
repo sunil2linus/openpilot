@@ -140,6 +140,12 @@ NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
 # closer to the link's bearing, 1 the same for the highway, 0 neither (no answer: the car side keeps counting the
 # distance driven). One frame's answer; the car side wants it sustained.
 EXIT_SHAPE_NONE, EXIT_SHAPE_HIGHWAY, EXIT_SHAPE_LINK = 0, 1, 2
+# Safety review of dff3e3310: in the lane next to the exit past the split the car is closer to the link's shape anyway,
+# so a 1-4 deg heading drift toward the opening or the GPS heading's noise (2-4 deg) gave "link" on the highway. "Link"
+# now needs our heading at least SHAPE_LINK_GAP closer to the link's than to the highway's (drive 53: 1.9-2.8 deg once on
+# the ramps, 0.3-0.9 deg in their first second), and no answer below SHAPE_MIN_SPEED (the GPS heading is noise in a jam).
+SHAPE_LINK_GAP = 1.0       # deg
+SHAPE_MIN_SPEED = 10.0     # m/s
 SHAPE_RANGE = 40.0         # m
 SHAPE_HEADING = 60.0       # deg: a shape turned more than this from our heading is not the road we are on
 WATCH_END = 600.0          # m behind its start (or this much more than navigation's range ahead): forgotten
@@ -195,15 +201,102 @@ def near_shapes(grid, lat, lon, bearing, chains):
   return out
 
 
-def shape_verdict(a, b):
-  """1 when shape a is closer AND heads closer to our heading than shape b, -1 the other way, 0 neither (or unknown)."""
+# Where the highway and the exit link go ahead (owner: the driving model's predicted path bends away from the highway as
+# soon as the ramp separates, independent of the GPS): the heading of each road's own shape BEND_AHEAD m ahead along it,
+# relative to the highway's heading at the car (not our heading: the GPS heading's error does not enter). For the link
+# that is its divergence plus its bend, for the highway its own bend. The car side compares the model path's heading that
+# far ahead relative to our lane's (map_curve_control.ModelPath). Drive 53: E1's link diverges ~5 deg from its start,
+# E2's ~4-6 deg and bends 6-13 deg 80-140 m past it.
+BEND_AHEAD = 80.0          # m
+BEND_STEP = 10.0           # m walked along the shape per step
+BEND_RANGE = 160.0         # m: shapes this far from the car are collected (one scan of the 3 x 3 cells)
+
+
+def road_bends(grid, lat, lon, bearing, chains):
+  """(highway, link) heading BEND_AHEAD m ahead along each relative to the highway's at the car, deg right positive;
+  None for one not found."""
+  if not grid or lat is None:
+    return None, None
+  cla, clo = int(math.floor(lat * MATCH_CELL)), int(math.floor(lon * MATCH_CELL))
+  kx = math.radians(1.0) * EARTH_R * math.cos(math.radians(lat))
+  ky = math.radians(1.0) * EARTH_R
+  segs = {"hwy": [], "link": []}
+  hx, hy = math.sin(math.radians(bearing)), math.cos(math.radians(bearing))
+  for dla in (-1, 0, 1):
+    for dlo in (-1, 0, 1):
+      for la1, lo1, la2, lo2, _wid, cid, one, cls in (seg for ri in grid for seg in ri.segments(cell_key(cla + dla, clo + dlo))):
+        key = "link" if cid in chains else ("hwy" if cls in HIGHWAY_CLASSES else None)
+        if key is None:
+          continue
+        ax, ay, bx, by = (lo1 - lon) * kx, (la1 - lat) * ky, (lo2 - lon) * kx, (la2 - lat) * ky
+        dx, dy = bx - ax, by - ay
+        ll = dx * dx + dy * dy
+        t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll)) if ll > 1e-6 else 0.0
+        if math.hypot(ax + t * dx, ay + t * dy) > BEND_RANGE:
+          continue
+        if (bx - ax) * hx + (by - ay) * hy < 0:
+          if one:
+            continue              # the other direction of a one-way road (the other carriageway)
+          ax, ay, bx, by = bx, by, ax, ay
+        segs[key].append((ax, ay, bx, by))
+  hw = _walk(segs["hwy"], bearing, SHAPE_RANGE)
+  if hw is None:
+    return None, None
+  lk = _walk(segs["link"], bearing, BEND_RANGE)
+  h0 = hw[0]
+  rel = lambda h: (h - h0 + 180.0) % 360.0 - 180.0  # noqa: E731
+  return rel(hw[1]), (rel(lk[1]) if lk is not None else None)
+
+
+def _nearest_on(segs, px, py, heading, max_turn):
+  best = None
+  for ax, ay, bx, by in segs:
+    dx, dy = bx - ax, by - ay
+    ll = dx * dx + dy * dy
+    if ll < 1e-6:
+      continue
+    h = math.degrees(math.atan2(dx, dy))
+    if abs((h - heading + 180.0) % 360.0 - 180.0) > max_turn:
+      continue
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / ll))
+    qx, qy = ax + t * dx, ay + t * dy
+    d = math.hypot(qx - px, qy - py)
+    if best is None or d < best[0]:
+      best = (d, qx, qy, h)
+  return best
+
+
+def _walk(segs, bearing, reach):
+  """(heading at the shape's point nearest the car, heading BEND_AHEAD m on along it), unwrapped; None when the shape is
+  farther than `reach` or ends before."""
+  if not segs:
+    return None
+  hit = _nearest_on(segs, 0.0, 0.0, bearing, SHAPE_HEADING)
+  if hit is None or hit[0] > reach:
+    return None
+  _, x, y, h = hit
+  h0, s = h, 0.0
+  while s < BEND_AHEAD - 1e-6:
+    x, y = x + math.sin(math.radians(h)) * BEND_STEP, y + math.cos(math.radians(h)) * BEND_STEP
+    s += BEND_STEP
+    hit = _nearest_on(segs, x, y, h, 45.0)
+    if hit is None or hit[0] > BEND_STEP:
+      return None                 # the shape ends (or leaves the collected range) before BEND_AHEAD
+    _, x, y, h_new = hit
+    h = h + ((h_new - h + 180.0) % 360.0 - 180.0)
+  return h0, h
+
+
+def shape_verdict(a, b, gap=0.0):
+  """1 when shape a is closer AND heads closer (by `gap` deg at least) to our heading than shape b, -1 when b is closer
+  and heads closer, 0 neither (or unknown)."""
   if a is None and b is None:
     return 0
   if b is None:
     return 1
   if a is None:
     return -1
-  if a[0] < b[0] and a[1] < b[1]:
+  if a[0] < b[0] and a[1] + gap <= b[1]:
     return 1
   if b[0] < a[0] and b[1] < a[1]:
     return -1
@@ -1313,6 +1406,8 @@ class MapCurves:
     self.exit_fork = FORK_NONE
     self.exit_curve = None       # the watched exit's next curve (forks decided) and the m to its entry
     self.exit_curve_dist = 0.0
+    self.exit_start = 0.0        # m to the watched exit's link start (negative behind), 0 unknown
+    self.exit_bends = (None, None)  # (highway, link) bends ahead, deg right positive (road_bends)
 
   # ---- the road ahead ----
   def _road(self, way_id, is_forward):
@@ -1427,7 +1522,8 @@ class MapCurves:
         return                   # no curve, ramp or exit: all of them come from the position
       shaky = trust.shaky
     # the watched exit (also while the match is doubtful: the shapes themselves tell the link from the highway)
-    self._watch_update(lat, lon, bearing, max(float((gps or {}).get("dt", 0.05)), 0.0))
+    self._watch_update(lat, lon, bearing, max(float((gps or {}).get("dt", 0.05)), 0.0),
+                       float(gps["v_ego"]) if gps is not None and "v_ego" in gps else None)
     road = self._road(way_id, is_forward) if way_id else None
     if road is not None:
       cid, increasing, s0, s1 = road
@@ -1603,7 +1699,7 @@ class MapCurves:
       if f["t"] >= FORK_CONFIRM - 1e-6:
         f["res"] = pick
 
-  def _watch_update(self, lat, lon, bearing, dt):
+  def _watch_update(self, lat, lon, bearing, dt, v=None):
     """The shape check and the exit's curve for the watched exit whose start is nearest (starpilotPlan.mapExit*)."""
     keep = []
     for w in self.watches:
@@ -1623,10 +1719,16 @@ class MapCurves:
     links = [near[c] for c in chains if c in near]
     link = min(links, key=lambda dh: dh[0]) if links else None
     hwy = near.get("hwy")
-    v = shape_verdict(link, hwy)
-    self.exit_shape = EXIT_SHAPE_LINK if v > 0 else (EXIT_SHAPE_HIGHWAY if v < 0 else EXIT_SHAPE_NONE)
+    verdict = shape_verdict(link, hwy, SHAPE_LINK_GAP)
+    if v is not None and v < SHAPE_MIN_SPEED:
+      verdict = 0
+    self.exit_shape = EXIT_SHAPE_LINK if verdict > 0 else (EXIT_SHAPE_HIGHWAY if verdict < 0 else EXIT_SHAPE_NONE)
     self.exit_link = link or (0.0, 0.0)
     self.exit_hwy = hwy or (0.0, 0.0)
+    self.exit_bends = road_bends(self.store.grid, lat, lon, bearing, chains)
+    # where the map's link starts (the car side's split point: navigation's exit point may be tens of m off it)
+    ok, d_start = ahead(lat, lon, bearing, *w["ramp"]["start"])
+    self.exit_start = (d_start if ok else -d_start) or 0.1
     self._fork_update(w, lat, lon, bearing, dt)
     if w["forks"]:
       self.exit_fork = FORK_OPEN if any(f["res"] is None for f in w["forks"]) else (
@@ -2020,6 +2122,11 @@ class MapCurvesPlanner:
     plan.mapExitLinkDist, plan.mapExitLinkHeading = (float(v) for v in mc.exit_link)
     plan.mapExitHighwayDist, plan.mapExitHighwayHeading = (float(v) for v in mc.exit_hwy)
     plan.mapExitFork = int(mc.exit_fork)
+    plan.mapExitStart = float(mc.exit_start)
+    hb, lb = mc.exit_bends
+    plan.mapExitBendValid = hb is not None and lb is not None
+    if plan.mapExitBendValid:
+      plan.mapExitHighwayBend, plan.mapExitLinkBend = float(hb), float(lb)
     if mc.exit_curve is not None:
       plan.mapExitCurveRadius = float(mc.exit_curve["r"])
       plan.mapExitCurveDistance = float(mc.exit_curve_dist)

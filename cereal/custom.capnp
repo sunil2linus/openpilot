@@ -295,6 +295,10 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapExitCurveRadius @74 :Float32;   # the exit's next curve from here (forks decided; the lower branch until then), 0 none
   mapExitCurveDistance @75 :Float32; # m to its entry
   mapExitCurveAdvisory @76 :Float32; # m/s, its advisory sign (0 none)
+  mapExitStart @77 :Float32;         # m to the watched exit's link start on the map (negative behind), 0 unknown
+  mapExitHighwayBend @78 :Float32;   # deg (right positive): the highway's heading 80 m ahead along it, from its heading here
+  mapExitLinkBend @79 :Float32;      # deg: the exit link's heading 80 m ahead along it, from the highway's here
+  mapExitBendValid @80 :Bool;        # both bends known
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

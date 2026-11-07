@@ -245,6 +245,16 @@ def test_wrapper_reads_the_exit_setting_feeds_the_lane_view_and_raises_the_brake
   _lane_model(sm.msgs["modelV2"], right_edge=False)
   _drive(c, 250)
   assert not c.map_control.lane.edge[1]
+  # the model path's heading 80 m ahead against our lane (map_curve_control.ModelPath): here the path turns off 5 deg
+  # toward the right from 40 m on (this model's y: right positive, as its lane lines say)
+  import math
+  m = sm.msgs["modelV2"]
+  xs = [float(k * 5) for k in range(25)]
+  m.position.x = xs
+  m.position.y = [0.0 if x < 40 else (x - 40) * math.tan(math.radians(5.0)) for x in xs]
+  _lane_model(m, right_edge=True)
+  _drive(c, 5)
+  assert c.map_control.model.rel is not None and abs(c.map_control.model.rel - 5.0) < 0.5, c.map_control.model.rel
   # a model without lane lines (or a malformed one) never breaks the wrapper
   sm.msgs["modelV2"].laneLines = []
   _drive(c, 10)
@@ -276,12 +286,16 @@ def test_wrapper_logs_each_navigation_exit_with_the_lane_and_shape_checks(tmp_pa
   monkeypatch.setattr(c.recorder, "add_row", lambda t, values: rows.append(values))
   plan = sm.msgs["starpilotPlan"]
   plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust, plan.slcSpeedLimit = 2, 1, 0, 70 * MPH
-  plan.mapNavExit, plan.mapNavExitDistance, plan.mapNavExitSide = 1, 900.0, 1
-  plan.mapNavCurveRadius, plan.mapNavCurveDistance = 95.0, 1170.0
+  plan.mapNavExit, plan.mapNavExitDistance, plan.mapNavExitSide = 1, 1500.0, 1
+  plan.mapNavCurveRadius, plan.mapNavCurveDistance = 95.0, 1770.0
   plan.mapExitShape, plan.mapExitLinkDist, plan.mapExitHighwayDist = 1, 0.0, 5.5
+  _drive(c, 400)                                                  # (the highway's limit steady LIMIT_STEADY far from it)
+  c.map_control.odo = c.map_control.plan.exit_at - 900.0         # (600 m driven)
+  plan.mapNavExitDistance, plan.mapNavCurveDistance = 900.0, 1170.0
   _drive(c, 10)
   assert not [k for k, _ in opened if k == "mapExit"]             # 900 m out: not yet (EXIT_LOG_BEFORE)
-  plan.mapNavExitDistance = 500.0
+  c.map_control.odo = c.map_control.plan.exit_at - 500.0
+  plan.mapNavExitDistance, plan.mapNavCurveDistance = 500.0, 770.0
   _drive(c, 10)
   ex = [s for k, s in opened if k == "mapExit"]
   assert len(ex) == 1 and abs(ex[0]["exit_m"] - 500) < 2 and ex[0]["side"] == 1 and abs(ex[0]["limit_mph"] - 70) < 1e-6

@@ -1257,7 +1257,8 @@ class CurveSlowdown:
                    "slc_mph", "slc_src", "limit_stable_mph", "limit_offer_mph", "limit_raise_mph",
                    # navigation exits (map_curve_control.ExitPlan, LaneView; the planner's shape check): see EXIT_LOG_*
                    "exit_rem", "exit_shape", "shape_link_m", "shape_hwy_m", "shape_link_deg", "shape_hwy_deg", "exit_fork",
-                   "exit_curve_r", "exit_curve_d", "lane_probs", "edge_gap_l", "edge_gap_r", "lane_edge", "lane_change"]
+                   "exit_curve_r", "exit_curve_d", "lane_probs", "edge_gap_l", "edge_gap_r", "lane_edge", "lane_change",
+                   "model_rel", "model_verdict", "bend_hwy", "bend_link"]
   # The exit log (owner's request): one "mapExit" event per navigation exit, from EXIT_LOG_BEFORE before its exit point
   # to EXIT_LOG_AFTER past it (or the plan's end), with the rows above, so a drive can show what the camera's lane check,
   # the shape check and the confirmation did. No GPS position in it.
@@ -1901,16 +1902,22 @@ class CurveSlowdown:
       pts = [y for x, y in zip(xs, ys, strict=False) if x <= LANE_NEAR_X]
       return sum(pts) / len(pts) if pts else (ys[0] if ys else 0.0)
     lines, edges = list(m.laneLines), list(m.roadEdges)
+    probs = list(m.laneLineProbs)
     if len(lines) < 4 or len(edges) < 2:
       lane.update(dt, False)
-      return
-    lane.update(dt, True, list(m.laneLineProbs), [near(x) for x in lines], [near(e) for e in edges],
-                list(m.roadEdgeStds))
+    else:
+      lane.update(dt, True, probs, [near(x) for x in lines], [near(e) for e in edges], list(m.roadEdgeStds))
+    # the model path's heading ahead against our lane's (map_curve_control.ModelPath): a few points of each
+    from opendbc.car.mazda.map_curve_control import model_path_heading
+    ours = [(lines[k].x, lines[k].y) for k in (1, 2) if len(lines) >= 4 and len(probs) >= 4 and probs[k] > 0.5]
+    rel = model_path_heading(m.position.x, m.position.y, ours, lane.left)
+    if rel is not None:
+      self.map_control.model.update(rel)
 
   def _exit_row(self, plan):
     mc = self.map_control
     if mc is None or plan is None:
-      return (0.0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, "", 0.0, 0.0, 0, 0)
+      return (0.0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, "", 0.0, 0.0, 0, 0, 0.0, -1, 0.0, 0.0)
     ln = mc.lane
     rem = mc.exit_rem
     edge = (2 if ln.edge[-1] and ln.edge[1] else (1 if ln.edge[1] else (-1 if ln.edge[-1] else 0)))
@@ -1918,7 +1925,9 @@ class CurveSlowdown:
     return (round(rem, 1) if rem is not None else 0.0, int(getattr(plan, "mapExitShape", 0) or 0), g("mapExitLinkDist"),
             g("mapExitHighwayDist"), g("mapExitLinkHeading"), g("mapExitHighwayHeading"), int(getattr(plan, "mapExitFork", 0) or 0),
             g("mapExitCurveRadius"), g("mapExitCurveDistance"), "/".join(f"{p:.2f}" for p in ln.probs),
-            round(ln.gaps[0], 2), round(ln.gaps[1], 2), edge, ln.change)
+            round(ln.gaps[0], 2), round(ln.gaps[1], 2), edge, ln.change,
+            round(mc.model.rel, 2) if mc.model.rel is not None and mc.model.age <= 0.5 else 0.0,
+            -1 if mc.model_v is None else mc.model_v, g("mapExitHighwayBend"), g("mapExitLinkBend"))
 
   def _exit_episode(self, t, i, plan):
     """One "mapExit" event per navigation exit (EXIT_LOG_*): what the lane check, the shape check and the confirmation
@@ -1935,7 +1944,8 @@ class CurveSlowdown:
         "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "signalled": p.signalled,
         "lane_edge": bool(p.side and mc.lane.edge.get(p.side, False))})
       self.exit_track = {"plan": p, "edge_s": 0.0, "sig_s": 0.0, "v_split": None, "rem_confirm": None, "chimes": mc.chime_count,
-                         "min_v": i.v_ego, "brake": False}
+                         "min_v": i.v_ego, "brake": False, "model_link_m": None, "model_hwy_m": None, "shape_link_m": None,
+                         "model_seen": False, "tentative_m": None}
     if self.exit_event is None:
       return
     tr = self.exit_track
@@ -1951,6 +1961,16 @@ class CurveSlowdown:
       tr["v_split"] = i.v_ego / MS_PER_MPH
     if tr["rem_confirm"] is None and q.confirmed:
       tr["rem_confirm"] = round(here, 1)
+    # where the model path first said link / highway, the shapes link, the tentative slowdown began (m from the exit point)
+    tr["model_seen"] |= mc.model_v is not None
+    if tr["model_link_m"] is None and mc.model_v == 2:
+      tr["model_link_m"] = round(-here, 1)
+    if tr["model_hwy_m"] is None and mc.model_v == 1 and here < 0:
+      tr["model_hwy_m"] = round(-here, 1)
+    if tr["shape_link_m"] is None and int(getattr(plan, "mapExitShape", 0) or 0) == 2:
+      tr["shape_link_m"] = round(-here, 1)
+    if tr["tentative_m"] is None and q.tentative:
+      tr["tentative_m"] = round(-here, 1)
     if mc.plan is not q or here < -self.EXIT_LOG_AFTER:
       self.recorder.close(self.exit_event, t, {
         "result": "confirmed" if q.confirmed else ("declined" if q.declined else (q.why or "past the log window")),
@@ -1958,6 +1978,8 @@ class CurveSlowdown:
         "v_at_split_mph": tr["v_split"], "min_speed_mph": tr["min_v"] / MS_PER_MPH, "driver_braked": tr["brake"],
         "edge_lane_s": round(tr["edge_s"], 1), "signalled_s": round(tr["sig_s"], 1),
         "chimes": mc.chime_count - tr["chimes"], "chime_why": mc.chime_why if mc.chime_count > tr["chimes"] else "",
+        "model_seen": tr["model_seen"], "model_link_m_past": tr["model_link_m"], "model_highway_m_past": tr["model_hwy_m"],
+        "shape_link_m_past": tr["shape_link_m"], "tentative_m_past": tr["tentative_m"], "settled": q.settled,
         "set_mph_after": i.set_speed / MS_PER_MPH})
       self.exit_event = None
 

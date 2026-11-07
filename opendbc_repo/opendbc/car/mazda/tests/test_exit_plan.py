@@ -290,9 +290,10 @@ def test_lane_view_sees_a_lane_change_and_its_direction():
 # ---------------- car side: closed loop ----------------
 
 def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, lane=None, signal=None, gas=None, lead=None,
-               max_drop=10):
+               max_drop=10, model=None):
   """drive_53 with the exit plan's inputs: lane(x) -> the exit side the camera sees us next to the edge of (None: no
-  edge lane), the setting, km/h. Returns the run with the chimes [(x, why, v mph, m to the exit point)]."""
+  edge lane), the setting, km/h, model(x) -> the model path's heading ahead (ModelPath, deg right positive) or None (no
+  model). Returns the run with the chimes [(x, why, v mph, m to the exit point)]."""
   step = KPH if metric else MPH
   set0 = set_mph * step / MPH
   car = T.Car(set0, dash_offset_mph=0.0, lag=10, accel=0.6, step=step, **TM.MEASURED_CRUISE)
@@ -307,6 +308,9 @@ def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, 
     fld = fields(x)
     side = lane(x) if lane else None
     ctl.lane.edge = {-1: side == -1, 1: side == 1}
+    rel = model(x) if model else None
+    if rel is not None:
+      ctl.model.update(rel)
     driver = car.set_speed + logic.offset * logic.step
     foot = gas(x) if gas else None
     mo = ctl.update(fld, driver, signal(x) if signal else 0, v_ego=car.v_ego, max_drop=md, gas=foot is not None)
@@ -320,6 +324,8 @@ def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, 
                             curve_floor=floor, curve_budget=budget, curve_track=track, curve_raise=raise_ok,
                             curve_no_accel=mix.no_accel, curve_hold=mix.firm, fast_restore=mo.fast_restore,
                             btn_counter=(f // 10) % 16)    # the wheel's 10 Hz frames (holds are phase locked to them)
+    if mo.adopt and logic.offset > 0:
+      logic._forget()             # (as the wrapper does: the set speed becomes his)
     btn, _ = logic.update(inp)
     if btn is not None:
       r["presses"].append((f, round(x), btn, logic.last_action, round(car.set_speed / step), round(car.v_ego / step, 1)))
@@ -357,16 +363,19 @@ def _plus(r, lo, hi):
 
 
 def exit_fields(exit_x, curve_x, r=95.0, ann=800.0, clear=46.0, limit=70.0, link_at=95.0, ramp_at=137.0, trust_from=None,
-                stay=False, shape=True, curve_held=56.0, side=1, ramp_end=230.0, nav_exit=1):
+                stay=False, shape=True, curve_held=56.0, side=1, ramp_end=230.0, nav_exit=1, stay_from=40.0):
   """An exit at exit_x (m driven), its tightest curve (radius r) at curve_x, announced from ann m before; navigation
   clears `clear` m before the exit point (drive 53: 46 m at E1, 9 m at E2). Past the exit point the shapes say "link"
   from link_at m (drive 53, GPS replay through the planner: E1 95 m, E2 ~120 m past navigation's exit point), the road
   match is on the link from ramp_at, its curve held (doubtful) until curve_held m before it. Before: "highway". stay:
-  the car stays on the highway (shapes "highway" from 40 m past the exit point). shape=False: an older planner."""
+  the car stays on the highway (shapes "highway" from stay_from m past the exit point). shape=False: an older planner."""
   trust_from = exit_x - clear if trust_from is None else trust_from
 
   def fields(x):
     hwy = dict(road_class=1, limit=limit * MPH, gps_trust=2 if x >= trust_from and x < exit_x + ramp_at else 0)
+    if exit_x - 300 <= x < exit_x + ramp_at:
+      # the roads ahead from the map: the highway straight on, the link 5 deg off it (drive 53's)
+      hwy.update(exit_bend_valid=True, exit_hwy_bend=0.0, exit_link_bend=5.0)
     sh = (lambda v: v if shape else 0)  # noqa: E731
     if x < exit_x - ann:
       return F(**hwy)
@@ -374,7 +383,7 @@ def exit_fields(exit_x, curve_x, r=95.0, ann=800.0, clear=46.0, limit=70.0, link
       return F(nav_exit=nav_exit, nav_exit_distance=exit_x - x, nav_curve_radius=r, nav_curve_distance=curve_x - x,
                nav_exit_side=side, exit_shape=sh(1), exit_curve_radius=r, exit_curve_distance=curve_x - x, **hwy)
     if stay:
-      return F(exit_shape=sh(1 if x > exit_x + 40 else 0), **{**hwy, "gps_trust": 2 if x < exit_x + 40 else 0})
+      return F(exit_shape=sh(1 if x > exit_x + stay_from else 0), **{**hwy, "gps_trust": 2 if x < exit_x + 40 else 0})
     ex = dict(exit_curve_radius=r, exit_curve_distance=max(curve_x - x, 0.0))
     if x < exit_x + link_at:
       return F(exit_shape=sh(0 if x > exit_x - 20 else 1), **ex, **hwy)
@@ -402,62 +411,72 @@ def _e1(**kw):
     (lambda x: 1 if exit_x - 300 <= x < exit_x - 250 else 0)
 
 
-def test_drive_53_e1_no_slowing_below_the_limit_an_early_chime_and_the_firm_slowdown_once_confirmed():
+def test_drive_53_e1_a_short_ramp_lowers_the_split_speed_and_the_slowdown_starts_at_the_split():
   fields, exit_x, curve_x, lead, signal = _e1()
   r = drive_exit(fields, 6000, 75, v_mph=57, lead=lead, signal=signal)
   v_split = _at(r, exit_x)
-  # below the highway's 70 already: not slowed before the split, but not let speed up into the exit either (the car
-  # ahead left 250 m before it): the set speed went to 58 (his 75 + nothing pressed would have taken it to 70+)
-  assert 56.5 <= v_split <= 59.5, v_split
-  assert _plus(r, 0, exit_x + 95) == [], _plus(r, 0, exit_x + 95)
-  # "Exit curve - brake" before the split (12 s ahead, in the exit lane by his signal): 270 m is too short from 58
-  pre = [c for c in r["chimes"] if c[3] > 0]
-  assert len(pre) == 1 and 200 <= pre[0][3] <= 320, r["chimes"]
-  # confirmed by the shapes 95 m past the exit point, then the strongest slowdown (a SET- hold): the set speed far below
+  # the 95 m curve 270 m on cannot be made from the highway's 70 (or the 57 behind the car ahead, gone 250 m before the
+  # split): the short ramp's split speed (B), about 45-50 mph, reached with taps before the split, never a SET+
+  assert 44.5 <= v_split <= 50.5, v_split
+  assert _plus(r, 0, exit_x) == [], _plus(r, 0, exit_x)
+  # (the shapes alone confirm 1.5 s after their "link": past TENT_MAX the set speed goes back up to the speed meanwhile)
+  assert all(p[3] == "raise" for p in _plus(r, exit_x, exit_x + 140)) and len(_plus(r, exit_x, exit_x + 140)) <= 5
+  # from the split, before the shapes confirm the ramp (106 m on): the tentative slowdown (A), the set speed at most
+  # TENT_GAP below the speed
   conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
-  assert exit_x + 95 <= conf <= exit_x + 112, conf - exit_x   # (sustained EXIT_CONFIRM_TIME)
-  holds = [p for p in r["presses"] if p[2] == cs.SET_MINUS and p[3] == "hold" and p[1] >= conf]
-  assert holds, "the firm slowdown takes a SET- hold"
-  assert _at(r, conf + 60, "sets") <= 46, _at(r, conf + 60, "sets")
+  assert exit_x + 125 <= conf <= exit_x + 140, conf - exit_x     # (no model path: the shapes alone, 1.5 s)
+  tent = _minus(r, exit_x, conf)
+  assert tent and all(p[5] - p[4] <= CTL.TENT_GAP / MPH + 1.01 for p in tent), tent
   v_entry = _at(r, curve_x)
-  # without his brake the cruise can only take ~0.9-1.0 m/s^2 off in 175 m: in at ~52 mph (the chime asked him to
-  # brake); with nothing done (the old drive 53 build after the restore) it was 59.6
-  assert 48 <= v_entry <= 55, v_entry
-  assert len([c for c in r["chimes"] if c[3] < 0]) == 1      # and once more at the confirmation (too little room)
+  assert V_C95 - 1.0 <= v_entry <= V_C95 + 2.5, v_entry        # at about the curve's speed, nobody braking
+  assert min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if curve_x <= xx < curve_x + 127) >= V_C95 - 1.5
+  # no chime before the split (A + B make it); with the shapes alone the confirmation comes late enough that the room
+  # left reads just short (the entry is 1-2 mph over)
+  assert [c[1] for c in r["chimes"]] in ([], ["confirmed, too little room"]), r["chimes"]
   assert min(r["sets"]) >= 25 - 1e-6
+  # the model path agreeing (its heading ahead the link's 5 deg from where the shapes say "link"): confirmed 1 s on
+  r = drive_exit(fields, 6000, 75, v_mph=57, lead=lead, signal=signal, model=lambda x: 5.0 if x >= exit_x + 95 else 0.0)
+  conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
+  assert exit_x + 110 <= conf <= exit_x + 125, conf - exit_x
+  assert V_C95 - 1.0 <= _at(r, curve_x) <= V_C95 + 2.0, _at(r, curve_x)
+  assert r["chimes"] == [], r["chimes"]
+  # ... and the model path following the highway (a drift, the shapes alone): never confirmed by the shapes then
+  r = drive_exit(exit_fields(exit_x, curve_x, ann=807.0, ramp_at=10000.0), 6000, 75, signal=signal, model=lambda x: 0.0)
+  assert "confirmed" not in r["state"], "the model path says highway"
 
 
 def _e2(**kw):
   """Drive 53, E2 (t 355-421): 75 mph with his 75 set, the 70 highway, announced 1478 m ahead, the 85 m curve 496 m
   after the exit point; he signalled 270 m before it. In the exit lane (the camera) from 400 m before."""
-  exit_x, curve_x = 1600.0, 2096.0
-  fields = exit_fields(exit_x, curve_x, r=85.0, ann=1478.0, clear=9.0, link_at=120.0, ramp_at=160.0, curve_held=325.0,
-                       ramp_end=190.0, **kw)
+  exit_x, curve_x = 1600.0, kw.pop("curve_x", 2096.0)
+  fields = exit_fields(exit_x, curve_x, r=85.0, ann=1478.0, clear=9.0, link_at=120.0, ramp_at=160.0,
+                       curve_held=kw.pop("curve_held", 325.0), ramp_end=190.0, **kw)
   return fields, exit_x, curve_x
 
 
-def test_drive_53_e2_slows_gently_to_the_limit_at_the_split_then_firm_after_the_confirmation():
+def _long(**kw):
+  """E2 with its curve 1500 m after the split (a long ramp: the setting's split speed)"""
+  return _e2(curve_x=3100.0, curve_held=1300.0, **kw)
+
+
+def test_drive_53_e2_slows_gently_to_the_short_ramp_speed_at_the_split_then_on_to_the_curve():
   fields, exit_x, curve_x = _e2()
   r = drive_exit(fields, 9000, 75, lane=lambda x: 1 if x >= 1200 else None)
   v_split = _at(r, exit_x)
-  assert 69.5 <= v_split <= 72.0, v_split                    # at about the limit, not lower
+  # 496 m to the 85 m curve: short for the highway's 70 (the planned A + B need ~640 m), so ~59-62 at the split
+  assert 58.5 <= v_split <= 63.5, v_split
   pre = _minus(r, 0, exit_x)
-  assert 4 <= len(pre) <= 7 and all(p[3] == "tap" for p in pre), pre   # gently: 1 mph taps, 75 -> 70
-  assert _plus(r, 0, exit_x + 120) == [] and min(r["sets"][:next(i for i, xx in enumerate(r["xs"]) if xx >= exit_x)]) >= 70 - 1e-6
-  first = pre[0][1]
-  assert exit_x - 400 <= first <= exit_x - 150, exit_x - first  # starts only as far out as the gentle plan needs
-  # the split to the confirmation: held (no SET-, no SET+)
-  assert _minus(r, exit_x + 5, exit_x + 119) == [] and _plus(r, exit_x, exit_x + 119) == []
-  # the chime before the split: from 70 at the split the 85 m curve 496 m on needs ~485 m after a ~3 s confirmation
-  pre_chime = [c for c in r["chimes"] if c[3] > 0]
-  assert len(pre_chime) == 1, r["chimes"]
+  assert 9 <= len(pre) <= 18 and all(p[3] == "tap" for p in pre), pre   # gently: 1 mph taps
+  assert _plus(r, 0, exit_x) == [] and all(p[3] == "raise" for p in _plus(r, exit_x, exit_x + 180))
+  assert exit_x - 420 <= pre[0][1] <= exit_x - 150, exit_x - pre[0][1]
+  assert _minus(r, exit_x + 2, exit_x + 119), "the slowdown goes on from the split (tentative) before the confirmation"
   v_entry = _at(r, curve_x)
-  assert 44 <= v_entry <= 52, v_entry                        # (was 38.5 on the drive's build with his signal, 30.4 after a2c9aac70)
-  assert min(r["sets"]) >= 25 - 1e-6
+  assert V_C85 - 1.0 <= v_entry <= V_C85 + 1.5, v_entry        # (was 44-52 on dff3e3310, 30.4 after a2c9aac70)
+  assert r["chimes"] == [] and min(r["sets"]) >= 25 - 1e-6
 
 
 def test_the_exit_speed_at_the_split_setting_incl_off_and_metric():
-  fields, exit_x, curve_x = _e2(limit=70.0)
+  fields, exit_x, curve_x = _long(limit=70.0)
   lane = lambda x: 1 if x >= 900 else None  # noqa: E731
   speeds = {}
   for mode in (0, 1, 2, 3):
@@ -466,33 +485,60 @@ def test_the_exit_speed_at_the_split_setting_incl_off_and_metric():
   assert 69.5 <= speeds[0] <= 72.5 and 74.5 <= speeds[1] <= 77.5 and 79.5 <= speeds[2] <= 82.5, speeds
   assert speeds[3] >= 84.5, speeds                           # Off: nothing before the split
   # metric: the highway's 110 km/h (+5 km/h), set 130 km/h
-  fields_m = exit_fields(1600.0, 2096.0, r=85.0, ann=1478.0, clear=9.0, limit=110 / 3.6 / MPH, link_at=120.0, ramp_at=160.0,
-                         curve_held=325.0)
+  fields_m = exit_fields(1600.0, 3100.0, r=85.0, ann=1478.0, clear=9.0, limit=110 / 3.6 / MPH, link_at=120.0, ramp_at=160.0,
+                         curve_held=1300.0)
   r = drive_exit(fields_m, 6000, 130, metric=True, lane=lane, split_mode=1)
   v_kph = _at(r, 1600.0) * MPH * 3.6
   assert 114.0 <= v_kph <= 119.0, v_kph
-  # the highway's limit unknown: nothing before the split
-  r = drive_exit(exit_fields(1600.0, 2096.0, r=85.0, ann=1478.0, clear=9.0, limit=0.0, link_at=120.0, ramp_at=160.0,
-                             curve_held=325.0), 6000, 80, lane=lane)
+  # the highway's limit unknown, a long ramp: nothing before the split
+  r = drive_exit(exit_fields(1600.0, 3100.0, r=85.0, ann=1478.0, clear=9.0, limit=0.0, link_at=120.0, ramp_at=160.0,
+                             curve_held=1300.0), 6000, 80, lane=lane)
   assert _minus(r, 0, 1600.0) == []
   # never raises: his 68 under the 70 highway
   r = drive_exit(fields, 7000, 68, lane=lane)
   assert _plus(r, 0, 1600.0) == [] and _minus(r, 0, 1600.0) == []
 
 
+def test_a_short_ramp_lowers_the_split_speed_only_in_an_exit_lane_and_never_raises():
+  lane = lambda x: 1 if x >= 900 else None  # noqa: E731
+  # the short ramp (E2's 496 m): lower than the setting's for each setting; the long one keeps the setting's
+  for mode in (0, 1, 2):
+    r = drive_exit(_e2()[0], 6000, 85, lane=lane, split_mode=mode)
+    assert 58.5 <= _at(r, 1600.0) <= 63.5, (mode, _at(r, 1600.0))
+  # Off: nothing before the split (the setting wins)
+  r = drive_exit(_e2()[0], 6000, 85, lane=lane, split_mode=3)
+  assert _minus(r, 0, 1600.0) == []
+  # the highway's limit unknown: the short ramp still lowers it from his speed
+  r = drive_exit(_e2(limit=0.0)[0], 6000, 80, lane=lane)
+  assert 58.5 <= _at(r, 1600.0) <= 63.5, _at(r, 1600.0)
+  # not in an exit lane: his speed (no SET- before the split)
+  r = drive_exit(_e2()[0], 6000, 80)
+  assert _minus(r, 0, 1600.0) == []
+  # already slower than the short ramp's speed: never raised
+  r = drive_exit(_e2()[0], 6000, 60, lane=lane)
+  assert _plus(r, 0, 1600.0) == [] and _minus(r, 0, 1600.0) == []
+  # the speed it computes: E1's 270 m to a 95 m curve, E2's 496 m to an 85 m curve
+  e1 = CTL.short_split_speed(270.0, math.sqrt(2.2 * 95.0), 70 * MPH) / MPH
+  e2 = CTL.short_split_speed(496.0, math.sqrt(2.2 * 85.0), 70 * MPH) / MPH
+  long_ = CTL.short_split_speed(1500.0, math.sqrt(2.2 * 85.0), 70 * MPH) / MPH
+  assert 43 <= e1 <= 49 and 57 <= e2 <= 63 and abs(long_ - 70) < 1e-6, (e1, e2, long_)
+
+
 def test_a_middle_lane_gets_no_slowing_before_the_split_but_the_ramp_is_still_handled():
   # a 2-lane exit taken from its left lane (a lane to our right: no rightmost-lane signal) without a signal: nothing
-  # before the split; a dive into the ramp at the last minute is confirmed and slowed for (with the chime)
+  # before the split, no tentative slowdown from it (no evidence); a dive into the ramp is confirmed and slowed for
+  # (with the chime: the room is too short from 80)
   fields, exit_x, curve_x = _e2()
   r = drive_exit(fields, 9000, 80)
   assert _minus(r, 0, exit_x) == [] and abs(_at(r, exit_x) - 80) < 0.6
-  assert [c for c in r["chimes"] if c[3] > 0] == []            # (no chime before the split outside an exit lane)
   conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
+  assert _minus(r, exit_x, conf - 5) == []                     # no exit lane evidence: held until confirmed
+  assert [c for c in r["chimes"] if c[3] > 0] == []            # (no chime before the split outside an exit lane)
   assert _minus(r, conf, curve_x) and len([c for c in r["chimes"] if c[3] < 0]) == 1
-  assert _at(r, curve_x) < _at(r, conf) - 20
-  # the same lane with his signal toward the exit (kept after it goes off): slowed to the limit before the split
+  assert _at(r, curve_x) < _at(r, conf) - 15
+  # the same lane with his signal toward the exit (kept after it goes off): slowed before the split
   r = drive_exit(fields, 9000, 80, signal=lambda x: 1 if 900 <= x < 960 else 0)
-  assert 69.5 <= _at(r, exit_x) <= 72.5 and _minus(r, 0, exit_x)
+  assert 58.5 <= _at(r, exit_x) <= 63.5 and _minus(r, 0, exit_x)
 
 
 def test_no_navigation_no_exit_plan_the_ramp_as_before():
@@ -509,33 +555,47 @@ def test_no_navigation_no_exit_plan_the_ramp_as_before():
   assert ramp and all(w in ("", "ramp", "street cap") for w in r["why"])
 
 
-def _stay(set_mph=75, shape=True, gas=None, signal=None):
-  fields, exit_x, curve_x = _e2(stay=True, shape=shape)
+def _stay(set_mph=75, shape=True, gas=None, signal=None, long=True, hwy_from=40.0):
+  fields, exit_x, curve_x = (_long if long else _e2)(stay=True, shape=shape, stay_from=hwy_from)
   return drive_exit(fields, 9000, set_mph, lane=lambda x: 1 if x >= 900 else None, gas=gas, signal=signal), exit_x
 
 
-def test_a_missed_exit_restores_the_speed_at_once():
+def test_a_missed_exit_restores_the_speed_at_once_and_the_tentative_slowdown_costs_a_few_mph():
   r, exit_x = _stay()
-  assert r["ctl"].plan is None and r["ctl"].last_plan.why == "missed"
+  assert r["ctl"].plan is None and r["ctl"].last_plan.why == "missed" and r["ctl"].last_plan.tentative
   past = [(v, xx) for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= exit_x]
-  assert min(v for v, _ in past) >= 69.0, min(v for v, _ in past)     # never more than the split's slowing
-  # the shapes say "highway" from 40 m past the exit point: missed 1 s later, SET+ holds back to his 75
+  v_split = _at(r, exit_x)
+  # the tentative slowdown from the split until the shapes say "highway" (40 m on, 1 s): a few mph
+  assert min(v for v, _ in past) >= v_split - 3.5, (v_split, min(v for v, _ in past))
   restore = _plus(r, exit_x, exit_x + 400)
-  assert len(restore) == 5 and restore[0][1] <= exit_x + 40 + 45, restore
-  assert restore[-1][0] - restore[0][0] <= 5 * 25, restore     # at once: a tap every ~0.2 s (5 mph: no hold needed)
+  assert restore and restore[0][1] <= exit_x + 40 + 45, restore
   back = next(xx for v, xx in past if v >= 74.5)
-  assert back - exit_x <= 600, back - exit_x                  # back at 75 within ~17 s (the cruise's speed-up, 0.33 m/s^2 at 5 mph)
+  assert back - exit_x <= 600, back - exit_x
   assert abs(r["sets"][-1] - 75) < 1e-6 and max(r["sets"]) <= 75 + 1e-6
+  # the bound (TENT_MAX): however late the shapes say "highway" (drive 53's split geometry: 1.3-4.3 s for a car going
+  # on 4-7 m right of the highway's line; here up to 250 m, the last resort), at most ~3.5 mph under the split speed
+  for hf in (90.0, 135.0, 180.0):
+    r, exit_x = _stay(hwy_from=hf)
+    low = min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= exit_x)
+    assert low >= _at(r, exit_x) - 3.5 and r["ctl"].last_plan.why == "missed", (hf, _at(r, exit_x), low)
   # from his 85 (slowed to the highway's 70): SET+ holds, then taps
   r, exit_x = _stay(set_mph=85)
   restore = _plus(r, exit_x, exit_x + 400)
   assert restore and any(p[3] == "hold" for p in restore) and restore[0][1] <= exit_x + 40 + 45, restore
   assert abs(r["sets"][-1] - 85) < 1e-6 and max(r["sets"]) <= 85 + 1e-6
-  # an older planner (no shape check): on the highway, not doubtful, EXIT_STAY_MARGIN past the exit point
+  # no shape answer (an older planner, review): never a fast restore on a guess, the set speed held (EXIT_LOST_MAX), then
+  # it becomes his speed
   r, exit_x = _stay(shape=False)
-  assert r["ctl"].last_plan.why == "missed"
+  assert r["ctl"].last_plan.why == "not confirmed" and _plus(r, exit_x, exit_x + CTL.EXIT_LOST_MAX + 50) == []
+  # the shapes and the model path both saying "highway": missed after MODEL_STAY_SHAPES
+  fields, exit_x, _ = _long(stay=True)
+  r = drive_exit(fields, 9000, 75, lane=lambda x: 1 if x >= 900 else None, model=lambda x: 0.0)
   restore = _plus(r, exit_x, exit_x + 400)
-  assert restore and exit_x + CTL.EXIT_STAY_MARGIN - 5 <= restore[0][1] <= exit_x + CTL.EXIT_STAY_MARGIN + 40, restore
+  assert r["ctl"].last_plan.why == "missed" and restore and restore[0][1] <= exit_x + 40 + 30, restore
+  # a short ramp (B's lower split speed) he does not take: the same few mph from the split on
+  r, exit_x = _stay(long=False)
+  low = min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= exit_x)
+  assert 58.5 <= _at(r, exit_x) <= 63.5 and low >= _at(r, exit_x) - 3.5, (_at(r, exit_x), low)
 
 
 def test_his_gas_or_the_other_signal_ends_the_exit_slowing_at_once():
@@ -630,23 +690,31 @@ def test_two_exits_close_together_the_first_one_taken_is_its_own_ramp():
   assert ctl.plan is None
 
 
-def test_the_brake_chime_only_when_the_curve_is_out_of_reach_once_per_exit():
+def test_the_brake_chime_only_when_even_the_short_ramp_speed_cannot_make_it():
   # a long exit (the 85 m curve 900 m after the split): no chime
   fields = exit_fields(1600.0, 2500.0, r=85.0, ann=1478.0, clear=9.0, link_at=60.0, ramp_at=100.0, curve_held=325.0)
   r = drive_exit(fields, 9000, 75, lane=lambda x: 1 if x >= 1200 else None)
   assert r["chimes"] == [], r["chimes"]
-  assert _at(r, 2500.0) <= V_C85 + 2.0, _at(r, 2500.0)         # reached on the cruise alone
-  # E1's short exit: once before the split, once at the confirmation
-  fields, exit_x, curve_x, lead, signal = _e1()
-  r = drive_exit(fields, 6000, 75, v_mph=57, lead=lead, signal=signal)
-  assert [c[1] for c in r["chimes"]] == ["before the split", "confirmed, too little room"], r["chimes"]
+  assert _at(r, 2500.0) <= V_C85 + 2.0, _at(r, 2500.0)
+  # E1's short exit with the exit lane known in time: A + B make it, no chime (test above)
+  # ... but his signal only 120 m before the split at 70 mph: too late to get down to the short ramp's speed: once
+  # before the split, and at the confirmation
+  fields, exit_x, curve_x, _lead, _sig = _e1()
+  r = drive_exit(fields, 6000, 70, signal=lambda x: 1 if exit_x - 120 <= x < exit_x - 100 else 0)
+  whys = [c[1] for c in r["chimes"]]
+  assert whys[:1] == ["before the split"] and whys.count("before the split") == 1, r["chimes"]
+  assert 90 <= r["chimes"][0][3] <= 125, r["chimes"]
+  # no exit lane evidence at all: only the confirmation can tell
+  r = drive_exit(fields, 6000, 70)
+  assert [c[1] for c in r["chimes"]] == ["confirmed, too little room"], r["chimes"]
 
 
 def test_the_firm_follower_takes_a_set_minus_hold_and_steps_back_up_to_the_curve_speed():
-  # confirmed at 60 mph 325 m before a 32 mph curve: needs ~0.9 m/s^2 (the usual follow's 0.6 is not enough) -> a SET-
-  # hold far below, back up to the curve's speed before the curve
+  # no exit lane evidence (nothing before the split, no tentative slowdown), confirmed at 60 mph 325 m before a 32 mph
+  # curve: needs ~0.9 m/s^2 (the usual follow's 0.6 is not enough) -> a SET- hold far below, back up to the curve's
+  # speed before the curve
   fields = exit_fields(500.0, 840.0, ann=450.0, link_at=1.0, ramp_at=40.0, curve_held=330.0)
-  r = drive_exit(fields, 4000, 60, lane=lambda x: 1)
+  r = drive_exit(fields, 4000, 60, model=lambda x: 5.0 if x >= 501 else 0.0)
   holds = [p for p in r["presses"] if p[2] == cs.SET_MINUS and p[3] == "hold"]
   assert holds and holds[0][1] >= 500.0, holds
   ups = _plus(r, 600.0, 840.0)
@@ -655,6 +723,214 @@ def test_the_firm_follower_takes_a_set_minus_hold_and_steps_back_up_to_the_curve
   assert V_C95 - 1.0 <= v_entry <= V_C95 + 1.5, v_entry
   assert min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if 840 <= xx < 940) >= V_C95 - 1.5
   # the usual follow (0.6 m/s^2 at most) would have entered faster: 380 m of room is enough for it, no hold
-  fields = exit_fields(500.0, 900.0, ann=450.0, link_at=1.0, ramp_at=40.0, curve_held=390.0)
-  r = drive_exit(fields, 4000, 60, lane=lambda x: 1)
-  assert [p for p in r["presses"] if p[3] == "hold"] == [] and _at(r, 900.0) <= V_C95 + 1.5
+  fields = exit_fields(500.0, 1000.0, ann=450.0, link_at=1.0, ramp_at=40.0, curve_held=490.0)
+  r = drive_exit(fields, 4500, 60, model=lambda x: 5.0 if x >= 501 else 0.0)
+  assert [p for p in r["presses"] if p[3] == "hold"] == [] and _at(r, 1000.0) <= V_C95 + 1.5
+
+
+# ---------------- safety review of dff3e3310 ----------------
+
+def _hwy_stay(shape_fn=None, cls_fn=None, trust_fn=None, set_mph=78, lane=lambda x: 1, gas=None, model=None, signal=None,
+              exit_x=1600.0, curve_x=1900.0, r=60.0, limit=70.0):
+  """falseconf.py: an exit 300 m long to a 60 m curve; he stays on in the lane next to it. shape_fn(x): the shapes."""
+  def fields(x):
+    hw = dict(road_class=cls_fn(x) if cls_fn else 1, limit=limit * MPH, gps_trust=trust_fn(x) if trust_fn else 0)
+    if exit_x - 300 <= x < exit_x + 400:
+      hw.update(exit_bend_valid=True, exit_hwy_bend=0.0, exit_link_bend=5.0)
+    ex = dict(exit_curve_radius=r, exit_curve_distance=max(curve_x - x, 0.0)) if x < curve_x + 40 else {}
+    sh = shape_fn(x) if shape_fn else (1 if x > exit_x + 40 else 0)
+    if x < exit_x - 1400:
+      return F(**hw)
+    if x < exit_x - 46:
+      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_curve_radius=r, nav_curve_distance=curve_x - x,
+               nav_exit_side=1, exit_shape=sh, **ex, **hw)
+    return F(exit_shape=sh, **ex, **hw)
+  return drive_exit(fields, 12000, set_mph, lane=lane, gas=gas, model=model, signal=signal), exit_x
+
+
+def _past(r, exit_x):
+  return [v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= exit_x]
+
+
+def test_review_noisy_or_alternating_shapes_never_confirm_on_the_highway():
+  # "link" every other answer from 60 m before the exit point to 300 m past it (a coin-flip heading in the lane next to
+  # the exit), then "highway": was confirmed and slowed to 37 mph with the traffic at 78
+  for every in (2, 3):
+    alt = lambda x, k=every: (2 if int(x / 1.5) % k == 0 else 0) if 1540 <= x < 1900 else (1 if x >= 1900 else 0)  # noqa: E731
+    r, exit_x = _hwy_stay(shape_fn=alt)
+    assert "confirmed" not in r["state"], every
+    v_split = _at(r, exit_x)
+    assert min(_past(r, exit_x)) >= v_split - 4.0, (every, v_split, min(_past(r, exit_x)))
+    assert r["ctl"].last_plan.why == "missed" and abs(r["sets"][-1] - 78) < 1e-6
+
+
+def test_review_a_false_confirmation_is_overturned_and_restored_at_once():
+  # the shapes say "link" 1.6 s without a gap (a drift toward the opening, no model path) 20-90 m past the exit point,
+  # then "highway": confirmed (shapes alone), then overturned while not on the link for sure: back to his speed
+  sh = lambda x: 2 if 1620 <= x < 1690 else (1 if x >= 1690 else 0)  # noqa: E731
+  r, exit_x = _hwy_stay(shape_fn=sh)
+  assert "confirmed" in r["state"] and r["ctl"].last_plan.why == "overturned: still on the highway"
+  over = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
+  restore = _plus(r, over, over + 300)
+  assert restore and restore[0][1] <= 1690 + 45, restore
+  assert min(_past(r, exit_x)) >= _at(r, exit_x) - 12.0 and abs(r["sets"][-1] - 78) < 1e-6
+  # the model path following the highway: no confirmation at all
+  r, exit_x = _hwy_stay(shape_fn=sh, model=lambda x: 0.0)
+  # (the tentative slowdown's TENT_MAX, and the short ramp's own approach still settling at the split: ~1 mph)
+  assert "confirmed" not in r["state"] and min(_past(r, exit_x)) >= _at(r, exit_x) - 5.0
+  # his gas after a (false) confirmation: overturned at once (was: gas held 300 m still ended at 38)
+  r, exit_x = _hwy_stay(shape_fn=lambda x: 2 if 1620 <= x < 2400 else 0, gas=lambda x: 0.0 if 1700 <= x < 1705 else None)
+  assert r["ctl"].last_plan.why == "overturned: gas" and abs(r["sets"][-1] - 78) < 1e-6
+  # ... the other signal too; once on the ramp for sure (matched, trusted, LINK_SETTLE) not any more
+  r, exit_x = _hwy_stay(shape_fn=lambda x: 2 if 1620 <= x < 2400 else 0, signal=lambda x: -1 if 1700 <= x < 1720 else 0)
+  assert r["ctl"].last_plan.why == "overturned: the other signal"
+  ctl = CTL.MapCurveControl(3.0)
+  ctl.update(F(nav_exit=1, nav_exit_distance=50.0, nav_curve_radius=60, nav_curve_distance=300, nav_exit_side=1, road_class=1),
+             30.0, 0, v_ego=25.0)
+  ctl.odo = ctl.plan.exit_at + 20
+  for _ in range(int((CTL.LINK_SETTLE + CTL.LINK_HOLD) / CTL.DT_CTRL) + 10):
+    ctl.update(F(road_class=2, exit_shape=2, exit_curve_radius=60, exit_curve_distance=200), 30.0, 0, v_ego=20.0)
+  assert ctl.plan.confirmed and ctl.plan.settled
+  ctl.update(F(road_class=2, exit_shape=2, exit_curve_radius=60, exit_curve_distance=190), 30.0, -1, v_ego=20.0, gas=True)
+  assert ctl.plan is not None and ctl.plan.confirmed
+
+
+def test_review_a_short_wrong_road_match_does_not_confirm():
+  # a 34 m wrong match on the link (trust 0) just past the exit point: was confirmed after LINK_HOLD (0.5 s)
+  for lo in (1620, 1560):
+    r, exit_x = _hwy_stay(cls_fn=lambda x, lo=lo: 2 if lo <= x < lo + 34 else 1)
+    assert "confirmed" not in r["state"], lo
+    assert min(_past(r, exit_x)) >= _at(r, exit_x) - 4.0
+
+
+def test_review_a_gps_pause_at_the_split_holds_the_speed_never_a_raise_on_the_ramp():
+  # misc.py P: the exit taken, GPS paused from the split for 400 m (no shapes, no road match): was a fast SET+ 70 -> 80
+  # on the ramp (the r85 curve at 77 mph)
+  fields, exit_x, curve_x = _e2()
+
+  def paused(x):
+    if exit_x - 46 <= x < exit_x + 400:
+      return F(gps_trust=3, road_class=0, limit=70 * MPH)
+    return fields(x)
+  r = drive_exit(paused, 9000, 80, lane=lambda x: 1 if x >= 1200 else None)
+  # (the tentative slowdown's TENT_MAX: the set speed back up to the speed, never more)
+  ups = _plus(r, exit_x, exit_x + 400)
+  assert all(p[3] == "raise" and p[4] <= p[5] + 0.5 for p in ups) and max(
+    st - v for st, v, xx in zip(r["sets"], r["vs"], r["xs"], strict=True) if exit_x <= xx < exit_x + 400) <= 1.0, ups
+  # (blind for 400 of the 496 m to the curve: the tentative slowdown, then held; the chime once the ramp is matched)
+  assert _at(r, curve_x) <= 62.0 and "confirmed, too little room" in [c[1] for c in r["chimes"]], (_at(r, curve_x), r["chimes"])
+
+
+def test_review_a_signal_the_other_way_clears_his_signal_and_losing_the_lane_holds():
+  fields, exit_x, curve_x = _long()
+  # right far out (into the right lane), later left (the middle lane, no edge lane): nothing before the split
+  r = drive_exit(fields, 9000, 80, signal=lambda x: 1 if exit_x - 1300 <= x < exit_x - 1250 else (
+    -1 if exit_x - 600 <= x < exit_x - 560 else 0))
+  assert _minus(r, 0, exit_x) == [] and not (r["ctl"].plan or r["ctl"].last_plan).signalled
+  # the camera's edge lane on, off for 650 m, on again (churn.py: 80 -> 72 -> 79 -> ...): no SET+ before the split
+  fields, exit_x, curve_x = _e2()
+  lane = lambda x: 1 if (exit_x - 900 <= x < exit_x - 250 or x >= exit_x - 120) else None  # noqa: E731
+  r = drive_exit(fields, 9000, 80, lane=lane)
+  assert _plus(r, exit_x - 900, exit_x) == [], _plus(r, exit_x - 900, exit_x)
+  assert _at(r, exit_x) <= 66.0, _at(r, exit_x)
+
+
+def test_review_the_ramps_limit_before_the_split_is_never_the_highways():
+  # limit.py: the highway's limit unknown, the ramp's 45 shows up 250 m before the split (still matched to the highway)
+  fields0, exit_x, curve_x = _long(limit=0.0, stay=True)
+
+  def f(x):
+    g = fields0(x)
+    g.limit = 45 * MPH if x >= exit_x - 250 else 0.0
+    return g
+  r = drive_exit(f, 9000, 75, lane=lambda x: 1 if x >= 900 else None)
+  assert min(r["sets"]) >= 74 - 1e-6, min(r["sets"])
+
+  # the highway's 70 known, then the ramp's 45 250 m before the split: still 70
+  def g(x):
+    h = fields0(x)
+    h.limit = 45 * MPH if x >= exit_x - 250 else 70 * MPH
+    return h
+  r = drive_exit(g, 9000, 80, lane=lambda x: 1 if x >= 900 else None)
+  assert 69.5 <= _at(r, exit_x) <= 72.5, _at(r, exit_x)
+
+
+def test_review_kept_from_speeding_up_never_far_below_the_split_speed():
+  # misc.py V2: behind a truck at 45 until 290 m before the split (the 70 highway), he stays on: was kept at 46
+  fields, exit_x, curve_x = _long(stay=True)
+  r = drive_exit(fields, 9000, 80, lane=lambda x: 1 if x >= 900 else None, lead=lambda x: 45 * MPH if x < exit_x - 290 else None)
+  assert _at(r, exit_x, "sets") >= 60 - 1e-6, _at(r, exit_x, "sets")
+  # the limit unknown: not kept at all
+  fields, exit_x, curve_x = _long(limit=0.0, stay=True)
+  r = drive_exit(fields, 9000, 80, lane=lambda x: 1 if x >= 900 else None, lead=lambda x: 60 * MPH if x < exit_x - 280 else None)
+  assert _minus(r, 0, exit_x) == []
+
+
+def test_review_the_maps_link_start_is_the_split_point():
+  # navigation's exit point 60 m before the map's link start: the missed exit test counts from the map's
+  ctl = CTL.MapCurveControl(3.0)
+  base = dict(road_class=1, limit=70 * MPH)
+  ctl.update(F(nav_exit=1, nav_exit_distance=400.0, nav_curve_radius=60, nav_curve_distance=700, nav_exit_side=1,
+               exit_start=460.0, **base), 33.0, 0, v_ego=30.0)
+  assert abs(ctl.exit_rem - 460.0) < 1.0
+  ctl.update(F(nav_exit=1, nav_exit_distance=400.0, nav_curve_radius=60, nav_curve_distance=700, nav_exit_side=1,
+               exit_start=900.0, **base), 33.0, 0, v_ego=30.0)
+  assert abs(ctl.exit_rem - 460.0) < 1.5                         # (one far off navigation's is not taken)
+  # re-identified as an exit without curves: not the old curve
+  ctl.update(F(nav_exit=2, nav_exit_distance=455.0, nav_exit_side=1, **base), 33.0, 0, v_ego=30.0)
+  assert ctl.plan.curve[0] == 0.0
+
+
+def test_review_road_edge_stds_missing_means_not_sure():
+  lv = CTL.LaneView()
+  for _ in range(40):
+    lv.update(0.05, True, (0.8, 0.9, 0.9, 0.0), [5.4, 1.8, -1.8, -5.4], [8.0, -2.8], [])
+  assert not lv.edge[1]
+  for _ in range(40):
+    lv.update(0.05, True, (0.8, 0.9, 0.9, 0.0), [5.4, 1.8, -1.8, -5.4], [8.0, -2.8], [0.3, 0.3])
+  assert lv.edge[1] and lv.left == 1.0                           # (y positive to the left: the right edge is negative)
+
+
+def test_the_model_path_heading_ahead_against_our_lane():
+  import numpy as np
+  xs = list(np.linspace(0, 120, 25))
+  straight = [0.0 for _ in xs]
+  # the path turning off 5 deg to the right from 40 m on (y positive to the left)
+  right = [0.0 if x < 40 else -(x - 40) * math.tan(math.radians(5.0)) for x in xs]
+  lanes = [(xs, [1.8] * len(xs)), (xs, [-1.8] * len(xs))]
+  assert abs(CTL.model_path_heading(xs, straight, lanes)) < 0.1
+  assert abs(CTL.model_path_heading(xs, right, lanes) - 5.0) < 0.3
+  # the car itself turned 2 deg in its lane (lines and path rotated alike): still the path against the lane
+  rot = lambda ys, a: [y + x * math.tan(math.radians(a)) for x, y in zip(xs, ys, strict=True)]  # noqa: E731
+  assert abs(CTL.model_path_heading(xs, rot(right, 2.0), [(xs, rot([1.8] * 25, 2.0)), (xs, rot([-1.8] * 25, 2.0))]) - 5.0) < 0.4
+  assert CTL.model_path_heading(xs[:10], straight[:10], lanes) is None          # too short (slow)
+  # the verdict against the map's roads ahead
+  mp = CTL.ModelPath()
+  f = F(exit_bend_valid=True, exit_hwy_bend=0.0, exit_link_bend=5.0)
+  mp.update(4.6)
+  assert mp.verdict(f) == 2
+  mp.update(0.4)
+  assert mp.verdict(f) == 1
+  mp.update(2.5)
+  assert mp.verdict(f) == 0
+  mp.tick(CTL.MODEL_STALE + 0.1)
+  assert mp.verdict(f) is None                                    # stale: a dropout
+  mp.update(4.6)
+  assert mp.verdict(F(exit_bend_valid=True, exit_hwy_bend=0.0, exit_link_bend=2.0)) is None   # the roads not apart
+
+
+def test_planner_shape_check_needs_a_heading_gap_and_speed_and_gives_the_roads_ahead():
+  root, _, ramps = write_files(fork_scene(fork=False))
+  car = _Car(root)
+  _announce(car)
+  pts = _ramp_pts(8, [("s", 200)])
+  x, y, h = _along(pts, 60)
+  m = car.at(x + 2.5, y, h, frames=5)
+  assert m.exit_shape == MC.EXIT_SHAPE_LINK
+  hb, lb = m.exit_bends
+  assert hb is not None and abs(hb) < 1.0 and lb is not None and 5.0 <= lb <= 11.0, (hb, lb)
+  m = car.at(x + 2.5, y, h, frames=5, v=5.0)                     # a jam: no answer
+  assert m.exit_shape == MC.EXIT_SHAPE_NONE
+  # our heading only 0.5 deg closer to the link's than the highway's (in between): no "link"
+  m = car.at(x + 2.5, y, 3.5, frames=5)
+  assert m.exit_shape != MC.EXIT_SHAPE_LINK, (m.exit_link, m.exit_hwy)
