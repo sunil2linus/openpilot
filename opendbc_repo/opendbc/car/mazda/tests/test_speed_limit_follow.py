@@ -676,6 +676,17 @@ def test_a_raise_from_a_glitch_is_undone_when_the_old_limit_comes_back():
   assert c.raises and c.undos == [] and [p for p in r["presses"] if p[1] == cs.SET_MINUS] == []
 
 
+def test_an_undo_needs_gps_trust_0():
+  # review (rule 4 had no trust check): the 45 back with trust 1 or 2 over its steady time is not trusted to take our
+  # raise back by SET-: the raise stays; with trust 0 it is undone (above)
+  for trust in (1, 2):
+    r, c = _sim(T.Car(45, dash_offset_mph=0.0), lambda f: 60 if 1000 <= f < 1600 else 45, 5000,
+                trust=lambda f, t=trust: t if f >= 1600 else 0)
+    assert c.raises and c.undos == [] and abs(r["final"] - 60) < 0.01, (trust, c.undos, r["final"])
+    assert [p for p in r["presses"] if p[1] == cs.SET_MINUS] == []
+    assert any("an undo needs 0" in x for x in _reasons(c)), _reasons(c)
+
+
 def test_no_undo_after_the_driver_changed_his_speed_braked_or_a_slowdown_owns_it():
   def drv(btn):
     return lambda s, c: c.press(btn, who="driver")
@@ -900,6 +911,107 @@ def test_merge_taken_back_when_the_link_ends_on_a_street():
   assert abs(r["final"] - 45) < 0.01
 
 
+class _GlitchAfterMerge(_Ramp):
+  """review: a few s after the merge the street's 45 is reported for `glitch` s, GPS trust 2 for 15 s after the merge
+  (the street next to the highway)."""
+  def __init__(self, after_s=5.0, glitch=4.0, **kw):
+    super().__init__(**kw)
+    self.after_s, self.glitch, self.merge_f = after_s, glitch, None
+
+  def road(self, f, x):
+    out = super().road(f, x)
+    if out.get("road_class") == self.after and self.merge_f is None:
+      self.merge_f = f
+    return out
+
+  def _in(self, f):
+    return self.merge_f is not None and self.merge_f + self.after_s * 100 <= f < self.merge_f + (self.after_s + self.glitch) * 100
+
+  def slc(self, f):
+    return self.street if self._in(f) else super().slc(f)
+
+  def trust(self, f):
+    return 2 if (self.merge_f is not None and f < self.merge_f + 1500) else super().trust(f)
+
+
+def test_merge_is_never_undone_once_on_the_highway():
+  # review (merge2.py): the street's 45 reported 3-4 s with trust 2 a few s after the merge undid our merge raise on the
+  # highway, 25 SET- 70 -> 45. Once the highway is matched the merge is done; an undo needs trust 0 too
+  for after_s in (3.0, 5.0):
+    ramp = _GlitchAfterMerge(after_s=after_s)
+    r, c, _ = _merge_sim(ramp, _car53(45, 45), 9000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+    assert c.raises and c.kinds == ["merge"] and c.undos == [], (after_s, c.undos)
+    assert [p for p in r["presses"] if p[0] >= ramp.merge_f and p[1] == cs.SET_MINUS] == []
+    assert abs(r["final"] - 70) < 0.01
+  # the same with trust 0 (a glitch the map is sure of): still not undone on the highway
+  ramp = _GlitchAfterMerge()
+  ramp.trust = lambda f: 0
+  r, c, _ = _merge_sim(ramp, _car53(45, 45), 9000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+  assert c.raises and c.undos == [] and abs(r["final"] - 70) < 0.01
+
+
+def test_merge_refused_after_his_set_or_cruise_off_any_time_on_the_link():
+  # review (merge1.py): his SET, cancel or brake on the link only ended the merge once its window was open
+  ev0 = lambda ramp: {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)}  # noqa: E731
+
+  def engage_set40(s, c):     # SET with cruise off: engages at the current speed, 40
+    c.v_ego = c.set_speed = 40 * MPH
+    c.driver_button, c.driver_button_until = cs.SET_MINUS, c.frame + 10
+
+  def on(s, c):
+    s["brake"], s["cruise"] = False, True
+  for known in (36.0, 250.0):
+    ramp = _Ramp(known=known)
+    ev = dict(ev0(ramp))
+    ev.update({ramp.at - 200: _cruise_off, ramp.at + 300: engage_set40, ramp.at + 310: on})
+    r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
+    assert c.raises == [] and r["max"] <= 45 + 1e-6 and abs(r["final"] - 40) < 0.01, (known, c.raises, r["final"])
+  # his brake on the link before mapd's next limit is known, then RES at the stored 45
+  ramp = _Ramp(known=200.0)
+  ev = dict(ev0(ramp))
+  ev.update({ramp.at + 50: _cruise_off, ramp.at + 400: _resume_now})
+  r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
+  assert c.raises == [] and r["max"] <= 45 + 1e-6, (c.raises, _reasons(c))
+  assert any("cruise off on the link" in x for x in _reasons(c)), _reasons(c)
+  # cruise already off when the link began, RES on it (drive 53, ramp 1: off from t 290.0, RES at 298.5, 0.3 s after the
+  # link was matched): not his choice of speed, the merge goes on
+  ramp = _Ramp()
+  ev = dict(ev0(ramp))
+  ev.update({ramp.at - 300: _cruise_off, ramp.at + 30: _resume_now})
+  r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
+  assert c.kinds == ["merge"] and abs(r["final"] - 70) < 0.01, (c.raises, _reasons(c))
+
+
+def test_a_planned_stop_ahead_holds_the_merge_raise_and_the_fast_restore():
+  # review (holdr.py): on a ramp to a highway (fast_restore) with a stopped car latched ahead (hold_restore), a merge
+  # offer of 70 went 45 -> 70 by SET+ holds; the fast restore also ignored hold_restore
+  def run(hold_restore, fast=True, frames=1500, set_mph=45, anchor=None):
+    car = T.Car(set_mph, dash_offset_mph=0.0, lag=10, accel=0.6, step=MPH)
+    logic = cs.CurveSlowdownLogic(False, 10)
+    if anchor is not None:
+      logic.anchor, logic.last_set_speed = anchor * MPH, set_mph * MPH
+    plus = 0
+    for f in range(frames):
+      i = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, csc_active=False, csc_speed=100.0,
+                            other_button_active=False, driver_button=None, fast_restore=fast, hold_restore=hold_restore(f),
+                            limit_raise=(70 * MPH if f >= 300 and anchor is None else 0.0))
+      btn, _ = logic.update(i)
+      if btn is not None:
+        plus += btn == cs.SET_PLUS
+        car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+      car.tick()
+    return car, logic, plus
+  car, logic, plus = run(lambda f: True)
+  assert plus == 0 and abs(car.set_speed / MPH - 45) < 1e-6 and logic.anchor is None, (plus, car.set_speed / MPH)
+  # the stop released at frame 800: the raise is taken then
+  car, logic, plus = run(lambda f: f < 800)
+  assert plus > 0 and abs(car.set_speed / MPH - 70) < 1e-6
+  # a restore pending (his 60, set 45) on the ramp with the stop latched: no fast restore while it holds
+  car, logic, plus = run(lambda f: True, anchor=60)
+  assert plus == 0 and abs(car.set_speed / MPH - 45) < 1e-6, (plus, car.set_speed / MPH)
+
+
 def test_merge_metric():
   # a 60 km/h street, a ramp to a 100 km/h highway: 100
   kph = 1 / 3.6
@@ -966,6 +1078,56 @@ def test_drive_53_tag_457_after_an_exit_the_streets_limit_is_his_speed():
             undo=c.undo, ceiling=c.ceiling, setup=lambda lg: c.setup(lg, 75))
   assert c.raises == [] and r["final"] < 50 - 1e-6, (c.raises, r["final"])
   assert any("set his speed" in x for x in _reasons(c)), _reasons(c)
+
+
+def _exit_wrong_first(first, street_mph, wrong_s, trust=lambda f: 0, extra=None, floor_mph=25):
+  """After an exit at the floor (his speed, map_curve_control's street adopt): mapd gives `first` for `wrong_s` s from
+  the street's first limit, then the street's own."""
+  ex = _Exit(limit=3200, street_mph=street_mph)
+  slc = lambda f: first if ex.limit <= f < ex.limit + wrong_s * 100 else ex.slc(f)  # noqa: E731
+  car = _car53(floor_mph, floor_mph)
+  c = Coupled(car, slc, road=ex.road, trust=trust)
+
+  def forget(s, cr):
+    s["brake"] = False
+    c.logic._forget()
+  ev = {0: _brake_held, ex.street + 50: forget}
+  ev.update(extra or {})
+  r = T.run(car, NO_CURVE, 9000, events=c.events(ev), limit=c.limit, cap=c.cap, undo=c.undo, ceiling=c.ceiling,
+            setup=lambda lg: c.setup(lg, 75))
+  return r, c
+
+
+def test_after_an_exit_a_wrong_first_limit_is_taken_back_by_the_streets_lower_one():
+  # review (exit6.py): a wrong 65 steady 6 s raised his speed, then the street's 35 only capped the restore (rule 3) at
+  # the set speed it had reached (50 on a 35 street). A lower limit within LIMIT_UNDO_TIME of a rule 6 raise brings his
+  # speed down to it, our own SET- taps (as rule 4's undo)
+  for wrong_s, first in ((10, 65), (15, 65), (15, 50)):
+    r, c = _exit_wrong_first(first, 35, wrong_s)
+    assert c.kinds == ["exit"] and abs(c.raises[0][1] - first) < 1e-6, (wrong_s, c.raises)
+    assert [u[2] for u in _undos(c)] == ["undo"], (wrong_s, c.undos)
+    assert abs(r["final"] - 35) < 0.01 and r["max"] <= first + 1e-6, (wrong_s, r["final"])
+    assert [p for p in r["presses"] if p[1] == cs.SET_MINUS], "our own raise taken back by SET-"
+  # never below his speed before our raise (45 from our restore, adopted off the exit: exit6.py): back to 45
+  r, c = _exit_wrong_first(65, 35, 15, floor_mph=45)
+  assert [u[2] for u in _undos(c)] == ["undo"] and abs(r["final"] - 45) < 0.01, (c.undos, r["final"])
+  # the lower limit with GPS trust 2: not taken back (and no cap from our own raise)
+  r, c = _exit_wrong_first(65, 35, 15, trust=lambda f: 2 if f >= 4700 else 0)
+  assert c.undos == [] and abs(r["final"] - 65) < 0.01 and [p for p in r["presses"] if p[1] == cs.SET_MINUS] == []
+  # 30 s or more after the raise: the street's own change, no undo, no SET-
+  r, c = _exit_wrong_first(50, 35, 40)
+  assert c.kinds == ["exit"] and c.undos == [] and [p for p in r["presses"] if p[1] == cs.SET_MINUS] == []
+
+
+def test_after_an_exit_the_offer_ends_with_cruise_off():
+  # review: a rule 6 offer survived cruise off and was taken 0.3 s after RES; cruise must stay on from when the limit
+  # appeared until it is taken (his brake held the offer at 3650, cancel at 3750, RES at 3950)
+  r, c = _exit_wrong_first(50, 50, 6, extra={3650: _brake_held, 3750: _cruise_off, 3950: _resume_now})
+  assert c.raises == [] and abs(r["final"] - 25) < 0.01, (c.raises, r["final"])
+  assert any("after the exit: cruise off" in x for x in _reasons(c)), _reasons(c)
+  # cruise on throughout: taken
+  r, c = _exit_wrong_first(50, 50, 6)
+  assert c.kinds == ["exit"] and abs(r["final"] - 50) < 0.01
 
 
 def test_drive_53_tag_1324_a_lower_limit_at_the_resume_holds_the_restore_at_once():

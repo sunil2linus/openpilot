@@ -23,7 +23,8 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    (after a first limit: any lower one) takes the raise back: the driver's speed goes back to what it was, and if the
    driver has not touched his speed since, the controller lowers the set speed back to it (undoing our own presses:
    the only SET- the posted limit can cause). Otherwise (his own change, brake, cancel, a stop or curve slowdown on)
-   it only works like rule 3's cap at his old speed.
+   it only works like rule 3's cap at his old speed. Only with GPS trust 0 on every frame of the lower limit's steady
+   time; never for a merge (rule 5) once the highway is matched.
 5. Merge onto a highway: on a link that leads to a highway (starpilotPlan.mapRampToHighway) from a street, the next
    posted limit ahead (mapdOut.nextSpeedLimit: the highway's) becomes the driver's speed when it is above his speed and
    his speed is a street's (at most MERGE_SURFACE_MAX_MPH, km/h: _KPH). Always the limit itself (drive 53: he chose 70
@@ -35,13 +36,16 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    cruise needs to get within MERGE_NEAR_MPH of it (MERGE_ACCEL) plus MERGE_LEAD_TIME, or at once when less (unknown
    too). The controller takes it once no curve or stopped car needs a lower speed (the lowest target wins) and stays
    open while on the link and LIMIT_OFFER_TIME after it. His SET press, cancel or brake on the link ends it (after it
-   was taken his buttons work as on any restore). Rule 4 takes it back if the next limit is his old one or lower within
-   LIMIT_UNDO_TIME, or if the car gets onto a road that is not a highway for LIMIT_STABLE_TIME (another link matched).
+   was taken his buttons work as on any restore); so does any SET press of his, cancel or brake since the link began,
+   or a planned stop ahead (the controller waits). Rule 4 takes it back if the next limit is his old one or lower
+   within LIMIT_UNDO_TIME before the highway is matched, or if the car gets onto a road that is not a highway for
+   LIMIT_STABLE_TIME (another link matched).
 6. After an exit: the first limit after a link from a highway (until EXIT_TIME after the car got onto the street) is
    the street's. A limit below the driver's speed caps a pending restore at it (any band: his highway speed is not a
    street's). A limit above his speed, with no SET press of his since the link began (our slowdown left the set speed
-   there), becomes his speed once steady 5 s off the link, as a first limit (GPS trust 0, cruise on since it appeared),
-   any gap (drive 53: the floor 19 to 50). Not undone by rule 4.
+   there), becomes his speed once steady 5 s off the link, as a first limit (GPS trust 0, cruise on since it appeared
+   until it is taken), any gap (drive 53: the floor 19 to 50). A lower limit within LIMIT_UNDO_TIME of that raise
+   (a wrong first one) is rule 4's undo, down to the lower limit (never below his speed before our raise).
 
 A lower limit reported but not steady yet (LIMIT_STABLE_TIME), with the driver's speed in rule 1's band of the one
 before (the one he matched, else the steady one): no SET+ of ours above it while it is reported (provisional, at once,
@@ -230,6 +234,7 @@ class SpeedLimitFollower:
     self.driver = None             # the driver's speed (steps) last seen with cruise on ...
     self.driver_since = -10_000    # ... and the frame it last changed
     self.cruise_off_frame = 0      # the last frame cruise was off (or the driver's speed unknown)
+    self.cruise_drop_frame = -10_000  # the last frame cruise went off (his cancel or brake) after being on
     self.rise = None               # (old, new, first frame): a higher limit waiting for LIMIT_RAISE_STABLE_TIME
     self.offer = None              # an open raise (rule 1 / 2)
     self.cap = None                # rule 3: open while the lower limit stays and the driver's speed is unchanged
@@ -289,6 +294,8 @@ class SpeedLimitFollower:
         reported = int(round(x))
     d = self._steps(i.driver_speed) if (i.cruise_enabled and i.driver_speed > 0) else None
     if d is None:
+      if self.cruise_off_frame != self.frame - 1:
+        self.cruise_drop_frame = self.frame
       self.cruise_off_frame = self.frame
     if d is not None and (self.driver is None or abs(d - self.driver) >= 0.5):
       self.driver, self.driver_since = d, self.frame
@@ -363,6 +370,8 @@ class SpeedLimitFollower:
     self.link_start = None
     if c in HIGHWAY_CLASSES:
       self.exit_start = self.merge_watch = None    # back on a highway (an interchange), or the merge got there
+      if self.raised is not None and self.raised.kind == "merge":
+        self.raised = None           # on the highway the merge is done: never undone (rule 4) from here
       return
     if self.exit_start is not None and self.exit_street is None:
       self.exit_street = self.frame
@@ -418,16 +427,21 @@ class SpeedLimitFollower:
     if self.link_start is None or self.merge_done or not self.link_to_hwy or self.link_from in HIGHWAY_CLASSES:
       self.merge_window = None
       return
-    if self.merge_window is not None and (i.driver_set or d is None):
-      self.merge_done = True         # the driver sets his own speed, cancels or brakes on the link: his
-      self._not_followed(None, self.merge_window[0], "Map Data",
-                         "merge: the driver set his speed on the link" if i.driver_set else "merge: cruise off on the link")
-      return
     n = None
     if i.next_limit >= 1.0:
       x = self._steps(i.next_limit)
       if abs(x - round(x)) <= LIMIT_WHOLE_TOL:
         n = int(round(x))
+    if self.driver_set_frame >= self.link_start or self.cruise_drop_frame >= self.link_start:
+      # the driver sets his own speed, cancels or brakes at any time since the link began (as rules 2 and 6): his
+      # (review: only once the window was open; engaged by SET at 40 on the link, or a brake and RES there, -> 70).
+      # Cruise already off when the link began and resumed (RES) on it is not his choice of speed: drive 53, ramp 1
+      # (tag 310), cruise off from t 290.0, RES at 298.5, 0.3 s after the link was matched, at his street's 45
+      self.merge_done = True
+      self._not_followed(None, self.merge_window[0] if self.merge_window is not None else n, "Map Data",
+                         "merge: the driver set his speed on the link" if self.driver_set_frame >= self.link_start else
+                         "merge: cruise off on the link")
+      return
     w = self.merge_window
     ready = w is not None and self.frame - w[2] >= _frames(MERGE_STABLE_TIME)
     if n is None or d is None:
@@ -482,11 +496,18 @@ class SpeedLimitFollower:
     r = self.raised
     if (r is not None and start - r.frame <= _frames(LIMIT_UNDO_TIME) and new < r.new and
         (r.old is None or new <= r.old)):
-      # rule 4: back at (or below) the limit we raised from, soon after our raise (a first limit had none: any lower
-      # one). The controller decides how (rule 4 in the module docstring); no rule 3 cap from our own raised speed. No
-      # GPS trust check: it only ever goes back to the driver's own speed.
+      # rule 4: back at (or below) the limit we raised from, soon after our raise (a first limit or an exit had none:
+      # any lower one). The controller decides how (rule 4 in the module docstring); no rule 3 cap from our own raised
+      # speed. GPS trust 0 on every frame of its steady time (review: a street's 45 for 3 s with trust 2 a few s after
+      # a merge took the set 70 -> 45 on the highway, 25 SET-).
+      if self.candidate_trust > LIMIT_FIRM_TRUST_MAX:
+        self._not_followed(r.new, new, i.source, f"undo: GPS trust {self.candidate_trust} (an undo needs 0)")
+        return
       self.raised = self.merge_watch = None
-      self.undo = Offer(r.new, r.driver, i.source, self.frame, "undo", r.new)
+      # after an exit (rule 6) his speed goes to the lower limit, the street's (review: a wrong first 65 raised the
+      # floor 19 to 65, then the street's 35 only capped the restore at 50), never below his speed before our raise
+      back = max(new, r.driver) if r.kind == "exit" else r.driver
+      self.undo = Offer(r.new, back, i.source, self.frame, "undo", r.new)
       return
     if self.exit_start is not None and start >= self.exit_start:
       self._exit_limit(new, old, d, i, start)   # rule 6: the first limit after a link from a highway
@@ -609,9 +630,11 @@ class SpeedLimitFollower:
       self._not_followed(o.old, o.new, o.source, "not taken in time (cruise off, a slowdown or the driver on the buttons)")
       return 0.0
     if d is None:
-      if o.kind == "merge":
-        self.offer = None            # his cancel or brake on the ramp: his
-        self._not_followed(o.old, o.new, o.source, "merge: cruise off")
+      if o.kind in ("merge", "exit"):
+        # his cancel or brake on the ramp: his; after an exit cruise must stay on from when the limit appeared until it
+        # is taken (as rule 2's check up to the offer; review: an exit offer survived cruise off, taken right after RES)
+        self.offer = None
+        self._not_followed(o.old, o.new, o.source, "merge: cruise off" if o.kind == "merge" else "after the exit: cruise off")
       return 0.0                     # cruise off since it was offered: wait (drive 52: a stop slowdown, his brake)
     if abs(d - o.new) < 0.5:
       self.offer = None              # already there (the driver's own SET+: drive 52, t 321)
@@ -625,8 +648,8 @@ class SpeedLimitFollower:
   def mark_adopted(self):
     """The controller took the offer (or Test mode logged it): close it, and remember it for rule 4."""
     o = self.offer
-    if o is not None and o.kind != "exit":
-      # (rule 6 is not undone: a lower limit soon after it is a street's normal change, and back to the floor is worse)
+    if o is not None and not (o.kind == "merge" and self.road in HIGHWAY_CLASSES):
+      # (a merge taken on the highway is never undone; rule 6's undo goes to the lower limit, not back to the floor)
       self.raised = Offer(o.old, o.new, o.source, self.frame, o.kind, o.driver)
       if o.kind == "merge":
         self.merge_watch = self.raised

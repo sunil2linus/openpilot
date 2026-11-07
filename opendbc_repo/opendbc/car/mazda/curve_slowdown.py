@@ -853,7 +853,8 @@ class CurveSlowdownLogic:
     # rule 3 does.
     if i.limit_undo > 0 and self.limit_raised is not None:
       raised, self.limit_raised = self.limit_raised, None
-      before = raised["before"]
+      # (his speed before our raise; after an exit the follower asks for the street's lower limit, above it: rule 6)
+      before = max(raised["before"], i.limit_undo)
       owned = (i.csc_active or i.stop_active or i.hold_restore or self.stop_episode or self.restore_pending or
                self.lower_presses > 0 or self.stop_presses > 0)
       if not raised["touched"] and not owned:
@@ -913,7 +914,9 @@ class CurveSlowdownLogic:
 
     if i.stop_restore_now and self.offset != 0:
       self.restore_pending = True
-    if i.fast_restore and self.offset > 0 and not i.csc_active and not i.stop_active:
+    # (not while a planned stop holds the speed: review, a merge raise 45 -> 70 went up by SET+ holds with a stopped car
+    # latched ahead)
+    if i.fast_restore and self.offset > 0 and not i.csc_active and not i.stop_active and not i.hold_restore:
       self.restore_pending = True
     if self.offset == 0 and not self.inflight or i.stop_active:
       self.restore_pending = False
@@ -1036,9 +1039,10 @@ class CurveSlowdownLogic:
       return None, None
 
     # A higher posted limit (the driver's speed was the old one): it becomes the driver's speed, never more; the
-    # restore below brings the set speed up. Not while a reason is active, the driver stands us down or is adjusting.
+    # restore below brings the set speed up. Not while a reason is active, a planned stop holds the speed
+    # (hold_restore), the driver stands us down or is adjusting.
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
-        self.last_set_speed is not None and i.limit_raise > driver_speed + self.half_step and
+        not i.hold_restore and self.last_set_speed is not None and i.limit_raise > driver_speed + self.half_step and
         self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
