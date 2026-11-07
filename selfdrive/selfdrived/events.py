@@ -260,6 +260,13 @@ def _map_curve_needs(radius: float, advisory: float) -> float:
   return needs
 
 
+def _map_curve_target(sp) -> float:
+  """The governing map curve's speed as the car side takes it (mapCurveTarget: the Max Drop floor counted), else its
+  shape and advisory alone (an older planner)."""
+  target = float(getattr(sp, "mapCurveTarget", 0.0) or 0.0)
+  return target if target > 0 else _map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory)
+
+
 def stopped_lead_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                        personality, starpilot_toggles: SimpleNamespace) -> Alert:
   # the stopped car warning also warns for a much slower moving car (stop_warning.SLOW_LEAD_*): "CAR AHEAD - BRAKE" then,
@@ -282,7 +289,7 @@ def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster
   where = "now" if sp.mapCurveDistance <= 1 else "in " + _map_distance(sp.mapCurveDistance, metric)
   action = "Test: would slow to" if sp.mapCurveMode == 1 else "Slowing to"
   return Alert(
-    f"{what} {where} · {action} {get_display_speed(_map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory), metric)}",
+    f"{what} {where} · {action} {get_display_speed(_map_curve_target(sp), metric)}",
     "",
     StarPilotAlertStatus.starpilot, AlertSize.small,
     Priority.LOW, VisualAlert.none, AudibleAlert.none, 6.)   # 3 s was easy to miss (drive 37)

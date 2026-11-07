@@ -299,6 +299,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapExitHighwayBend @78 :Float32;   # deg (right positive): the highway's heading 80 m ahead along it, from its heading here
   mapExitLinkBend @79 :Float32;      # deg: the exit link's heading 80 m ahead along it, from the highway's here
   mapExitBendValid @80 :Bool;        # both bends known
+  mapCurveTarget @81 :Float32;       # m/s, the governing curve's speed as the car side takes it (Max Drop floor for a road curve), 0 none
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

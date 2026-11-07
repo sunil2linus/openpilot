@@ -48,7 +48,8 @@ PLAN_DECEL = 0.45         # m/s^2
 PROFILE_PATH = "/data/media/0/mazda_car_profile.json"
 PROFILE_DECEL_RANGE = (0.15, 0.40)
 PROFILE_DECEL_DEFAULT = 0.25   # car_profile.DECEL_DEFAULT: the staircase pace assumed until measured (logs only)
-PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry
+PLAN_LEAD_TIME = 1.0      # s at the curve's speed before its entry (ramp curves and exits)
+PLAN_ROAD_LEAD_TIME = 0.5  # s, road curves (the car side's curve_target.MAP_ROAD_LEAD_TIME, drive 54 West Utica)
 PLAN_REACTION_TIME = 1.5  # s for the stock cruise to start slowing after a SET- press
 # The driver's Curve Max Drop (MazdaCurveSlowdownMaxDrop, an index into MAX_DROP_CHOICES_MPH, read as the car side's
 # curve_slowdown.py reads it): the car side never takes a road curve below the driver's speed less this, so the plan
@@ -344,12 +345,13 @@ def curve_speed_limit(radius, advisory=0.0, lat_limit=PLAN_LAT):
   return min(v, advisory + ADVISORY_OVER) if advisory > 0 else v
 
 
-def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL, floor=0.0):
+def plan_speed(radius, distance, advisory=0.0, reaction_speed=0.0, lat_limit=PLAN_LAT, decel=PLAN_DECEL, floor=0.0,
+               lead_time=PLAN_LEAD_TIME):
   """Highest speed (m/s) from which the stock cruise (reacting for PLAN_REACTION_TIME at `reaction_speed`, then
-  slowing at `decel`) reaches the curve speed (never below `floor`, the driver's max drop) PLAN_LEAD_TIME before its
-  entry (the car side's map_curve_speed)."""
+  slowing at `decel`) reaches the curve speed (never below `floor`, the driver's max drop) `lead_time` before its
+  entry (the car side's map_curve_speed; PLAN_ROAD_LEAD_TIME for road curves)."""
   v_curve = max(curve_speed_limit(radius, advisory, lat_limit), floor)
-  room = distance - v_curve * PLAN_LEAD_TIME - PLAN_REACTION_TIME * max(reaction_speed, v_curve)
+  room = distance - v_curve * lead_time - PLAN_REACTION_TIME * max(reaction_speed, v_curve)
   return math.sqrt(v_curve ** 2 + 2 * decel * max(room, 0.0))
 
 
@@ -1537,7 +1539,8 @@ class MapCurves:
         cands = self.veto.filter(self, cid, cands, camera, shaky)
       if cands:
         c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel,
-                                                    floor=0.0 if cd[0].get("ramp") else self.floor))
+                                                    floor=0.0 if cd[0].get("ramp") else self.floor,
+                                                    lead_time=PLAN_LEAD_TIME if cd[0].get("ramp") else PLAN_ROAD_LEAD_TIME))
         if trust is not None and trust.low:
           self.held = (c, d)     # another road this close may be the one we are on: do not slow early
           self.status = STATUS_HELD
@@ -1894,13 +1897,16 @@ class MapCurvesPlanner:
     self._feature_log(mc, v_ego, set_speed, now, gps_position)
     self._measure_pass(sm, mc.inside, gps_position["latitude"], gps_position["longitude"], dt=self.call_dt)
     road_floor = 0.0 if mc.status == STATUS_RAMP_CURVE else floor     # ramp curves are planned without the max drop floor
+    road_lead = PLAN_LEAD_TIME if mc.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME
     self.prev_slowing = mc.curve is not None and set_speed > 0 and \
-      plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor) < set_speed - 2 * MPH
+      plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor,
+                 lead_time=road_lead) < set_speed - 2 * MPH
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
       if key != self.announced_curve and \
-         plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor) < set_speed - 2 * MPH and \
+         plan_speed(mc.radius, mc.distance, mc.advisory, set_speed, decel=self.decel, floor=road_floor,
+                    lead_time=road_lead) < set_speed - 2 * MPH and \
          curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"
@@ -2096,6 +2102,11 @@ class MapCurvesPlanner:
       plan.mapCurveDistance = float(mc.distance)
       plan.mapCurveRadius = float(mc.radius)
     plan.mapCurveAdvisory = float(mc.advisory)
+    # the governing curve's speed as the car side takes it: a road curve never below the driver's Curve Max Drop floor
+    # (drive 54, West Utica: the notice said 32 for a curve the car took to 35)
+    if mc.curve is not None and mc.radius > 0:
+      plan.mapCurveTarget = float(max(curve_speed_limit(mc.radius, mc.advisory),
+                                      0.0 if mc.status == STATUS_RAMP_CURVE else mc.floor))
     plan.mapCurveName = (mc.curve or {}).get("name", "") or ""
     plan.mapOnRamp = bool(mc.on_ramp)
     r = mc.ramp if mc.on_ramp else mc.nav_ramp

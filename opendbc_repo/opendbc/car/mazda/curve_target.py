@@ -158,6 +158,17 @@ MAP_FOLLOW_MAX_DECEL = 0.6    # m/s^2: a 7.9 mph gap at MAP_FOLLOW_GAIN
 MAP_SETTLE_HYST = 1.0 * MS_PER_MPH  # m/s: once settled, only this much above the settle speed asks for a gap again (no churn)
 MAP_MIN_ROOM = 5.0            # m: the required decel is never computed over less than this (a curve we are nearly in)
 MAP_FOLLOW_BUDGET = 40        # SET- presses for one followed curve (max drop + undershoot + ignored presses, also in km/h)
+# Road curves (not ramps or exits, which keep the values above): drive 54, West Utica Road (the 30 mph curve, 35 by the
+# memory cap / Max Drop) at 45.4 mph: the follow began 190-204 m out as planned, but the set speed went 3 under the curve
+# (the command 5 under), the car slowed up to 0.82 m/s^2 (the cruise there gave ~0.55 m/s^2 at a 1-2 m/s gap, about
+# twice the model above) and was at the curve's speed 43-60 m (3-4 s) before the entry; owner: "we could slow down a
+# little later, it brakes a little too much". So for road curves: the undershoot is 3 mph, the curve's speed is reached
+# MAP_ROAD_LEAD_TIME before the entry (car side and planner), and the follower asks for no lower set speed while the car
+# already slows at least as hard as the room left needs (aEgo filtered over MAP_ROAD_ACCEL_TAU, MapCurveFollower
+# closed_loop): a cruise that answers harder than the model is not pushed further.
+MAP_ROAD_UNDERSHOOT = 3 * MS_PER_MPH   # m/s
+MAP_ROAD_LEAD_TIME = 0.5      # s
+MAP_ROAD_ACCEL_TAU = 0.5      # s
 # Firm follow (ramp curves and navigation exits only, owner's exit design): when the room left needs more than
 # MAP_FOLLOW_MAX_DECEL, the set speed is taken well below so the stock cruise slows at its strongest. Measured: the
 # cruise slows ~0.19 m/s^2 per m/s of gap, capped at ~1.0 m/s^2 (drives 44-53: a set speed held far below gave 0.9-1.0,
@@ -219,9 +230,9 @@ class MapCurveTarget:
     self.active = False
     self.speed = NO_CURVE
 
-  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None, floor=0.0):
+  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None, floor=0.0, lead_time=MAP_LEAD_TIME):
     self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory, reaction_speed=driver_speed,
-                                 decel=self.decel if decel is None else decel, floor=floor)
+                                 decel=self.decel if decel is None else decel, floor=floor, lead_time=lead_time)
     if not self.active:
       self.active = radius > 0 and self.speed <= driver_speed - MAP_START_GAP
     else:
@@ -235,10 +246,13 @@ class MapCurveFollower:
   are not churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends.
 
   max_decel / undershoot / lead_time: the follow's own bounds (the gentle slowdown before an exit's split uses smaller
-  ones). firm: may turn firm (FIRM_*) when the room left needs more than max_decel (ramp curves, exits)."""
+  ones). firm: may turn firm (FIRM_*) when the room left needs more than max_decel (ramp curves, exits). closed_loop:
+  no lower command while the car already slows at least as hard as the room left needs (road curves, MAP_ROAD_*)."""
 
-  def __init__(self, max_decel=MAP_FOLLOW_MAX_DECEL, undershoot=MAP_UNDERSHOOT, lead_time=MAP_LEAD_TIME, firm=False):
+  def __init__(self, max_decel=MAP_FOLLOW_MAX_DECEL, undershoot=MAP_UNDERSHOOT, lead_time=MAP_LEAD_TIME, firm=False,
+               closed_loop=False):
     self.max_decel, self.undershoot, self.lead_time, self.can_firm = max_decel, undershoot, lead_time, firm
+    self.closed_loop = closed_loop
     self.cmd = None
     self.v_curve = None
     self.settled = False          # the car is (nearly) at the curve's speed: the command is the curve's speed
@@ -253,7 +267,8 @@ class MapCurveFollower:
     """The lowest the command may go (m/s): the curve's speed less the undershoot in use."""
     return (self.v_curve or 0.0) - (FIRM_UNDERSHOOT if self.firm else self.undershoot)
 
-  def update(self, v_ego, v_curve, distance, plan_speed):
+  def update(self, v_ego, v_curve, distance, plan_speed, a_ego=None):
+    """a_ego: the car's filtered acceleration (m/s^2) for closed_loop (None: not used)."""
     if self.v_curve is None or abs(v_curve - self.v_curve) > 0.05:
       self.cmd, self.settled, self.firm = None, False, False   # a new curve (or its speed changed)
     self.v_curve = v_curve
@@ -278,6 +293,9 @@ class MapCurveFollower:
       want = map_follow_speed(v_ego, v_curve, distance, lead_time=self.lead_time, max_decel=self.max_decel,
                               undershoot=self.undershoot)
     want = min(want, plan_speed)  # the plan is never below the curve's speed
+    if (self.closed_loop and a_ego is not None and self.cmd is not None and want < self.cmd and
+        -a_ego >= (v_ego ** 2 - v_curve ** 2) / (2 * room)):
+      want = self.cmd             # already slowing as hard as the room left needs: no further SET-
     if self.cmd is None or want < self.cmd:
       self.cmd = want             # down with the car only (small rises of the command do not move the buttons)
     return self.cmd

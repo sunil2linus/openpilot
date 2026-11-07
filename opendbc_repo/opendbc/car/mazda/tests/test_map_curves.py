@@ -462,7 +462,7 @@ MEASURED_CRUISE = dict(cruise_gain=0.19, cruise_dead=1.0)
 
 
 def drive_map(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, length=80.0, follow=True, decel=None,
-              metric=False, events=None, frames=6000, second=None, camera=None, stop=None, car_kw=None):
+              metric=False, events=None, frames=6000, second=None, camera=None, stop=None, car_kw=None, closed=True):
   """Drive at the driver's speed towards a map curve `start_d` m ahead (`length` m long), the map control and the
   controller in the loop. follow=False: the old plan-only staircase (no true speed, no max drop in the plan).
   second: (radius, gap m) of a curve starting that far after the first one's exit. camera(x) / stop(x): the camera
@@ -490,7 +490,8 @@ def drive_map(radius=WEST_UTICA_R, set_mph=45, max_drop=10, start_d=600.0, lengt
     else:
       fld = F(status=0)
     driver = car.set_speed + logic.offset * logic.step if st["cruise"] else 0.0
-    mo = ctl.update(fld, driver, 0, v_ego=car.v_ego if follow else 0.0, max_drop=md if follow else 0.0)
+    mo = ctl.update(fld, driver, 0, v_ego=car.v_ego if follow else 0.0, max_drop=md if follow else 0.0,
+                    a_ego=(a_hist[-1] if a_hist else 0.0) if (follow and closed) else None)
     # the wrapper's combination with the camera curve target (curve_slowdown.CurveSlowdown.update)
     cam = camera(x) if camera is not None else None
     active, speed, floor, budget, track, raise_ok = mix.update(cam is not None, cam if cam is not None else CTL.NO_CURVE, mo,
@@ -553,9 +554,11 @@ def test_west_utica_follower_starts_later_and_slows_firmer():
     assert abs(r["v_entry"] - v_curve) <= 1.0, (max_drop, r["v_entry"], v_curve)
     assert r["min_v"] >= v_curve - 1.0 and r["min_in_curve"] >= v_curve - 1.0, (max_drop, r["min_v"], r["min_in_curve"])
     assert r["peak"] <= 0.7, (max_drop, r["peak"])
-    # the temporary undershoot stays within MAP_UNDERSHOOT of the curve's speed (so of the max drop floor), the set
-    # speed the car settles at is the curve's speed (>= the floor), and the driver's speed comes back after the curve
-    assert r["min_set"] >= v_curve - 5 - 1e-6 and r["min_set"] <= v_curve - 3, (max_drop, r["min_set"])
+    # the temporary undershoot stays within MAP_ROAD_UNDERSHOOT of the curve's speed (so of the max drop floor; drive
+    # 54: 3 mph, it was 5), the set speed the car settles at is the curve's speed (>= the floor), and the driver's speed
+    # comes back after the curve
+    road_under = CT.MAP_ROAD_UNDERSHOOT / MPH
+    assert r["min_set"] >= v_curve - road_under - 1e-6 and r["min_set"] <= v_curve - 1, (max_drop, r["min_set"])
     in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
     assert min(in_curve_sets) >= 45 - max_drop - 1e-6 and max(in_curve_sets) <= math.ceil(v_curve) + 1e-6, (max_drop, min(in_curve_sets))
     assert abs(r["final_set"] - 45) < 1e-6
@@ -629,7 +632,7 @@ def test_follower_lowest_target_wins_camera_and_stopped_car():
   r = drive_map(max_drop=15, camera=cam)
   in_curve_sets = [sp / MPH for sp, xx in zip(r["sets"], r["xs"], strict=True) if -80 < xx <= -20]
   assert max(in_curve_sets) <= 30 + 1e-6 and min(in_curve_sets) >= 30 - 1e-6, (min(in_curve_sets), max(in_curve_sets))
-  assert 26 <= r["min_set"] <= 28, r["min_set"]
+  assert 28 <= r["min_set"] <= 29, r["min_set"]       # (the road undershoot: 3 mph, drive 54)
 
   # max drop 10 (floor 35): a camera target below the floor is held at the floor, as today
   def cam35(x):
@@ -2214,3 +2217,65 @@ def test_a_stalled_planner_starts_the_pass_over(tmp_path):
   assert _learned(mp, c) == []
   c, mp = _dobry(tmp_path, stall_at=20.0)                             # well before the curve: the pass is still whole
   assert len(_learned(mp, c)) == 1
+
+
+def _near(a, b):
+  return abs(a - b) < 1e-9
+
+
+def _at_curve_speed(r, v_curve):
+  """m before the entry where the car was first within 1 mph of the curve's speed."""
+  return next(x for v, x in zip(r["vs"], r["xs"], strict=True) if v / MPH <= v_curve + 1.0)
+
+
+def test_drive_54_road_curves_slow_later_and_less_ramps_and_exits_unchanged():
+  # drive 54, West Utica Road (35 by the memory cap / Max Drop) at 45.4 mph: the set speed went 3 under the curve, the
+  # car slowed up to 0.82 m/s^2 and was at the curve's speed 43-60 m before the entry ("slow down a little later, it
+  # brakes a little too much"). Road curves now: 3 mph undershoot, at the curve's speed 0.5 s before the entry, and no
+  # further SET- while the car already slows as hard as the room left needs
+  ctl = CTL.MapCurveControl(3.0)
+  assert _near(ctl.road_follower.undershoot, 3 * MPH) and _near(ctl.road_follower.lead_time, 0.5) and ctl.road_follower.closed_loop
+  for fol in (ctl.follower, ctl.nav_follower):                  # ramp curves and exits keep theirs
+    assert _near(fol.undershoot, CT.MAP_UNDERSHOOT) and _near(fol.lead_time, CT.MAP_LEAD_TIME) and not fol.closed_loop
+  assert _near(CT.MAP_UNDERSHOOT, 5 * MPH) and _near(CT.MAP_LEAD_TIME, 1.0)
+  # the car side's road plan and the planner's agree (the notice and the slowdown start together)
+  assert _near(MC.PLAN_ROAD_LEAD_TIME, CT.MAP_ROAD_LEAD_TIME) and _near(MC.PLAN_LEAD_TIME, CT.MAP_LEAD_TIME)
+  _, sp = ctl.curve.update(91.0, 300.0, 20.0, 0.0, ctl.decel, floor=15.6, lead_time=CT.MAP_ROAD_LEAD_TIME)
+  assert abs(MC.plan_speed(91.0, 300.0, 0.0, 20.0, decel=ctl.decel, floor=15.6, lead_time=MC.PLAN_ROAD_LEAD_TIME) - sp) < 1e-9
+  # the measured cruise: at the curve's speed closer to the entry than with the old 1 s lead (46 m there), still at it
+  r = drive_map(max_drop=10)
+  assert 15 <= _at_curve_speed(r, 35.0) <= 40 and abs(r["v_entry"] - 35.0) <= 1.0 and r["min_set"] >= 32 - 1e-6
+  # a cruise that slows harder than the model (this stretch of West Utica: ~0.55 m/s^2 at a 1-2 m/s gap): the closed
+  # loop keeps the set speed from going further down once the car slows hard enough, so the car gets to the curve's
+  # speed nearer the entry than open loop
+  for gain in (0.28, 0.4):
+    closed = drive_map(max_drop=10, car_kw=dict(cruise_gain=gain))
+    open_ = drive_map(max_drop=10, car_kw=dict(cruise_gain=gain), closed=False)
+    assert _at_curve_speed(closed, 35.0) <= _at_curve_speed(open_, 35.0) - 10, (gain, _at_curve_speed(closed, 35.0),
+                                                                                 _at_curve_speed(open_, 35.0))
+    assert abs(closed["v_entry"] - 35.0) <= 1.0 and closed["min_in_curve"] >= 34.0, (gain, closed["v_entry"])
+  # a slower cruise still gets there
+  slow = drive_map(max_drop=10, car_kw=dict(cruise_gain=0.15))
+  assert abs(slow["v_entry"] - 35.0) <= 1.0 and slow["min_in_curve"] >= 34.0, slow["v_entry"]
+
+
+def test_the_curve_notice_shows_the_speed_the_car_takes_the_curve_to():
+  # drive 54: "Map curve in 550 ft · Slowing to 32 mph" for West Utica, which the car took to 35 (the Max Drop floor
+  # of his 45): the planner publishes the curve's speed with the floor (mapCurveTarget) and the notice shows that
+  from types import SimpleNamespace as N
+  mc = N(data_here=True, paused=False, curve={"name": "West Utica Road"}, held=None, status=MC.STATUS_CURVE, distance=190.0,
+         radius=93.08, advisory=0.0, floor=35 * MPH, on_ramp=False, ramp=None, nav_ramp=None, veto_status=0, veto_radius=0.0,
+         source=2, trust_status=0, nav_exit=0, nav_exit_dist=0.0, nav_curve=None, nav_curve_dist=0.0, nav_side=0,
+         exit_shape=0, exit_link=(0.0, 0.0), exit_hwy=(0.0, 0.0), exit_fork=0, exit_curve=None, exit_curve_dist=0.0,
+         exit_start=0.0, exit_bends=(None, None), ramp_end_dist=0.0)
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mode, mp.mc, mp.road_class, mp.gps_acc = 2, mc, 0, 0.0
+  plan = N()
+  mp.publish(plan)
+  assert abs(plan.mapCurveTarget / MPH - 35.0) < 1e-6 and abs(math.sqrt(2.2 * plan.mapCurveRadius) / MPH - 32.0) < 0.05
+  mc.floor = 25 * MPH                                            # a lower floor (Max Drop 20 of his 45): the curve's own
+  mp.publish(plan)
+  assert abs(plan.mapCurveTarget - math.sqrt(2.2 * 93.08)) < 1e-6
+  mc.status, mc.floor = MC.STATUS_RAMP_CURVE, 35 * MPH            # a ramp curve: never the road's floor
+  mp.publish(plan)
+  assert abs(plan.mapCurveTarget - math.sqrt(2.2 * 93.08)) < 1e-6

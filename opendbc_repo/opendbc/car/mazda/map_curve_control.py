@@ -64,11 +64,13 @@ from dataclasses import dataclass
 
 try:
   from opendbc.car.mazda.curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
-                                              END_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET,
-                                              MAP_START_GAP, MAP_LEAD_TIME)
+                                              END_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET,
+                                              MAP_START_GAP, MAP_LEAD_TIME, MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME,
+                                              MAP_ROAD_ACCEL_TAU)
 except ImportError:          # offline tests load this file directly
   from curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP, END_GAP,
-                            MAP_LATERAL_ACCEL, MAP_DECEL, MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET, MAP_START_GAP, MAP_LEAD_TIME)
+                            MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET, MAP_START_GAP, MAP_LEAD_TIME,
+                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU)
 
 MPH = 0.44704
 KPH = 1 / 3.6
@@ -551,7 +553,8 @@ class MapCurveControl:
     self.unit = KPH if metric else MPH
     self.curve = MapCurveTarget(lat_accel, decel)
     self.follower = MapCurveFollower(firm=True)          # (firm only for a ramp curve, see update)
-    self.road_follower = MapCurveFollower()
+    self.road_follower = MapCurveFollower(undershoot=MAP_ROAD_UNDERSHOOT, lead_time=MAP_ROAD_LEAD_TIME, closed_loop=True)
+    self.a_f = None                 # the car's acceleration, filtered (MAP_ROAD_ACCEL_TAU), for the road follower
     self.nav = MapCurveTarget(lat_accel, decel)
     self.nav_follower = MapCurveFollower(firm=True)
     self.split_follower = MapCurveFollower(max_decel=SPLIT_MAX_DECEL, undershoot=SPLIT_UNDERSHOOT, lead_time=0.0)
@@ -914,11 +917,15 @@ class MapCurveControl:
     cmd = self.nav_follower.update(v_ego, v_c, max(d, 0.0), sp)
     return cmd, sp, v_c, "nav exit", self.nav_follower, self.nav_follower.firm
 
-  def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0, gas=False):
+  def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0, gas=False, a_ego=None):
     """signal: turn signal side, -1 left, 1 right, 0 none. v_ego: the true speed (m/s) for the followers (0: plan
     only). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan). gas: the driver is on the
-    gas (his decision near an exit)."""
+    gas (his decision near an exit). a_ego: the car's acceleration (m/s^2; None: the road follower runs open loop)."""
     out = MapOutput()
+    if a_ego is None:
+      self.a_f = None
+    else:
+      self.a_f = a_ego if self.a_f is None else self.a_f + DT_CTRL / (MAP_ROAD_ACCEL_TAU + DT_CTRL) * (a_ego - self.a_f)
     self.odo += max(v_ego, 0.0) * DT_CTRL
     self.model.tick(DT_CTRL)
     if self.adopt_frames > 0:
@@ -957,7 +964,8 @@ class MapCurveControl:
     # a road curve is never planned below the driver's Curve Max Drop (the controller would not go there anyway, and
     # planning for a lower speed only starts the slowdown earlier than that speed needs)
     floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
-    a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor)
+    a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
+                              lead_time=MAP_ROAD_LEAD_TIME if road_curve else MAP_LEAD_TIME)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
     speed, why = NO_CURVE, ""
     if a:
@@ -970,7 +978,7 @@ class MapCurveControl:
       fol, other = (self.follower, self.road_follower) if ramp_curve else (self.road_follower, self.follower)
       other.reset()
       out.curve_speed = map_curve_target(radius, self.lat_accel, f.advisory, floor)
-      speed = fol.update(v_ego, out.curve_speed, f.distance, sp)
+      speed = fol.update(v_ego, out.curve_speed, f.distance, sp, a_ego=self.a_f if fol is self.road_follower else None)
       track, settled, firm = True, fol.settled, fol.firm
       low = fol.low
     else:
@@ -1020,9 +1028,9 @@ class MapCurveControl:
       out.floor = max(RAMP_FLOOR, low) if track else RAMP_FLOOR
       out.budget = RAMP_BUDGET
     elif track:
-      # the follower may ask up to MAP_UNDERSHOOT below the curve's speed (so at most that far below the max drop
+      # the follower may ask up to MAP_ROAD_UNDERSHOOT below the curve's speed (so at most that far below the max drop
       # floor, which the curve's speed never goes under): that is the floor the controller gets, and nothing lower
-      out.floor, out.budget = out.curve_speed - MAP_UNDERSHOOT, MAP_FOLLOW_BUDGET
+      out.floor, out.budget = out.curve_speed - MAP_ROAD_UNDERSHOOT, MAP_FOLLOW_BUDGET
     out.fast_restore = (f.on_ramp and ramp_held and f.ramp_to_highway and not out.active) or \
       (self.restore_frames > 0 and not out.active)
     out.adopt = (self.on_street_exit and not f.on_ramp and f.road_class not in HIGHWAY_CLASSES) or self.adopt_frames > 0

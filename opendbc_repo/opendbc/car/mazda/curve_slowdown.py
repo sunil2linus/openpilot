@@ -1582,6 +1582,7 @@ class CurveSlowdown:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
       signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
       mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal, v_ego=v_ego,
+                                                  a_ego=float(CS.out.aEgo),
                                                   max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed))
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
