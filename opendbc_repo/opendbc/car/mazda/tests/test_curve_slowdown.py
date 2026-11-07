@@ -25,7 +25,8 @@ DT = 0.01
 class Car:
   def __init__(self, set_mph, dash_offset_mph=2.0, lag=15, accel=1.0, ignore=False, step=MPH, lose=None, lag_fn=None,
                hold_rate=8.3, hold_start=0.5, hold_latency=0.0, hold_ignored=False, decel=1.5, decel_fn=None, min_set_mph=None,
-               hold_phase_window=None, plus_jumps=True, jump_extra=0, cruise_gain=None, cruise_dead=1.0, cruise_max=1.0):
+               hold_phase_window=None, plus_jumps=True, jump_extra=0, cruise_gain=None, cruise_dead=1.0, cruise_max=1.0,
+               accel_fn=None):
     self.set_speed = set_mph * MPH
     self.dash_offset = dash_offset_mph * MPH
     self.v_ego = self.set_speed - self.dash_offset
@@ -36,6 +37,9 @@ class Car:
     # 10-12 mph 0.84 m/s^2), capped at `cruise_max`, and answers a set speed change `cruise_dead` s later. Off (None) the
     # old fixed `decel` / `decel_fn` model is used, which the older tests were written against.
     self.cruise_gain, self.cruise_max = cruise_gain, cruise_max
+    # accel_fn(gap_mph) -> m/s^2 the stock cruise speeds up at with the set speed gap_mph above the true speed (drives
+    # 4c-53 median: 0.33 up to 5 mph, 0.51 5-10, 0.75 10-15, 0.91 15-20, 1.06 20-25); None: the constant `accel`
+    self.accel_fn = accel_fn
     self.cruise_dead_frames = int(round(cruise_dead / DT))
     self.gaps = []                    # set speed gap seen each frame (true speed - set speed), for the dead time
     self.hold_phase_window = hold_phase_window   # frames: a hold frame later than this after the wheel's reads as a tap
@@ -125,10 +129,13 @@ class Car:
       if gap > 0:
         self.v_ego -= min(self.cruise_gain * gap, self.cruise_max) * DT
       elif gap < 0:
-        self.v_ego += max(0.0, min(self.accel * DT, tgt - self.v_ego))    # back up to the set speed, never past it
+        self.v_ego += max(0.0, min(self._accel(tgt) * DT, tgt - self.v_ego))   # back up to the set speed, never past it
       return
     dec = self.decel_fn((self.v_ego - tgt) / MPH) if self.decel_fn is not None else self.decel
-    self.v_ego += max(-dec * DT, min(self.accel * DT, tgt - self.v_ego))
+    self.v_ego += max(-dec * DT, min(self._accel(tgt) * DT, tgt - self.v_ego))
+
+  def _accel(self, tgt):
+    return self.accel if self.accel_fn is None else self.accel_fn((tgt - self.v_ego) / MPH)
 
 
 class StoppedLead:
@@ -192,12 +199,12 @@ class CSC:
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
         limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False,
-        cap=lambda f: 0.0, undo=lambda f: 0.0):
+        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check).
   red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
-  limit(f) / cap(f) / undo(f): the speed limit follower's raise / lower limit cap / undo (m/s, 0 none), called in that
-  order."""
+  limit(f) / cap(f) / undo(f) / ceiling(f): the speed limit follower's raise / lower limit cap / undo / provisional
+  ceiling (m/s, 0 none), called in that order."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -252,7 +259,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
                             stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
                             stop_slower_ahead=bool(lead is not None and trigger.slower_after_red and stop_mode == 2),
-                            limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f))
+                            limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f), limit_ceiling=ceiling(f))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16

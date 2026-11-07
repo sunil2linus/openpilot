@@ -399,13 +399,16 @@ def test_limit_raise_never_above_the_limit_for_any_overrun():
 class Coupled:
   """Every frame the follower sees the posted limit slc(f) (mph, 0 none; trust(f) its GPS trust) and the controller's
   driver's speed (the anchor, else the set speed; 0 with cruise off); the controller gets its raise, cap and undo. An
-  adoption closes the offer (the wrapper's _limit_bookkeeping, here on the next frame, before the follower runs)."""
-  def __init__(self, car, slc, metric=False, trust=lambda f: 0):
-    self.car, self.slc, self.trust = car, slc, trust
+  adoption closes the offer (the wrapper's _limit_bookkeeping, here on the next frame, before the follower runs).
+  road(f, x): the map fields at frame f, x m driven (road_class, ramp_to_highway, next_limit in mph, next_distance);
+  the driver's SET presses (the simulated car's driver button) are passed on."""
+  def __init__(self, car, slc, metric=False, trust=lambda f: 0, road=None):
+    self.car, self.slc, self.trust, self.road = car, slc, trust, road
     self.f = slf.SpeedLimitFollower(metric)
     self.logic, self.st, self.frame = None, None, -1
-    self.raise_, self.cap_, self.undo_ = 0.0, 0.0, 0.0
-    self.raises, self.caps, self.undos = [], [], []
+    self.raise_, self.cap_, self.undo_, self.ceiling_ = 0.0, 0.0, 0.0, 0.0
+    self.raises, self.caps, self.undos, self.kinds = [], [], [], []
+    self.x = 0.0                                    # m driven
 
   def setup(self, logic, anchor_mph=None):
     self.logic = logic
@@ -428,7 +431,9 @@ class Coupled:
       return
     self.frame = f
     lg = self.logic
+    self.x += self.car.v_ego * slf.DT_CTRL
     if lg.limit_adopted is not None:
+      self.kinds.append(self.f.offer.kind if self.f.offer is not None else "")
       self.f.mark_adopted()
       self.raises.append((f - 1, lg.limit_adopted[1] / MPH))
     if lg.limit_capped is not None:
@@ -440,9 +445,15 @@ class Coupled:
       self.f.mark_undone()
     cruise = self.st["cruise"] if self.st is not None else True
     drv = (lg.anchor if lg.anchor is not None else self.car.set_speed) if cruise else 0.0
-    self.raise_ = self.f.update(slf.LimitInputs(self.slc(f) * MPH, "Map Data", self.trust(f), drv, cruise))
+    kw = {}
+    if self.road is not None:
+      kw = dict(self.road(f, self.x))
+      kw["next_limit"] = kw.get("next_limit", 0.0) * MPH
+    kw.update(v_ego=self.car.v_ego, driver_set=self.car.driver_button_now() is not None)
+    self.raise_ = self.f.update(slf.LimitInputs(self.slc(f) * MPH, "Map Data", self.trust(f), drv, cruise, **kw))
     self.cap_ = self.f.cap_speed
     self.undo_ = self.f.undo_speed
+    self.ceiling_ = self.f.ceiling_speed
 
   def limit(self, f):
     self._step(f)
@@ -455,6 +466,10 @@ class Coupled:
   def undo(self, f):
     self._step(f)
     return self.undo_
+
+  def ceiling(self, f):
+    self._step(f)
+    return self.ceiling_
 
 
 def _brake_held(s, c):
@@ -469,10 +484,10 @@ def _resume_now(s, c):
   s["cruise"], s["brake"] = True, False
 
 
-def _sim(car, slc, frames, events=None, anchor_mph=None, trust=lambda f: 0, **kw):
-  c = Coupled(car, slc, trust=trust)
+def _sim(car, slc, frames, events=None, anchor_mph=None, trust=lambda f: 0, road=None, **kw):
+  c = Coupled(car, slc, trust=trust, road=road)
   r = T.run(car, kw.pop("curve", NO_CURVE), frames, events=c.events(events), limit=c.limit, cap=c.cap, undo=c.undo,
-            setup=lambda lg: c.setup(lg, anchor_mph), **kw)
+            ceiling=c.ceiling, setup=lambda lg: c.setup(lg, anchor_mph), **kw)
   return r, c
 
 
@@ -665,10 +680,11 @@ def test_no_undo_after_the_driver_changed_his_speed_braked_or_a_slowdown_owns_it
   def drv(btn):
     return lambda s, c: c.press(btn, who="driver")
   glitch = lambda f: 60 if 1000 <= f < 1800 else 45  # noqa: E731
-  # his SET+ after our raise (61): his speed, nothing undone, nothing pressed by us after it
+  # his SET+ after our raise: his speed, nothing undone, nothing pressed by us after it (the 45 back at frame 1800
+  # paused our restore at 57 at once, the provisional ceiling: his tap makes it 58)
   r, c = _sim(T.Car(45, dash_offset_mph=0.0), glitch, 5000, events={1950: drv(cs.SET_PLUS)})
-  assert c.raises and abs(r["final"] - 61) < 0.01, r["final"]
-  assert [f for f, b in r["presses"] if b == cs.SET_MINUS] == []
+  assert c.raises and abs(r["final"] - 58) < 0.01, r["final"]
+  assert [f for f, b in r["presses"] if b == cs.SET_MINUS or f >= 1950] == []
   # his SET- during our restore: his
   r, c = _sim(T.Car(45, dash_offset_mph=0.0), glitch, 5000, events={1550: drv(cs.SET_MINUS)})
   assert c.raises and [f for f, b in r["presses"] if b == cs.SET_MINUS] == [] and r["final"] < 60
@@ -716,3 +732,277 @@ def test_a_cap_never_cancels_a_set_minus_correcting_our_own_overshoot():
   r = T.run(car, NO_CURVE, 1500, setup=setup, cap=lambda f: 45 * MPH if f >= 5 else 0.0)
   assert abs(r["final"] - 50) < 0.01, r["final"]
   assert [b for _, b in r["presses"]] == [cs.SET_MINUS, cs.SET_MINUS] and r["min"] >= 50 - 1e-6
+
+
+# ---- drive 53: the merge onto a highway (rule 5), the street after an exit (rule 6), a lower limit not steady yet ----
+
+def _accel53(gap_mph):
+  """The stock cruise's speed-up by the set speed gap in mph (drives 4c-53, medians)."""
+  for top, a in ((5, 0.33), (10, 0.51), (15, 0.75), (20, 0.91)):
+    if gap_mph < top:
+      return a
+  return 1.06
+
+
+def _car53(set_mph, v_mph=None):
+  car = T.Car(set_mph, dash_offset_mph=0.0, accel_fn=_accel53, cruise_gain=0.19)
+  if v_mph is not None:
+    car.v_ego = v_mph * MPH
+  return car
+
+
+class _Ramp:
+  """A street (class 7, 45 mph) until frame `at`, then a link to a highway (class 2, mapRampToHighway) whose merge point
+  is `length` m on; mapd's next limit (70) and its distance from `known` m into the link; SLC's own limit is none on the
+  link and the highway's from 88 m before the merge (its lookahead, drive 53: t 333.2); class 1 after the merge. GPS
+  trust 0, 2 from 200 m before the merge (drive 53: t 326.2)."""
+  def __init__(self, at=500, length=650.0, known=36.0, to_highway=True, next_mph=70, street=45, after=1, trust_low=200.0):
+    self.at, self.length, self.known, self.to_hwy, self.next, self.street, self.after = at, length, known, to_highway, next_mph, street, after
+    self.trust_low = trust_low
+    self.x0 = None
+    self.x = 0.0
+
+  def left(self, f):
+    return self.length - (self.x - self.x0) if (self.x0 is not None and f >= self.at) else None
+
+  def road(self, f, x):
+    self.x = x
+    if f < self.at:
+      return dict(road_class=7)
+    if self.x0 is None:
+      self.x0 = x
+    rest = self.length - (x - self.x0)
+    if rest <= 0:
+      return dict(road_class=self.after)
+    out = dict(road_class=2, ramp_to_highway=self.to_hwy)
+    if x - self.x0 >= self.known:
+      out.update(next_limit=self.next, next_distance=rest)
+    return out
+
+  def slc(self, f):
+    rest = self.left(f)
+    if rest is None:
+      return self.street
+    return self.next if rest <= 88.0 else 0
+
+  def trust(self, f):
+    rest = self.left(f)
+    return 2 if (rest is not None and self.trust_low is not None and rest <= self.trust_low) else 0
+
+
+def _merge_sim(ramp, car, frames, **kw):
+  r, c = _sim(car, ramp.slc, frames, road=ramp.road, trust=ramp.trust, **kw)
+  merged = next((k for k in range(len(r["vs"])) if c.x >= 0 and k >= ramp.at and _at(r, ramp, k) >= ramp.length), None)
+  return r, c, merged
+
+
+def _at(r, ramp, k):
+  # m driven along the link by frame k (the car's speeds since the link began)
+  return sum(v * slf.DT_CTRL for v in r["vs"][ramp.at:k])
+
+
+def test_drive_53_ramp_1_the_highway_limit_ahead_becomes_the_drivers_speed_in_time_for_the_merge():
+  # tag 310: set 45 (his speed on the 45 road), onto the ramp at 18 mph (t 298.2), mapd's next limit 70 at 614 m (t 302.2),
+  # no limit on the link; he held SET+ 45 -> 70 himself at t 320.7 (305-345 m before the merge) and was at 64 mph at
+  # the merge. Before: nothing (the set stayed 45).
+  ramp = _Ramp()
+  car = _car53(45, 45)
+  r, c, merged = _merge_sim(ramp, car, 6000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+  assert c.raises and abs(c.raises[0][1] - 70) < 1e-6 and c.kinds[0] == "merge", (c.raises, _reasons(c))
+  f_raise = c.raises[0][0]
+  left = ramp.length - _at(r, ramp, f_raise)
+  assert 250 < left < 420, left                                   # started near where he started his own hold
+  assert merged is not None and r["vs"][merged] / MPH >= 60, (merged, r["vs"][merged] / MPH if merged else None)
+  assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6    # the highway's limit itself, not 70 + anything
+  assert r["holds"] and [b for _, b in r["presses"] if b == cs.SET_MINUS] == []
+  assert len(c.raises) == 1                                        # once per link (the 70 itself then is nothing new)
+  # GPS trust 2 from 450 m before the merge (after the 5 s of trust 0 that start it, before it is due): still in time
+  ramp = _Ramp(trust_low=450.0)
+  r, c, merged = _merge_sim(ramp, _car53(45, 45), 6000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+  assert c.raises and c.kinds == ["merge"] and r["vs"][merged] / MPH >= 60
+
+
+def test_drive_53_ramp_2_the_merge_waits_for_the_loops_curve_then_goes_to_the_highway_limit():
+  # tag 1059.7: the loop's curve held the set at 29 (his speed 50) to the merge, 412 m (t 1020) .. 5 m (t 1049.8); then
+  # the restore went back to his 50 only. Now the merge is offered at once (too short to wait) and taken when the curve
+  # is over: the restore goes on to 70.
+  ramp = _Ramp(at=500, length=430.0, known=18.0, street=50, trust_low=None)
+  car = _car53(29, 29)
+  end = ramp.at + 3100                                               # the curve ends at the merge (31 s at 29-32 mph)
+  r, c, merged = _merge_sim(ramp, car, end + 3000, anchor_mph=50, curve=T.between(0, end, 27), max_drop=15,
+                            events={0: _brake_held, 400: _resume_now})
+  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] - 70) < 1e-6, (c.raises, _reasons(c))
+  assert c.raises[0][0] >= end                                      # (the curve's lower target wins until it ends)
+  assert max(r["sets"][:end]) / MPH <= 29 + 1e-6
+  assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6
+
+
+def test_merge_negatives():
+  car = lambda: _car53(45, 45)  # noqa: E731
+  ev = lambda ramp: {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)}  # noqa: E731
+  # a link to a road that is not a highway: nothing
+  ramp = _Ramp(to_highway=False, after=5)
+  r, c, _ = _merge_sim(ramp, car(), 6000, events=ev(ramp))
+  assert c.raises == [] and abs(r["final"] - 45) < 0.01
+  # the next limit is not above his speed (40 ahead), or not a highway's (45): nothing
+  for nxt in (40, 45):
+    ramp = _Ramp(next_mph=nxt)
+    r, c, _ = _merge_sim(ramp, car(), 6000, events=ev(ramp))
+    assert c.raises == [] and r["max"] <= 45 + 1e-6, nxt
+  # GPS trust not 0 on the link: nothing
+  ramp = _Ramp()
+  ramp.trust = lambda f: 1
+  r, c, _ = _merge_sim(ramp, car(), 6000, events=ev(ramp))
+  assert c.raises == [] and r["max"] <= 45 + 1e-6
+  # from a highway (an interchange link): the merge is not ours (his highway speed, the curve's restore)
+  ramp = _Ramp(street=70)
+  ramp.road = (lambda orig: lambda f, x: dict(orig(f, x), road_class=1) if f < ramp.at else orig(f, x))(ramp.road)
+  r, c, _ = _merge_sim(ramp, _car53(55, 55), 6000)
+  assert c.raises == []
+  # his SET+ on the link before it starts: his (he chose 50; no raise to 70 on top)
+  ramp = _Ramp()
+  e = dict(ev(ramp))
+  e[ramp.at + 900] = lambda s, cr: cr.press(cs.SET_PLUS, who="driver")
+  r, c, _ = _merge_sim(ramp, car(), 6000, events=e)
+  assert c.raises == [] and abs(r["final"] - 46) < 0.01, (c.raises, r["final"])
+  assert any("the driver set his speed on the link" in x for x in _reasons(c))
+
+
+def test_merge_the_driver_touching_his_speed_during_it_is_his():
+  # our hold to 65 is going; his SET- at once: his speed, nothing of ours after it
+  ramp = _Ramp()
+  base, _, _ = _merge_sim(ramp, _car53(45, 45), 6000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+  f0 = base["holds"][0]
+  for btn in (cs.SET_MINUS, cs.SET_PLUS):
+    ramp = _Ramp()
+    ev = {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH), f0 + 150: lambda s, cr, b=btn: cr.press(b, who="driver")}
+    r, c, _ = _merge_sim(ramp, _car53(45, 45), 6000, events=ev)
+    after = [f for f, _ in r["presses"] if f > f0 + 150] + [f for f in r["holds"] if f > f0 + 150]
+    if btn == cs.SET_MINUS:
+      assert after == [] and r["final"] < 70 - 1e-6, (btn, r["final"], after)
+    else:
+      assert r["final"] <= 70 + 1e-6 and r["max"] <= 70 + 1e-6, (btn, r["final"])   # SET+: the rest still restored to 70
+  # his brake (cruise off) on the ramp before the merge is taken: no raise after it
+  ramp = _Ramp()
+  ev = {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH), f0 - 300: _cruise_off, f0 - 200: _resume_now}
+  r, c, _ = _merge_sim(ramp, _car53(45, 45), 6000, events=ev)
+  assert c.raises == [] and r["max"] <= 45 + 1e-6, (c.raises, _reasons(c))
+
+
+def test_merge_taken_back_when_the_link_ends_on_a_street():
+  # the map matched the wrong link: after our raise the car is on a street (class 5) for 3 s: back to his 45 (our own
+  # SET- taps only), as rule 4
+  ramp = _Ramp(after=5)
+  ramp.slc = (lambda orig: lambda f: 45 if (orig(f) == 70) else orig(f))(ramp.slc)
+  r, c, merged = _merge_sim(ramp, _car53(45, 45), 8000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+  assert c.raises and c.kinds == ["merge"]
+  assert [u[2] for u in _undos(c)] == ["undo"], c.undos
+  assert abs(r["final"] - 45) < 0.01
+
+
+def test_merge_metric():
+  # a 60 km/h street, a ramp to a 100 km/h highway: 100
+  kph = 1 / 3.6
+  ramp = _Ramp(next_mph=100 * kph / MPH, street=60 * kph / MPH)
+  car = T.Car(60, dash_offset_mph=0.0, step=kph, accel_fn=_accel53, cruise_gain=0.19)
+  car.set_speed = car.v_ego = 60 * kph
+  c = Coupled(car, ramp.slc, metric=True, trust=ramp.trust, road=ramp.road)
+  ev = c.events({ramp.at: lambda s, cr: setattr(cr, "v_ego", 30 * kph)})
+  r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap, undo=c.undo, ceiling=c.ceiling, metric=True,
+            setup=lambda lg: c.setup(lg))
+  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] * MPH / kph - 100) < 1e-6, c.raises
+  assert abs(r["final"] * MPH / kph - 100) < 1.0          # (the simulated car's long press steps in mph)
+
+
+def test_merge_need_follows_the_cruise_table():
+  f = slf.SpeedLimitFollower(False)
+  need = f._merge_need(45 * MPH, 70) - 45 * MPH * slf.MERGE_LEAD_TIME
+  assert 290 < need < 310, need                                     # 45 -> 65 mph: ~11.9 s, ~300 m
+  assert f._merge_need(70 * MPH, 70) == 70 * MPH * slf.MERGE_LEAD_TIME
+
+
+class _Exit:
+  """Drive 53, tag 457: the highway (class 1, 70; his 75) until frame `link`, the exit (class 2, no limit) until
+  `street`, then a street (class 0 for 1 s, then 5) whose limit 50 comes at `limit`."""
+  def __init__(self, link=1000, street=3000, limit=3400, street_mph=50):
+    self.link, self.street, self.limit, self.street_mph = link, street, limit, street_mph
+
+  def road(self, f, x):
+    return dict(road_class=1 if f < self.link else (2 if f < self.street else (0 if f < self.street + 100 else 5)))
+
+  def slc(self, f):
+    return 70 if f < self.link else (self.street_mph if f >= self.limit else 0)
+
+
+def test_drive_53_tag_457_after_an_exit_the_streets_limit_is_his_speed():
+  # our stop slowdown left the set at the floor 19 on the exit (his 75); off the ramp the map's street rule made 19 his
+  # speed (t 443.2), the street's 50 came at t 448.2: rule 2 refused 31 mph and he held SET+ himself at t 457
+  ex = _Exit()
+
+  def forget(s, car):
+    s["brake"] = False
+    c.logic._forget()                                            # (map_curve_control's adopt: off an exit onto a street)
+  car = _car53(19, 19)
+  c = Coupled(car, ex.slc, road=ex.road)
+  ev = c.events({0: _brake_held, 2000: _cruise_off, 2700: _resume_now, ex.street + 50: forget})
+  r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap,
+            undo=c.undo, ceiling=c.ceiling, setup=lambda lg: c.setup(lg, 75))
+  assert c.raises and c.kinds == ["exit"] and abs(c.raises[0][1] - 50) < 1e-6, (c.raises, _reasons(c))
+  assert c.raises[0][0] >= ex.limit + slf.LIMIT_RAISE_STABLE_TIME * 100
+  assert abs(r["final"] - 50) < 0.01 and r["max"] <= 50 + 1e-6
+  # the restore still pending (no street rule: his 75 kept): it stops at the street's 50, never 75 on the street
+  car = _car53(19, 19)
+  c = Coupled(car, ex.slc, road=ex.road)
+  ev = c.events({0: _brake_held, 2000: _cruise_off, ex.street + 300: _resume_now})
+  r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap, undo=c.undo, ceiling=c.ceiling,
+            setup=lambda lg: c.setup(lg, 75))
+  assert abs(r["final"] - 50) < 0.01 and r["max"] <= 50 + 1e-6, (r["final"], r["max"], c.caps)
+  # his own SET press since the exit began: his speed, no raise
+  car = _car53(19, 19)
+  c = Coupled(car, ex.slc, road=ex.road)
+  ev = c.events({0: _brake_held, 2000: _cruise_off, 2700: _resume_now, 2800: lambda s, cr: cr.press(cs.SET_PLUS, who="driver"),
+                 ex.street + 50: forget})
+  r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap,
+            undo=c.undo, ceiling=c.ceiling, setup=lambda lg: c.setup(lg, 75))
+  assert c.raises == [] and r["final"] < 50 - 1e-6, (c.raises, r["final"])
+  assert any("set his speed" in x for x in _reasons(c)), _reasons(c)
+
+
+def test_drive_53_tag_1324_a_lower_limit_at_the_resume_holds_the_restore_at_once():
+  # his 50 on a 45 road (inside the band), set 39 after a curve, his brake (cruise off t 1279-1317.8); the 45 -> 40 came at
+  # t 1317.7, 0.1 s before cruise was back: the restore went 39 -> 50 by t 1323 (rule 3's cap, 3 s later: ~47)
+  slc = lambda f: 45 if f < 1000 else 40  # noqa: E731
+  r, c = _sim(_car53(39, 39), slc, 3000, events={0: _brake_held, 400: _cruise_off, 1010: _resume_now}, anchor_mph=50)
+  assert r["max"] <= 40 + 1e-6 and abs(r["final"] - 40) < 0.01, (r["max"], r["final"])
+  assert c.caps and r["logic"].anchor is None
+  assert [b for _, b in r["presses"] if b == cs.SET_MINUS] == []
+
+
+def test_drive_53_tags_1324_1355_the_40_road_then_the_45_again():
+  # t 1279 his brake (set 39, his 50), the 40 at the resume (t 1317.8), our curve slowdown at t 1332.8, his brake again
+  # (t 1339.1-1351.1), the 45 back at t 1354.2: never above 40 on the 40 road; on the 45 road his speed is the 45 (rule 1
+  # from 40). Before: 50 by t 1323 and again at t 1352.7 (tags 1324.5, 1355.9).
+  t0 = 1279.0
+
+  def fr(t):
+    return int(round((t - t0) * 100)) + 500
+  slc = lambda f: 45 if f < fr(1317.7) or f >= fr(1354.2) else 40  # noqa: E731
+  ev = {0: _brake_held, 400: _cruise_off, fr(1317.8): _resume_now, fr(1339.1): _cruise_off, fr(1351.1): _resume_now}
+  r, c = _sim(_car53(39, 39), slc, fr(1375), events=ev, anchor_mph=50, curve=T.between(fr(1332.8), fr(1337.0), 36))
+  on40 = r["sets"][fr(1317.8):fr(1354.2)]
+  assert max(on40) / MPH <= 40 + 1e-6, max(on40) / MPH
+  assert abs(r["final"] - 45) < 0.01 and r["max"] <= 45 + 1e-6, (r["final"], r["max"])
+
+
+def test_a_short_lower_limit_while_restoring_only_pauses_it():
+  # a junction's flap (35 for 1.5 s) while the restore 40 -> 50 runs on a 50 road: no SET+ while it is reported, then
+  # on to 50; never a SET-, no cap (it never was steady)
+  slc = lambda f: 35 if 1100 <= f < 1250 else 50  # noqa: E731
+  r, c = _sim(_car53(40, 40), slc, 3500, events={0: _brake_held, 1000: _resume_now}, anchor_mph=50)
+  assert c.caps == [] and abs(r["final"] - 50) < 0.01 and r["max"] <= 50 + 1e-6
+  during = [f for f, b in r["presses"] if 1110 <= f < 1250] + [f for f in r["holds"] if 1110 <= f < 1250]
+  assert during == [], during
+  assert [b for _, b in r["presses"] if b == cs.SET_MINUS] == []
+  # the same flap with the driver outside the band (57 on a 50 road): his, not paused
+  r, c = _sim(_car53(40, 40), slc, 3500, events={0: _brake_held, 1000: _resume_now}, anchor_mph=57)
+  assert abs(r["final"] - 57) < 0.01

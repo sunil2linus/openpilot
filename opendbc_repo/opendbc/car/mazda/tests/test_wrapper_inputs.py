@@ -138,3 +138,61 @@ def test_wrapper_builds_the_new_trigger_inputs(tmp_path, monkeypatch):
   m.position.x, m.position.y = [], []
   _drive(c, 2)
   assert seen[-1].lead_y_path == -2.0 and seen[-1].model_length == 0.0
+
+
+def _mapd(sm, limit_mph, dist):
+  sm.msgs["mapdOut"] = SimpleNamespace(nextSpeedLimit=limit_mph * MPH, nextSpeedLimitDistance=dist)
+  sm.alive["mapdOut"], sm.recv_frame["mapdOut"], sm.updated["mapdOut"] = True, 1, True
+
+
+def test_wrapper_feeds_the_merge_and_exit_inputs(tmp_path, monkeypatch):
+  # drive 53 (rules 5, 6): the road class, "this link leads to a highway", mapd's next limit and its distance (else
+  # starpilotPlan's value, no distance), the true speed and the driver's SET switch
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=2)
+  seen = []
+  orig = c.limit_follow.update
+  monkeypatch.setattr(c.limit_follow, "update", lambda li: (seen.append(li), orig(li))[1])
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapRoadClass, plan.mapOnRamp, plan.mapRampToHighway, plan.slcNextSpeedLimit = 2, True, True, 65 * MPH
+  _mapd(sm, 70, 400.0)
+  _drive(c, 2, v_mph=30)
+  li = seen[-1]
+  assert li.road_class == 2 and li.ramp_to_highway and abs(li.next_limit / MPH - 70) < 1e-6 and li.next_distance == 400.0
+  assert abs(li.v_ego / MPH - 30) < 1e-6 and not li.driver_set
+  plan.mapOnRamp = False                                          # (the ramp match lost: not known to lead anywhere)
+  sm.alive["mapdOut"] = False
+  c.update(W.CC, W.car_state(30, 45, set_plus=True), None, None, False)
+  li = seen[-1]
+  assert not li.ramp_to_highway and abs(li.next_limit / MPH - 65) < 1e-6 and li.next_distance < 0 and li.driver_set
+
+
+def test_wrapper_merge_on_and_test(tmp_path, monkeypatch):
+  for mode in (2, 1):
+    c, sm, records = _make(tmp_path, monkeypatch, limit_mode=mode)
+    _drive(c, 400)                                                # the 45 street
+    plan = sm.msgs["starpilotPlan"]
+    plan.slcSpeedLimit, plan.mapRoadClass, plan.mapOnRamp, plan.mapRampToHighway = 0.0, 2, True, True
+    _mapd(sm, 70, 250.0)                                          # (already less than the cruise needs: at once)
+    sent = _drive(c, 600)
+    adopt = [d for k, d in records if k == "speedLimitAdopt"]
+    assert len(adopt) == 1 and adopt[0]["kind"] == "merge" and abs(adopt[0]["new_mph"] - 70) < 1e-6, (mode, records)
+    if mode == 2:
+      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 70) < 1e-6 and any(s for s in sent)
+    else:
+      assert adopt[0]["mode"] == "test" and c.logic.anchor is None and not any(sent)
+
+
+def test_wrapper_gives_the_provisional_ceiling_in_on_mode_only_and_logs_it(tmp_path, monkeypatch):
+  for mode in (2, 1):
+    c, sm, records = _make(tmp_path, monkeypatch, limit_mode=mode)
+    seen = []
+    orig = c.logic.update
+    monkeypatch.setattr(c.logic, "update", lambda i, seen=seen, orig=orig: (seen.append(i.limit_ceiling), orig(i))[1])
+    plan = sm.msgs["starpilotPlan"]
+    c.logic.anchor, c.logic.last_set_speed = 50 * MPH, 40 * MPH  # a restore 40 -> 50 pending, his 50 on the 45 road
+    _hold_brake(c, 400, set_mph=40)
+    plan.slcSpeedLimit = 40 * MPH
+    _hold_brake(c, 50, set_mph=40)
+    assert (abs(seen[-1] / MPH - 40) < 1e-6) if mode == 2 else seen[-1] == 0.0, (mode, seen[-1])
+    hold = [d for k, d in records if k == "speedLimitHold"]
+    assert len(hold) == 1 and abs(hold[0]["limit_mph"] - 40) < 1e-6 and hold[0]["mode"] == ("on" if mode == 2 else "test")
