@@ -515,6 +515,14 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_value": get_value,
       "on_click": on_click,
     })
+    get_value, on_click = choice("MazdaStreetSpeedOffset", (tr_noop("Legal limit"), tr_noop("Limit + 3"), tr_noop("Limit + 5"),
+                                                            tr_noop("Limit + 8")), 2)
+    tiles.append({
+      "title": tr("Street Speed"),
+      "subtitle": tr("Off a highway: a street's posted limit plus this (exits, turns, Speed Limit Follow). Metric +5/+8/+13 km/h."),
+      "get_value": get_value,
+      "on_click": on_click,
+    })
     get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
     tiles.append({
       "title": tr("Model Follow (Test)"),

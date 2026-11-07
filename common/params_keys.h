@@ -826,6 +826,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaMapCurves", {PERSISTENT, INT, "0", "0"}},
     {"MazdaMapCurveChime", {PERSISTENT, INT, "1", "1"}},
     {"MazdaExitSplitSpeed", {PERSISTENT, INT, "0", "0"}},            // navigation exit: speed at the split, 0 highway limit, 1 +5, 2 +10, 3 off
+    {"MazdaStreetSpeedOffset", {PERSISTENT, INT, "2", "2"}},         // street targets from a posted limit: 0 the limit, 1 +3, 2 +5, 3 +8 mph (0/5/8/13 km/h)
     {"MazdaCurveMapRange", {PERSISTENT, INT, "2", "2"}},             // curve_mapd: build map folders within 30/50/100/200/300 mi (index) of the car
     {"MazdaCurveMapStates", {PERSISTENT, STRING, "", ""}},           // curve_mapd: states (MapsSelected tokens, CSV) built in full whatever the range
     {"MazdaStopWarningChime", {PERSISTENT, INT, "0", "0"}},

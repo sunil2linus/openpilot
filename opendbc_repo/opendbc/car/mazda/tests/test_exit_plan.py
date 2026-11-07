@@ -315,7 +315,8 @@ def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, 
       ctl.model.update(rel)
     driver = car.set_speed + logic.offset * logic.step
     foot = gas(x) if gas else None
-    mo = ctl.update(fld, driver, signal(x) if signal else 0, v_ego=car.v_ego, max_drop=md, gas=foot is not None)
+    mo = ctl.update(fld, driver, signal(x) if signal else 0, v_ego=car.v_ego, max_drop=md, gas=foot is not None,
+                    set_speed=car.set_speed)
     if mo.chime:
       r["chimes"].append((round(x), ctl.chime_why, round(car.v_ego / MPH, 1), round(ctl.exit_rem or 0.0)))
     active, speed, floor, budget, track, raise_ok = mix.update(False, CTL.NO_CURVE, mo,
@@ -485,10 +486,11 @@ def test_drive_53_e2_slows_gently_to_the_short_ramp_speed_at_the_split_then_on_t
   # (the camera's edge lane from 400 m: its chime at DECIDE_NEAR, before his signal could say more)
   assert [c[1] for c in r["chimes"]] in ([], ["before the split"]), r["chimes"]
   # the camera alone (final review: the edge lane is also the ordinary right lane): from DECIDE_NEAR, no deeper than
-  # SPLIT_DECEL takes the speed there; then the chime (A + B cannot make it) and the ramp's own slowdown
+  # SPLIT_DECEL takes the speed there; then the ramp's own slowdown. No chime before the split on the camera alone (drive
+  # 55: it chimed 300 m before an exit he stayed past): only at the confirmation
   r = drive_exit(fields, 9000, 75, lane=lambda x: 1 if x >= 1200 else None)
   assert _minus(r, 0, exit_x - CTL.DECIDE_NEAR - 1) == [] and _at(r, exit_x) >= 70.0, _at(r, exit_x)
-  assert [c[1] for c in r["chimes"]][:1] == ["before the split"] and 280 <= r["chimes"][0][3] <= 300, r["chimes"]
+  assert [c[1] for c in r["chimes"]] == ["confirmed, too little room"], r["chimes"]
   assert _at(r, curve_x) <= V_C85 + 11.0, _at(r, curve_x)
 
 
@@ -1338,3 +1340,177 @@ def test_outside_review_an_exit_onto_a_street_without_its_limit_never_restores_o
   # metric: 70 km/h
   r = drive_exit(fields, 6000, 76, v_mph=74, metric=True)
   assert _minus(r, 0, end) and _at(r, end, "sets") <= 70 + 2.0, _at(r, end, "sets")          # (the end gap)
+
+
+# ---------------- drives 54 / 55 (owner's tags; build 0c1b66da3) ----------------
+
+def test_drives_54_55_planner_past_the_link_start_heading_along_the_highway_is_the_highway():
+  # drive 55, exit 1 (missed, right lane): 1-6 m from the link's first shape, 7-8 m from the highway's line, heading the
+  # highway's (0.1-0.2 deg off) and 5 deg off the link's: no answer for 5.5 s (the tentative slowdown ran on, 55 mph in
+  # 67 mph traffic). Now "highway" (SHAPE_HWY_HEADING_GAP); before the link's start, or turned toward the link, not.
+  assert MC.shape_verdict((3.0, 5.0), (7.5, 0.2), MC.SHAPE_LINK_GAP) == 0
+  hw = (MC.SHAPE_HWY_HEADING_GAP, MC.SHAPE_HWY_NEAR, MC.SHAPE_HWY_HEADING_MAX)
+  assert MC.shape_verdict((3.0, 5.0), (7.5, 0.2), MC.SHAPE_LINK_GAP, hw) == -1
+  # drive 53, E2 (taken), 26-54 m on: 2.3-2.9 deg closer to the highway's, the highway's 1.3-1.6 deg off ours: not
+  assert MC.shape_verdict((9.3, 4.2), (11.6, 1.3), MC.SHAPE_LINK_GAP, hw) == 0
+  assert MC.shape_verdict((6.8, 3.9), (12.0, 1.6), MC.SHAPE_LINK_GAP, hw) == 0
+  # the highway's shape farther than SHAPE_HWY_NEAR: not
+  assert MC.shape_verdict((3.0, 5.0), (13.0, 0.2), MC.SHAPE_LINK_GAP, hw) == 0
+  # in the planner (the motorway with its 8 deg exit): 5 m right of its line, 30 m past the link's start, heading north
+  root, _, _ = write_files(fork_scene(fork=False))
+  car = _Car(root)
+  _announce(car)
+  m = car.at(5.0, 30, 0.0, frames=5)
+  assert m.exit_shape == MC.EXIT_SHAPE_HIGHWAY and m.exit_start < 0, (m.exit_shape, m.exit_link, m.exit_hwy)
+  # the same place 30 m before the link's start: no answer from the heading alone there
+  m = car.at(5.0, -30, 0.0, frames=5)
+  assert m.exit_start > 0 and m.exit_shape != MC.EXIT_SHAPE_LINK
+  # on the link, heading along it: still the link's
+  x, y, h = _along(_ramp_pts(8, [("s", 200)]), 60)
+  assert car.at(x + 2.5, y, h, frames=5).exit_shape == MC.EXIT_SHAPE_LINK
+
+
+def _no_curve_exit(street_mph=45.0, exit_x=1500.0, link_len=450.0, shapes_link_from=100.0, street_v=40.0):
+  """Drive 55, exit 2 (tag 552.3): navigation's exit with no curves (mapNavExit 2), his signal 300 m before it, GPS trust
+  2 from the split along the whole link (so the planner never says "on a ramp": no street rules), the shapes "link" from
+  100 m past it, then a street (class 7, trust 0, its limit street_mph, 0: unknown); traffic takes the car to street_v
+  on the street (the v_ego cap)."""
+  def fields(x):
+    hwy = dict(road_class=1, limit=70 * MPH)
+    if x < exit_x - 1300:
+      return F(**hwy)
+    if x < exit_x - 30:
+      return F(nav_exit=2, nav_exit_distance=exit_x - x, nav_exit_side=1, exit_shape=1, **hwy)
+    if x < exit_x + 15:
+      return F(exit_shape=0, **{**hwy, "gps_trust": 2})
+    if x < exit_x + link_len:
+      return F(road_class=2, gps_trust=2, exit_shape=2 if x > exit_x + shapes_link_from else 0)
+    return F(road_class=7, gps_trust=0, limit=street_mph * MPH)
+  signal = lambda x: 1 if exit_x - 300 <= x < exit_x - 280 else 0  # noqa: E731
+  lead = lambda x: street_v * MPH if x > exit_x + link_len - 150 else None  # noqa: E731
+  return fields, exit_x, exit_x + link_len, signal, lead
+
+
+def test_drive_55_exit_2_no_curve_exit_holds_on_the_ramp_then_the_streets_limit_plus_the_setting():
+  fields, exit_x, street_x, signal, lead = _no_curve_exit()
+  r = drive_exit(fields, 9000, 75, signal=signal, lead=lead)
+  # before the split: the highway's 70 (his signal); on the link (no curve): held, never back up toward his 75 (was:
+  # the plan ended on the link match, 64 -> 75 on the ramp)
+  assert _plus(r, exit_x - 300, street_x) == [], _plus(r, exit_x - 300, street_x)
+  assert max(s for s, xx in zip(r["sets"], r["xs"], strict=True) if exit_x <= xx < street_x) <= 70 + 1e-6
+  assert r["ctl"].last_plan is not None and r["ctl"].last_plan.why in ("on the ramp, no curve", "on a street")
+  # the street (45): the exit's last target 45 + 5 (the setting's default) by our SET- taps, then his speed
+  assert _minus(r, street_x, street_x + 400) and all(p[3] == "tap" for p in _minus(r, street_x, street_x + 400))
+  assert abs(r["sets"][-1] - 50) < 1e-6 and r["logic"].anchor is None, (r["sets"][-1], r["logic"].anchor)
+  # the map without the street's limit: STREET_FALLBACK (43 mph, no offset)
+  fields, exit_x, street_x, signal, lead = _no_curve_exit(street_mph=0.0)
+  r = drive_exit(fields, 9000, 75, signal=signal, lead=lead)
+  assert abs(r["sets"][-1] - 43) < 1e-6 and r["logic"].anchor is None, r["sets"][-1]
+  # still at highway speed on the "street" (a wrong match beside the highway): nothing (EXIT_STREET_MAX_V)
+  fields, exit_x, street_x, signal, lead = _no_curve_exit(street_v=65.0)
+  r = drive_exit(fields, 9000, 75, signal=signal, lead=lead)
+  assert _minus(r, street_x, street_x + 600) == [] and r["sets"][-1] >= 65 - 1e-6, r["sets"][-1]
+
+
+def test_exit_street_target_res_gas_and_metric():
+  """The exit's street target directly (MapCurveControl): his RES within EXIT_STREET_TIME brings back the highway's 75
+  (drive 55, t 581: on a 45 street) -> 50; his gas ends it (what it reached is his); metric."""
+  def street_run(c, frames, set_v, driver, v=10.0, gas=lambda k: False, limit=45 * MPH, metric_unit=MPH, res=False):
+    outs = []
+    for k in range(frames):
+      out = c.update(F(road_class=7, limit=limit), driver if driver else 0.0, 0, v_ego=v, gas=gas(k),
+                     set_speed=set_v if driver else None)
+      outs.append(out)
+      if out.active and out.speed < set_v - 0.1 and k % 30 == 0:
+        set_v -= metric_unit                                   # (a tap every 0.3 s)
+    return outs, set_v
+
+  def exited(c, metric_unit=MPH):
+    for _ in range(100):
+      c.update(F(road_class=1, limit=70 * MPH), 75 * metric_unit / MPH, 0, v_ego=30.0)
+    for _ in range(300):
+      c.update(F(road_class=2, gps_trust=2), 75 * metric_unit / MPH, 0, v_ego=25.0)
+    for _ in range(300):                                       # his brake: cruise off from the ramp on
+      c.update(F(road_class=7, limit=45 * MPH), 0.0, 0, v_ego=10.0)
+  c = CTL.MapCurveControl(3.0)
+  exited(c)
+  assert c.xs_since is not None
+  outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH)        # RES at 75
+  assert outs[0].active and abs(outs[0].speed - 50 * MPH) < 1e-6 and outs[0].why == "exit street"
+  assert abs(set_v - 50 * MPH) < 1e-6 and any(o.adopt for o in outs)
+  # his gas while it lowers: it ends there, adopted
+  c = CTL.MapCurveControl(3.0)
+  exited(c)
+  outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH, gas=lambda k: k >= 150)
+  assert set_v > 60 * MPH and any(o.adopt for o in outs) and not outs[-1].active
+  # RES later than EXIT_STREET_TIME: nothing
+  c = CTL.MapCurveControl(3.0)
+  exited(c)
+  for _ in range(int(CTL.EXIT_STREET_TIME / CTL.DT_CTRL) + 10):
+    c.update(F(road_class=7, limit=45 * MPH), 0.0, 0, v_ego=10.0)
+  outs, set_v = street_run(c, 200, 75 * MPH, 75 * MPH)
+  assert not any(o.active for o in outs)
+  # his own lower speed at RES (40 on the 45 street): his
+  c = CTL.MapCurveControl(3.0)
+  exited(c)
+  outs, set_v = street_run(c, 200, 40 * MPH, 40 * MPH)
+  assert not any(o.active for o in outs) and set_v == 40 * MPH
+  # metric (+8 km/h the default): a 50 km/h street -> 58
+  c = CTL.MapCurveControl(3.0, metric=True)
+  exited(c, KPH)
+  outs, set_v = street_run(c, 3000, 120 * KPH, 120 * KPH, limit=50 * KPH, metric_unit=KPH)
+  first = next(o for o in outs if o.active)                    # (once the 50 is steady: his RES is kept until then)
+  assert abs(first.speed - 58 * KPH) < 1e-6 and abs(set_v - 58 * KPH) < 1e-6
+  # the setting's options
+  for m, add in ((0, 0), (1, 3), (2, 5), (3, 8), (7, 5)):
+    assert abs(CTL.MapCurveControl(3.0, street_mode=m).street_add - add * MPH) < 1e-9, m
+  for m, add in ((0, 0), (1, 5), (2, 8), (3, 13)):
+    assert abs(CTL.MapCurveControl(3.0, street_mode=m, metric=True).street_add - add * KPH) < 1e-9, m
+
+
+def test_drive_55_exit_1_the_camera_alone_losing_its_edge_lane_ends_the_slowing():
+  # in the right lane (the camera's edge lane) toward a short exit he does not take; 230 m before it the exit lane opens
+  # beside him (no edge lane any more); the shapes say "highway" only 186 m past it (drive 55). Was: held at the split
+  # speed for 8 s, then the tentative slowdown past the split (67 -> 55.6 mph).
+  ex = 3000.0
+
+  def fields(x):
+    hw = dict(road_class=1, limit=70 * MPH)
+    sh = 1 if x > ex + 186 else 0
+    if x < ex - 2500:
+      return F(**hw)
+    if x < ex - 46:
+      return F(nav_exit=1, nav_exit_distance=ex - x, nav_curve_radius=95.0, nav_curve_distance=ex + 305 - x,
+               nav_exit_side=1, exit_shape=1, **hw)
+    return F(exit_shape=sh, **hw)
+  r = drive_exit(fields, 16000, 75, lane=lambda x: 1 if ex - 2000 < x < ex - 230 else None)
+  assert _minus(r, ex - CTL.DECIDE_NEAR, ex - 225), "the camera's slowdown from DECIDE_NEAR, as before"
+  assert _minus(r, ex - 220, ex + 400) == [], _minus(r, ex - 220, ex + 400)
+  low = min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if ex - 220 <= xx <= ex + 400)
+  assert low >= 67.0 and r["ctl"].last_plan.why == "missed" and not r["ctl"].last_plan.tentative, low
+  assert r["chimes"] == [], r["chimes"]                          # (no chime on the camera alone)
+  # his signal toward it (the same lanes): the slowdown holds, then the tentative one from the split (unchanged)
+  r = drive_exit(fields, 16000, 75, lane=lambda x: 1 if ex - 2000 < x < ex - 230 else None,
+                 signal=lambda x: 1 if ex - 260 <= x < ex - 240 else 0)
+  assert r["ctl"].last_plan.tentative and _minus(r, ex - 260, ex)
+
+
+def test_drive_54_exit_2_no_set_plus_from_the_exit_wait_on_the_real_ramp():
+  # his signal, the split; on the link (class 2) the shapes silent for 250 m (drive 54: 5.6 s), the 95 m curve 600 m on:
+  # the tentative slowdown's end (TENT_MAX_QUIET) gave a SET+ 55 -> 57 on the ramp; now held until the confirmation
+  ex = 1500.0
+
+  def fields(x):
+    hw = dict(road_class=1, limit=70 * MPH)
+    ec = dict(exit_curve_radius=95.0, exit_curve_distance=max(ex + 600 - x, 0.0))
+    if x < ex - 1300:
+      return F(**hw)
+    if x < ex - 30:
+      return F(nav_exit=1, nav_exit_distance=ex - x, nav_exit_side=1, nav_curve_radius=95.0, nav_curve_distance=ex + 600 - x,
+               exit_shape=1, **ec, **hw)
+    if x < ex + 20:
+      return F(exit_shape=0, **ec, **{**hw, "gps_trust": 2})
+    return F(road_class=2, gps_trust=2, exit_shape=2 if x > ex + 250 else 0, **ec)
+  r = drive_exit(fields, 9000, 70, signal=lambda x: 1 if ex - 350 <= x < ex - 330 else 0)
+  conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
+  assert conf > ex + 250 and _plus(r, ex, conf) == [], (conf, _plus(r, ex, conf))

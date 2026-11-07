@@ -278,10 +278,17 @@ def test_exit_onto_a_street_caps_then_keeps_the_street_speed():
   for k in range(HOLD + 1):                                   # driving along the exit for a second
     assert not c.update(F(ramp_end_distance=500 - k * 0.3, **ramp), 70 * MPH, False).active
   out = on_ramp_for(c, 10, 70 * MPH, ramp_end_distance=150, **ramp)
-  assert out.active and out.why == "street cap" and abs(out.speed - 45 * MPH) < 1e-9
+  # (the Street Speed setting's default: the street's limit + 5 mph)
+  assert out.active and out.why == "street cap" and abs(out.speed - 50 * MPH) < 1e-9
   out = c.update(F(on_ramp=False), 70 * MPH, False)          # off the ramp onto the street
   assert out.adopt
-  assert not c.update(F(on_ramp=False), 45 * MPH, False).adopt
+  assert not c.update(F(on_ramp=False), 50 * MPH, False).adopt
+  # the legal limit setting: 45
+  c = CTL.MapCurveControl(3.0, street_mode=0)
+  for k in range(HOLD + 1):
+    c.update(F(ramp_end_distance=500 - k * 0.3, **ramp), 70 * MPH, False)
+  out = on_ramp_for(c, 10, 70 * MPH, ramp_end_distance=150, **ramp)
+  assert out.active and out.why == "street cap" and abs(out.speed - 45 * MPH) < 1e-9
 
 
 def test_ramp_onto_a_highway_restores_fast():

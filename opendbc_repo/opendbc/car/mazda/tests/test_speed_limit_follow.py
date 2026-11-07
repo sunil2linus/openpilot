@@ -14,6 +14,7 @@ cs, MPH = T.cs, T.MPH
 NO_CURVE = lambda f: None  # noqa: E731
 STABLE = int(slf.LIMIT_STABLE_TIME / slf.DT_CTRL)
 RAISE = int(slf.LIMIT_RAISE_STABLE_TIME / slf.DT_CTRL)        # a higher limit (rules 1, 2)
+QUICK = int(slf.LIMIT_RISE_QUICK_TIME / slf.DT_CTRL)          # a one-band rise with GPS trust 0 (F)
 
 
 def _li(limit_mph, driver_mph=45.0, source="Map Data", gps_trust=0, cruise=True):
@@ -37,10 +38,21 @@ def _feed(f, n, *a, **kw):
 
 
 def test_a_higher_limit_must_be_stable_for_5_s():
+  # (F, owner after drives 54 / 55) a one-band rise with GPS trust 0 on every frame: 2.5 s
   f = _settled(45)
   out = _feed(f, RAISE + 10, 50)
-  assert all(x == 0.0 for x in out[:RAISE - 1])
+  assert all(x == 0.0 for x in out[:QUICK - 1]) and abs(out[QUICK + 5] / MPH - 50) < 1e-6
   assert abs(out[-1] / MPH - 50) < 1e-6
+  # trust 1 on one frame of it, a big rise, a first limit: 5 s
+  f = _settled(45)
+  out = _feed(f, 1, 50, gps_trust=1) + _feed(f, RAISE + 10, 50)
+  assert all(x == 0.0 for x in out[:RAISE - 1]) and abs(out[-1] / MPH - 50) < 1e-6
+  f = _settled(45)
+  out = _feed(f, RAISE + 10, 60)
+  assert all(x == 0.0 for x in out[:RAISE - 1]) and abs(out[-1] / MPH - 60) < 1e-6
+  f = _fresh(2000)
+  out = _feed(f, RAISE + 10, 45, driver_mph=35)
+  assert all(x == 0.0 for x in out[:RAISE - 1]) and abs(out[-1] / MPH - 45) < 1e-6
 
 
 def test_only_when_the_drivers_speed_is_at_the_old_limit_or_up_to_5_above():
@@ -65,7 +77,7 @@ def test_drive_52_tag_318_at_50_on_a_45_road_the_55_is_followed_to_55():
   # he set 50 himself on the 45 road (t 230); the limit went 45 -> 55 (t 310.3); he raised 50 -> 55 by hand (t 321)
   f = _settled(45, driver_mph=50)
   out = _feed(f, RAISE + 10, 55, driver_mph=50)
-  assert all(x == 0.0 for x in out[:RAISE - 1])
+  assert all(x == 0.0 for x in out[:QUICK - 1])
   assert abs(out[-1] / MPH - 55) < 1e-6                           # the new limit, not 55 + his 5
   assert f.offer.old == 45 and f.offer.kind == "raise"
   # once he is at 55 (our raise, or his own SET+ first) the offer is closed, quietly
@@ -158,7 +170,7 @@ def test_cruise_off_waits_for_the_drivers_speed():
   # offered, then cruise off a while (a stop slowdown, his brake): taken once he is back at the speed it was offered for
   f = _settled(45)
   _feed(f, 200, 50, cruise=False)
-  out = _feed(f, RAISE - 200 + 5, 50)
+  out = _feed(f, QUICK - 200 + 5, 50)
   assert all(x == 0.0 for x in out[:-6]) and abs(out[-1] / MPH - 50) < 1e-6 and abs(f.offer.driver - 45) < 1e-6
   assert all(x == 0.0 for x in _feed(f, 400, 50, cruise=False))
   assert abs(_feed(f, 1, 50)[-1] / MPH - 50) < 1e-6
@@ -402,9 +414,10 @@ class Coupled:
   adoption closes the offer (the wrapper's _limit_bookkeeping, here on the next frame, before the follower runs).
   road(f, x): the map fields at frame f, x m driven (road_class, ramp_to_highway, next_limit in mph, next_distance);
   the driver's SET presses (the simulated car's driver button) are passed on."""
-  def __init__(self, car, slc, metric=False, trust=lambda f: 0, road=None):
+  def __init__(self, car, slc, metric=False, trust=lambda f: 0, road=None, street_mode=0):
     self.car, self.slc, self.trust, self.road = car, slc, trust, road
-    self.f = slf.SpeedLimitFollower(metric)
+    # (the legal limit: these tests are of the rules themselves; the Street Speed offset: test_street_speed_*)
+    self.f = slf.SpeedLimitFollower(metric, street_mode=street_mode)
     self.logic, self.st, self.frame = None, None, -1
     self.raise_, self.cap_, self.undo_, self.ceiling_ = 0.0, 0.0, 0.0, 0.0
     self.raises, self.caps, self.undos, self.kinds = [], [], [], []
@@ -620,9 +633,13 @@ def test_a_map_glitch_shorter_than_5_s_never_raises():
     for driver in (45, 50):
       r, c = _sim(T.Car(driver, dash_offset_mph=0.0), lambda f, d=dur: 60 if 1000 <= f < 1000 + d * 100 else 45, 3000)
       assert c.raises == [] and r["max"] <= driver + 1e-6 and r["presses"] == [] and r["holds"] == [], (dur, driver)
-  # a flap 45 / 55 every 4 s neither
-  r, c = _sim(T.Car(45, dash_offset_mph=0.0), lambda f: 55 if (f // 400) % 2 else 45, 6000)
+  # a flap 45 / 55 every 2.4 s neither
+  r, c = _sim(T.Car(45, dash_offset_mph=0.0), lambda f: 55 if (f // 240) % 2 else 45, 6000)
   assert c.raises == [] and r["max"] <= 45 + 1e-6
+  # (F: a one-band rise with trust 0 is offered after 2.5 s) every 4 s: one raise, taken back by rule 4 at once, then
+  # LIMIT_RAISE_STABLE_TIME again (no churn)
+  r, c = _sim(T.Car(45, dash_offset_mph=0.0), lambda f: 55 if (f // 400) % 2 else 45, 6000)
+  assert len(c.raises) == 1 and len(c.undos) == 1 and abs(r["final"] - 45) < 0.01, (c.raises, c.undos, r["final"])
 
 
 def test_a_first_limit_or_a_rise_of_more_than_10_mph_needs_gps_trust_0():
@@ -822,8 +839,10 @@ def test_drive_53_ramp_1_the_highway_limit_ahead_becomes_the_drivers_speed_in_ti
   assert c.raises and abs(c.raises[0][1] - 70) < 1e-6 and c.kinds[0] == "merge", (c.raises, _reasons(c))
   f_raise = c.raises[0][0]
   left = ramp.length - _at(r, ramp, f_raise)
-  assert 250 < left < 420, left                                   # started near where he started his own hold
-  assert merged is not None and r["vs"][merged] / MPH >= 60, (merged, r["vs"][merged] / MPH if merged else None)
+  # (owner, drive 54: "we can do it way before that") as soon as the window is ready: mapd's 70 known 36 m into the
+  # link, MERGE_STABLE_TIME on (was timed to arrive 5 mph under the limit at the merge: 250-420 m before it)
+  assert 560 < left < 610, left
+  assert merged is not None and r["vs"][merged] / MPH >= 64, (merged, r["vs"][merged] / MPH if merged else None)
   assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6    # the highway's limit itself, not 70 + anything
   assert r["holds"] and [b for _, b in r["presses"] if b == cs.SET_MINUS] == []
   assert len(c.raises) == 1                                        # once per link (the 70 itself then is nothing new)
@@ -873,7 +892,7 @@ def test_merge_negatives():
   # his SET+ on the link before it starts: his (he chose 50; no raise to 70 on top)
   ramp = _Ramp()
   e = dict(ev(ramp))
-  e[ramp.at + 900] = lambda s, cr: cr.press(cs.SET_PLUS, who="driver")
+  e[ramp.at + 300] = lambda s, cr: cr.press(cs.SET_PLUS, who="driver")
   r, c, _ = _merge_sim(ramp, car(), 6000, events=e)
   assert c.raises == [] and abs(r["final"] - 46) < 0.01, (c.raises, r["final"])
   assert any("the driver set his speed on the link" in x for x in _reasons(c))
@@ -1168,3 +1187,107 @@ def test_a_short_lower_limit_while_restoring_only_pauses_it():
   # the same flap with the driver outside the band (57 on a 50 road): his, not paused
   r, c = _sim(_car53(40, 40), slc, 3500, events={0: _brake_held, 1000: _resume_now}, anchor_mph=57)
   assert abs(r["final"] - 57) < 0.01
+
+
+# ---------------- Street Speed (MazdaStreetSpeedOffset), rule 7 (after a turn), owner after drives 54 / 55 ----------------
+
+def _lis(limit_mph, driver_mph=45.0, road_class=5, name="A Road", trust=0, cruise=True, source="Map Data"):
+  return slf.LimitInputs(limit=limit_mph * MPH, source=source, gps_trust=trust,
+                         driver_speed=driver_mph * MPH if cruise else 0.0, cruise_enabled=cruise, road_class=road_class,
+                         road_name=name)
+
+
+def _on_street(mode=2, limit=45, driver=50, road_class=5, name="A Road"):
+  f = slf.SpeedLimitFollower(False, street_mode=mode)
+  for _ in range(STABLE + 5):
+    f.update(_lis(limit, driver, road_class=road_class, name=name, cruise=False))
+  for _ in range(5):
+    f.update(_lis(limit, driver, road_class=road_class, name=name))
+  f.events = []
+  return f
+
+
+def _run(f, n, *a, **kw):
+  return [f.update(_lis(*a, **kw)) for _ in range(n)]
+
+
+def test_street_speed_setting_options_and_metric():
+  for m, add in ((0, 0), (1, 3), (2, 5), (3, 8), (9, 5)):
+    assert slf.SpeedLimitFollower(False, street_mode=m).street_add == add, m
+  for m, add in ((0, 0), (1, 5), (2, 8), (3, 13)):
+    assert slf.SpeedLimitFollower(True, street_mode=m).street_add == add, m
+  assert slf.SpeedLimitFollower(False).street_add == 5                    # the default: +5 mph
+
+
+def test_street_speed_rule_1_raise_and_band_on_a_street_never_on_a_highway():
+  # at 50 on a 45 street (+5): the 55 road -> 60
+  f = _on_street(2, 45, 50)
+  out = _run(f, RAISE + 10, 55, 50)
+  assert abs(out[-1] / MPH - 60) < 1e-6 and f.offer.kind == "raise" and f.offer.new == 55
+  # the legal limit setting: 55 itself
+  f = _on_street(0, 45, 50)
+  assert abs(_run(f, RAISE + 10, 55, 50)[-1] / MPH - 55) < 1e-6
+  # +8: at 53 on the 45 street he is "at" its speed (the band is the offset when larger): 55 -> 63; with the legal
+  # limit setting 53 is outside rule 1's band (45 .. 50)
+  f = _on_street(3, 45, 53)
+  assert abs(_run(f, RAISE + 10, 55, 53)[-1] / MPH - 63) < 1e-6
+  f = _on_street(0, 45, 53)
+  assert _run(f, RAISE + 10, 55, 53)[-1] == 0.0
+  # a highway (class 1): the limit itself whatever the setting (70 -> 75 at his 70)
+  f = _on_street(3, 70, 70, road_class=1)
+  assert abs(_run(f, RAISE + 10, 75, 70, road_class=1)[-1] / MPH - 75) < 1e-6
+  # the road class unknown (Map Curves off): no offset
+  f = _on_street(2, 45, 45, road_class=0)
+  assert abs(_run(f, RAISE + 10, 50, 45, road_class=0)[-1] / MPH - 50) < 1e-6
+
+
+def test_street_speed_rule_3_cap_and_rule_2_first_limit():
+  # at 50 (45 + 5) the 35 road: a pending restore stops at 40
+  f = _on_street(2, 45, 50)
+  _run(f, STABLE + 5, 35, 50)
+  assert f.cap is not None and abs(f.cap_speed / MPH - 40) < 1e-6
+  # a first limit on a street: the limit + 5 (35 -> 50 for a 45 road)
+  f = slf.SpeedLimitFollower(False)
+  _run(f, 2000, 0, 35, source="None")
+  out = _run(f, RAISE + 10, 45, 35)
+  assert abs(out[-1] / MPH - 50) < 1e-6 and f.offer.kind == "first"
+
+
+def _turned(mode=2, old=45, new=50, driver=75, trust=lambda k: 0, cruise_off=False):
+  """On A Road (old) at his `driver`, a turn onto B Road (new): the name changes, the new limit from the same moment."""
+  f = _on_street(mode, old, driver)
+  outs = []
+  for k in range(RAISE + 600):
+    outs.append(f.update(_lis(new, driver, name="B Road", trust=trust(k), cruise=not cruise_off)))
+  return f, outs
+
+
+def test_rule_7_after_a_turn_a_restore_never_goes_back_above_the_new_roads_limit():
+  # drive 55: Dobry Drive (45), right turn onto Mound Road (50), his highway 75 still the restore's target: capped at 55
+  f, outs = _turned(2, 45, 50, 75)
+  assert all(x == 0.0 for x in outs) and f.cap is not None and abs(f.cap_speed / MPH - 55) < 1e-6
+  assert f.cap.band is False and f.exit_kind == "turn"
+  # the same limit on the new road (45 -> 45): its limit once the name has changed
+  f, outs = _turned(2, 45, 45, 75)
+  assert f.cap is not None and abs(f.cap_speed / MPH - 50) < 1e-6
+  # GPS trust 2 when its limit became steady (drive 55, t 633-639), 0 again later: taken then
+  f, outs = _turned(2, 45, 50, 75, trust=lambda k: 2 if k < 900 else 0)
+  assert f.cap is not None and abs(f.cap_speed / MPH - 55) < 1e-6
+  # no name change (the same road's new limit): rule 3 as before (his 75 is outside the band: nothing)
+  f = _on_street(2, 45, 75)
+  _run(f, RAISE + 600, 50, 75)
+  assert f.cap is None and f.offer is None
+
+
+def test_rule_7_a_first_known_limit_on_the_new_road_raises_him_never_slows_him():
+  # at 40 on A Road, a turn onto the 50 road: his speed 55 (+5) once steady 5 s
+  f, outs = _turned(2, 45, 50, 40)
+  got = [x for x in outs if x > 0]
+  assert got and abs(got[-1] / MPH - 55) < 1e-6 and f.offer.kind == "turn", (got[-1:] and got[-1] / MPH, f.events)
+  assert all(x == 0.0 for x in outs[:RAISE - 1])
+  # more than LIMIT_FIRST_MAX above his speed: not followed
+  f, outs = _turned(2, 45, 50, 30)
+  assert all(x == 0.0 for x in outs) and any("more than 15" in e[1]["reason"] for e in f.events), f.events
+  # his speed above the new road's: never a SET- (a cap of a pending restore only)
+  f, outs = _turned(0, 50, 35, 50)
+  assert all(x == 0.0 for x in outs) and f.undo is None
