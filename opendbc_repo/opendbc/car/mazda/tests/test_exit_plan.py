@@ -1028,13 +1028,18 @@ def test_final_review_the_camera_alone_slows_only_near_the_split_and_gently():
   assert _minus(r, 0, ex - 900) and _at(r, ex) <= 50.5, _at(r, ex)
 
 
-def test_final_review_a_lane_change_away_while_slowing_declines_at_any_distance():
-  # his signal 1.8 km before the exit, the slowdown on; then he changes lanes to the left 700 m before it (no signal)
+def test_final_review_a_lane_change_away_while_slowing_ends_it_at_any_distance():
+  # his signal 1.8 km before the exit, the slowdown on; then he changes lanes to the left 700 m before it (no signal):
+  # the slowing ends (restored) and his signal no longer counts; farther than DECIDE_NEAR not declined (re-review: the
+  # camera's edge lane, here still on, may take it again from DECIDE_NEAR, gently)
   r, ex = _right_lane(75, signal=lambda x: 1 if 1200 <= x < 1300 else 0, change=lambda x: -1 if 2300 <= x < 2301.5 else 0)
   p = r["ctl"].plan or r["ctl"].last_plan
-  assert p.declined and not p.signalled
-  assert _plus(r, 2300, 2400) and _minus(r, 2310, ex + 400) == [], _minus(r, 2310, ex + 400)
-  assert _at(r, ex) >= 74.0, _at(r, ex)
+  assert not p.declined and not p.signalled
+  assert _plus(r, 2300, 2400) and _minus(r, 2310, ex - CTL.DECIDE_NEAR - 1) == [], _minus(r, 2310, ex - CTL.DECIDE_NEAR)
+  assert _at(r, ex) >= 70.0, _at(r, ex)
+  # 200 m before it: declined
+  r, ex = _right_lane(75, signal=lambda x: 1 if 1200 <= x < 1300 else 0, change=lambda x: -1 if 2800 <= x < 2801.5 else 0)
+  assert (r["ctl"].plan or r["ctl"].last_plan).declined and _minus(r, 2810, ex + 400) == []
 
 
 def test_final_review_on_the_real_ramp_gas_a_keep_left_signal_or_a_lane_change_do_not_undo_it():
@@ -1082,12 +1087,13 @@ def test_final_review_no_answer_past_the_split_is_never_adopted_low_on_the_highw
   # mph under his speed. The trusted match is staying on (missed: his speed back)
   r, ex = _right_lane(80, hwy_from=None)
   assert r["ctl"].last_plan.why == "missed" and abs(r["sets"][-1] - 80) < 1e-6, r["ctl"].last_plan.why
-  # the match on the highway but doubtful (trust low) all along: held to EXIT_LOST_MAX, then his speed back with taps
-  # (not adopted); GPS paused then: adopted (it may be the ramp)
-  for trust, why, end in ((2, "not confirmed, on the highway", 80.0), (3, "not confirmed", None)):
-    def fields(x, trust=trust):
+  # the match on the highway but doubtful (trust low) to just before EXIT_LOST_MAX, then trusted: held, then his speed
+  # back with taps (not adopted); doubtful or paused then: adopted (it may be the ramp; re-review of d4f848215)
+  for trust, ok_at, why, end in ((2, 795.0, "not confirmed, on the highway", 80.0), (2, 1e9, "not confirmed", None),
+                                 (3, 1e9, "not confirmed", None)):
+    def fields(x, trust=trust, ok_at=ok_at):
       ex = 1600.0
-      hw = dict(road_class=1, limit=70 * MPH, gps_trust=trust if x >= ex - 46 else 0)
+      hw = dict(road_class=1, limit=70 * MPH, gps_trust=trust if ex - 46 <= x < ex + ok_at else 0)
       if x < ex - 1400:
         return F(**hw)
       if x < ex - 46:
@@ -1096,7 +1102,7 @@ def test_final_review_no_answer_past_the_split_is_never_adopted_low_on_the_highw
       return F(exit_shape=0, **hw)
     r = drive_exit(fields, 14000, 80, lane=lambda x: 1, signal=lambda x: 1 if 900 <= x < 960 else 0)
     p = r["ctl"].last_plan
-    assert p.why == why, (trust, p.why)
+    assert p.why == why, (trust, ok_at, p.why)
     ended = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if xx > 1600 + CTL.EXIT_LOST_MAX and s == "")
     assert ended - 1600 <= CTL.EXIT_LOST_MAX + 30, ended
     if end is not None:
@@ -1136,3 +1142,90 @@ def test_final_review_the_tentative_slowdown_is_bounded_whatever_carries_it_on()
     assert "confirmed" not in r["state"] and p.why == "missed", p.why
     # (tentative: the plan's state past the split until the missed exit, its slowing TENT_HARD_MAX at most)
     assert tent and p.tent_s <= (tent[-1] - ex) / 20.0 + 1.0
+
+
+# ---------------- re-review of d4f848215 ----------------
+
+def _once(events):
+  """change(x): the camera's lane change at each (x, dir), one frame each"""
+  done = set()
+
+  def change(x):
+    for k, (at, d) in enumerate(events):
+      if x >= at and k not in done:
+        done.add(k)
+        return d
+    return 0
+  return change
+
+
+def test_rereview_a_lane_change_away_far_out_only_ends_the_slowing():
+  # n1.py N1: his signal far out, a lane change away 500 m before the exit while slowing, back into the exit lane at
+  # 350 m (no new signal): was declined for good, E1 70.9 mph into its 32 mph curve, E2 55.3 into 31
+  fields, ex, cx = _e2()
+  lane = lambda x: 1 if (700 <= x < ex - 500 or x >= ex - 310) else None  # noqa: E731
+  for back_sig, top in ((False, 11.0), (True, 1.5)):
+    sig = (lambda x, b=back_sig: 1 if (900 <= x < 960) or (b and 1240 <= x < 1260) else 0)  # noqa: E731
+    r = drive_exit(fields, 9000, 75, lane=lane, signal=sig, change=_once([(ex - 500, -1), (ex - 350, 1)]))
+    p = r["ctl"].plan or r["ctl"].last_plan
+    assert not p.declined and _at(r, cx) <= V_C85 + top, (back_sig, _at(r, cx))
+    assert _plus(r, ex - 500, ex - 450), "the slowing ended at the lane change (restored)"
+  f1, ex1, cx1, lead1, _sig1 = _e1()
+  lane1 = lambda x: 1 if (x < ex1 - 450 or x >= ex1 - 280) else None  # noqa: E731
+  r = drive_exit(f1, 6000, 75, v_mph=57, lead=lead1, lane=lane1, signal=lambda x: 1 if ex1 - 700 <= x < ex1 - 650 else 0,
+                 change=_once([(ex1 - 450, -1), (ex1 - 320, 1)]))
+  assert _at(r, cx1) <= V_C95 + 5.0, _at(r, cx1)
+  # within DECIDE_NEAR it is still his decision (declined, test_his_gas_or_the_other_signal_ends_the_exit_slowing_at_once)
+
+
+def _false_link(shape_fn, gas=None, signal=None, model=None):
+  """n3.py: he stays on (set 80, the camera's edge lane near the split), the shapes say what shape_fn gives"""
+  ex = 3000.0
+
+  def fields(x):
+    hw = dict(road_class=1, limit=70 * MPH)
+    if x < ex - 2500:
+      return F(**hw)
+    if x < ex - 46:
+      return F(nav_exit=1, nav_exit_distance=ex - x, nav_curve_radius=85.0, nav_curve_distance=ex + 500 - x,
+               nav_exit_side=1, exit_shape=shape_fn(x), **hw)
+    return F(exit_shape=shape_fn(x), **hw)
+  return drive_exit(fields, 17000, 80, lane=lambda x: 1 if ex - 300 < x < ex + 300 else None, gas=gas, signal=signal,
+                    model=model), ex
+
+
+def test_rereview_his_gas_held_past_the_split_is_his_decision_even_after_a_link():
+  # a false "link" for 200 m right after the split (confirmed by the shapes alone), then silence: was the full ramp
+  # slowdown on the highway to ~30 mph, his gas ignored. Held 1.5 s (or speeding the car up 3 mph): overturned
+  link_then_none = lambda x: 2 if 3000 < x < 3200 else 0  # noqa: E731
+  r, ex = _false_link(link_then_none, gas=lambda x: 36.0 if 3300 <= x < 3360 else None)
+  assert r["ctl"].last_plan.why == "overturned: gas", r["ctl"].last_plan.why
+  assert _at(r, ex + 500, "sets") >= 79.0 and abs(r["sets"][-1] - 80) < 1e-6, _at(r, ex + 500, "sets")
+  # before a confirmation (alternating "link" / nothing): declined, his speed kept, never adopted low
+  alt = lambda x: (2 if ((x - 3000) % 40.0) < 34.0 else 0) if 3000 < x < 3600 else 0  # noqa: E731
+  r, ex = _false_link(alt, gas=lambda x: 36.0 if 3300 <= x < 3700 else None)
+  assert r["ctl"].last_plan.declined and abs(r["sets"][-1] - 80) < 1e-6, (r["ctl"].last_plan.why, r["sets"][-1])
+  # a tap (3 m) on the real ramp stays ignored (test_final_review_on_the_real_ramp_gas_..., E1 / E2)
+
+
+def test_rereview_the_800_m_highway_match_needs_gps_trusted_and_no_link():
+  # n2.py N6: he took the ramp, GPS paused to +790, then a doubtful (trust 2) match to the highway beside it, or the
+  # shapes' last answer "link": was taken as the highway, set 54 -> 75 on the ramp. Adopted instead (no taps up)
+  ex = 3000.0
+  for trust, last in ((2, 1), (0, 2)):
+    def fields(x, trust=trust, last=last):
+      paused = ex - 50 <= x < ex + 790
+      hw = dict(road_class=1, limit=70 * MPH, gps_trust=3 if paused else (trust if x >= ex + 790 else 0))
+      if x < ex - 2500:
+        return F(**hw)
+      if x < ex - 46:
+        return F(nav_exit=1, nav_exit_distance=ex - x, nav_curve_radius=85.0, nav_curve_distance=ex + 500 - x,
+                 nav_exit_side=1, exit_shape=1, **hw)
+      if paused:
+        return F(exit_shape=0, **hw)
+      return F(exit_shape=last if x < ex + 795 else 0, **hw)
+    r = drive_exit(fields, 17000, 75, lane=lambda x: 1 if ex - 400 < x < ex + 300 else None,
+                   signal=lambda x: 1 if ex - 700 < x < ex - 650 else 0)
+    p = r["ctl"].last_plan
+    assert p.why == "not confirmed", (trust, last, p.why)
+    assert _at(r, ex + 1000, "sets") <= 62 and r["sets"][-1] <= 62, (trust, last, r["sets"][-1])

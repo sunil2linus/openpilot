@@ -204,7 +204,13 @@ RESTORE_PULSE = 1.0             # s the fast restore is asked for after a plan e
 # answer not "link", is staying on (final review: with no shape answer the speed was held and then adopted 20-50 mph low);
 # so is, after a confirmation, the model path saying "highway" EXIT_STAY_TIME with the shapes' last answer not "link"
 HWY_MATCH_STAY = 2.0            # s
-TRUST_PAUSED = 3                # mapGpsTrust 3 / 4: paused (no match to go by)
+# His gas past the split, before the car is on the ramp for sure, held this long or speeding the car up this much since
+# he pressed it, is his decision even while the shapes' last answer is "link" (re-review of d4f848215: a false "link" for
+# 1.5 s, then silence, ran the full ramp slowdown on the highway to ~30 mph, his gas ignored); a tap is not (drive 53's
+# E1 / E2 timelines: a 3 m tap on the ramp kept the slowdown, s7_rampgas.py). (Not the speed over the set speed: the
+# firm slowdown holds the set speed far below it on purpose.)
+GAS_OVERTURN_TIME = 1.5         # s
+GAS_OVERTURN_GAIN = 3 * MPH     # m/s
 
 # ---- the camera's view of our lane (LaneView) ----
 # modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
@@ -456,6 +462,8 @@ class ExitPlan:
     self.answered = False         # the shapes answered (either way) past the split (QUIET_FROM)
     self.match_s = 0.0            # s matched to a link road (or the planner's ramp) with GPS trusted
     self.hwy_match_s = 0.0        # s matched to a highway with GPS trusted past the split
+    self.gas_s = 0.0              # s of his gas without a break (GAS_OVERTURN_TIME)
+    self.gas_v0 = 0.0             # m/s: the speed when he pressed it
     self.model_link_s = self.model_hwy_s = 0.0  # s of the model path saying link / highway (consecutive)
     self.model_seen = False       # the model path gave an answer
     self.settled = False          # on the ramp for sure (LINK_SETTLE): a confirmation is no longer overturned
@@ -681,6 +689,11 @@ class MapCurveControl:
     hwy_match = f.road_class in HIGHWAY_CLASSES and not on_link and not f.on_ramp and f.gps_trust < TRUST_LOW
     p.hwy_match_s = p.hwy_match_s + DT_CTRL if (hwy_match and rem < 0) else 0.0
     not_link = p.last_shape != 2
+    # his gas held (GAS_OVERTURN_*): his decision past the split whatever the shapes' last answer
+    if gas and p.gas_s <= 0.0:
+      p.gas_v0 = v_ego
+    p.gas_s = p.gas_s + DT_CTRL if gas else 0.0
+    gas_firm = gas and (p.gas_s >= GAS_OVERTURN_TIME - 1e-6 or v_ego > p.gas_v0 + GAS_OVERTURN_GAIN)
     stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
@@ -701,6 +714,7 @@ class MapCurveControl:
       # keep-left signal or a lane change on a 2-lane ramp restored the speed: E1 35-49 mph into its 32 mph curve)
       model_hwy = not_link and p.model_hwy_s >= EXIT_STAY_TIME - 1e-6
       why = ("still on the highway" if (stayed or model_hwy) else
+             "gas" if gas_firm else
              "" if not not_link else
              "gas" if gas else
              "the other signal" if (signal and side and signal == -side) else
@@ -720,15 +734,18 @@ class MapCurveControl:
       elif side and signal == -side:
         p.signalled = False                        # (review: one the other way far out kept the old signal)
         if decide:
-          p.declined = True
+          # (re-review: far out it only ends the slowing; the plan takes new exit lane evidence again)
+          p.declined = p.declined or not (rem > DECIDE_NEAR)
           self._end_slowing(p, restore=True)
       # (the exit's side unknown: a signal says nothing; the camera neither)
     if side and self.lane.change == -side:
       p.signalled = False                          # (final review: out of the exit lane, his old signal no longer counts)
       if decide and not p.declined:
-        p.declined = True                          # (while slowing: at any distance)
+        # while slowing it ends at any distance; farther than DECIDE_NEAR only the slowing (re-review of d4f848215: a
+        # permanent decline there, then back into the exit lane, took E1 at 71 mph into its 32 mph curve)
+        p.declined = not (rem > DECIDE_NEAR)
         self._end_slowing(p, restore=True)
-    if gas and decide and not p.declined:
+    if gas and (decide or (rem <= 0 and gas_firm)) and not p.declined:
       p.declined = True
       self._end_slowing(p, restore=True)
     # missed: past the exit point the shapes say "highway" (fast restore); with no shape answer (an older planner, a GPS
@@ -739,9 +756,11 @@ class MapCurveControl:
       return none
     if rem < -EXIT_PASS_MARGIN:
       if rem < -EXIT_LOST_MAX or p.last_cmd is None or p.declined:
-        # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS not paused): his speed back
+        # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS trusted): his speed back
         # (the usual taps, no fast restore); else the held set speed becomes his
-        on_hwy = f.road_class in HIGHWAY_CLASSES and not on_link and not f.on_ramp and f.gps_trust < TRUST_PAUSED
+        # (re-review: GPS trusted and the shapes' last answer not "link": a doubtful match beside the ramp took 54 -> 75 on it)
+        on_hwy = (f.road_class in HIGHWAY_CLASSES and not on_link and not f.on_ramp and f.gps_trust < TRUST_LOW and
+                  p.last_shape != 2)
         self._end("not confirmed, on the highway" if on_hwy else "not confirmed",
                   adopt=p.last_cmd is not None and not p.declined and not on_hwy)
         return none
