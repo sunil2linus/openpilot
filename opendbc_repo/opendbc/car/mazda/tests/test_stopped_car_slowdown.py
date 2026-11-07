@@ -2816,3 +2816,47 @@ def test_drive_54_e_stop_ahead_gone_releases_after_1_s_and_restores_with_a_hold_
   at35_old = next(k for k, s in enumerate(r2["sets"]) if k > rel2[0][0] and s / MPH >= 35 - 1e-6)
   assert at35_old - at35 >= 80, (at35, at35_old)
   assert max(s / MPH for s in r2["sets"][rel2[0][0]:]) <= 40 + 1e-6
+
+
+def _cap_in_a_map_curve(fits=None):
+  """Drive 54, t 742-769: his speed still the highway's 70 (anchor) on a street whose lower limit (here 50) is pending,
+  a followed map curve (target 40, floor 37) on the whole time, a stop ahead that clears."""
+  def setup(lg):
+    lg.anchor = 70 * MPH
+    if fits is not None:
+      lg._cap_fits_curve = lambda: fits
+  presses = []
+  r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10,
+                                 model=lambda f: -0.6 if 200 <= f < 500 else -0.2, plan=lambda f: 200 <= f < 500,
+                                 red=lambda f: 200 <= f < 500, map_curve=lambda f: (True, 40 * MPH, 37 * MPH),
+                                 cap=lambda f: 50 * MPH, setup=setup))
+  presses = r["presses"]
+  return r, rel, presses
+
+
+def test_a_pending_lower_limit_cap_applies_in_a_curve_once_it_cannot_cause_a_set_minus():
+  # the cap waited for the curve to end, so the anchor stayed 70 and the pending cap kept the in-curve restore hold out;
+  # now it applies inside the curve once the set speed is at or below the curve's lowest from the capped speed (50 - 10
+  # Max Drop - 3 undershoot = 37): here after the stop ahead took the set to the floor
+  r, rel, presses = _cap_in_a_map_curve()
+  lg = r["logic"]
+  assert rel and rel[0][1].startswith("stop ahead cleared")
+  assert lg.limit_cap is None                                                 # applied
+  ups = [h for h in lg.hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups and ups[0]["frame"] > rel[0][0] and ups[0]["bound_mph"] <= 40 - 5 + 1e-6, ups
+  after = [s / MPH for s in r["sets"][rel[0][0]:]]
+  assert max(after) <= 40 + 1e-6 and near(r["final"], 40)                     # never above the curve's target
+  assert [f for f, b in presses if b == cs.SET_MINUS and f > rel[0][0]] == []   # no SET- for the lower limit
+  # the anchor is the cap: after the curve the restore would stop at 50, not 70
+  assert lg.anchor is not None and near(lg.anchor / MPH, 50)
+  # before (the cap never applied in a curve): the anchor stayed 70 and the restore only tapped
+  r0, rel0, _ = _cap_in_a_map_curve(fits=False)
+  lg0 = r0["logic"]
+  assert near(lg0.anchor / MPH, 70) and lg0.limit_cap is not None
+  assert not [h for h in lg0.hold_log if h["direction"] == cs.SET_PLUS]
+  # while the set speed is still above the capped speed's curve floor the cap waits (no SET- because of it): the same
+  # SET- presses as with no cap at all until the stop ahead starts
+  r1 = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 180, lead=_NoCar(200), max_drop=10,
+           map_curve=lambda f: (True, 40 * MPH, 37 * MPH), cap=lambda f: 50 * MPH, setup=lambda lg: setattr(lg, "anchor", 70 * MPH))
+  assert r1["logic"].limit_cap is not None and near(r1["logic"].anchor / MPH, 70)
+  assert near(r1["final"], 40)

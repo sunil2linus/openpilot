@@ -205,7 +205,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
   limit(f) / cap(f) / undo(f) / ceiling(f): the speed limit follower's raise / lower limit cap / undo / provisional
   ceiling (m/s, 0 none), called in that order.
-  map_curve(f): a followed map curve instead of the camera mimic: (active, target m/s) or None (curve_track on while active)."""
+  map_curve(f): a followed map curve instead of the camera mimic: (active, target m/s[, floor m/s]) or None (curve_track
+  on while active; the floor is MapOutput.floor, 0 / none: the controller's own Max Drop floor)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -264,7 +265,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
                             stop_slower_ahead=bool(lead is not None and trigger.slower_after_red and stop_mode == 2),
                             limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f), limit_ceiling=ceiling(f),
-                            curve_track=bool(map_curve is not None and pa))
+                            curve_track=bool(map_curve is not None and pa),
+                            curve_floor=mc[2] if (mc is not None and pa and len(mc) > 2) else 0.0)
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16

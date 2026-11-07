@@ -213,6 +213,14 @@ CURVE_HOLDS = 1
 # then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
 # 764.7-768: 19 -> 26 in 3.3 s in a 42 mph curve, the car slowing 35 -> 30, 20 s before the real stop).
 RESTORE_IN_CURVE_HOLD = True
+# A lower posted limit's cap (rule 3) while a curve target is on: the driver's speed is where the curve's Max Drop floor
+# counts from, so bringing it down there could lower the floor and cause a SET- for a lower limit
+# (speed_limit_follow tests: a cap during a curve waits for it to end). It is applied in the curve too once the set
+# speed is already at or below the lowest the curve could then ask for (the new driver's speed less the Max Drop and
+# the road follower's undershoot, curve_target.MAP_ROAD_UNDERSHOOT): then it cannot cause a SET-. Drive 54, t 742-769:
+# a 70 from the highway capped at 45 on the street never applied through a followed map curve, and the pending cap kept
+# the in-curve restore hold (RESTORE_IN_CURVE_HOLD) out.
+CAP_CURVE_MARGIN = 3 * MS_PER_MPH        # m/s (curve_target.MAP_ROAD_UNDERSHOOT)
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -444,6 +452,16 @@ class CurveSlowdownLogic:
     """The highest a SET+ of ours may take the set speed while a lower limit's cap (rule 3, or rule 4's) is pending."""
     caps = [c for c in (self.limit_cap, self.undo_cap) if c is not None]
     return min(caps) if caps else None
+
+  def _capped_anchor(self):
+    """The driver's speed with the pending cap applied: the cap, or the set speed if higher, never above it now."""
+    return min(self.anchor, max(self._cap(), self.last_set_speed))
+
+  def _cap_fits_curve(self):
+    """Inside a curve the cap may apply only when the set speed is already at or below the lowest the curve could ask
+    for from the capped driver's speed (its Max Drop floor less the road undershoot): then it cannot cause a SET-
+    (CAP_CURVE_MARGIN)."""
+    return self.last_set_speed <= self._capped_anchor() - self.max_drop_steps * self.step - CAP_CURVE_MARGIN + 1e-3
 
   def _ceiling(self):
     """The highest a SET+ of ours may take the set speed now: a pending cap, or a lower limit not steady yet."""
@@ -918,10 +936,11 @@ class CurveSlowdownLogic:
       if self.anchor is None:
         self.limit_cap = self.undo_cap = None
       elif (cruise_ok and not self.inflight and self.pending is None and self.hold is None and
-            not any(p.direction == SET_PLUS for p in self.expired) and not i.csc_active and not i.stop_active):
+            not any(p.direction == SET_PLUS for p in self.expired) and not i.stop_active and
+            (not i.csc_active or self._cap_fits_curve())):
         # a pending restore stops at the cap (or the set speed, if higher); a set speed above the driver's speed (our
         # own overshoot, a SET- correcting it) keeps the driver's speed: a cap only ever limits SET+
-        self.anchor = min(self.anchor, max(self._cap(), self.last_set_speed))
+        self.anchor = self._capped_anchor()
         self.limit_cap = self.undo_cap = None
     if self.offset == 0 and not self.inflight:
       self.flicker = False

@@ -444,3 +444,31 @@ def test_learned_decel_changes_the_plan_consistently():
   assert sp_lo < sp_hi
   assert MC.plan_speed(120.0, 400.0, 0.0, 25.0, decel=0.2) < MC.plan_speed(120.0, 400.0, 0.0, 25.0, decel=0.4)
   assert abs(MC.plan_speed(120.0, 400.0, 0.0, 25.0, decel=0.2) - sp_lo) < 1e-9
+
+
+def test_the_curve_notice_target_matches_the_car_sides_curve_speed():
+  """starpilotPlan.mapCurveTarget (the curve notice's number) and the car side's curve speed (MapOutput.curve_speed)
+  count the Max Drop floor from the same speed: the driver's, which the planner gets as the dash set speed plus the steps
+  the Mazda slowdown took off it (starpilotCarState.curveSlowdownOffset, starpilot_planner.py) and the car side as the
+  set speed plus CurveSlowdownLogic.offset. Drive 54, West Utica (r 93 m, 32 mph alone): his 45, Max Drop 10 -> 35, also
+  once our follower has lowered the set to 38 (offset 7)."""
+  from types import SimpleNamespace as N
+  for set_mph, offset in ((45, 0), (38, 7), (32, 13)):
+    driver = (set_mph + max(offset, 0)) * MPH                    # starpilot_planner.py: cruise speed + offset steps
+    pl = MC.MapCurvesPlanner(FakeParams({"MazdaMapCurves": "2", "MazdaCurveSlowdownMaxDrop": "1"}), FakeParams({}))
+    pl._read_mode()
+    mc = N(data_here=True, paused=False, curve={"name": "West Utica Road"}, held=None, status=MC.STATUS_CURVE,
+           distance=150.0, radius=93.08, advisory=0.0, floor=pl._floor(driver), on_ramp=False, ramp=None, nav_ramp=None,
+           veto_status=0, veto_radius=0.0, source=2, trust_status=0, nav_exit=0, nav_exit_dist=0.0, nav_curve=None,
+           nav_curve_dist=0.0, nav_side=0, exit_shape=0, exit_link=(0.0, 0.0), exit_hwy=(0.0, 0.0), exit_fork=0,
+           exit_curve=None, exit_curve_dist=0.0, exit_start=0.0, exit_bends=(None, None), ramp_end_dist=0.0)
+    pl.mode, pl.mc, pl.road_class, pl.gps_acc = 2, mc, 0, 0.0
+    plan = N()
+    pl.publish(plan)
+    lg = cs.CurveSlowdownLogic(False, cs.MAX_DROP_CHOICES_MPH[1])
+    ctl = CTL.MapCurveControl(CT.TI_LATERAL_ACCEL)
+    f = CTL.MapFields(mode=CTL.ON)
+    f.status, f.radius, f.distance = MC.STATUS_CURVE, 93.08, 150.0
+    out = ctl.update(f, set_mph * MPH + offset * lg.step, 0, v_ego=set_mph * MPH, max_drop=lg.max_drop_steps * lg.step)
+    assert out.active and abs(out.curve_speed - plan.mapCurveTarget) < 1e-6, (set_mph, out.curve_speed, plan.mapCurveTarget)
+    assert abs(plan.mapCurveTarget / MPH - 35.0) < 1e-6
