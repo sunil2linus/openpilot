@@ -1073,6 +1073,12 @@ def test_drive_53_e3_negatives_the_max_drop_still_holds_on_a_normal_road_and_ram
   fields, camera, lead, _, loop_x, end_x = _loop_53(link=False)
   r = drive_53(fields, 3800, 50, v_mph=31, camera=camera, lead=lead)
   assert min(r["sets"]) >= 40 - 1e-6 and min(r["sets"]) <= 40 + 1e-6, min(r["sets"])
+  # behind a slower car (35 mph) in a camera curve that allows 44 (driver's 50, Max Drop 10): on a normal road the set
+  # speed only goes to the camera's target (no step down toward the car's speed); on a link it is not left above it
+  r = drive_53(lambda x: F(road_class=5), 2500, 50, v_mph=35, camera=lambda x: 44 * MPH, lead=lambda x: 35 * MPH)
+  assert min(r["sets"]) >= 44 - 1e-6 and len(r["presses"]) <= 7, (min(r["sets"]), r["presses"])
+  r = drive_53(lambda x: F(road_class=2), 2500, 50, v_mph=35, camera=lambda x: 44 * MPH, lead=lambda x: 35 * MPH)
+  assert 35 - 1e-6 <= min(r["sets"]) <= 36 + 1e-6, min(r["sets"])
   # a link with a camera target of 18 mph, the car behind a car at 30 mph: never under the ramp floor
   r = drive_53(lambda x: F(road_class=2), 2500, 50, v_mph=30, camera=lambda x: 18 * MPH, lead=lambda x: 30 * MPH)
   assert 25 - 1e-6 <= min(r["sets"]) <= 26 + 1e-6, min(r["sets"])

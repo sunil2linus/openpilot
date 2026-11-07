@@ -290,8 +290,9 @@ class CurveMix:
   of the Max Drop (drive 53, the on-ramp loop onto M-59 at 1019-1030: the map's ramp curve was matched 8 m before the
   71 m loop and lost inside it, the camera's slowdown stopped at the Max Drop floor, 40 mph with the driver's 50, and
   the car sped up from 27 to 32 mph in the loop behind a car: "Turn Exceeds Steering Limit" twice).
-  `no_accel` is True while the camera's target governs (SlowdownInputs.curve_no_accel): the controller then never lets
-  the set speed sit above the current speed in the curve.
+  `no_accel` is True while the camera's target governs on a link (SlowdownInputs.curve_no_accel): the controller then
+  never lets the set speed sit above the current speed in the curve. On a normal road the camera curve slowdown is as
+  before (no extra SET- behind a slower car in a curve).
   While a follower runs, the camera's target counts at the lowest it has been since the follower started, with the
   margin and the Max Drop floor the controller gives it (`drop_floor`; the ramp floor on a link). The camera's target
   is the least demanding curvature of the last second, so it pops up for a second at a time (review sC: a camera
@@ -309,7 +310,7 @@ class CurveMix:
   def __init__(self, margin):
     self.margin = margin
     self.cam_low = NO_CURVE       # the camera's lowest target (margin and Max Drop floor in) while the follower runs
-    self.no_accel = False         # the camera's target governs: the set speed never above the current speed in the curve
+    self.no_accel = False         # the camera's target governs on a link: the set speed never above the current speed
 
   def update(self, cam_active, cam_speed, mo, drop_floor=0.0):
     link = mo.link
@@ -318,7 +319,7 @@ class CurveMix:
       self.cam_low = NO_CURVE
       active, speed = cam_active, cam_speed
       floor, budget = (RAMP_FLOOR, RAMP_BUDGET) if (cam_active and link) else (0.0, 0)
-      self.no_accel = cam_active
+      self.no_accel = cam_active and link
       if mo.active and (not cam_active or mo.speed < cam_speed):
         speed, floor, budget = mo.speed, mo.floor, mo.budget
         self.no_accel = False

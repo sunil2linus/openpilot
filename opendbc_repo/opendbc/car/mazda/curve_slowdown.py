@@ -172,11 +172,13 @@ GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= 
 GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed during which a SET+ may still jump
 # Never speed up inside a curve (drive 53, the on-ramp loop onto M-59, t 1019-1030): behind a car the set speed sat at
 # 39-41 while the car went 27-28 mph into a 71 m loop; the cruise followed the car ahead up to 32 mph in the loop
-# ("Turn Exceeds Steering Limit" twice). While the camera's curve target governs, the target is also never above the
-# current speed plus half a step, so the set speed ends at most a step above it. On this car the true speed holds at or
-# a little above the dash set speed (drive 53: set 29 -> 29.4-29.5 mph, set 75 -> 75.0-75.9), so this does not chase the
-# speed down; the floor (the Max Drop on a normal road, the ramp floor on a link) still holds. A followed map curve
-# (curve_track) has its own rule: never above the curve's speed, back up to it once the car is nearly there.
+# ("Turn Exceeds Steering Limit" twice). While the camera's curve target governs on a link road (map curves On: the
+# map's road class for map_curve_control.LINK_HOLD), the target is also never above the current speed plus half a
+# step, so the set speed ends at most a step above it; the ramp floor still holds. On this car the true speed holds at
+# or a little above the dash set speed (drive 53: set 29 -> 29.4-29.5 mph, set 75 -> 75.0-75.9), so this does not
+# chase the speed down. On a normal road the camera curve slowdown is as before (no extra SET- behind a slower car in a
+# curve). A followed map curve (curve_track) has its own rule: never above the curve's speed, back up to it once the
+# car is nearly there.
 CURVE_NO_ACCEL = True
 # The curve's restore on the gas (drive 53, t 1035-1060): after the on-ramp loop the set speed stayed 29 with the
 # driver's 50 while he drove onto M-59 on the gas (27 -> 49 mph); the curve's "over" timer is frozen on the gas, so the
@@ -219,8 +221,8 @@ class SlowdownInputs:
   # that curve, margin included, when that is lower: map_curve_control.CurveMix)
   curve_track: bool = False
   curve_raise: bool = False       # (with curve_track) the follower has settled at the curve's speed: the raise may go
-  # the camera's curve target governs (map_curve_control.CurveMix.no_accel): inside the curve the set speed is never
-  # left more than a step above the current speed, so the cruise does not speed up in it (CURVE_NO_ACCEL)
+  # the camera's curve target governs on a link (map_curve_control.CurveMix.no_accel): inside the curve the set speed is
+  # never left more than a step above the current speed, so the cruise does not speed up in it (CURVE_NO_ACCEL)
   curve_no_accel: bool = False
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
@@ -1418,7 +1420,7 @@ class CurveSlowdown:
 
     # Map curves (Test: computed and logged only; On: combined with the camera curve target)
     curve_floor, curve_budget, fast_restore, curve_track, curve_raise = 0.0, 0, False, False, False
-    curve_no_accel = curve_active          # the camera's target alone governs (CURVE_NO_ACCEL)
+    curve_no_accel = False                 # only on a link, which only the map knows (CurveMix.no_accel, CURVE_NO_ACCEL)
     self.map_out = None
     if self.map_control is not None and plan_alive:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
