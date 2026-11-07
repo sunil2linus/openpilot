@@ -26,20 +26,24 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
         MazdaExitSplitSpeed: the highway's posted limit, +5, +10, or Off), never raising the speed, only while the
         car is in an exit lane: the turn signal toward the exit, or the camera says we are in the lane next to the
         exit side (LaneView). Map lane data (which lanes exit) is not in the curve files. On a short ramp (its curve
-        out of reach from that speed) the split speed is lowered to the one that makes it (short_split_speed).
+        out of reach from that speed) the split speed is lowered to the one that makes it (short_split_speed). On the
+        camera alone (the edge lane is also the ordinary right lane) only from DECIDE_NEAR and no deeper than
+        SPLIT_DECEL takes the speed from there; his signal toward the exit allows it from farther out.
       - At the split (the map's link start when the planner gives it, else navigation's exit point): confirmed on the
         ramp by the map's shapes (starpilotPlan.mapExitShape: our position closer to the link's shape and our heading
         closer to its by SHAPE_LINK_GAP, on consecutive answers) together with the driving model's predicted path
         (ModelPath: its heading ahead the link's, not the highway's), or the shapes alone for longer when there is no
-        model answer, or the road match on the link with GPS trusted for LINK_CONFIRM. Until the car is on the link for
-        sure (LINK_SETTLE) a confirmation is overturned (fast restore) by the shapes saying "highway", his gas, the other
-        signal or a lane change away. With exit lane evidence the slowdown starts at the split, tentative (TENT_*:
+        model answer, or the road match on the link (or the planner's ramp) with GPS trusted for LINK_CONFIRM. Until the
+        car is on the link for sure (LINK_SETTLE) a confirmation is overturned (fast restore) by the shapes, the trusted
+        road match or the model path saying "highway"; by his gas, the other signal or a lane change away only while
+        the shapes' last answer is not "link". With exit lane evidence the slowdown starts at the split, tentative (TENT_*:
         bounded, undone by the missed exit test); without, the command holds until then. Then the full slowdown toward
         the exit's curve (the planner's exit curve, the lower of the branches of a fork not decided yet; else the
         announced curve carried on by the distance driven), firm (the cruise's strongest) when the room left needs it.
-      - Missed (past the split the shapes say "highway", or shorter with the model path agreeing): the plan ends and
-        the speed comes back at once (SET+ holds). With no answer at all (a GPS pause, an older planner) the set speed
-        is held, never restored on a guess (EXIT_LOST_MAX). The driver decides too: his gas, a signal to the other side,
+      - Missed (past the split the shapes say "highway", or shorter with the model path agreeing, or the road match on
+        the highway with GPS trusted HWY_MATCH_STAY): the plan ends and the speed comes back at once (SET+ holds). With
+        no answer at all (a GPS pause) the set speed is held, never restored on a guess (EXIT_LOST_MAX: then back with
+        taps when matched to a highway). The driver decides too: his gas, a signal to the other side,
         or a lane change away near the split end the exit slowing at once; a last-minute dive into the ramp is still
         confirmed.
       - "Exit curve - brake" (chime_count): before the split, in an exit lane, when even the above cannot reach the
@@ -113,7 +117,7 @@ EXIT_STAY_TIME = 1.0            # s of the shapes saying "highway" past the exit
 EXIT_STAY_MARGIN = 90.0         # m
 EXIT_PASS_MARGIN = 250.0        # m
 # ... and then (no fast restore: it may be the ramp) the set speed is held until the shapes or the road match tell, at most
-# EXIT_LOST_MAX past the exit point; then it becomes his speed (nothing restored)
+# EXIT_LOST_MAX past the exit point; then his speed comes back (taps) when matched to a highway, else it becomes his speed
 EXIT_LOST_MAX = 800.0           # m
 # The road match on a link with GPS trust below TRUST_LOW: this long confirms the ramp (review: LINK_HOLD's 0.5 s took a
 # 34 m wrong match), LINK_SETTLE for the car to be on it for sure (drive 53: the matches held 10+ s on both ramps)
@@ -150,6 +154,11 @@ CHIME_CONFIRM = 4.0             # s at the split speed
 CHIME_AHEAD = 12.0              # s before the split (at least CHIME_AHEAD_MIN): the chime before the split comes from here
 CHIME_AHEAD_MIN = 250.0         # m
 DECIDE_NEAR = 300.0             # m before the exit point: his gas / a lane change away there is his decision
+# Final review of 7d155ce18 (owner's safety priority): the camera's edge lane is also the ordinary right through lane, so
+# on the camera alone the slowdown before the split (the setting's split speed, the short ramp's) starts only DECIDE_NEAR
+# before it, and no deeper than SPLIT_DECEL takes the speed from there (cam_floor); only his signal toward the exit starts
+# it earlier and deeper (s1_bstay.py: with the camera from 2 km, 47 mph at the split from his 75 / 80 while he stayed on,
+# the slowdown from 1.2-1.7 km before, 27-66 s more than 20 mph under his speed)
 # Owner (after the drive 53 replay of dff3e3310: E1 49 mph into the 32 mph curve, E2 44 into 31): the ramp slowdown starts
 # at the split, not at the shape confirmation (4.8 s later on drive 53), when there was exit lane evidence (his signal
 # toward the exit, the camera's edge lane) DECIDE_NEAR before it. Until confirmed it is tentative, and its cost when he
@@ -167,6 +176,12 @@ TENT_LINK = 0.5                 # s of "link" without a gap (the shapes or the m
 TENT_MAX_QUIET = 6.0            # s
 QUIET_FROM = 10.0               # m past the split (at the split itself the shapes may still say "highway")
 TENT_DECEL = 0.45               # m/s^2: the most it gives (the chime)
+# ... and whatever carries it on (final review: shapes saying "link" 34 m, nothing 6 m, over and over, ratcheted it down
+# 23 mph under his speed while he stayed on): it stops slowing TENT_HARD_MAX after the split, or once the speed is
+# TENT_DIP_MAX under the speed at the split (drive 53's replay, the shapes alone: the confirmation 7.8 s after E1's split,
+# the speed 6.3 mph down by then; 6.2 s / 4.3 mph at E2; a cap on the set speed instead cost E1 4 mph at its curve)
+TENT_HARD_MAX = 9.0             # s
+TENT_DIP_MAX = 8 * MPH          # m/s
 # ... and what it gave on drive 53's replay (the taps follow the speed down, the gap 3-5 mph), with the confirmation it
 # waits for (drive 53's GPS through the planner, the shapes alone with SHAPE_LINK_GAP and EXIT_CONFIRM_SHAPE_ONLY: 7.3-7.6 s
 # past E1's exit point, 5.7-6.2 s past E2's, the GPS fix's age included; the model path's agreement would shorten it, not
@@ -185,9 +200,14 @@ SHORT_PLAN_DECEL = 0.8          # m/s^2
 LIMIT_STEADY = 3.0              # s
 LIMIT_NEAR = 1000.0             # m before the split: no first limit, none lower than the highway's (a ramp's)
 RESTORE_PULSE = 1.0             # s the fast restore is asked for after a plan ends by his decision or a missed exit
+# The road match on a highway with GPS trusted this long past the split, EXIT_STAY_MARGIN or more past it and the shapes' last
+# answer not "link", is staying on (final review: with no shape answer the speed was held and then adopted 20-50 mph low);
+# so is, after a confirmation, the model path saying "highway" EXIT_STAY_TIME with the shapes' last answer not "link"
+HWY_MATCH_STAY = 2.0            # s
+TRUST_PAUSED = 3                # mapGpsTrust 3 / 4: paused (no match to go by)
 
 # ---- the camera's view of our lane (LaneView) ----
-# modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the left, MODEL_LEFT) and
+# modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
 # road edges 0 / 1 (left, right). In the lane next to the right edge: no usable lane line to our right (laneLineProbs[3])
 # and the right road edge close to our right lane line (a lane is ~3.6 m; a shoulder adds up to ~3 m). Mirrored for left.
 # Not verified on a drive: the qlogs have no lane lines (the exit log, MapExitLog, records them for the next drive).
@@ -201,9 +221,10 @@ LANE_OFF_TIME = 2.0             # s of "not" before it no longer counts (a gore,
 LANE_DROPOUT = 3.0              # s with no model lines: the last state is kept that long
 LANE_JUMP = 2.0                 # m: both our lines jumping this much between two model frames is a lane change
 LANE_HALF = 1.8                 # m: half a lane, from the car to its lane line
-# The model's y is positive to the left (x forward, y left, z up: its yaw rate is the curvature, left positive; the
-# stopped car code reads the path the same way). LaneView takes the side from our own two lines when it sees them.
-MODEL_LEFT = 1.0
+# The model's y is positive to the RIGHT (final review: selfdrive/controls/lib/ldw.py, the left line close when its y >
+# -1.08; radard.py matches a radar point's yRel to -lead.y; the device frame is x forward, y right, z down). LaneView still
+# takes the side from our own two lines when it sees them (-1: y positive right), MODEL_LEFT until then.
+MODEL_LEFT = -1.0
 
 
 class LaneView:
@@ -220,7 +241,7 @@ class LaneView:
     self.prev = None                      # (left line y, right line y) last frame both were seen
     self.change = 0                       # the lane change seen on the last update: -1 left, 1 right
     self.gaps = (0.0, 0.0)                # m to the left / right edge from our lines (logs)
-    self.left = MODEL_LEFT                # +1: the model's y is positive to the left
+    self.left = MODEL_LEFT                # -1: the model's y is positive to the right (+1: to the left)
     self.probs = (0.0, 0.0, 0.0, 0.0)
 
   def update(self, dt, valid, probs=None, lines_y=None, edges_y=None, edge_stds=None):
@@ -426,12 +447,15 @@ class ExitPlan:
     self.evidence = False         # exit lane evidence (signal toward it, the camera's edge lane) DECIDE_NEAR before it
     self.tentative = False        # the ramp slowdown started at the split, not confirmed yet
     self.tent_s = 0.0             # s of it
+    self.tent_v0 = None           # m/s: the speed when it began (TENT_DIP_MAX)
+    self.cam_floor = None         # m/s: on the camera alone, the lowest speed before the split (SPLIT_DECEL from DECIDE_NEAR)
     self.v_cap = 0.0              # m/s: the car was slower than the split speed when it began: the speed is kept at this
     self.hold = None              # m/s: the command held from the split to the confirmation
     self.link_s = self.hwy_s = 0.0  # s of the shapes saying link (consecutive) / highway
     self.last_shape = 0           # the shapes' last answer (0 none yet)
     self.answered = False         # the shapes answered (either way) past the split (QUIET_FROM)
-    self.match_s = 0.0            # s matched to a link road with GPS trusted
+    self.match_s = 0.0            # s matched to a link road (or the planner's ramp) with GPS trusted
+    self.hwy_match_s = 0.0        # s matched to a highway with GPS trusted past the split
     self.model_link_s = self.model_hwy_s = 0.0  # s of the model path saying link / highway (consecutive)
     self.model_seen = False       # the model path gave an answer
     self.settled = False          # on the ramp for sure (LINK_SETTLE): a confirmation is no longer overturned
@@ -617,7 +641,7 @@ class MapCurveControl:
     back at once."""
     self._end(why, restore=True)
 
-  def _exit(self, f, driver_speed, v_ego, on_link, ramp_held, signal, gas):
+  def _exit(self, f, driver_speed, v_ego, on_link, signal, gas):
     """The plan's command: (speed, plan, curve speed, why, follower or None, firm). NO_CURVE when it asks for nothing."""
     p = self._nav_plan(f, on_link, signal)
     none = (NO_CURVE, NO_CURVE, NO_CURVE, "", None, False)
@@ -645,13 +669,19 @@ class MapCurveControl:
     stayed = p.hwy_s >= EXIT_STAY_TIME - 1e-6 or (p.hwy_s >= MODEL_STAY_SHAPES - 1e-6 and p.model_hwy_s >= MODEL_STAY_SHAPES - 1e-6)
     shapes_link = (p.link_s >= EXIT_CONFIRM_TIME - 1e-6 and p.model_link_s >= MODEL_CONFIRM - 1e-6) if mv is not None else \
       p.link_s >= EXIT_CONFIRM_SHAPE_ONLY - 1e-6
-    # the road match on the link with GPS trusted (review: a 34 m wrong match confirmed after LINK_HOLD): LINK_CONFIRM
-    p.match_s = p.match_s + DT_CTRL if (on_link and f.gps_trust < TRUST_LOW) else 0.0
-    ramp = f.on_ramp and ramp_held
-    link_match = p.match_s >= LINK_CONFIRM - 1e-6 or ramp
+    # the road match on the link with GPS trusted (review: a 34 m wrong match confirmed after LINK_HOLD): LINK_CONFIRM;
+    # the planner's ramp (mapOnRamp: the match on a ramp's chain, trust not low) counts the same, no sooner (final review:
+    # its RAMP_HOLD confirmed and settled a 34 m wrong match with trust 0 at once, 78 -> 32 on the highway)
+    p.match_s = p.match_s + DT_CTRL if ((on_link or f.on_ramp) and f.gps_trust < TRUST_LOW) else 0.0
+    link_match = p.match_s >= LINK_CONFIRM - 1e-6
     # on the ramp for sure: matched to it, trusted, long enough; until then a confirmation can still be overturned
-    if ramp or p.match_s >= LINK_SETTLE - 1e-6:
+    if p.match_s >= LINK_SETTLE - 1e-6:
       p.settled = True
+    # matched to the highway, trusted, past the split; with the shapes' last answer not "link": staying on (HWY_MATCH_STAY)
+    hwy_match = f.road_class in HIGHWAY_CLASSES and not on_link and not f.on_ramp and f.gps_trust < TRUST_LOW
+    p.hwy_match_s = p.hwy_match_s + DT_CTRL if (hwy_match and rem < 0) else 0.0
+    not_link = p.last_shape != 2
+    stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
         self._end("an earlier exit")              # on a link well before this exit: its own ramp rules
@@ -665,9 +695,13 @@ class MapCurveControl:
           self._chime("confirmed, too little room")
     near = rem <= DECIDE_NEAR
     if p.confirmed and not p.settled:
-      # (review: after the confirmation nothing ended a false one) the shapes saying "highway", his gas, the other signal
-      # or a lane change away still end it until the car is on the ramp for sure
-      why = ("still on the highway" if stayed else
+      # (review: after the confirmation nothing ended a false one) until the car is on the ramp for sure: positive highway
+      # evidence (the shapes, the trusted match or the model path saying "highway"); his gas, the other signal or a lane
+      # change away only while the shapes' last answer is not "link" (final review: on the real ramp a gas tap, a fork's
+      # keep-left signal or a lane change on a 2-lane ramp restored the speed: E1 35-49 mph into its 32 mph curve)
+      model_hwy = not_link and p.model_hwy_s >= EXIT_STAY_TIME - 1e-6
+      why = ("still on the highway" if (stayed or model_hwy) else
+             "" if not not_link else
              "gas" if gas else
              "the other signal" if (signal and side and signal == -side) else
              "lane change away" if (side and self.lane.change == -side) else "")
@@ -676,20 +710,25 @@ class MapCurveControl:
         return none
     if p.confirmed:
       return self._ramp_command(f, p, driver_speed, v_ego, on_link)
-    # his decision: the other signal, a lane change away from the exit side near it, his gas while we slow for it
+    # his decision: the other signal, a lane change away from the exit side near it, his gas while we slow for it; past
+    # the split only while the shapes' last answer is not "link" (final review: on the real ramp before the confirmation a
+    # gas tap or a fork's keep-left signal took the tentative slowdown back, E2 44-46 mph into its 31 mph curve)
+    decide = (near or p.slowing) if rem > 0 else not_link
     if signal:
       if side and signal == side and rem > 0:
         p.signalled, p.declined = True, False      # (a new signal toward it takes a decision back)
       elif side and signal == -side:
         p.signalled = False                        # (review: one the other way far out kept the old signal)
-        if near or p.slowing or rem <= 0:
+        if decide:
           p.declined = True
           self._end_slowing(p, restore=True)
       # (the exit's side unknown: a signal says nothing; the camera neither)
-    if side and self.lane.change == -side and (near or rem <= 0) and not p.declined:
-      p.declined = True
-      self._end_slowing(p, restore=True)
-    if gas and (near or p.slowing or rem <= 0) and not p.declined:
+    if side and self.lane.change == -side:
+      p.signalled = False                          # (final review: out of the exit lane, his old signal no longer counts)
+      if decide and not p.declined:
+        p.declined = True                          # (while slowing: at any distance)
+        self._end_slowing(p, restore=True)
+    if gas and decide and not p.declined:
       p.declined = True
       self._end_slowing(p, restore=True)
     # missed: past the exit point the shapes say "highway" (fast restore); with no shape answer (an older planner, a GPS
@@ -698,17 +737,26 @@ class MapCurveControl:
     if rem < 0 and stayed:
       self._end("missed", restore=True)
       return none
-    if rem < -EXIT_PASS_MARGIN or (not p.seen_shape and f.road_class in HIGHWAY_CLASSES and f.gps_trust < TRUST_LOW and
-                                   rem < -EXIT_STAY_MARGIN):
+    if rem < -EXIT_PASS_MARGIN:
       if rem < -EXIT_LOST_MAX or p.last_cmd is None or p.declined:
-        self._end("not confirmed", adopt=p.last_cmd is not None and not p.declined)
+        # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS not paused): his speed back
+        # (the usual taps, no fast restore); else the held set speed becomes his
+        on_hwy = f.road_class in HIGHWAY_CLASSES and not on_link and not f.on_ramp and f.gps_trust < TRUST_PAUSED
+        self._end("not confirmed, on the highway" if on_hwy else "not confirmed",
+                  adopt=p.last_cmd is not None and not p.declined and not on_hwy)
         return none
       return p.last_cmd, p.last_cmd, p.last_cmd, "exit lost", None, False
     if p.declined:
       return none
-    in_lane = p.signalled or (side != 0 and self.lane.edge[side])
+    cam = side != 0 and self.lane.edge[side]
+    in_lane = p.signalled or cam
     if in_lane and 0 < rem <= DECIDE_NEAR:
       p.evidence = True
+    # on the camera alone (no signal toward it): nothing before DECIDE_NEAR, and no lower than SPLIT_DECEL takes the
+    # speed from where it first counts (cam_floor)
+    cam_only = cam and not p.signalled
+    if cam_only and 0 < rem <= DECIDE_NEAR and p.cam_floor is None:
+      p.cam_floor = self._gentle(v_ego, rem)
     vs = self.split_speed(p)
     # slower than the split speed near it: kept from speeding up into the exit, never more than SPLIT_CAP_FLOOR under the
     # split speed (review: behind a truck at 45 until 290 m before, he stays on: 30 mph under the traffic), and only with
@@ -725,12 +773,18 @@ class MapCurveControl:
       v_short = short_split_speed(at - p.exit_at, v_c, base)
       if v_short < base - 0.05:
         vs = v_short
+    if cam_only and vs > 0:
+      vs = max(vs, p.cam_floor) if p.cam_floor is not None else 0.0
     if rem > 0:
-      if in_lane and not p.chimed and p.curve[0] > 0 and rem <= max(CHIME_AHEAD * v_ego, CHIME_AHEAD_MIN):
+      # (on the camera alone from DECIDE_NEAR, as its slowdown: his signal may still come and allow a deeper one)
+      if in_lane and not p.chimed and p.curve[0] > 0 and rem <= max(CHIME_AHEAD * v_ego, CHIME_AHEAD_MIN) and not (
+          cam_only and p.cam_floor is None):
         # the speed at the split: the chosen one (slowed to it, or the cruise may still speed up to it; no lower than the
         # cruise can take it there, SPLIT_MAX_DECEL after its dead time), else the current one
         v_at = min(vs, driver_speed) if vs > 0 else v_ego
         v_at = max(v_at, (max(v_ego * v_ego - 2 * SPLIT_MAX_DECEL * max(rem - v_ego * CHIME_DEAD, 0.0), 0.0)) ** 0.5)
+        if cam_only:
+          v_at = max(v_at, p.cam_floor)
         r, at, adv = p.curve
         if exit_room_needed(v_at, map_curve_target(r, self.lat_accel, adv), decel=CHIME_MAX, lead=0.0) > at - p.exit_at:
           p.chimed = True
@@ -759,11 +813,16 @@ class MapCurveControl:
     if p.evidence:
       p.tentative = True
       p.tent_s += DT_CTRL
+      if p.tent_v0 is None:
+        p.tent_v0 = v_ego
       cmd, sp, v_c, why, fol, _ = self._ramp_command(f, p, driver_speed, v_ego, on_link)
       if cmd < NO_CURVE:
-        # (no shape answer at all since QUIET_FROM past the split: an answer either way is followed as such)
-        quiet = p.tent_s <= TENT_MAX_QUIET and not p.answered and p.model_hwy_s <= 0.0
-        if p.tent_s <= TENT_MAX or quiet or p.link_s >= TENT_LINK - 1e-6 or p.model_link_s >= TENT_LINK - 1e-6:
+        # (no shape answer at all since QUIET_FROM past the split: an answer either way is followed as such); carried on
+        # past TENT_MAX only while the model path does not say "highway", never past TENT_HARD_MAX nor TENT_DIP_MAX
+        model_ok = p.model_hwy_s <= 0.0
+        quiet = p.tent_s <= TENT_MAX_QUIET and not p.answered and model_ok
+        more = model_ok and (p.link_s >= TENT_LINK - 1e-6 or p.model_link_s >= TENT_LINK - 1e-6)
+        if (p.tent_s <= TENT_MAX or quiet or more) and p.tent_s <= TENT_HARD_MAX and v_ego > p.tent_v0 - TENT_DIP_MAX:
           cmd = max(cmd, v_ego - TENT_GAP)
           if p.hold is not None and p.slowing and p.tent_s <= TENT_MAX:
             cmd = min(cmd, p.hold)
@@ -775,6 +834,11 @@ class MapCurveControl:
     if p.hold is not None and p.slowing:
       return self._cmd(p, p.hold, p.hold, p.hold, "exit hold", None)
     return none
+
+  @staticmethod
+  def _gentle(v, rem):
+    """m/s: the speed SPLIT_DECEL takes v to in rem m (after the cruise's ~1.5 s, as the split plan has it)."""
+    return max(v * v - 2 * SPLIT_DECEL * max(rem - v * 1.5, 0.0), 0.0) ** 0.5
 
   def _cmd(self, p, cmd, plan, v_c, why, fol, firm=False):
     p.last_cmd = cmd
@@ -879,7 +943,7 @@ class MapCurveControl:
       self.road_follower.reset()
       low = NO_CURVE
     self._highway_limit(f, on_link)
-    cmd, nplan, ncurve, nwhy, nfol, nfirm = self._exit(f, driver_speed, v_ego, on_link, ramp_held, int(signal), gas)
+    cmd, nplan, ncurve, nwhy, nfol, nfirm = self._exit(f, driver_speed, v_ego, on_link, int(signal), gas)
     na = cmd < NO_CURVE
     if na and cmd < speed:
       speed, why = cmd, nwhy

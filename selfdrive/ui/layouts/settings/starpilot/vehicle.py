@@ -511,7 +511,7 @@ class VehicleSettingsManagerView(PanelManagerView):
                                                          tr_noop("Off")), 0)
     tiles.append({
       "title": tr("Exit Speed at Split"),
-      "subtitle": tr("With navigation: slow gently to this speed at the exit's split (exit lane only; lower on a short ramp)."),
+      "subtitle": tr("With navigation, in the exit lane: slow toward this speed at the split (lower on a short ramp; no signal: last 300 m)."),
       "get_value": get_value,
       "on_click": on_click,
     })
