@@ -634,3 +634,60 @@ def test_radar_cruise_following_a_slower_car_down_is_not_warned():
     return run(seq)
   assert approach(radar=True) == []
   assert [k for _, k, _ in approach(radar=False)] == [sw.STOPPED_LEAD]
+
+
+def _car_ahead(v_mph, d, lead_mph, brake=False, a_ego=-0.3):
+  return _own(sw.StopWarningInputs(cruise_enabled=True, v_ego=v_mph * MPH, a_ego=a_ego, brake_pressed=brake, standstill=False,
+                                   lead_status=True, lead_d=d, lead_v=lead_mph * MPH, lead_prob=0.98, lead_y=0.3))
+
+
+def _fired(seq):
+  logic = sw.StopWarningLogic()
+  out = []
+  for k, i in enumerate(seq):
+    out += [(round(k * sw.DT, 2), det.moving) for det, _ in logic.update(i, BOTH_ON)]
+  return out
+
+
+def test_a_moving_car_warning_never_holds_back_a_stopped_car_warning():
+  # review sw2: a moving car warning (drive 52-like: 8 mph at 35 m, we at 28), the driver's short brake, then a stopped
+  # car at 30 m at 24 mph: the shared gate's MIN_GAP held STOPPED CAR to 10.45 s (19 m); now 0.5 s after it is there
+  seq = (repeat(_car_ahead(28, 35.0, 8), 1.0) + repeat(_car_ahead(24, 30.0, 3, brake=True), 4.0) +
+         [_car_ahead(24, 30.0 - k * sw.DT * 2, 0, a_ego=-0.2) for k in range(int(9.0 / sw.DT))])
+  out = _fired(seq)
+  assert out[0] == (round(sw.LEAD_DEBOUNCE - sw.DT, 2), True), out
+  assert len(out) == 2 and not out[1][1] and out[1][0] <= 5.0 + sw.LEAD_DEBOUNCE + 1e-6, out
+  # the same event, no gap: the car ahead stops while we close in: STOPPED CAR 0.5 s after it stopped (the shared latch
+  # never gave it), as without the moving car rule
+  out = _fired(repeat(_car_ahead(28, 35.0, 8), 2.0) + repeat(_car_ahead(28, 30.0, 0), 2.0))
+  assert [m for _, m in out] == [True, False] and out[1][0] <= 2.0 + sw.LEAD_DEBOUNCE + 1e-6, out
+  # ... but vLead noise around 2 m/s after the moving car warning does not chime again
+  out = _fired(repeat(_car_ahead(28, 35.0, 8), 2.0) +
+               [_car_ahead(28, 30.0, 4.3 if k % 2 else 4.6) for k in range(int(2.0 / sw.DT))])
+  assert [m for _, m in out] == [True], out
+  # and a stopped car warning first still keeps the moving car rule quiet for the event and MIN_GAP
+  out = _fired(repeat(_car_ahead(28, 30.0, 0), 2.0) + repeat(_car_ahead(28, 35.0, 8), 2.0))
+  assert [m for _, m in out] == [False], out
+
+
+def test_events_stopped_lead_alert_callback():
+  # selfdrived builds the alert by calling it with 7 positional args; the text follows radarState's lead speed
+  import types
+  import pytest
+  try:
+    from openpilot.selfdrive.selfdrived import events
+  except Exception as e:                                          # (needs the device's native modules, or their stubs)
+    pytest.skip(f"events.py not importable here: {e}")
+  NS = types.SimpleNamespace
+  texts = {}
+  for v in (0.0, sw.LEAD_STOPPED_SPEED, sw.LEAD_STOPPED_SPEED + 0.1, 8.0):
+    sm = {"radarState": NS(leadOne=NS(vLead=v))}
+    a = events.stopped_lead_alert(None, None, sm, False, 0, None, NS())
+    texts[v] = a.alert_text_1
+    assert a.alert_text_2 == "Cruise may not stop for this" and a.duration > 0
+  assert texts[0.0] == texts[sw.LEAD_STOPPED_SPEED] == sw.STOPPED_LEAD_TEXT
+  assert texts[sw.LEAD_STOPPED_SPEED + 0.1] == texts[8.0] == sw.SLOW_LEAD_TEXT
+  # radarState missing: the stopped car text, never an exception in selfdrived
+  assert events.stopped_lead_alert(None, None, {}, False, 0, None, NS()).alert_text_1 == sw.STOPPED_LEAD_TEXT
+  # and it is the event's alert
+  assert events.STARPILOT_EVENTS[events.StarPilotEventName.stoppedLeadWarning][events.ET.PERMANENT] is events.stopped_lead_alert

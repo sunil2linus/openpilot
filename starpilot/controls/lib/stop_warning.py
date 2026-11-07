@@ -80,7 +80,11 @@ OWN_LEAD_MIN_PROB = 0.6
 # already slowing nearly that hard (aEgo filtered above -(required - SLOW_LEAD_DECEL_MARGIN): the radar cruise tracking
 # that car brakes for it itself, the driver too). The rest is the stopped car's rule: in our lane, LEAD_MIN_PROB
 # (OWN_LEAD_MIN_PROB and no time to collision rule while own_stop()), LEAD_MIN_SPEED, LEAD_MAX_TTC, LEAD_DEBOUNCE, and
-# the same event and gate (one warning per event, MIN_GAP); the alert says "CAR AHEAD - BRAKE" (lead_warning_text).
+# the same event (one warning per event, MIN_GAP); the alert says "CAR AHEAD - BRAKE" (lead_warning_text). The stopped
+# car warning keeps its own gate and is never held back by a moving car warning (review sw2: a moving car warning at
+# 0.45 s, the driver's short brake, then a stopped car: the shared 10 s MIN_GAP held STOPPED CAR to 10.45 s, 19 m,
+# instead of 5.5 s): stopped cars still fire on their own debounce, latch and MIN_GAP; a moving car's warning needs
+# neither kind fired for this event and MIN_GAP since the last of either (StopWarningLogic._lead_gates).
 SLOW_LEAD_ENABLED = True
 SLOW_LEAD_CLOSING = 4.0         # m/s
 SLOW_LEAD_DECEL = 1.1           # m/s^2
@@ -177,7 +181,8 @@ class _Gate:
     self.latched = False
     self.last_fire = -10_000
 
-  def update(self, condition, frame):
+  def count(self, condition):
+    """This frame's debounce / re-arm bookkeeping; True while the condition has held long enough."""
     if condition:
       self.true_frames += 1
       self.false_frames = 0
@@ -187,10 +192,18 @@ class _Gate:
         self.true_frames = 0
       if self.false_frames >= _frames(REARM_TIME):
         self.latched = False
-    if (condition and not self.latched and self.true_frames >= self.debounce_frames and
-        frame - self.last_fire >= _frames(MIN_GAP)):
-      self.latched = True
-      self.last_fire = frame
+    return condition and self.true_frames >= self.debounce_frames
+
+  def ready(self, frame):
+    return not self.latched and frame - self.last_fire >= _frames(MIN_GAP)
+
+  def fire(self, frame):
+    self.latched = True
+    self.last_fire = frame
+
+  def update(self, condition, frame):
+    if self.count(condition) and self.ready(frame):
+      self.fire(frame)
       return True
     return False
 
@@ -214,7 +227,9 @@ def lead_is_relevant(lead_status, lead_d, lead_v, lead_a, standstill, v_ego, mod
 class StopWarningLogic:
   def __init__(self):
     self.frame = 0
+    # STOPPED_LEAD's gate sees stopped cars only (as before SLOW_LEAD_*); lead_gate any car of the rule, moving or not
     self.gates = {STOP_AHEAD: _Gate(STOP_DEBOUNCE, STOP_DROPOUT), STOPPED_LEAD: _Gate(LEAD_DEBOUNCE)}
+    self.lead_gate = _Gate(LEAD_DEBOUNCE)
     self.a_filtered = None
     self.since_lane_change = _frames(LANE_CHANGE_HOLD)
 
@@ -291,6 +306,25 @@ class StopWarningLogic:
   def _not_slowing_for(self, required):
     return self.a_filtered is None or self.a_filtered > -(required - SLOW_LEAD_DECEL_MARGIN)
 
+  def _lead_gates(self, det):
+    """Whether this frame's STOPPED_LEAD detection fires. A stopped car: its own gate (stopped cars only: debounce,
+    latch, MIN_GAP), or, the first warning of an event, the debounce over any car of the rule (vLead noise around
+    LEAD_STOPPED_SPEED does not restart it). A moving car (SLOW_LEAD_*): the debounce over any car of the rule, nothing
+    fired for this event and MIN_GAP since the last warning of either kind. So a moving car's warning never holds a
+    stopped car's back."""
+    stopped_gate, lead_gate = self.gates[STOPPED_LEAD], self.lead_gate
+    stopped = det is not None and not det.moving
+    any_ok = lead_gate.count(det is not None)
+    stopped_ok = stopped_gate.count(stopped)
+    if stopped and stopped_gate.ready(self.frame) and (stopped_ok or (any_ok and not lead_gate.latched)):
+      stopped_gate.fire(self.frame)
+      lead_gate.fire(self.frame)
+      return True
+    if det is not None and det.moving and any_ok and lead_gate.ready(self.frame):
+      lead_gate.fire(self.frame)
+      return True
+    return False
+
   # ---- diagnostics for the per-event logs (what blocked a candidate) ----
   def common_blockers(self, i, mode):
     out = []
@@ -354,7 +388,7 @@ class StopWarningLogic:
     if i.v_ego < LEAD_MIN_SPEED:
       out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {LEAD_MIN_SPEED / MS_PER_MPH:.0f} mph")
     if not out:
-      gate = self.gates[STOPPED_LEAD]
+      gate = self.lead_gate if (i.lead_status and i.lead_v > LEAD_STOPPED_SPEED) else self.gates[STOPPED_LEAD]
       out.append("debounce" if gate.true_frames < gate.debounce_frames else "latched or min gap")
     return out
 
@@ -368,7 +402,8 @@ class StopWarningLogic:
     for kind, detect in ((STOP_AHEAD, self.stop_ahead), (STOPPED_LEAD, self.stopped_lead)):
       mode = modes.get(kind, OFF)
       det = detect(i) if (active and mode != OFF) else None
-      if self.gates[kind].update(det is not None, self.frame) and det is not None:
+      fire = self._lead_gates(det) if kind == STOPPED_LEAD else self.gates[kind].update(det is not None, self.frame)
+      if fire and det is not None:
         det.lead_status, det.lead_d, det.lead_y, det.lead_relevant = i.lead_status, i.lead_d, i.lead_y, i.lead_relevant
         if kind == STOP_AHEAD:
           det.lead_speed, det.lead_prob = i.lead_v, i.lead_prob
