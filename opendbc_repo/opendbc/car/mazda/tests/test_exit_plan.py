@@ -326,7 +326,8 @@ def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, 
                             csc_active=active, csc_speed=min(speed, 100.0), other_button_active=False, driver_button=None,
                             curve_floor=floor, curve_budget=budget, curve_track=track, curve_raise=raise_ok,
                             curve_no_accel=mix.no_accel, curve_hold=mix.firm, fast_restore=mo.fast_restore,
-                            btn_counter=(f // 10) % 16)    # the wheel's 10 Hz frames (holds are phase locked to them)
+                            btn_counter=(f // 10) % 16,    # the wheel's 10 Hz frames (holds are phase locked to them)
+                            street_lower=bool(mo.street and track and abs(speed - mo.speed) < 1e-3))
     if mo.adopt and logic.offset > 0:
       logic._forget()             # (as the wrapper does: the set speed becomes his)
     btn, _ = logic.update(inp)
@@ -1399,8 +1400,11 @@ def test_drive_55_exit_2_no_curve_exit_holds_on_the_ramp_then_the_streets_limit_
   assert _plus(r, exit_x - 300, street_x) == [], _plus(r, exit_x - 300, street_x)
   assert max(s for s, xx in zip(r["sets"], r["xs"], strict=True) if exit_x <= xx < street_x) <= 70 + 1e-6
   assert r["ctl"].last_plan is not None and r["ctl"].last_plan.why in ("on the ramp, no curve", "on a street")
-  # the street (45): the exit's last target 45 + 5 (the setting's default) by our SET- taps, then his speed
-  assert _minus(r, street_x, street_x + 400) and all(p[3] == "tap" for p in _minus(r, street_x, street_x + 400))
+  # the street (45): the exit's last target 45 + 5 (the setting's default), then his speed; held down while the set
+  # speed is 10 mph or more above max(target, his speed + 5) (second review), never below his speed + 5, then taps
+  ms = _minus(r, street_x, street_x + 400)
+  assert ms and all(p[3] in ("tap", "hold") for p in ms), ms
+  assert any(p[3] == "hold" for p in ms) and all(p[4] >= max(50, p[5] + 5) - 1 for p in ms if p[3] == "hold"), ms
   assert abs(r["sets"][-1] - 50) < 1e-6 and r["logic"].anchor is None, (r["sets"][-1], r["logic"].anchor)
   # the map without the street's limit: STREET_FALLBACK (43 mph, no offset)
   fields, exit_x, street_x, signal, lead = _no_curve_exit(street_mph=0.0)
@@ -1414,7 +1418,8 @@ def test_drive_55_exit_2_no_curve_exit_holds_on_the_ramp_then_the_streets_limit_
 
 def test_exit_street_target_res_gas_and_metric():
   """The exit's street target directly (MapCurveControl): his RES within EXIT_STREET_TIME brings back the highway's 75
-  (drive 55, t 581: on a 45 street) -> 50; his gas ends it (what it reached is his); metric."""
+  (drive 55, t 581: on a 45 street) -> 50; his gas at the launch does not end it (second review: only his SET or
+  cruise off do); metric."""
   def street_run(c, frames, set_v, driver, v=10.0, gas=lambda k: False, limit=45 * MPH, metric_unit=MPH, res=False):
     outs = []
     for k in range(frames):
@@ -1438,11 +1443,19 @@ def test_exit_street_target_res_gas_and_metric():
   outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH)        # RES at 75
   assert outs[0].active and abs(outs[0].speed - 50 * MPH) < 1e-6 and outs[0].why == "exit street"
   assert abs(set_v - 50 * MPH) < 1e-6 and any(o.adopt for o in outs)
-  # his gas while it lowers: it ends there, adopted
+  # his gas while it lowers (drive 55, 608-611: pulling away from the light): it goes on to 50, adopted there
   c = CTL.MapCurveControl(3.0)
   exited(c)
   outs, set_v = street_run(c, 1500, 75 * MPH, 75 * MPH, gas=lambda k: k >= 150)
-  assert set_v > 60 * MPH and any(o.adopt for o in outs) and not outs[-1].active
+  assert abs(set_v - 50 * MPH) < 1e-6 and any(o.adopt for o in outs) and not outs[-1].active
+  # his SET- while it lowers: his, ended there and adopted
+  c = CTL.MapCurveControl(3.0)
+  exited(c)
+  for k in range(200):
+    o = c.update(F(road_class=7, limit=45 * MPH), 75 * MPH, 0, v_ego=10.0, set_speed=75 * MPH, driver_set=k == 100)
+    if k == 100:
+      assert o.adopt and not o.active, (o.why, o.active)
+  assert not c.xs_on
   # RES later than EXIT_STREET_TIME: still (review of merge-f: the window never ends before the exit's street speed
   # was applied, so his highway speed is never left the target on the street)
   c = CTL.MapCurveControl(3.0)

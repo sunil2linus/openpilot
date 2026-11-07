@@ -261,6 +261,9 @@ class SlowdownInputs:
   # (with curve_track) the followed curve is firm (map_curve_control.MapOutput.firm): a SET- hold may take the set speed
   # down to its command (CURVE_HOLD_*)
   curve_hold: bool = False
+  # (with curve_track) the governing target is the street speed (map_curve_control MapOutput.street: the exit's street,
+  # speed_limit_follow rules 8 / 9): presses from KEEP_SPEED, not START_SPEED (his RES at a red light: second review)
+  street_lower: bool = False
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
@@ -989,7 +992,9 @@ class CurveSlowdownLogic:
       self.restore_pending = False
     if not self.restore_pending:
       self.restore_in_curve = False
-    speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED)
+    speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED) or (
+      i.street_lower and i.csc_active and i.curve_track and not i.stop_active and not i.hold_restore and
+      i.v_ego >= KEEP_SPEED)
     self.standstill_frames = self.standstill_frames + 1 if i.standstill else 0
     # At a standstill only the restore after stopping behind the car is sent (SET+ there only raises the set
     # speed; the MRCC keeps holding behind the car ahead), once we have been stopped STANDSTILL_RESTORE_DELAY.
@@ -1617,6 +1622,7 @@ class CurveSlowdown:
     # Map curves (Test: computed and logged only; On: combined with the camera curve target)
     curve_floor, curve_budget, fast_restore, curve_track, curve_raise = 0.0, 0, False, False, False
     curve_hold = False
+    curve_street = False                   # the street speed governs (MapOutput.street): presses from KEEP_SPEED
     curve_no_accel = False                 # only on a link, which only the map knows (CurveMix.no_accel, CURVE_NO_ACCEL)
     self.map_out = None
     if self.map_control is not None and plan_alive:
@@ -1627,7 +1633,10 @@ class CurveSlowdown:
                                                   max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed),
                                                   set_speed=set_speed if (cruise_enabled and set_speed > 0) else None,
                                                   driver_set=bool(CS.crz_set_minus or CS.crz_set_plus),
-                                                  limit_lower=self._limit_lower())
+                                                  limit_lower=self._limit_lower(plan),
+                                                  limit_lower_gas=bool(self.limit_follow is not None and
+                                                                       self.limit_follow.lower is not None and
+                                                                       self.limit_follow.lower.kind == "lower"))
       if self.map_control.lower_event is not None:
         # the street speed (speed_limit_follow rules 8 / 9) carried out or ended by him: the follower knows
         if self.limit_follow is not None:
@@ -1643,6 +1652,7 @@ class CurveSlowdown:
           curve_active, curve_speed, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step, MIN_SET_SPEED))
         curve_no_accel = self.curve_mix.no_accel
         curve_hold = self.curve_mix.firm
+        curve_street = bool(mo.street and curve_track and abs(curve_speed - mo.speed) < 1e-3)
         fast_restore = mo.fast_restore
       if mo.chime:
         # "Exit curve - brake" (On only: Test logs it); the planner raises the alert from starpilotCarState
@@ -1681,9 +1691,13 @@ class CurveSlowdown:
                        nav_limit=float(getattr(plan, "mapNavSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
                        nav_dist=float(getattr(plan, "mapNavManeuverDistance", 0.0) or 0.0) if plan_alive else 0.0,
                        nav_turn=bool(plan_alive and getattr(plan, "mapNavManeuverTurn", False)),
-                       turned=self._heading_turned(CS, CP, v_ego))
+                       turned=self._heading_turned(CS, CP, v_ego),
+                       pending=bool(cruise_enabled and lg.anchor is not None and set_speed < lg.anchor - lg.half_step))
+      # rules 8 / 9 only act with Speed Limit Follow and Map Curves both On (second review: Map Curves in Test left the
+      # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
+      self.limit_follow.street_active = self._street_active(plan)
       self.limit_want = self.limit_follow.update(li)
-      if self.limit_mode != LIMIT_ON and self.limit_follow.lower is not None:
+      if not self.limit_follow.street_active and self.limit_follow.lower is not None:
         self.limit_follow.lower_finished("test: logged only")      # (Test: nothing carried out)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
@@ -1706,6 +1720,7 @@ class CurveSlowdown:
       curve_raise=curve_raise,
       curve_no_accel=curve_no_accel,
       curve_hold=curve_hold,
+      street_lower=curve_street,
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -2008,8 +2023,8 @@ class CurveSlowdown:
 
   # ---- map curve logs ----
   def _heading_turned(self, CS, CP, v_ego):
-    """speed_limit_follow rule 7: the car's heading changed TURN_HEADING within TURN_HEADING_TIME (its yaw from the
-    speed and the steering angle: v tan(angle / steer ratio) / wheelbase)."""
+    """speed_limit_follow rule 7: the car's heading changed TURN_HEADING within TURN_HEADING_TIME and _DIST (its yaw
+    from the speed and the steering angle: v tan(angle / steer ratio) / wheelbase)."""
     import math
     from opendbc.car.mazda.speed_limit_follow import HeadingWatch
     if getattr(self, "heading", None) is None:
@@ -2018,13 +2033,19 @@ class CurveSlowdown:
     wheelbase = float(getattr(CP, "wheelbase", 0.0) or 2.7)
     angle = float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0)
     rate = max(v_ego, 0.0) * math.tan(math.radians(angle) / ratio) / wheelbase
-    self.heading.update(DT_CTRL, math.degrees(rate))
+    self.heading.update(DT_CTRL, math.degrees(rate), v_ego)
     return self.heading.turned()
 
-  def _limit_lower(self):
-    """m/s: speed_limit_follow's street speed for the map control to carry out (On only), 0 none."""
+  def _street_active(self, plan):
+    """speed_limit_follow rules 8 / 9 act (Speed Limit Follow and Map Curves On, the planner's map curves On)."""
     from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
-    if self.limit_follow is None or self.limit_mode != LIMIT_ON:
+    from opendbc.car.mazda.map_curve_control import ON as MAP_ON
+    return (self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.map_control is not None and
+            self.map_mode == MAP_ON and int(getattr(plan, "mapCurveMode", 0) or 0) == MAP_ON)
+
+  def _limit_lower(self, plan):
+    """m/s: speed_limit_follow's street speed for the map control to carry out (_street_active only), 0 none."""
+    if not self._street_active(plan):
       return 0.0
     return self.limit_follow.lower_speed
 

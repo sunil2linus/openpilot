@@ -48,7 +48,8 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    (a wrong first one) is rule 4's undo, down to the lower limit (never below his speed before our raise).
 
 7. After a turn onto another road (mapdOut's road name changes and stays TURN_NAME_STEADY, the car's heading changed
-   TURN_HEADING within TURN_HEADING_TIME (HeadingWatch), not on a highway or a link):
+   TURN_HEADING within TURN_HEADING_TIME and TURN_HEADING_DIST (HeadingWatch) at some time since the new name appeared,
+   not on a highway or a link):
    the new road's first steady limit is handled as rule 6's: a restore never goes back above it (any band), and below it
    (with no SET press of his since the turn, cruise on since it appeared, GPS trust 0, at most LIMIT_FIRST_MAX above his
    speed) it becomes his speed. Never a SET- (it never slows him early); open TURN_TIME. The same limit as the old road's
@@ -58,13 +59,17 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    cruise to come to a stop at a red signal, if I set the cruise we should either reduce or increase the speed to the
    road's speed limit"): cruise turned on (SET or RES) on a street, the road class steady ENGAGE_ROAD_STEADY with GPS
    trust 0: the steady limit plus the Street Speed offset becomes his speed (up: an offer the controller raises to, down:
-   `lower`, the map control's paced slowdown, then his). No limit known: only down, to STREET_FALLBACK. His SET within
-   ENGAGE_WINDOW first: his. This also covers his RES after an exit (map_curve_control's street rule while cruise is on).
+   `lower`, the map control's paced slowdown, then his; his gas does not end it). No map limit: navigation's alone (up
+   to NAV_ALONE_MAX) only down, to it plus the offset; nothing known: only down, to STREET_FALLBACK, and only from at
+   most FALLBACK_MAX_SPEED. His SET within ENGAGE_WINDOW first: his. This also covers his RES after an exit
+   (map_curve_control's street rule while cruise is on). Rules 8 and 9 act only with Map Curves On (street_active).
+   No target under STREET_FLOOR (the controller's 25 mph curve floor: a 20 mph / 30 km/h zone ends at 25 / 41).
 9. Slow for a lower limit (setting MazdaSlowLowerLimit, default on): on a street a lower limit steady LOWER_STEADY
    (LOWER_BIG_STEADY for a drop of more than LOWER_BIG_DROP) with GPS trust 0 on every frame, the road name unchanged
    since it appeared (or a turn onto a new road), his speed above it plus the offset: `lower` (the map control's paced
    slowdown, ~0.5 m/s^2 at most, then his speed). His gas held or his SET buttons end it (his speed what it reached); the
-   limit back up within LOWER_UNDO_TIME: his speed before it comes back (an "unlower" offer).
+   limit back up within LOWER_UNDO_TIME: his speed before it comes back (an "unlower" offer; a pending restore's anchor
+   only up to the new limit plus the offset). Once per steady limit (a later drop to it again slows again).
    Navigation's limit (LimitInputs.nav_limit, Mapbox; under NAV_LIMIT_MIN junk) is a second opinion: the two agree
    (NAV_AGREE): LOWER_NAV_STEADY / LOWER_NAV_BIG_STEADY; they disagree: never past either one (the engage match only
    into [lower, higher] + offset, the slowdown only down to the higher one + offset). A lower limit that appears with
@@ -245,13 +250,24 @@ NAV_AGREE = (1, 2)           # mph / km/h
 # t 552-622), which as a "disagreeing" opinion kept his RES at 75 there. On a street a navigation limit above this is
 # a highway's: no limit.
 NAV_STREET_MAX = (55, 90)    # mph / km/h
+# ... but with no map limit at all, navigation's up to this counts as the limit (second review: a 65 road with no map
+# limit, SET at 70 -> the 43 fallback): it may cap him at it plus the offset, never raise him on it alone
+NAV_ALONE_MAX = (70, 112)    # mph / km/h
+# Rule 8's fallback only below this (second review: no speed guard; map_curve_control.EXIT_STREET_MAX_V-like)
+FALLBACK_MAX_SPEED = (50, 80)  # mph / km/h
+# The lowest street speed: the controller never takes a curve target under 25 mph (curve_slowdown.MIN_SET_SPEED); a
+# 20 mph / 30 km/h zone ends here (second review: a lower target never finished)
+STREET_FLOOR = (25, 41)      # mph / km/h (41: 25 mph rounded up)
 NAV_TURN_NEAR = 80.0         # m: navigation's next turn this close when a lower limit appears: the cross road's
 NAV_STRAIGHT = 300.0         # m: navigation's next maneuver farther: we go straight through this junction
 TURN_NAME_STEADY_STRAIGHT = 5.0  # s a road name change must last then
 # (review of merge-f: road names change along the same road, and the highway's name became the street's after the exit)
 # a name change is a turn (rule 7) only with the car's heading changed this much within this long
-TURN_HEADING = 30.0          # deg
+# (second review: 30 deg in 10 s is a 380 m radius sweep at 45 mph) 45 deg within 10 s and 150 m (a 190 m radius
+# sweep at most); drive 55's Mound Road right turn: ~90 deg in ~40 m
+TURN_HEADING = 45.0          # deg
 TURN_HEADING_TIME = 10.0     # s
+TURN_HEADING_DIST = 150.0    # m
 NAV_TURN_TYPES = ("turn", "end of road", "roundabout", "rotary", "exit roundabout", "exit rotary")
 
 
@@ -260,24 +276,27 @@ def _frames(seconds):
 
 
 class HeadingWatch:
-  """The car's heading change within the last TURN_HEADING_TIME from its yaw (the wrapper: speed and steering angle):
-  turned() for rule 7 (a turn, not a road name changing along the same road)."""
+  """The car's heading change within the last TURN_HEADING_TIME and TURN_HEADING_DIST from its yaw (the wrapper: speed
+  and steering angle): turned() for rule 7 (a turn, not a road name changing along the same road)."""
   SAMPLE = 0.5                   # s between the kept samples
 
   def __init__(self):
     self.yaw = 0.0                 # deg, integrated
-    self.hist = []                 # (s, yaw) samples
+    self.hist = []                 # (s, m, yaw) samples
     self.t = 0.0
+    self.odo = 0.0                 # m
 
-  def update(self, dt, yaw_rate_deg):
+  def update(self, dt, yaw_rate_deg, v=None):
+    """v: the car's speed (m/s; None: the distance bound off)."""
     self.t += dt
+    self.odo += max(v, 0.0) * dt if v is not None else 0.0
     self.yaw += yaw_rate_deg * dt
     if not self.hist or self.t - self.hist[-1][0] >= self.SAMPLE:
-      self.hist.append((self.t, self.yaw))
-      self.hist = [h for h in self.hist if self.t - h[0] <= TURN_HEADING_TIME]
+      self.hist.append((self.t, self.odo, self.yaw))
+    self.hist = [h for h in self.hist if self.t - h[0] <= TURN_HEADING_TIME and self.odo - h[1] <= TURN_HEADING_DIST]
 
   def turned(self):
-    return any(abs(self.yaw - y) >= TURN_HEADING for _, y in self.hist)
+    return any(abs(self.yaw - y) >= TURN_HEADING for _, _, y in self.hist)
 
 
 @dataclass
@@ -298,6 +317,9 @@ class LimitInputs:
   nav_dist: float = 0.0     # m to navigation's next maneuver (0 none)
   nav_turn: bool = False    # that maneuver is a turn
   turned: bool = False      # the car's heading changed TURN_HEADING within TURN_HEADING_TIME (the wrapper: the yaw)
+  # a restore of the controller's is pending (the set speed under its anchor): driver_speed is not the set speed he
+  # chose (rule 9's undo never brings such a speed back above the limit)
+  pending: bool = False
 
 
 @dataclass
@@ -316,6 +338,7 @@ class Offer:
   # his speed is above the new limit)
   band: bool = True
   tgt: object = None        # steps: the driver's speed it asks for (the limit plus the Street Speed offset), None: new
+  own: bool = True          # rule 9: `driver` was his own set speed (False: a pending restore's, not his choice)
 
   @property
   def target(self):
@@ -330,6 +353,8 @@ class SpeedLimitFollower:
     self.fallback = STREET_FALLBACK[m]
     self.big_drop = LOWER_BIG_DROP[m]
     self.nav_min, self.nav_agree, self.nav_street_max = NAV_LIMIT_MIN[m], NAV_AGREE[m], NAV_STREET_MAX[m]
+    self.nav_alone_max, self.fallback_max, self.street_floor = NAV_ALONE_MAX[m], FALLBACK_MAX_SPEED[m], STREET_FLOOR[m]
+    self.street_active = True      # rules 8 / 9 act (the wrapper: Speed Limit Follow and Map Curves On)
     offs = STREET_OFFSETS[1 if is_metric else 0]
     self.street_add = offs[street_mode] if street_mode in range(len(offs)) else offs[STREET_OFFSET_DEFAULT]  # steps
     self.multiple = LIMIT_MULTIPLE_KPH if is_metric else LIMIT_MULTIPLE_MPH
@@ -388,6 +413,7 @@ class SpeedLimitFollower:
     self.cand_name = ""            # the road name when the candidate limit first appeared ...
     self.cand_turn = False         # ... and navigation's turn was within NAV_TURN_NEAR then
     self.turn_frame = -1_000_000   # rule 7's last turn (the name changed)
+    self.turned_frame = -1_000_000  # the last frame the heading watch said "turned"
     self.nav = None                # navigation's limit (steps, None: none usable) this frame
     self.stable_before = None      # the steady limit before the current one
 
@@ -442,6 +468,8 @@ class SpeedLimitFollower:
     if i.driver_set:
       self.driver_set_frame = self.frame
     self._road(i)
+    if i.turned:
+      self.turned_frame = self.frame
     self._turn(i)
     c = self.cap
     if c is not None and d is not None:
@@ -559,9 +587,12 @@ class SpeedLimitFollower:
     if self.name_frames < _frames(TURN_NAME_STEADY_STRAIGHT if straight else TURN_NAME_STEADY):
       return                         # (navigation says straight on through here: a short name change is a flap)
     old, self.name, self.name_cand = self.name, n, ""
-    if old and i.turned:
+    # the heading turned at any time since the new name appeared (mapd's name comes seconds after the turn: drive 55,
+    # Mound Road, 45 deg at 624.8, the name steady at 635.6 with the 10 s window just past)
+    turned = self.frame - self.turned_frame < self.name_frames      # (name_frames counts its first frame)
+    if old and turned:
       self.turn_frame = self.frame
-    if old and i.turned and self._street() and (self.exit_start is None or self.exit_kind == "turn"):
+    if old and turned and self._street() and (self.exit_start is None or self.exit_kind == "turn"):
       self.exit_start = self.frame - self.name_frames - _frames(TURN_EARLY)
       self.exit_street, self.exit_kind, self.exit_retry, self.turn_check = self.frame, "turn", None, True
       if self.rise is not None and self.rise[0] == "exit":
@@ -581,7 +612,8 @@ class SpeedLimitFollower:
     if i.nav_limit <= 0:
       return None
     x = self._steps(i.nav_limit)
-    if self._street() and x > self.nav_street_max + 0.5:
+    top = self.nav_street_max if i.limit >= 1.0 else self.nav_alone_max
+    if self._street() and x > top + 0.5:
       return None                      # (its route step's highway limit on a street: drive 55, Dobry Drive)
     return int(round(x)) if x >= self.nav_min - 0.5 else None
 
@@ -607,6 +639,9 @@ class SpeedLimitFollower:
       elif lw.kind == "lower" and reported != lw.new and reported is not None and reported > lw.new:
         self.lower = None              # the limit back up before he got there: his speed (the anchor) comes back
         self._log("speedLimitSlow", "undo: the limit back up before it got there", reported, lw.driver, d)
+      return
+    if not self.street_active:
+      self.engage_frame = None
       return
     if self.engage_frame is not None:
       self._engage(i, d, reported)
@@ -642,18 +677,24 @@ class SpeedLimitFollower:
         self.engage_frame = None
         return
     elif reported is None and self.unknown_frames >= steady:
-      # no limit known: only down, to the fallback (navigation's alone: down to it plus the offset, never under 43 ... the
-      # higher of the two)
+      # no map limit: navigation's alone (up to NAV_ALONE_MAX) only caps him at it plus the offset; nothing at all: only
+      # down, to the fallback, and only from a street's speed (FALLBACK_MAX_SPEED)
       tgt, limit = self.fallback, None
       sources = "none: fallback"
       if nav is not None:
-        tgt, limit, sources = max(nav + self._add(), self.fallback), nav, "nav only"
+        tgt, limit, sources = nav + self._add(), nav, "nav only"
+      elif d > self.fallback_max + 0.5:
+        self.engage_frame = None
+        return
       if d <= tgt + 0.5:
         self.engage_frame = None
         return
     else:
       return                           # (a limit not steady yet, or not with trust 0: wait for it)
     self.engage_frame = None
+    tgt = max(tgt, self.street_floor)
+    if abs(tgt - d) < 0.5:
+      return
     if tgt > d:
       self.offer = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt)
     else:
@@ -680,11 +721,12 @@ class SpeedLimitFollower:
     limit, sources = c, ("map+nav" if agree else "map")
     if nav is not None and not agree:
       limit, sources = max(nav, c), f"map {c}, nav {nav}: the higher"
-    tgt = limit + self._add()
-    self.lower_skip = c                # (once for this limit)
+    tgt = max(limit + self._add(), self.street_floor)
+    self.lower_skip = c                # (once for this limit: until the steady limit changes)
     if d <= tgt + 0.5:
       return
     self.lower = Offer(old, limit, i.source or "Map Data", self.frame, "lower", d, tgt=tgt)
+    self.lower.own = not i.pending     # (his own speed, not a pending restore's: the undo may bring it back as it was)
     self.cap = None
     self._log("speedLimitSlow", f"start: {old} -> {c}", limit, tgt, d, sources)
 
@@ -696,7 +738,7 @@ class SpeedLimitFollower:
       return
     self.lower = None
     if why == "done" and lw.kind == "lower":
-      self.lowered = Offer(lw.old, lw.new, lw.source, self.frame, "lower", lw.driver, tgt=lw.tgt)
+      self.lowered = Offer(lw.old, lw.new, lw.source, self.frame, "lower", lw.driver, tgt=lw.tgt, own=lw.own)
     self._log("speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch", why, lw.new, lw.target,
               d_now if d_now is not None else lw.driver)
 
@@ -801,14 +843,21 @@ class SpeedLimitFollower:
 
   def _new_limit(self, i, d):
     new, start = self.candidate, self.frame - self.candidate_frames    # start: the new limit's first frame
+    if new != self.lower_skip:
+      self.lower_skip = None           # (second review: never cleared, a later lower limit in the drive was ignored)
     lw = self.lowered
     if (lw is not None and self.frame - lw.frame <= _frames(LOWER_UNDO_TIME) and new > lw.new and d is not None and
         abs(d - lw.target) < 0.5 and self.driver_set_frame < lw.frame):
       # rule 9's undo: the limit back up soon after it slowed him (a wrong lower limit): his speed before comes back
       self.lowered = None
       self.stable, self.stable_last_seen = new, self.frame
-      self.offer, self.cap, self.rise = Offer(lw.new, new, i.source, self.frame, "unlower", d, tgt=lw.driver), None, None
-      self._log("speedLimitSlow", "undo: the limit back up", new, lw.driver, d)
+      # (second review: a pending restore's 70 / 75 came back on the street) his own speed as it was; a pending
+      # restore's at most the new limit plus the offset
+      back = lw.driver if lw.own else min(lw.driver, max(new + self._add(), self.street_floor))
+      if back > d + 0.5:
+        self.offer = Offer(lw.new, new, i.source, self.frame, "unlower", d, tgt=back)
+      self.cap, self.rise = None, None
+      self._log("speedLimitSlow", "undo: the limit back up", new, back, d)
       return
     old, old_seen = self.stable, self.stable_last_seen
     self.stable_before = self.stable

@@ -1192,10 +1192,11 @@ def test_a_short_lower_limit_while_restoring_only_pauses_it():
 
 # ---------------- Street Speed (MazdaStreetSpeedOffset), rule 7 (after a turn), owner after drives 54 / 55 ----------------
 
-def _lis(limit_mph, driver_mph=45.0, road_class=5, name="A Road", trust=0, cruise=True, source="Map Data", turned=False):
+def _lis(limit_mph, driver_mph=45.0, road_class=5, name="A Road", trust=0, cruise=True, source="Map Data", turned=False,
+         pending=False):
   return slf.LimitInputs(limit=limit_mph * MPH, source=source, gps_trust=trust,
                          driver_speed=driver_mph * MPH if cruise else 0.0, cruise_enabled=cruise, road_class=road_class,
-                         road_name=name, turned=turned)
+                         road_name=name, turned=turned, pending=pending)
 
 
 def _on_street(mode=2, limit=45, driver=50, road_class=5, name="A Road"):
@@ -1303,6 +1304,39 @@ def test_rule_7_needs_a_heading_change_and_the_trust_retry_raises():
   for k in range(400):
     h.update(0.01, 3.0 if k < 200 else -3.0)
   assert not h.turned()
+  # (second review) 45 deg within 10 s and 150 m: a 90 deg right turn at 6 m/s (drive 55, Mound Road) is one; 40 deg is
+  # not; 50 deg swept over 10 s at 20 m/s (200 m, a gentle curve) is not; the same 50 deg within 100 m is
+  for rate, v, n, want in ((30.0, 6.0, 300, True), (8.0, 6.0, 500, False), (5.0, 20.0, 1000, False),
+                           (10.0, 20.0, 500, True)):
+    h = slf.HeadingWatch()
+    for _ in range(n):
+      h.update(0.01, rate, v)
+    assert h.turned() is want, (rate, v, n)
+  assert slf.TURN_HEADING == 45.0 and slf.TURN_HEADING_DIST == 150.0
+  # mapd's new name comes seconds after the turn (drive 55, Mound Road: the name steady 0.2 s after the heading's 10 s
+  # window ended): a turn if the heading said so at any time since the new name appeared
+  f = _on_street(2, 45, 75)
+  for k in range(RAISE + 600):
+    f.update(_lis(50, 75, name="B Road", turned=k < 50))
+  assert f.exit_kind == "turn" and f.cap is not None and abs(f.cap_speed / MPH - 55) < 1e-6
+  # ... not if it said so only before the new name appeared (a curve on the old road)
+  f = _on_street(2, 45, 75)
+  _run(f, 100, 45, 75, turned=True)
+  _run(f, RAISE + 600, 50, 75, name="B Road", turned=False)
+  assert f.exit_kind != "turn" and f.cap is None
+
+
+def test_review2_rule_9_undo_brings_back_his_own_speed_not_a_pending_restores():
+  # a 45 street, the controller's anchor 70 (his highway speed, a restore pending: the set under it), the limit 35:
+  # slowed to 40; the limit back to 45 soon after (a wrong lower limit): back to at most 45 + 5 (was: 70 on the street)
+  for pending, back in ((True, 50), (False, 70)):
+    f = _on_street(2, 45, 70)
+    f.slow_lower = True
+    _run(f, int(slf.LOWER_STEADY / slf.DT_CTRL) + 50, 35, 70, pending=pending)
+    assert f.lower is not None and f.lower.target == 40 and f.lower.own is (not pending), f.events
+    f.lower_finished("done", 40)
+    _run(f, RAISE + 50, 45, 40)
+    assert f.offer is not None and f.offer.kind == "unlower" and f.offer.target == back, (pending, f.offer, f.events)
 
 
 def test_rule_7_a_first_known_limit_on_the_new_road_raises_him_never_slows_him():

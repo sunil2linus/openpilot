@@ -18,11 +18,13 @@ DT = CTL.DT_CTRL
 
 def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda f: "A Road", trust=lambda f: 0,
                nav=lambda f: (0.0, 0.0, False), cruise=lambda f: True, vcap=lambda f: None, gas=lambda f: None,
-               driver=None, slow_lower=True, street_mode=2, metric=False, settled=True, max_drop=10, follower=True):
+               driver=None, slow_lower=True, street_mode=2, metric=False, settled=True, max_drop=10, follower=True,
+               street_active=True):
   """limit(f) mph (0 none, km/h when metric), road(f) class, name(f) mapd's road name, nav(f) (its limit, m to its next
   maneuver, a turn), cruise(f) on, vcap(f) the car ahead (m/s or None), gas(f) his foot (m/s he takes the car to, or
   None), driver(f) his button (SET_MINUS / SET_PLUS / None). settled: the follower has seen the road (cruise on) 20 s
-  before frame 0 (no fresh engage)."""
+  before frame 0 (no fresh engage). street_active: Map Curves On with Speed Limit Follow On (False: Map Curves Test,
+  the wrapper's _street_active)."""
   step = KPH if metric else MPH
   car = T.Car(set_mph * step / MPH, dash_offset_mph=0.0, lag=10, accel=0.6, step=step, **TM.MEASURED_CRUISE)
   car.set_speed, car.v_ego = set_mph * step, (v_mph if v_mph is not None else set_mph) * step
@@ -37,7 +39,8 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
     lim = limit(fr)
     return slf.LimitInputs(lim * step if lim else 0.0, "Map Data" if lim else "None", trust(fr), drv, on,
                            road_class=road(fr), road_name=name(fr), v_ego=car.v_ego, nav_limit=nl[0] * step,
-                           nav_dist=nl[1], nav_turn=nl[2], driver_set=car.driver_button_now() is not None)
+                           nav_dist=nl[1], nav_turn=nl[2], driver_set=car.driver_button_now() is not None,
+                           pending=bool(on and logic.anchor is not None and car.set_speed < logic.anchor - logic.half_step))
   if settled:
     for _ in range(2000):
       f_.update(li(0, True, car.set_speed, nav(0)))
@@ -49,14 +52,18 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
       car.driver_button, car.driver_button_until = b, car.frame + 10
       car.set_speed += step if b == cs.SET_PLUS else -step
     drv = (logic.anchor if logic.anchor is not None else car.set_speed) if on else 0.0
+    f_.street_active = street_active
     want = f_.update(li(fr, on, drv, nav(fr))) if follower else 0.0
+    if follower and not street_active and f_.lower is not None:
+      f_.lower_finished("test: logged only")
     lim = limit(fr)
     fld = F(road_class=road(fr), limit=lim * step if lim else 0.0, gps_trust=trust(fr))
     driver_speed = car.set_speed + logic.offset * logic.step if on else 0.0
     foot = gas(fr)
     mo = ctl.update(fld, driver_speed, 0, v_ego=car.v_ego, max_drop=md, gas=foot is not None,
                     set_speed=car.set_speed if on else None, driver_set=car.driver_button_now() is not None,
-                    limit_lower=f_.lower_speed if follower else 0.0)
+                    limit_lower=f_.lower_speed if follower and street_active else 0.0,
+                    limit_lower_gas=bool(follower and f_.lower is not None and f_.lower.kind == "lower"))
     if ctl.lower_event is not None:
       f_.lower_finished(ctl.lower_event, car.set_speed / step if on else None)
       ctl.lower_event = None
@@ -72,7 +79,8 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
                             curve_track=track, curve_raise=raise_ok, curve_no_accel=mix.no_accel, curve_hold=mix.firm,
                             fast_restore=mo.fast_restore, btn_counter=(fr // 10) % 16, limit_raise=want,
                             limit_cap=f_.cap_speed if follower else 0.0, limit_undo=f_.undo_speed if follower else 0.0,
-                            limit_ceiling=f_.ceiling_speed if follower else 0.0)
+                            limit_ceiling=f_.ceiling_speed if follower else 0.0,
+                            street_lower=bool(mo.street and track and abs(speed - mo.speed) < 1e-3))
     btn, _ = logic.update(inp)
     if logic.limit_adopted is not None:
       f_.mark_adopted()
@@ -126,11 +134,16 @@ def _engage(**kw):
 # ---------------- rule 8: match on engage ----------------
 
 def test_engage_on_a_known_street_matches_its_limit_up_and_down():
-  # RES after a stop at a red light on a 45 street (drive 55, t 581: his highway 75 came back): down to 50 (+5) by taps
-  # once moving, then his speed
+  # RES after a stop at a red light on a 45 street (drive 55, t 581: his highway 75 came back): down to 50 (+5) once
+  # moving, from the controller's KEEP_SPEED (12 mph; was: 25): a SET- hold while the set speed is 10+ mph above
+  # max(50, his speed + 5), never under that, then taps; then his speed
   r = street_sim(4000, lambda f: 45, 75, v_mph=0, vcap=lambda f: 0.0 if f < 700 else None, **_engage())
   assert abs(r["sets"][-1] - 50) < 1e-6 and r["logic"].anchor is None, (r["sets"][-1], _reasons(r))
-  assert _minus(r, ENGAGE) and not _minus(r, 0, 700) and r["holds"] == [], r["presses"][:5]     # (none at a standstill)
+  assert _minus(r, ENGAGE) and not _minus(r, 0, 700), r["presses"][:5]                      # (none at a standstill)
+  first = _minus(r)[0][0]
+  assert r["vs"][first] >= cs.KEEP_SPEED / MPH - 0.5 and r["vs"][first] < 20, r["vs"][first]   # (was: 25 mph)
+  assert r["holds"] and all(r["sets"][k] >= max(50, r["vs"][k] + 5) - 1 for k in r["holds"]), r["holds"]
+  assert min(r["sets"][first:]) >= 50 - 1e-6 and r["adopted"] and len(r["adopted"]) <= 2, r["adopted"]
   assert any("start: cruise on, down" in x for x in _reasons(r)) and "done" in _reasons(r)
   # SET at 30 on the 45 street: up to 50 (the controller's raise: taps / a hold)
   r = street_sim(4000, lambda f: 45, 30, **_engage())
@@ -141,13 +154,23 @@ def test_engage_on_a_known_street_matches_its_limit_up_and_down():
 
 
 def test_engage_with_no_limit_known_only_down_to_43():
-  r = street_sim(4000, lambda f: 0, 60, **_engage())
+  r = street_sim(4000, lambda f: 0, 50, **_engage())
   assert abs(r["sets"][-1] - 43) < 1e-6 and r["logic"].anchor is None, r["sets"][-1]
   r = street_sim(3000, lambda f: 0, 38, **_engage())
   assert r["presses"] == [] and abs(r["sets"][-1] - 38) < 1e-6                       # never raised to 43
-  # metric: 70 km/h
-  r = street_sim(4000, lambda f: 0, 100, metric=True, **_engage())
+  # (second review) above 50 mph: not a street's speed, no fallback (a 65 road with no limit in the map)
+  r = street_sim(3000, lambda f: 0, 70, v_mph=70, **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 70) < 1e-6
+  # ... navigation's 65 alone there: its 65 + 5, never under it, never up on it alone
+  r = street_sim(3000, lambda f: 0, 75, v_mph=70, nav=lambda f: (65.0, 2000.0, False), **_engage())
+  assert abs(r["sets"][-1] - 70) < 1e-6 and _plus(r) == [], (r["sets"][-1], _reasons(r))
+  r = street_sim(3000, lambda f: 0, 60, nav=lambda f: (65.0, 2000.0, False), **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 60) < 1e-6
+  # metric: 70 km/h (from 75; above 80 km/h nothing)
+  r = street_sim(4000, lambda f: 0, 78, metric=True, **_engage())
   assert abs(r["sets"][-1] - 70) < 1e-6, r["sets"][-1]
+  r = street_sim(3000, lambda f: 0, 100, metric=True, **_engage())
+  assert r["presses"] == [], r["presses"][:3]
 
 
 def test_engage_his_set_after_it_wins_and_a_highway_or_unknown_road_is_unchanged():
@@ -346,3 +369,82 @@ def test_review_a_one_frame_limit_dropout_is_not_the_fallback_and_trust_1_is_no_
   outs = [c.update(F(road_class=7, limit=45 * MPH, gps_trust=1), 75 * MPH, 0, v_ego=12.0, set_speed=75 * MPH)
           for _ in range(800)]
   assert not any(o.active for o in outs) and c.xs_since is None
+
+
+# ---------------- second review ----------------
+
+def test_review2_a_lower_limit_twice_slows_twice():
+  # 45 -> 35 (slowed to 40), 35 -> 45 (rule 9's undo: his 50 back; his SET+ to 60 after), later 45 -> 35 again:
+  # slowed again (was: the second 35 skipped for the rest of the drive)
+  lim = lambda f: 35 if (1000 <= f < 6000 or f >= 12000) else 45  # noqa: E731
+  drv = lambda f: cs.SET_PLUS if f in range(8000, 11000, 300) else None  # noqa: E731
+  r = street_sim(20000, lim, 50, driver=drv)
+  starts = [x for x in r["logs"] if x[2].startswith("start")]
+  assert len(starts) == 2 and abs(r["sets"][7999] - 50) < 1e-6 and abs(r["sets"][11999] - 60) < 1e-6, starts
+  assert abs(r["sets"][-1] - 40) < 1e-6, r["sets"][-1]
+
+
+def test_review2_a_zone_under_25_mph_ends_at_25():
+  # 45 -> 15 (+5: 20, under the controller's 25 mph MIN_SET_SPEED): to 25, then done, his (was: never finished)
+  r = street_sim(9000, lambda f: 45 if f < 500 else 15, 50)
+  assert abs(r["sets"][-1] - 25) < 1e-6 and "done" in _reasons(r) and r["f"].lower is None and not r["ctl"].ll_on
+  assert r["logic"].anchor is None
+  # a 20 mph zone the same; metric: a 30 km/h zone (+8: 38) ends at 41 (25 mph rounded up)
+  r = street_sim(9000, lambda f: 45 if f < 500 else 20, 50)
+  assert abs(r["sets"][-1] - 25) < 1e-6 and "done" in _reasons(r)
+  r = street_sim(9000, lambda f: 50 if f < 500 else 30, 58, metric=True)
+  assert abs(r["sets"][-1] - 41) < 1e-6 and "done" in _reasons(r), r["sets"][-1]
+  # rule 8 too: RES on a 15 street at 40: down to 25
+  r = street_sim(5000, lambda f: 15, 40, **_engage())
+  assert abs(r["sets"][-1] - 25) < 1e-6 and "done" in _reasons(r)
+
+
+def test_review2_his_gas_with_the_set_lowered_by_something_else_is_not_adopted():
+  # the paced lower is on (target 40, his 50); something else (a stop) has the set at 19; his gas 1.5 s: it ends, the
+  # 19 is not made his (only a set speed at the target is)
+  c = CTL.MapCurveControl(3.0)
+  adopt, ev = [], None
+  for k in range(300):
+    o = c.update(F(road_class=7, limit=35 * MPH), 50 * MPH, 0, v_ego=8 * MPH, gas=k >= 50, set_speed=19 * MPH,
+                 limit_lower=40 * MPH)
+    adopt.append(o.adopt)
+    ev = ev or c.lower_event
+  assert ev == "cancel: his gas" and not any(adopt)
+  # rule 8's match: his gas does not end it
+  c = CTL.MapCurveControl(3.0)
+  for k in range(300):
+    c.update(F(road_class=7, limit=35 * MPH), 50 * MPH, 0, v_ego=8 * MPH, gas=k >= 50, set_speed=50 * MPH,
+             limit_lower=40 * MPH, limit_lower_gas=False)
+  assert c.lower_event is None and c.ll_on
+
+
+def test_review2_rule_8_gas_at_the_launch_does_not_end_the_match():
+  # drive 55 (608-611): RES at a red light on the 45 street (his highway 75), then his gas pulling away 3 s: still
+  # down to 50, adopted there (was: his gas ended it at the launch, the 75 left his)
+  r = street_sim(5000, lambda f: 45, 75, v_mph=0, vcap=lambda f: 0.0 if f < 700 else None,
+                 gas=lambda f: (12 + (f - 700) * 0.04) * MPH if 700 <= f < 1000 else None, **_engage())
+  assert "cancel: his gas" not in _reasons(r) and "done" in _reasons(r), _reasons(r)
+  assert abs(r["sets"][-1] - 50) < 1e-6 and r["logic"].anchor is None, r["sets"][-1]
+  assert not any(p[1] == cs.SET_MINUS for p in r["presses"] if p[0] < 1000)     # (nothing pressed on his gas)
+  # rule 9's lower limit: his gas still ends it (the existing case: test_his_gas_or_set_ends_it_...)
+
+
+def test_review2_rule_8_at_highway_speed_on_a_street_match_is_no_fallback():
+  # a street match (class 5, trust 0) at 70 mph with no limit known (a 65 road missing from the map): nothing (was:
+  # lowered to 43)
+  r = street_sim(6000, lambda f: 0, 70, road=lambda f: 5, **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 70) < 1e-6
+  # navigation's 65 (up to 70 with no map limit counts): 75 -> 70, never up
+  r = street_sim(6000, lambda f: 0, 80, v_mph=70, road=lambda f: 5, nav=lambda f: (65.0, 3000.0, False), **_engage())
+  assert abs(r["sets"][-1] - 70) < 1e-6 and _plus(r) == [], r["sets"][-1]
+  # with a map limit, navigation's 65 on a street is a route step's highway limit: not taken (NAV_STREET_MAX)
+  f_ = slf.SpeedLimitFollower(False)
+  assert f_.nav_street_max == 55 and f_.nav_alone_max == 70
+
+
+def test_review2_map_curves_test_never_slows():
+  # Map Curves Test (Speed Limit Follow On): no lower, no alert, no rule 8 press
+  r = street_sim(9000, lambda f: 45 if f < 500 else 25, 50, street_active=False)
+  assert _minus(r) == [] and r["f"].lower is None and abs(r["sets"][-1] - 50) < 1e-6
+  r = street_sim(4000, lambda f: 45, 75, street_active=False, **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 75) < 1e-6

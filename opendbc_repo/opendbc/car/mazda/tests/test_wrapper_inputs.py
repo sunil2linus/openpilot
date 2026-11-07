@@ -247,6 +247,14 @@ def test_wrapper_reads_slow_for_lower_limits_and_raises_its_alert_flag(monkeypat
   assert abs(c.limit_slow_limit - 25 * MPH) < 1e-6
   c.limit_follow.lower.kind = "match"
   assert c.limit_slow_limit == 0.0
+  # (second review) rules 8 / 9 act with Map Curves On only (and the planner's map curves On): Test logs only
+  on, test = SimpleNamespace(mapCurveMode=2), SimpleNamespace(mapCurveMode=1)
+  assert c._street_active(on) and not c._street_active(test) and c._limit_lower(test) == 0.0
+  c.limit_follow.lower.kind = "lower"
+  assert abs(c._limit_lower(on) - 30 * MPH) < 1e-6
+  c_test = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False}), curve_enabled=False, map_mode=1, limit_mode=2)
+  c_test.limit_follow.lower = Offer(45, 25, "Map Data", 0, "lower", 50, tgt=30)
+  assert not c_test._street_active(on) and c_test._limit_lower(on) == 0.0
   # the heading watch for rule 7 (a turn): the steering angle and the speed
   CS = SimpleNamespace(out=SimpleNamespace(steeringAngleDeg=150.0))
   turned = [c._heading_turned(CS, SimpleNamespace(steerRatio=15.5, wheelbase=2.7), 6.0) for _ in range(500)]
