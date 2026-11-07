@@ -53,7 +53,7 @@ def test_wrapper_feeds_the_limit_follower_and_logs_the_adoption(tmp_path, monkey
   c, sm, records = _make(tmp_path, monkeypatch, limit_mode=2)
   _drive(c, 400)
   sm.msgs["starpilotPlan"].slcSpeedLimit = 50 * MPH
-  sent = _drive(c, 400)
+  sent = _drive(c, 600)                                           # (a higher limit: steady 5 s)
   assert c.logic.anchor is not None and abs(c.logic.anchor / MPH - 50) < 1e-6
   assert any(s for s in sent)                                     # the first SET+ went out
   adopt = [d for k, d in records if k == "speedLimitAdopt"]
@@ -62,7 +62,7 @@ def test_wrapper_feeds_the_limit_follower_and_logs_the_adoption(tmp_path, monkey
   c, sm, records = _make(tmp_path, monkeypatch, limit_mode=1)
   _drive(c, 400)
   sm.msgs["starpilotPlan"].slcSpeedLimit = 50 * MPH
-  sent = _drive(c, 400)
+  sent = _drive(c, 600)
   assert c.logic.anchor is None and not any(sent)
   adopt = [d for k, d in records if k == "speedLimitAdopt"]
   assert len(adopt) == 1 and adopt[0]["mode"] == "test"

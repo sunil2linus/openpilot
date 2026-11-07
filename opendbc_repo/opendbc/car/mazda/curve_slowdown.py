@@ -214,6 +214,9 @@ class SlowdownInputs:
   # the posted limit fell to this (m/s) with the driver's speed at the old one (speed_limit_follow.py rule 3): a pending
   # restore stops here, or at the set speed if that is higher (never a SET- for it)
   limit_cap: float = 0.0
+  # the posted limit went back down soon after our raise (speed_limit_follow.py rule 4): undo our raise (m/s: the
+  # driver's speed before it, > 0 while offered)
+  limit_undo: float = 0.0
   # stopped car trigger: released by brake / disengage / lane exit and no slower car is in our lane: the restore may
   # use SET+ holds (stopped_car_slowdown CLEAR_*)
   stop_clear_ahead: bool = False
@@ -307,6 +310,11 @@ class CurveSlowdownLogic:
     self.limit_adopted = None        # (driver's speed before, new limit) on the frame a higher limit was adopted
     self.limit_cap = None            # a lower limit (m/s): no SET+ of ours above it until the driver's speed comes down
     self.limit_capped = None         # (driver's speed before, the cap) on the frame a lower limit capped it
+    # our last raise for a posted limit (speed_limit_follow.py rule 4): {"frame", "before" (m/s), "new", "touched": the
+    # driver changed his speed, braked or cruise was off since}
+    self.limit_raised = None
+    self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
+    self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     # What the car profile (car_profile.py) remembers across drives: every hold whose landing after the release was
     # measured, ours (_finish_hold) and the driver's own (a held SET-/SET+ on the stock switch, watched below, so
     # Test mode learns the car too), is counted here with its quanta after the release.
@@ -362,10 +370,16 @@ class CurveSlowdownLogic:
       return _frames(PENDING_TIMEOUT + LATE_WINDOW)
     return max(_frames(MIN_IN_FLIGHT_WINDOW), int(LATE_FACTOR * latency))
 
+  def _cap(self):
+    """The highest a SET+ of ours may take the set speed while a lower limit's cap (rule 3, or rule 4's) is pending."""
+    caps = [c for c in (self.limit_cap, self.undo_cap) if c is not None]
+    return min(caps) if caps else None
+
   def _forget(self):
     """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
     self.anchor = None
     self.limit_cap = None
+    self.undo_cap = None
     self.restoring = False
     self.no_effect = 0
     self.no_effect_trips = 0
@@ -373,6 +387,7 @@ class CurveSlowdownLogic:
 
   def _disable(self):
     self._forget()
+    self.limit_raised = None
     self.pending = None
     self.hold = None
     self.inflight = []
@@ -709,6 +724,7 @@ class CurveSlowdownLogic:
     self.last_action = None
     self.limit_adopted = None
     self.limit_capped = None
+    self.limit_undone = None
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
     if self.new_wheel:
       self.wheel_frame = self.frame
@@ -750,6 +766,9 @@ class CurveSlowdownLogic:
 
     if cruise_ok:
       self._observe_set_speed(i)
+    # (every driver change of the set speed and every driver SET edge sets `blocked`, which our raise needed clear)
+    if self.limit_raised is not None and (self.blocked or i.brake_pressed or not cruise_ok):
+      self.limit_raised["touched"] = True
 
     # A press that has not shown up yet: count it; it stays in flight for a late arrival.
     if self.pending is not None and not self.pending.hold and self.frame - self.pending.frame > _frames(PENDING_TIMEOUT):
@@ -786,6 +805,23 @@ class CurveSlowdownLogic:
       self.prev_csc_active = i.csc_active
       self.curve_free_frames = 0 if i.csc_active else self.curve_free_frames + 1
       self.reason_free_frames = 0 if (i.csc_active or i.stop_active or i.hold_restore) else self.reason_free_frames + 1
+    # The posted limit back down soon after our raise (speed_limit_follow.py rule 4, review: a raise for a wrong road's
+    # limit, 60 on a 45 road, was never taken back): if the driver has not touched his speed since our raise and no stop
+    # / curve slowdown owns the set speed, his speed goes back to what it was before and the restore below lowers the set
+    # speed back to it (SET- taps, undoing our own presses). Otherwise his old speed only caps a pending restore, as
+    # rule 3 does.
+    if i.limit_undo > 0 and self.limit_raised is not None:
+      raised, self.limit_raised = self.limit_raised, None
+      before = raised["before"]
+      owned = (i.csc_active or i.stop_active or i.hold_restore or self.stop_episode or self.restore_pending or
+               self.lower_presses > 0 or self.stop_presses > 0)
+      if not raised["touched"] and not owned:
+        self.limit_undone = (self.anchor if self.anchor is not None else self.last_set_speed, before, "undo")
+        self.anchor = before
+        self.undo_cap = None
+      elif self.anchor is not None and before < self.anchor - self.half_step:
+        self.limit_undone = (self.anchor, before, "cap")
+        self.undo_cap = before
     # A lower posted limit (speed_limit_follow.py rule 3; drive 52, tag 450: after a stop our restore took the set back
     # up to 50 on a new 45 road). From now on no SET+ of ours above it; once none of our presses can still land (and no
     # curve / stopped car is on: their limits count from the driver's speed) the driver's speed comes down to it, or
@@ -798,13 +834,15 @@ class CurveSlowdownLogic:
         self.limit_capped = (self.anchor, i.limit_cap)
     else:
       self.limit_cap = None
-    if self.limit_cap is not None:
+    if self._cap() is not None:
       if self.anchor is None:
-        self.limit_cap = None
+        self.limit_cap = self.undo_cap = None
       elif (cruise_ok and not self.inflight and self.pending is None and self.hold is None and
             not any(p.direction == SET_PLUS for p in self.expired) and not i.csc_active and not i.stop_active):
-        self.anchor = max(min(self.anchor, self.limit_cap), self.last_set_speed)
-        self.limit_cap = None
+        # a pending restore stops at the cap (or the set speed, if higher); a set speed above the driver's speed (our
+        # own overshoot, a SET- correcting it) keeps the driver's speed: a cap only ever limits SET+
+        self.anchor = min(self.anchor, max(self._cap(), self.last_set_speed))
+        self.limit_cap = self.undo_cap = None
     if self.offset == 0 and not self.inflight:
       self.flicker = False
       self.anchor = None             # back at the driver's speed: nothing left to restore
@@ -906,7 +944,7 @@ class CurveSlowdownLogic:
       # a SET- hold also stops when the target rises above its bound (the radar took over the car ahead)
       target_rose = d == SET_MINUS and reason == "stop" and target > self.hold_bound + self.half_step
       reason_gone = (reason != "stop" or target_rose) if d == SET_MINUS else \
-                    (reason is not None or offset <= 0 or self.limit_cap is not None)
+                    (reason is not None or offset <= 0 or self._cap() is not None)
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
@@ -955,8 +993,9 @@ class CurveSlowdownLogic:
         self.last_set_speed is not None and i.limit_raise > driver_speed + self.half_step and
         self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
+      self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
       self.anchor = i.limit_raise
-      self.limit_cap = None
+      self.limit_cap = self.undo_cap = None
       offset = self.offset
       driver_speed = set_speed + offset * self.step
 
@@ -980,8 +1019,9 @@ class CurveSlowdownLogic:
     # left; and it waits out the curve's 1 s SET- settle like the curve's own restore does.
     up_ok = not i.csc_active or (target is not None and set_speed + self.step <= target + 1e-3)
     # the highest a SET+ of ours may take the set speed: the driver's speed, or a lower limit's cap still pending
-    top = driver_speed if self.limit_cap is None else min(driver_speed, self.limit_cap)
-    if self.limit_cap is not None:
+    ceiling = self._cap()
+    top = driver_speed if ceiling is None else min(driver_speed, ceiling)
+    if ceiling is not None:
       up_ok = up_ok and set_speed + self.step <= top + 1e-3
     if want_lower:
       self.restoring = False
@@ -1062,7 +1102,7 @@ class CurveSlowdownLogic:
             self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
-            (not self.stop_episode or fast_stop or i.fast_restore) and self.limit_cap is None):
+            (not self.stop_episode or fast_stop or i.fast_restore) and self._cap() is None):
         # one rule for every restore hold (RESTORE_HOLD_MIN_GAIN): a stop episode only when its car has clearly
         # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins (and
         # taps while a lower limit's cap is pending: it releases a hold)
@@ -1357,6 +1397,7 @@ class CurveSlowdown:
                        cruise_enabled=cruise_enabled)
       self.limit_want = self.limit_follow.update(li)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
+    limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
 
     inputs = SlowdownInputs(
       enabled=bool(CC.enabled),
@@ -1387,6 +1428,7 @@ class CurveSlowdown:
       stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
+      limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
     if self.limit_follow is not None:
@@ -1553,6 +1595,8 @@ class CurveSlowdown:
           "offer_age_s": round((lf.frame - o.frame) * DT_CTRL, 2) if o else None, "clear_ahead": i.stop_clear_ahead,
           "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
     c = lf.cap
+    if c is not None and c.driver is None:
+      c = None                       # (cruise off when the lower limit came: the follower decides when it is back)
     if c is not None and c is not self.limit_cap_logged:
       # a lower limit (rule 3), its first frame: On, the controller took it if a restore was pending above it; Test: the
       # same check here (the set speed counted with our presses still in flight, which may still land)
@@ -1577,6 +1621,20 @@ class CurveSlowdown:
           lf.events.append(("speedLimitNotFollowed", {"old": c.old, "new": c.new, "source": c.source, "reason": why}))
     if c is not None and (self.limit_mode != 2 or lg.limit_cap is None):
       lf.mark_capped()               # nothing (more) to cap: nothing pending, the restore stopped there, or Test
+    u = lf.undo
+    if u is not None:
+      # rule 4: On, the controller dealt with it this frame (or had nothing of ours to take back); Test: logged only
+      done = lg.limit_undone if self.limit_mode == 2 else None
+      if self.recorder is not None:
+        import time
+        how = (done[2] if done is not None else
+               ("test" if self.limit_mode != 2 else "nothing pending (the driver's own change, a brake or a slowdown)"))
+        self.recorder.record("speedLimitUndo", time.monotonic(), {
+          "mode": "on" if self.limit_mode == 2 else "test", "raised_to_mph": u.old * unit, "back_to_mph": u.new * unit,
+          "source": u.source, "how": how, "driver_mph_before": (done[0] / MS_PER_MPH) if done is not None else None,
+          "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "cruise": i.cruise_enabled,
+          "in_flight": len(lg.inflight), "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
+      lf.mark_undone()
     if lf.events:
       if self.recorder is not None:
         import time
