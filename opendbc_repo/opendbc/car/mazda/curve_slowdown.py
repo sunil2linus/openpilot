@@ -1279,9 +1279,17 @@ class CurveSlowdown:
     self.logic = CurveSlowdownLogic(params.get_bool("IsMetric"), max_drop)
     self.limit_mode = limit_mode
     self.limit_follow = None
+    # Street Speed (MazdaStreetSpeedOffset: legal limit, +3, +5, +8 mph; read at the start of a drive as the others)
+    from opendbc.car.mazda.speed_limit_follow import STREET_OFFSET_DEFAULT
+    try:
+      raw = params.get("MazdaStreetSpeedOffset", encoding="utf8")
+      street_mode = STREET_OFFSET_DEFAULT if raw is None or raw == "" else int(raw)
+    except (TypeError, ValueError, AttributeError):
+      street_mode = STREET_OFFSET_DEFAULT  # (an older params build without the key: the default, +5)
+    self.street_mode = street_mode
     if limit_mode:
       from opendbc.car.mazda.speed_limit_follow import SpeedLimitFollower
-      self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"))
+      self.limit_follow = SpeedLimitFollower(params.get_bool("IsMetric"), street_mode=street_mode)
     self.limit_want = 0.0
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
@@ -1321,7 +1329,7 @@ class CurveSlowdown:
       except (TypeError, ValueError, AttributeError):
         split_mode = 0               # (an older params build without the key: the default, the highway's limit)
       self.map_control = MapCurveControl(self.lat_limit, self.decel_used, split_mode=split_mode,
-                                         metric=bool(params.get_bool("IsMetric")))
+                                         metric=bool(params.get_bool("IsMetric")), street_mode=street_mode)
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
     self.learner = None
@@ -1364,6 +1372,13 @@ class CurveSlowdown:
 
   def _alive(self, service):
     return bool(self.sm.alive[service] and self.sm.recv_frame[service] > 0)
+
+  def _road_name(self):
+    """mapdOut's road name ('' unknown): speed_limit_follow rule 7, a turn onto another road."""
+    try:
+      return str(self.sm['mapdOut'].roadName or "") if self._alive('mapdOut') else ""
+    except (KeyError, AttributeError):
+      return ""
 
   def _next_limit(self, plan, plan_alive):
     """The next posted limit ahead (m/s, 0 none) and the m to it (-1 unknown): mapdOut's, else starpilotPlan's value
@@ -1531,7 +1546,9 @@ class CurveSlowdown:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
       signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
       mo = self.map_out = self.map_control.update(MapFields.from_plan(plan), driver_speed, signal, v_ego=v_ego,
-                                                  max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed))
+                                                  max_drop=lg.max_drop_steps * lg.step, gas=bool(CS.out.gasPressed),
+                                                  set_speed=set_speed if (cruise_enabled and set_speed > 0) else None,
+                                                  driver_set=bool(CS.crz_set_minus or CS.crz_set_plus))
       if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
@@ -1575,7 +1592,7 @@ class CurveSlowdown:
                        ramp_to_highway=bool(plan_alive and getattr(plan, "mapOnRamp", False) and
                                             getattr(plan, "mapRampToHighway", False)),
                        next_limit=next_limit, next_distance=next_dist, v_ego=v_ego,
-                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus))
+                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus), road_name=self._road_name())
       self.limit_want = self.limit_follow.update(li)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
@@ -2076,7 +2093,10 @@ class CurveSlowdown:
           "driver_mph_before": adopted[0] / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "gap_steps": gap_steps,
           "how": "taps" if gap_steps <= lg._quantum_steps() else "hold to 5 below, then taps",
           "offer_age_s": round((lf.frame - o.frame) * DT_CTRL, 2) if o else None, "clear_ahead": i.stop_clear_ahead,
-          "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
+          "stop_episode": lg.stop_episode, "limit_mph": (o.new * unit) if o else None,
+          # (map lag: mapd's next limit and its distance when the offer was made)
+          "next_limit_mph": lf.last_next[0] / MS_PER_MPH, "next_dist_m": round(lf.last_next[1], 1)},
+          min_gap=0.0, signals=False)
     c = lf.cap
     if c is not None and c.driver is None:
       c = None                       # (cruise off when the lower limit came: the follower decides when it is back)

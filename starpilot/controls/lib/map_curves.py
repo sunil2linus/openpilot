@@ -148,6 +148,15 @@ SHAPE_LINK_GAP = 1.0       # deg
 SHAPE_MIN_SPEED = 10.0     # m/s
 SHAPE_RANGE = 40.0         # m
 SHAPE_HEADING = 60.0       # deg: a shape turned more than this from our heading is not the road we are on
+# Past the exit link's start, closer to the link's shape but heading along the highway (drives 54 / 55: a car going on in
+# the right lane is 7-8 m from the highway's center line and 1-6 m from the link's first shape, heading 0.1-0.2 deg off
+# the highway's and ~5 deg off the link's; no answer for 2.5-5.5 s while the tentative slowdown ran): "highway" when the
+# highway's heading is SHAPE_HWY_HEADING_GAP closer, within SHAPE_HWY_HEADING_MAX of ours, and its shape within
+# SHAPE_HWY_NEAR (half a wide carriageway). Taken ramps (drive 53 E2, 26-54 m on: 2.3-2.9 deg closer, the highway's
+# 1.3-1.6 deg off ours; drive 53 E1 and drives 54 / 55's two: 1.5 deg or less) never give it; 2 deg gave E2 1 s of it.
+SHAPE_HWY_HEADING_GAP = 3.5  # deg
+SHAPE_HWY_HEADING_MAX = 1.0  # deg
+SHAPE_HWY_NEAR = 12.0        # m
 WATCH_END = 600.0          # m behind its start (or this much more than navigation's range ahead): forgotten
 WATCH_KEEP = 3             # exits watched at most (a reroute, the next maneuver)
 WATCH_NEAR = 600.0         # m: the shape check is for the watched exit whose start is nearest, within this
@@ -287,9 +296,11 @@ def _walk(segs, bearing, reach):
   return h0, h
 
 
-def shape_verdict(a, b, gap=0.0):
+def shape_verdict(a, b, gap=0.0, b_heading=None):
   """1 when shape a is closer AND heads closer (by `gap` deg at least) to our heading than shape b, -1 when b is closer
-  and heads closer, 0 neither (or unknown)."""
+  and heads closer, 0 neither (or unknown). b_heading (deg, m, deg): also -1 when b heads closer by the first, is within
+  the second and heads within the third of ours, whatever the distances (the exit watch past the link's start:
+  SHAPE_HWY_HEADING_GAP, SHAPE_HWY_NEAR, SHAPE_HWY_HEADING_MAX)."""
   if a is None and b is None:
     return 0
   if b is None:
@@ -299,6 +310,8 @@ def shape_verdict(a, b, gap=0.0):
   if a[0] < b[0] and a[1] + gap <= b[1]:
     return 1
   if b[0] < a[0] and b[1] < a[1]:
+    return -1
+  if b_heading is not None and b[1] + b_heading[0] <= a[1] and b[0] <= b_heading[1] and b[1] <= b_heading[2]:
     return -1
   return 0
 
@@ -1719,15 +1732,17 @@ class MapCurves:
     links = [near[c] for c in chains if c in near]
     link = min(links, key=lambda dh: dh[0]) if links else None
     hwy = near.get("hwy")
-    verdict = shape_verdict(link, hwy, SHAPE_LINK_GAP)
+    # where the map's link starts (the car side's split point: navigation's exit point may be tens of m off it)
+    ok, d_start = ahead(lat, lon, bearing, *w["ramp"]["start"])
+    # (past it, heading along the highway is "highway" even closer to the link's shape: SHAPE_HWY_HEADING_GAP)
+    verdict = shape_verdict(link, hwy, SHAPE_LINK_GAP, None if ok else (SHAPE_HWY_HEADING_GAP, SHAPE_HWY_NEAR,
+                                                                               SHAPE_HWY_HEADING_MAX))
     if v is not None and v < SHAPE_MIN_SPEED:
       verdict = 0
     self.exit_shape = EXIT_SHAPE_LINK if verdict > 0 else (EXIT_SHAPE_HIGHWAY if verdict < 0 else EXIT_SHAPE_NONE)
     self.exit_link = link or (0.0, 0.0)
     self.exit_hwy = hwy or (0.0, 0.0)
     self.exit_bends = road_bends(self.store.grid, lat, lon, bearing, chains)
-    # where the map's link starts (the car side's split point: navigation's exit point may be tens of m off it)
-    ok, d_start = ahead(lat, lon, bearing, *w["ramp"]["start"])
     self.exit_start = (d_start if ok else -d_start) or 0.1
     self._fork_update(w, lat, lon, bearing, dt)
     if w["forks"]:

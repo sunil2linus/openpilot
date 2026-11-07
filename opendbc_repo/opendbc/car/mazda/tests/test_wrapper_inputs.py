@@ -230,6 +230,25 @@ def _lane_model(m, right_edge=True):
   m.roadEdgeStds = [0.3, 0.3]
 
 
+def test_wrapper_reads_the_street_speed_setting_for_the_map_control_and_the_limit_follower(monkeypatch):
+  # MazdaStreetSpeedOffset 0..3: the legal limit, +3, +5 (default; also an unknown or bad value), +8 mph
+  for raw, mph in ((None, 5), ("0", 0), ("1", 3), ("2", 5), ("3", 8), ("x", 5), ("9", 5)):
+    sm = W.FakeSM()
+    monkeypatch.setattr(messaging, "SubMaster", lambda services, sm=sm: sm)
+    CP = SimpleNamespace(flags=MazdaSafetyFlags.GEN1, carFingerprint="MAZDA_CX5", maxLateralAccel=1.09)
+    c = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False, "MazdaStreetSpeedOffset": raw}), curve_enabled=False,
+                         map_mode=2, limit_mode=2)
+    assert abs(c.map_control.street_add - mph * MPH) < 1e-9 and c.limit_follow.street_add == mph, (raw, mph)
+  # metric: 0 / +5 / +8 / +13 km/h
+  for raw, kph in (("0", 0), ("1", 5), ("2", 8), ("3", 13)):
+    sm = W.FakeSM()
+    monkeypatch.setattr(messaging, "SubMaster", lambda services, sm=sm: sm)
+    CP = SimpleNamespace(flags=MazdaSafetyFlags.GEN1, carFingerprint="MAZDA_CX5", maxLateralAccel=1.09)
+    c = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": True, "MazdaStreetSpeedOffset": raw}), curve_enabled=False,
+                         map_mode=2, limit_mode=2)
+    assert abs(c.map_control.street_add - kph / 3.6) < 1e-9 and c.limit_follow.street_add == kph, (raw, kph)
+
+
 def test_wrapper_reads_the_exit_setting_feeds_the_lane_view_and_raises_the_brake_alert(tmp_path, monkeypatch):
   for raw, want in ((None, 0), ("2", 2), ("3", 3), ("x", 0), ("9", 0)):
     sm = W.FakeSM()

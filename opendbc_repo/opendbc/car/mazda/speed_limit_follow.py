@@ -47,6 +47,18 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    until it is taken), any gap (drive 53: the floor 19 to 50). A lower limit within LIMIT_UNDO_TIME of that raise
    (a wrong first one) is rule 4's undo, down to the lower limit (never below his speed before our raise).
 
+7. After a turn onto another road (mapdOut's road name changes and stays TURN_NAME_STEADY, not on a highway or a link):
+   the new road's first steady limit is handled as rule 6's: a restore never goes back above it (any band), and below it
+   (with no SET press of his since the turn, cruise on since it appeared, GPS trust 0, at most LIMIT_FIRST_MAX above his
+   speed) it becomes his speed. Never a SET- (it never slows him early); open TURN_TIME. The same limit as the old road's
+   counts as the new road's once the name has changed.
+
+Street Speed (MazdaStreetSpeedOffset, STREET_OFFSETS): on a street (the matched road class known and not a highway nor a
+link; after an exit or a turn always) every target set from a posted limit is the limit plus the setting's offset: rules
+1, 2, 3, 6, 7, the provisional ceiling, rule 6's undo. Rule 1's band on a street is the old limit up to the larger of
+LIMIT_BAND multiples and the offset (at 53 on a 45 road with +8 he is "at" the 45 road's speed). Highways and links (the
+merge, rule 5) never take it; with the road class unknown (Map Curves off) neither.
+
 A lower limit reported but not steady yet (LIMIT_STABLE_TIME), with the driver's speed in rule 1's band of the one
 before (the one he matched, else the steady one): no SET+ of ours above it while it is reported (provisional, at once,
 also on the first frame cruise is back), never a SET-. If it goes again (a junction's flap) the restore goes on; if it
@@ -107,6 +119,12 @@ LIMIT_STABLE_TIME = 3.0      # s the new value must be reported unchanged (map m
 # measured car: a wrong road matched for 3.5 s, 60 on a 45 road, took the set speed to 59-60 and nothing took it back).
 # Drive 52's tags 211 and 318 stayed 123 s and 30 s. Lower limits (rule 3, the undo) keep LIMIT_STABLE_TIME.
 LIMIT_RAISE_STABLE_TIME = 5.0  # s
+# ... but a one-band rise (rule 1, at most LIMIT_BIG_RAISE_MPH / _KPH) with GPS trust 0 on every frame of it only this
+# long (owner, drives 54 / 55: the raise came 5-8 s into the new road; the 3.5 s wrong match above had trust 1-2). First
+# limits, big rises, trust above 0 and the undo keep theirs.
+LIMIT_RISE_QUICK_TIME = 2.5  # s
+# ... not again this long after a rule 4 undo (a 45 / 55 flap every 4 s: one raise and its undo, then LIMIT_RAISE_STABLE_TIME)
+LIMIT_QUICK_AFTER_UNDO = 60.0  # s
 LIMIT_OLD_MAX_AGE = 30.0     # s: the previous limit counts as the old one only this long after it was last seen
 # Drive 4d (tag 2, t 740-808): 45 mph road, a red light, a right turn onto a 55 mph road; while waiting at the light the
 # map matched the cross road for 28 s (45 -> 40 at t 759, then 40 -> 55 at t 787). The driver's speed (45) was not the
@@ -159,7 +177,9 @@ MERGE_SURFACE_MAX_MPH = 55
 MERGE_SURFACE_MAX_KPH = 90
 # The next limit and the driver's speed reported unchanged this long, GPS trust 0 and cruise on throughout (ramp 1: trust
 # 0 from the link's start to 28 s in, 2 near the merge, where the highway is next to the ramp; ramp 2 the same)
-MERGE_STABLE_TIME = LIMIT_RAISE_STABLE_TIME
+# (owner, drive 54: the raise came 382 m before the merge, he was on the gas from 456; now as soon as the window is ready,
+# 2 s: drive 54's would have come at 448.3 at 30 mph, 554 m before the highway's limit)
+MERGE_STABLE_TIME = 2.0      # s
 # When: the stock cruise's speed-up with the set speed above the speed (drives 4c-53, median m/s^2 by the gap in mph:
 # up to 5 below, 5-10, ..., 20 and more), so the cruise is MERGE_NEAR_MPH below the highway's limit where it starts
 # (mapdOut.nextSpeedLimitDistance). 45 -> 65 mph: 11.9 s, 300 m; with MERGE_LEAD_TIME for our presses (a SET+ hold to 5
@@ -178,6 +198,14 @@ MERGE_WATCH_TIME = 60.0      # s
 # began, raises the driver's speed to it (as a first limit: steady 5 s with GPS trust 0, cruise on since it appeared,
 # off the link). Open from the link's start until EXIT_TIME after the car got onto the street.
 EXIT_TIME = 60.0             # s
+# Rule 7, after a turn onto another road: mapdOut's road name (not empty) changed and stayed this long ...
+TURN_NAME_STEADY = 2.0       # s
+TURN_EARLY = 2.0             # s: a limit whose first frame came this long before the name changed is the new road's
+TURN_TIME = EXIT_TIME        # s the turn's window stays open on the new road
+# Street Speed (MazdaStreetSpeedOffset 0..3, map_curve_control.STREET_OFFSETS): legal limit, +3, +5 (default), +8 mph;
+# metric 0, +5, +8, +13 km/h
+STREET_OFFSETS = ((0, 3, 5, 8), (0, 5, 8, 13))
+STREET_OFFSET_DEFAULT = 2
 
 
 def _frames(seconds):
@@ -197,6 +225,7 @@ class LimitInputs:
   next_distance: float = -1.0  # m to it (mapdOut.nextSpeedLimitDistance; < 0 unknown)
   v_ego: float = 0.0        # m/s, the true speed
   driver_set: bool = False  # the driver is on the SET-/SET+ switch this frame (cruise on or off)
+  road_name: str = ""       # mapdOut.roadName (rule 7: a turn onto another road)
 
 
 @dataclass
@@ -214,11 +243,18 @@ class Offer:
   # a cap that came with cruise off: kept only if his speed is in rule 1's band of `old` (False, after an exit: kept if
   # his speed is above the new limit)
   band: bool = True
+  tgt: object = None        # steps: the driver's speed it asks for (the limit plus the Street Speed offset), None: new
+
+  @property
+  def target(self):
+    return self.new if self.tgt is None else self.tgt
 
 
 class SpeedLimitFollower:
-  def __init__(self, is_metric):
+  def __init__(self, is_metric, street_mode=STREET_OFFSET_DEFAULT):
     self.step = MS_PER_KPH if is_metric else MS_PER_MPH
+    offs = STREET_OFFSETS[1 if is_metric else 0]
+    self.street_add = offs[street_mode] if street_mode in range(len(offs)) else offs[STREET_OFFSET_DEFAULT]  # steps
     self.multiple = LIMIT_MULTIPLE_KPH if is_metric else LIMIT_MULTIPLE_MPH
     self.first_max = LIMIT_FIRST_MAX_KPH if is_metric else LIMIT_FIRST_MAX_MPH
     self.big_raise = LIMIT_BIG_RAISE_KPH if is_metric else LIMIT_BIG_RAISE_MPH
@@ -259,13 +295,28 @@ class SpeedLimitFollower:
     self.exit_start = None         # rule 6: the frame a link from a highway began (None: no exit open)
     self.exit_street = None        # the frame the car first got onto a street after it
     self.driver_set_frame = -10_000  # the last frame the driver was on SET-/SET+
+    self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
+    self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
+    self.name, self.name_cand, self.name_frames = "", "", 0   # mapdOut's road name: steady, candidate, frames
+    self.turn_check = False        # rule 7: the steady limit as the new road's once (the same value as the old road's)
+    self.last_next = (0.0, -1.0)   # the next limit (m/s) and its distance (m) when the last offer was made (logs)
+    self.undo_frame = -1_000_000   # the last rule 4 undo (LIMIT_QUICK_AFTER_UNDO)
 
   def _steps(self, v):
     return v / self.step
 
+  def _street(self):
+    """On a street: the matched road class known, not a highway, not a link."""
+    return bool(self.road) and self.road not in HIGHWAY_CLASSES + LINK_CLASSES
+
+  def _add(self, kind=""):
+    """steps the Street Speed setting adds to a posted limit now (after an exit or a turn: always)."""
+    return self.street_add if (kind in ("exit", "turn") or self._street()) else 0
+
   def _in_band(self, d, old):
-    """The driver's speed d (steps) is at the old limit or up to LIMIT_BAND multiples above it."""
-    return -0.5 < d - old < LIMIT_BAND * self.multiple + 0.5
+    """The driver's speed d (steps) is at the old limit or up to LIMIT_BAND multiples above it (on a street: or the
+    Street Speed offset above it, if more)."""
+    return -0.5 < d - old < max(LIMIT_BAND * self.multiple, self._add()) + 0.5
 
   def _plausible(self, old, new, source, gps_trust, firm=False):
     """'' or why a change old -> new (steps; old None for a first limit) is not taken. firm: a first limit or a big
@@ -302,10 +353,11 @@ class SpeedLimitFollower:
     if i.driver_set:
       self.driver_set_frame = self.frame
     self._road(i)
+    self._turn(i)
     c = self.cap
     if c is not None and d is not None:
       if c.driver is None:           # cruise was off when the lower limit came: his speed now, the first frame back
-        if (self._in_band(d, c.old) if c.band else d > c.new + 0.5):
+        if (self._in_band(d, c.old) if c.band else d > c.target + 0.5):
           c.driver = d
         else:
           self.cap = None
@@ -328,10 +380,16 @@ class SpeedLimitFollower:
       self.candidate_trust = max(self.candidate_trust, trust)
     else:
       self.candidate, self.candidate_frames, self.candidate_trust = reported, 0, trust
-    if self.candidate is not None and self.candidate != self.stable and self.candidate_frames >= _frames(LIMIT_STABLE_TIME):
+    if self.candidate is not None and self.candidate != self.stable and self.candidate_frames >= _frames(self._stable_time()):
       self._new_limit(i, d)
     if self.rise is not None:
       self._steady_rise(i, d)
+    if (self.exit_start is not None and reported is not None and reported == self.stable and
+        (self.turn_check or self.exit_retry == reported) and self.rise is None and
+        not self._plausible(None, reported, i.source, i.gps_trust)):
+      # rule 7: the new road's limit the same as the old road's; rule 6 / 7: one refused only for the GPS trust, again
+      self.turn_check, self.exit_retry = False, None
+      self._exit_limit(reported, None, d, i, self.frame)
     self._provisional(reported, d, i)
     self._merge(i, d)
     return self._offered(d)
@@ -351,6 +409,7 @@ class SpeedLimitFollower:
     if (self.exit_start is not None and self.exit_street is not None and
         self.frame - self.exit_street > _frames(EXIT_TIME) and not (self.rise is not None and self.rise[0] == "exit")):
       self.exit_start = None         # no limit for EXIT_TIME on the street: nothing of the exit's any more
+      self.turn_check, self.exit_retry = False, None
     w = self.merge_watch
     if w is not None and self.frame - w.frame > _frames(MERGE_WATCH_TIME):
       self.merge_watch = None
@@ -361,7 +420,7 @@ class SpeedLimitFollower:
         self.link_start, self.link_from, self.link_to_hwy, self.merge_done, self.merge_window = (
           self.frame, self.road, False, False, None)
         if self.road in HIGHWAY_CLASSES:
-          self.exit_start, self.exit_street = self.frame, None
+          self.exit_start, self.exit_street, self.exit_kind, self.exit_retry = self.frame, None, "exit", None
       self.road, self.road_since = c, self.frame
     if c in LINK_CLASSES:
       self.link_last = self.frame
@@ -383,6 +442,34 @@ class SpeedLimitFollower:
         self.raised = None
         self.undo = Offer(r.new, r.driver, r.source, self.frame, "undo", r.new)
 
+  def _stable_time(self):
+    """s a new limit must be reported unchanged before it is steady: LIMIT_STABLE_TIME, a one-band rise with GPS trust 0
+    (rule 1, F) LIMIT_RISE_QUICK_TIME."""
+    c, st = self.candidate, self.stable
+    if st is not None and c is not None and self.exit_start is None and st < c and self._rise_time(st, c) < LIMIT_STABLE_TIME:
+      return LIMIT_RISE_QUICK_TIME
+    return LIMIT_STABLE_TIME
+
+  def _turn(self, i):
+    """Rule 7: mapdOut's road name changed (not empty) and stayed TURN_NAME_STEADY on a street: rule 6's window opens
+    for the new road (unless an exit's is open)."""
+    n = (i.road_name or "").strip()
+    if not n or n == self.name:
+      self.name_cand, self.name_frames = "", 0
+      return
+    if n != self.name_cand:
+      self.name_cand, self.name_frames = n, 0
+    self.name_frames += 1
+    if self.name_frames < _frames(TURN_NAME_STEADY):
+      return
+    old, self.name, self.name_cand = self.name, n, ""
+    if old and self._street() and (self.exit_start is None or self.exit_kind == "turn"):
+      self.exit_start = self.frame - self.name_frames - _frames(TURN_EARLY)
+      self.exit_street, self.exit_kind, self.exit_retry, self.turn_check = self.frame, "turn", None, True
+      if self.rise is not None and self.rise[0] == "exit":
+        self.rise = None             # (the old road's pending raise: the new road decides)
+    self.name_frames = 0
+
   def _provisional(self, reported, d, i):
     """A lower limit reported now, not steady yet, with the driver's speed in rule 1's band of the limit before (the
     one he matched, else the steady one): no SET+ of ours above it until it goes again (a junction's flap: the restore
@@ -398,8 +485,9 @@ class SpeedLimitFollower:
       base = self.stable
     else:
       return
-    if reported < base and reported < d - 0.5 and not self._plausible(base, reported, i.source, i.gps_trust):
-      self.ceiling = reported
+    add = self._add()
+    if reported < base and reported + add < d - 0.5 and not self._plausible(base, reported, i.source, i.gps_trust):
+      self.ceiling = reported + add
 
   def _merge_need(self, v, new):
     """m the cruise needs from v (m/s) to MERGE_NEAR_MPH below the limit `new` (steps), set at it (MERGE_ACCEL), plus
@@ -469,9 +557,10 @@ class SpeedLimitFollower:
       self.merge_done = True
       self._not_followed(None, n, "Map Data", "merge: " + why)
       return
-    if self.next_dist is not None and self.next_dist > self._merge_need(i.v_ego, n):
-      return                         # not yet: the cruise reaches the highway's speed near the merge from here
+    # (owner, drive 54: timed for the merge with _merge_need it came 382 m before it, "we can do it way before that"):
+    # offered as soon as the window is ready
     self.merge_done = True
+    self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
     old = self.stable if (self.stable is not None and self.frame - self.stable_last_seen <= _frames(LIMIT_OLD_MAX_AGE)) else None
     self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d)
 
@@ -504,16 +593,18 @@ class SpeedLimitFollower:
         self._not_followed(r.new, new, i.source, f"undo: GPS trust {self.candidate_trust} (an undo needs 0)")
         return
       self.raised = self.merge_watch = None
+      self.undo_frame = self.frame
       # after an exit (rule 6) his speed goes to the lower limit, the street's (review: a wrong first 65 raised the
       # floor 19 to 65, then the street's 35 only capped the restore at 50), never below his speed before our raise
-      back = max(new, r.driver) if r.kind == "exit" else r.driver
+      back = max(new + self._add(r.kind), r.driver) if r.kind in ("exit", "turn") else r.driver
       self.undo = Offer(r.new, back, i.source, self.frame, "undo", r.new)
       return
     if self.exit_start is not None and start >= self.exit_start:
-      self._exit_limit(new, old, d, i, start)   # rule 6: the first limit after a link from a highway
+      self.turn_check = False
+      self._exit_limit(new, old, d, i, start)   # rule 6 / 7: the first limit after a link from a highway, or a turn
       return
     if stale and quiet:
-      if d is None or self.cruise_off_frame >= start or new - round(d) <= 0:
+      if d is None or self.cruise_off_frame >= start or new + self._add() - round(d) <= 0:
         self._first_limit(new, start, d, i)            # cruise off since it appeared, or nothing to raise: now
       else:
         self.rise = (None, new, start)                 # rule 2, decided once steady (_steady_rise)
@@ -523,7 +614,7 @@ class SpeedLimitFollower:
       if new > old:
         self._not_followed(old, new, i.source, "old limit not seen recently")
     elif new > old:
-      if d is not None and abs(d - new) < 0.5:
+      if d is not None and abs(d - new - self._add()) < 0.5:
         return                                         # already at the new limit
       self.rise = (old, new, start)                    # rule 1, decided once steady (_steady_rise)
     elif d is None or self._in_band(d, old):
@@ -532,39 +623,50 @@ class SpeedLimitFollower:
         self._not_followed(old, new, i.source, f"lower limit: {why}")
       else:
         # (cruise off: decided with the driver's speed on the first frame it is back; until then nothing to cap)
-        self.cap = Offer(old, new, i.source, self.frame, "cap", d)
+        self.cap = Offer(old, new, i.source, self.frame, "cap", d, tgt=new + self._add())
     # (a lower limit with the driver's speed outside the band: his own speed, nothing to do)
 
   def _exit_limit(self, new, old, d, i, start):
-    """Rule 6: the street's limit after an exit. Above the driver's speed (or cruise off: decided when it is back) a
-    cap of a pending restore, any band; below it a raise, decided once steady (_steady_rise)."""
+    """Rule 6 / 7: the street's limit after an exit or a turn (its target: plus the Street Speed offset). Above the
+    driver's speed (or cruise off: decided when it is back) a cap of a pending restore, any band; below it a raise,
+    decided once steady (_steady_rise). Refused only for the GPS trust: tried again while it stays (exit_retry)."""
     hw = old if (old is not None and old > new) else None
+    tgt = new + self._add(self.exit_kind)
     why = self._plausible(None, new, i.source, i.gps_trust)
     if why:
-      self.exit_start = None
-      self._not_followed(hw, new, i.source, f"after the exit: {why}")
+      if why.startswith("GPS trust"):
+        self.exit_retry = new        # (drive 55: the new road's 50 steady just as the trust went 2 for 6 s)
+      else:
+        self.exit_start = None
+      self._not_followed(hw, new, i.source, f"after the {self.exit_kind}: {why}")
       return
-    if d is None or d > new + 0.5:
-      self.cap = Offer(hw, new, i.source, self.frame, "cap", d, band=False)
-    if d is None or d < new - 0.5:
+    self.exit_retry = None
+    if d is None or d > tgt + 0.5:
+      self.cap = Offer(hw, new, i.source, self.frame, "cap", d, band=False, tgt=tgt)
+    if d is None or d < tgt - 0.5:
       self.rise = ("exit", new, start)
     else:
       self.exit_start = None
 
   def _exit_raise(self, new, start, d, i):
     exit_start, self.exit_start = self.exit_start, None
-    if d is not None and d >= new - 0.5:
+    kind = self.exit_kind
+    tgt = new + self._add(kind)
+    if d is not None and d >= tgt - 0.5:
       return                                           # already there (or above: a cap's)
     why = self._plausible(None, new, i.source, self.candidate_trust, firm=True)
     if not why:
       if d is None or self.cruise_off_frame >= start:
         why = "cruise was not on from when the limit appeared until it was steady"
       elif exit_start is None or self.driver_set_frame >= exit_start:
-        why = f"the driver set his speed ({round(d)}) himself since the exit"
+        why = f"the driver set his speed ({round(d)}) himself since the {kind}"
+      elif kind == "turn" and new - round(d) > self.first_max:
+        why = f"limit {new} is more than {self.first_max} above the driver's speed {round(d)}"
     if why:
-      self._not_followed(None, new, i.source, f"after the exit: {why}")
+      self._not_followed(None, new, i.source, f"after the {kind}: {why}")
     else:
-      self.offer = Offer(None, new, i.source, self.frame, "exit", d)
+      self.offer = Offer(None, new, i.source, self.frame, kind, d, tgt=tgt)
+      self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
 
   def _steady_rise(self, i, d):
     """A higher limit once reported unchanged for LIMIT_RAISE_STABLE_TIME: rule 1 or 2 with the driver's speed now."""
@@ -576,7 +678,7 @@ class SpeedLimitFollower:
         old = None
       self._not_followed(old, new, i.source, f"not steady for {LIMIT_RAISE_STABLE_TIME:.0f} s")
       return
-    if self.candidate != new or self.candidate_frames < _frames(LIMIT_RAISE_STABLE_TIME):
+    if self.candidate != new or self.candidate_frames < _frames(self._rise_time(old, new)):
       return                                           # (a short flap restarts the count)
     if old == "exit" and self.road in LINK_CLASSES:
       return                                           # still on the exit (mapd's lookahead): once off it
@@ -587,7 +689,8 @@ class SpeedLimitFollower:
     if old is None:
       self._first_limit(new, start, d, i)
       return
-    if d is not None and abs(d - new) < 0.5:
+    add = self._add()
+    if d is not None and abs(d - new - add) < 0.5:
       return                                           # already at the new limit
     why = self._plausible(old, new, i.source, self.candidate_trust, firm=new - old > self.big_raise)
     if not why and d is None:
@@ -597,11 +700,20 @@ class SpeedLimitFollower:
     if why:
       self._not_followed(old, new, i.source, why)
     else:
-      self.offer = Offer(old, new, i.source, self.frame, "raise", d)
+      self.offer = Offer(old, new, i.source, self.frame, "raise", d, tgt=new + add)
+      self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
+
+  def _rise_time(self, old, new):
+    """s a higher limit must be steady before it is offered: LIMIT_RISE_QUICK_TIME for a one-band rise (rule 1) with
+    GPS trust 0 on every frame of it, else LIMIT_RAISE_STABLE_TIME."""
+    quick = (old not in (None, "exit") and 0 < new - old <= self.big_raise and self.candidate_trust <= LIMIT_FIRM_TRUST_MAX and
+             self.frame - self.undo_frame > _frames(LIMIT_QUICK_AFTER_UNDO))
+    return LIMIT_RISE_QUICK_TIME if quick else LIMIT_RAISE_STABLE_TIME
 
   def _first_limit(self, new, start, d, i):
     """Rule 2: a first limit after none (or none for a long time)."""
-    if d is not None and new - round(d) <= 0:
+    add = self._add()
+    if d is not None and new + add - round(d) <= 0:
       return                                           # at or below the driver's speed: nothing to raise
     why = self._plausible(None, new, i.source, self.candidate_trust, firm=True)
     if not why:
@@ -616,7 +728,8 @@ class SpeedLimitFollower:
     if why:
       self._not_followed(None, new, i.source, why)
     else:
-      self.offer = Offer(None, new, i.source, self.frame, "first", d)
+      self.offer = Offer(None, new, i.source, self.frame, "first", d, tgt=new + add)
+      self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
 
   def _offered(self, d):
     o = self.offer
@@ -636,11 +749,11 @@ class SpeedLimitFollower:
         self.offer = None
         self._not_followed(o.old, o.new, o.source, "merge: cruise off" if o.kind == "merge" else "after the exit: cruise off")
       return 0.0                     # cruise off since it was offered: wait (drive 52: a stop slowdown, his brake)
-    if abs(d - o.new) < 0.5:
+    if abs(d - o.target) < 0.5:
       self.offer = None              # already there (the driver's own SET+: drive 52, t 321)
       return 0.0
     if abs(d - o.driver) < 0.5:
-      return o.new * self.step
+      return o.target * self.step
     self.offer = None                # the driver chose another speed: theirs
     self._not_followed(o.old, o.new, o.source, f"driver changed his speed to {round(d)}")
     return 0.0
@@ -650,7 +763,7 @@ class SpeedLimitFollower:
     o = self.offer
     if o is not None and not (o.kind == "merge" and self.road in HIGHWAY_CLASSES):
       # (a merge taken on the highway is never undone; rule 6's undo goes to the lower limit, not back to the floor)
-      self.raised = Offer(o.old, o.new, o.source, self.frame, o.kind, o.driver)
+      self.raised = Offer(o.old, o.new, o.source, self.frame, o.kind, o.driver, tgt=o.tgt)
       if o.kind == "merge":
         self.merge_watch = self.raised
     self.offer = None
@@ -669,11 +782,11 @@ class SpeedLimitFollower:
 
   @property
   def offer_speed(self):
-    return self.offer.new * self.step if self.offer is not None else 0.0
+    return self.offer.target * self.step if self.offer is not None else 0.0
 
   @property
   def cap_speed(self):
-    return self.cap.new * self.step if (self.cap is not None and self.cap.driver is not None) else 0.0
+    return self.cap.target * self.step if (self.cap is not None and self.cap.driver is not None) else 0.0
 
   @property
   def ceiling_speed(self):
