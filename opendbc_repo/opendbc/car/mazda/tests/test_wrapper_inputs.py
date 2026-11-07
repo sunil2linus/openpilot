@@ -307,3 +307,43 @@ def test_wrapper_logs_each_navigation_exit_with_the_lane_and_shape_checks(tmp_pa
   _drive(c, 5)
   done = [e for k, e in closed if k == "mapExit"]
   assert len(done) == 1 and done[0]["result"] == "missed" and done[0]["ended"] == "missed"
+
+
+def test_the_writer_threads_leave_cards_real_time_priority_first(tmp_path, monkeypatch):
+  # outside review of e1be62454: the follow summary and curve learning writers inherited card's SCHED_FIFO (drives 3b /
+  # 44: "System Lagging" from file writes at card's priority); each now leaves it before any file work
+  calls = []
+  monkeypatch.setattr(cp, "leave_caller_priority", lambda: calls.append("leave"))
+  monkeypatch.setattr(cs.CurveSlowdown, "_learning_dir", classmethod(lambda cls: (calls.append("dir"), str(tmp_path))[1]))
+  c = cs.CurveSlowdown.__new__(cs.CurveSlowdown)
+  c.follow_params = W.FakeParams({})
+  c._write_follow_line({"ticks": 1})
+  assert calls[:2] == ["leave", "dir"], calls
+  calls.clear()
+  c._write_learning({"duration_s": 1.0}, {"x": 1})
+  assert calls[:2] == ["leave", "dir"], calls
+  assert (tmp_path / cs.CurveSlowdown.FOLLOW_SUMMARY_CSV).exists() and (tmp_path / cs.CurveSlowdown.LEARNING_CSV).exists()
+
+
+def test_the_wheels_cancel_or_resume_stops_our_frames(tmp_path, monkeypatch):
+  # outside review of e1be62454: the wheel's CANCEL (CRZ_BTNS CAN_OFF) and RES were never read, so our 0x9D frames during
+  # a hold could hide his CANCEL. While either is down, and DRIVER_QUIET after, the logic is told another button is on
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0)
+  seen = []
+  monkeypatch.setattr(c.logic, "update", lambda i: (seen.append(i.other_button_active), (None, None))[1])
+
+  def state(**kw):
+    s = W.car_state(44, 45)
+    s.crz_cancel, s.crz_resume = kw.get("cancel", False), kw.get("resume", False)
+    return s
+  for kw in (dict(cancel=True), dict(resume=True)):
+    seen.clear()
+    c.update(W.CC, state(), None, None, False)
+    c.update(W.CC, state(**kw), None, None, False)
+    for _ in range(int(cs.DRIVER_QUIET / 0.01) - 1):
+      c.update(W.CC, state(), None, None, False)
+    c.update(W.CC, state(), None, None, False)
+    assert seen[0] is False and all(seen[1:-1]) and seen[-1] is False, (kw, seen[:3], seen[-3:])
+  # carstate reads them from CRZ_BTNS
+  src = open(os.path.join(os.path.dirname(cs.__file__), "carstate.py")).read()
+  assert 'cp.vl["CRZ_BTNS"]["CAN_OFF"]' in src and 'cp.vl["CRZ_BTNS"]["RES"]' in src

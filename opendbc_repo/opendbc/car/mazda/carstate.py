@@ -24,6 +24,8 @@ class CarState(CarStateBase):
     self.crz_btns_counter = 0
     self.crz_set_plus = False     # driver's SET+ / SET- from the stock steering wheel switch (Gen1)
     self.crz_set_minus = False
+    self.crz_cancel = False       # ... and CANCEL / RES (outside review: never read, so our holds could hide his CANCEL)
+    self.crz_resume = False
     self.radar_has_lead = False   # stock MRCC radar lead (CRZ_CTRL, Gen1 without Radar Interceptor)
     self.radar_lead_distance = 0  # its distance bucket (0-5)
     self.acc_active_last = False
@@ -166,6 +168,8 @@ class CarState(CarStateBase):
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
     self.crz_set_plus = cp.vl["CRZ_BTNS"]["SET_P"] == 1
     self.crz_set_minus = cp.vl["CRZ_BTNS"]["SET_M"] == 1
+    self.crz_cancel = cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1
+    self.crz_resume = cp.vl["CRZ_BTNS"]["RES"] == 1
 
     # camera signals
     if not self.CP.flags & MazdaSafetyFlags.NO_FSC:

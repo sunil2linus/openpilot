@@ -199,7 +199,7 @@ class CSC:
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
         limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False,
-        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0):
+        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0, other=lambda f: False):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check).
   red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
@@ -252,7 +252,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       ctr = ((f - wheel_phase) // 10) % 16       # the wheel's CRZ_BTNS frame every 10 frames (10 Hz)
     inp = cs.SlowdownInputs(btn_counter=ctr if wheel_phase is not None else -1, enabled=st["enabled"], cruise_enabled=st["cruise"], set_speed=car.set_speed,
                             v_ego=car.v_ego, gas_pressed=st["gas"], brake_pressed=st["brake"], standstill=car.v_ego < 0.3,
-                            plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=False,
+                            plan_alive=st["plan_alive"], csc_active=pa, csc_speed=ps, other_button_active=other(f),
                             driver_button=car.driver_button_now(), stop_active=stop_active, stop_target=stop_target,
                             stop_urgent=stop_urgent, stop_restore_now=restore_now, hold_restore=hold_restore,
                             radar_lead=bool(lead is not None and trigger.radar_stable),
@@ -1110,3 +1110,16 @@ def test_fuzz_never_above_the_drivers_speed():
     # with only SET- taps from the driver, never back above the starting speed
     if all(ev[f].__defaults__[0] == cs.SET_MINUS for f in ev):
       assert r["max"] <= top + 1e-6 and r["final"] <= top + 1e-6, (seed, r["max"], r["final"])
+
+
+def test_his_cancel_or_resume_stops_our_hold_at_once_and_no_frame_goes_out():
+  # outside review of e1be62454: the wheel's CANCEL / RES (other_button_active from the wrapper while he holds one): a
+  # SET+ restore hold in progress stops at once, none of our frames while it is down
+  r = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 30), 4000, max_drop=15, setup=_measured_clean)
+  assert r["holds"]
+  at = r["holds"][0] + 30
+  win = range(at, at + 60)
+  r2 = run(Car(45, dash_offset_mph=0.0), between(100, 1500, 30), 4000, max_drop=15, setup=_measured_clean,
+           other=lambda f: f in win)
+  assert not [f for f in r2["holds"] if f in win] and not [f for f, _ in r2["presses"] if f in win]
+  assert [f for f in r2["holds"] if at - 30 <= f < at], "the hold was on before"

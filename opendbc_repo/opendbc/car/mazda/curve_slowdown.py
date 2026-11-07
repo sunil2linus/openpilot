@@ -1343,6 +1343,7 @@ class CurveSlowdown:
     from opendbc.car.mazda.stopped_car_slowdown import StoppedCarTrigger
     self.trigger = StoppedCarTrigger()
     self.frame = 0
+    self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.recorder = None
     self.curve_event = None
     self.stop_event = None
@@ -1447,6 +1448,14 @@ class CurveSlowdown:
     from opendbc.car.mazda.stopped_car_slowdown import StoppedCarInputs, TEST, ON
 
     self.frame += 1
+    # his CANCEL / RES on the wheel (outside review of e1be62454: never read; during one of our holds, up to 6 s, our
+    # frame right after the wheel's could hide his CANCEL from the PCM): our holds and presses stop at once and no frame
+    # of ours goes out while he holds it, nor DRIVER_QUIET after (as for his SET buttons); openpilot's own CANCEL /
+    # RESUME (carcontroller) are untouched
+    if getattr(CS, "crz_cancel", False) or getattr(CS, "crz_resume", False):
+      self.driver_other_frame = self.frame
+    if self.frame - self.driver_other_frame < _frames(DRIVER_QUIET):
+      other_button_active = True
     self.sm.update(0)
     plan = self.sm['starpilotPlan']
     lead = self.sm['radarState'].leadOne
@@ -1793,8 +1802,19 @@ class CurveSlowdown:
     row = self._follow_summary_row()
     threading.Thread(target=self._write_follow_line, args=(row,), daemon=True).start()
 
+  @staticmethod
+  def _leave_priority():
+    """A writer thread inherits card's SCHED_FIFO and core (outside review of e1be62454; drives 3b / 44: "System
+    Lagging" from file writes at card's priority): normal priority elsewhere first (car_profile.leave_caller_priority)."""
+    try:
+      from opendbc.car.mazda.car_profile import leave_caller_priority
+      leave_caller_priority()
+    except Exception:
+      pass
+
   def _write_follow_line(self, row):
     import os
+    self._leave_priority()
     try:
       try:
         row["route"] = str(self.follow_params.get("CurrentRoute", encoding="utf8") or "")
@@ -1858,6 +1878,7 @@ class CurveSlowdown:
     import json
     import os
     import time
+    self._leave_priority()
     try:
       root = self._learning_dir()
       os.makedirs(root, exist_ok=True)

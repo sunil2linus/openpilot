@@ -31,16 +31,16 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
         SPLIT_DECEL takes the speed from there; his signal toward the exit allows it from farther out.
       - At the split (the map's link start when the planner gives it, else navigation's exit point): confirmed on the
         ramp by the map's shapes (starpilotPlan.mapExitShape: our position closer to the link's shape and our heading
-        closer to its by SHAPE_LINK_GAP, on consecutive answers) together with the driving model's predicted path
-        (ModelPath: its heading ahead the link's, not the highway's), or the shapes alone for longer when there is no
-        model answer, or the road match on the link (or the planner's ramp) with GPS trusted for LINK_CONFIRM. Until the
-        car is on the link for sure (LINK_SETTLE) a confirmation is overturned (fast restore) by the shapes, the trusted
-        road match or the model path saying "highway"; by his gas, the other signal or a lane change away only while
+        closer to its by SHAPE_LINK_GAP, on consecutive answers, EXIT_CONFIRM_SHAPE_ONLY), or the road match on the link
+        (or the planner's ramp) with GPS trusted for LINK_CONFIRM. The driving model's predicted path (ModelPath) is
+        logged only for now (MODEL_DECIDES). Until the car is on the link for sure (LINK_SETTLE) a confirmation is
+        overturned (fast restore) by the shapes or the trusted road match saying "highway", or his gas held; by a gas
+        tap, the other signal or a lane change away only while
         the shapes' last answer is not "link". With exit lane evidence the slowdown starts at the split, tentative (TENT_*:
         bounded, undone by the missed exit test); without, the command holds until then. Then the full slowdown toward
         the exit's curve (the planner's exit curve, the lower of the branches of a fork not decided yet; else the
         announced curve carried on by the distance driven), firm (the cruise's strongest) when the room left needs it.
-      - Missed (past the split the shapes say "highway", or shorter with the model path agreeing, or the road match on
+      - Missed (past the split the shapes say "highway", or the road match on
         the highway with GPS trusted HWY_MATCH_STAY): the plan ends and the speed comes back at once (SET+ holds). With
         no answer at all (a GPS pause) the set speed is held, never restored on a guess (EXIT_LOST_MAX: then back with
         taps when matched to a highway). The driver decides too: his gas, a signal to the other side,
@@ -55,7 +55,8 @@ starpilot/controls/lib/map_curves.py) into the inputs of CurveSlowdownLogic.
   * End of a ramp onto a highway: restore at once with SET+ holds (merge).
   * End of an exit onto a street with a known speed limit: within STREET_CAP_DISTANCE of the end, cap the
     set speed at the street's limit; once off the ramp, that lowered set speed becomes the driver's speed
-    (never restored to the highway speed on a street).
+    (never restored to the highway speed on a street). The street's limit unknown: no restore on the ramp above what
+    its slowdown left, and STREET_DEFAULT near its end.
 
 Pure logic (no openpilot imports) so it can be unit tested; the wrapper in curve_slowdown.py feeds it.
 """
@@ -78,6 +79,10 @@ DT_CTRL = 0.01
 STREET_CAP_DISTANCE = 200.0     # m before the end of an exit onto a street
 RAMP_HOLD = 1.0                 # s on the ramp before ramp rules apply (a short wrong ramp match does nothing)
 STREET_PROGRESS = 50.0          # m driven along an exit (its end getting closer) before the street rules apply
+# An exit onto a street whose limit the map does not know (mapRampToSpeed 0; outside review of e1be62454, sim_1c.py: after
+# the ramp curve 53 SET+ back toward his highway 75, 51.8 mph near the ramp's end): no restore above the speed the ramp's
+# slowdown left while on the ramp, and within STREET_CAP_DISTANCE of its end at most this (mph; km/h when metric)
+STREET_DEFAULT = (45, 70)
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
 RAMP_EXIT = 1
 HIGHWAY_CLASSES = (1, 3)        # motorway, trunk
@@ -309,6 +314,12 @@ MODEL_CONFIRM = 0.5             # s of the model saying "link" (consecutive), wi
 MODEL_STAY_SHAPES = 0.5         # s of the shapes and the model path both saying "highway" past the exit point: stayed on
 # Without a model answer (no modelV2, the roads not apart enough ahead) the shapes alone need this long
 EXIT_CONFIRM_SHAPE_ONLY = 1.5   # s
+# Outside review of e1be62454 (sim_1a.py): the model path is measured against our own lane ahead, the map's bends against
+# the highway at the car, so once the car's lane is a straight ramp (drive 53: E1's first 270 m, E2's first 80 m) the
+# model path reads "highway" on the ramp (E1 confirmed only 213 m past the split, 44 mph into its 32 mph curve; E2 never).
+# Until the two are in one frame and checked on a drive with modelV2, the model path is logged only (mapExit: model_rel,
+# model_verdict, the bends) and never changes a decision (the confirmation, the missed exit, the tentative slowdown).
+MODEL_DECIDES = False
 
 
 def _interp(x, xs, ys):
@@ -559,6 +570,7 @@ class MapCurveControl:
     self.chime_count = 0            # "Exit curve - brake" chimes so far (the wrapper raises the alert on a change)
     self.chime_why = ""
     self.on_street_exit = False
+    self.street_last = None         # m/s: the last speed a slowdown asked for on this exit onto a street (STREET_DEFAULT)
     self.ramp_frames = 0            # consecutive updates on a ramp
     self.ramp_end_first = 0.0       # distance to the ramp's end when it was first matched
     self.link_frames = 0            # consecutive updates matched to a link road
@@ -672,10 +684,14 @@ class MapCurveControl:
     p.model_hwy_s = p.model_hwy_s + DT_CTRL if (mv == 1 and rem < 0) else 0.0
     if mv is not None:
       p.model_seen = True
+    # (MODEL_DECIDES: the verdict and its counts the decisions below use; logged only when off)
+    md = mv if MODEL_DECIDES else None
+    m_hwy = p.model_hwy_s if MODEL_DECIDES else 0.0
+    m_link = p.model_link_s if MODEL_DECIDES else 0.0
     # stayed on: the shapes say "highway" EXIT_STAY_TIME, or MODEL_STAY_SHAPES with the model path agreeing (the model
     # alone never: in a parallel exit lane before its gore the path follows the highway too)
-    stayed = p.hwy_s >= EXIT_STAY_TIME - 1e-6 or (p.hwy_s >= MODEL_STAY_SHAPES - 1e-6 and p.model_hwy_s >= MODEL_STAY_SHAPES - 1e-6)
-    shapes_link = (p.link_s >= EXIT_CONFIRM_TIME - 1e-6 and p.model_link_s >= MODEL_CONFIRM - 1e-6) if mv is not None else \
+    stayed = p.hwy_s >= EXIT_STAY_TIME - 1e-6 or (p.hwy_s >= MODEL_STAY_SHAPES - 1e-6 and m_hwy >= MODEL_STAY_SHAPES - 1e-6)
+    shapes_link = (p.link_s >= EXIT_CONFIRM_TIME - 1e-6 and m_link >= MODEL_CONFIRM - 1e-6) if md is not None else \
       p.link_s >= EXIT_CONFIRM_SHAPE_ONLY - 1e-6
     # the road match on the link with GPS trusted (review: a 34 m wrong match confirmed after LINK_HOLD): LINK_CONFIRM;
     # the planner's ramp (mapOnRamp: the match on a ramp's chain, trust not low) counts the same, no sooner (final review:
@@ -712,7 +728,7 @@ class MapCurveControl:
       # evidence (the shapes, the trusted match or the model path saying "highway"); his gas, the other signal or a lane
       # change away only while the shapes' last answer is not "link" (final review: on the real ramp a gas tap, a fork's
       # keep-left signal or a lane change on a 2-lane ramp restored the speed: E1 35-49 mph into its 32 mph curve)
-      model_hwy = not_link and p.model_hwy_s >= EXIT_STAY_TIME - 1e-6
+      model_hwy = not_link and m_hwy >= EXIT_STAY_TIME - 1e-6
       why = ("still on the highway" if (stayed or model_hwy) else
              "gas" if gas_firm else
              "" if not not_link else
@@ -838,9 +854,9 @@ class MapCurveControl:
       if cmd < NO_CURVE:
         # (no shape answer at all since QUIET_FROM past the split: an answer either way is followed as such); carried on
         # past TENT_MAX only while the model path does not say "highway", never past TENT_HARD_MAX nor TENT_DIP_MAX
-        model_ok = p.model_hwy_s <= 0.0
+        model_ok = m_hwy <= 0.0
         quiet = p.tent_s <= TENT_MAX_QUIET and not p.answered and model_ok
-        more = model_ok and (p.link_s >= TENT_LINK - 1e-6 or p.model_link_s >= TENT_LINK - 1e-6)
+        more = model_ok and (p.link_s >= TENT_LINK - 1e-6 or m_link >= TENT_LINK - 1e-6)
         if (p.tent_s <= TENT_MAX or quiet or more) and p.tent_s <= TENT_HARD_MAX and v_ego > p.tent_v0 - TENT_DIP_MAX:
           cmd = max(cmd, v_ego - TENT_GAP)
           if p.hold is not None and p.slowing and p.tent_s <= TENT_MAX:
@@ -980,6 +996,19 @@ class MapCurveControl:
       if f.ramp_to_speed < speed:
         speed, why, track, settled, firm = f.ramp_to_speed, "street cap", False, False, False
       capped = True
+    if exit_to_street and (a or na):
+      self.street_last = speed
+    elif not f.on_ramp:
+      self.street_last = None
+    if exit_to_street and progress and f.ramp_to_speed <= 0 and not (a or na):
+      # the street's limit unknown: the speed the ramp's slowdown left (never restored on the ramp), and STREET_DEFAULT
+      # near its end
+      cap = NO_CURVE if self.street_last is None else self.street_last
+      if f.ramp_end_distance <= STREET_CAP_DISTANCE:
+        cap = min(cap, STREET_DEFAULT[1 if self.unit == KPH else 0] * self.unit)
+      if cap < driver_speed - START_GAP:
+        speed, why, track, settled, firm = cap, "street cap", False, False, False
+        capped = True
     out.active = a or na or capped
     out.speed = speed
     out.track = track
