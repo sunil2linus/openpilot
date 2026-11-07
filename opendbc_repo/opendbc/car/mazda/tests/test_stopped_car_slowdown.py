@@ -1856,9 +1856,10 @@ def _unsure_started(**kw):
 
 
 def test_unsure_car_cap_is_below_the_set_speed_and_not_for_oncoming_cars():
-  # review: v_ego 30 mph under a 45 set speed (after a stop) aimed at 25: 13 taps; now 5 below the set speed
-  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
-  assert tr.active and tr.kind == scs.SLOW_UNSURE and abs(tr.target / MPH - 40) < 0.01
+  # review: v_ego 30 mph under a 45 set speed (after a stop) aimed at 25: 13 taps; now 5 below the set speed while it is
+  # near our speed (the cruise still accelerating, more than CATCH_UP_GAP above it: the drop to our speed first, below)
+  tr = _unsure_started(v_ego=43.1 * MPH, set_speed=45 * MPH)
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and abs(tr.target / MPH - 40) < 0.01 and not tr.urgent
   tr = _unsure_started(lead_v=-15.0)                            # an oncoming car is not "slower"
   assert not tr.active
 
@@ -2094,13 +2095,13 @@ def test_red_light_head_start_after_2_s_steps_1_mph_a_second_to_5_below():
   for _ in range(400):
     tr.update(_no_car())
   assert tr.active and near(tr.target / MPH, 45 - 5)        # the cap
-  # the cap is below the set speed when the car is slower than it
+  # the steps are from the set speed when the car is a little slower than it (CATCH_UP_GAP or less: cruising)
   tr = scs.StoppedCarTrigger()
   for _ in range(60):
     tr.update(_no_car(red_light=False))
   for _ in range(260):
-    tr.update(_no_car(v_ego=30 * MPH, set_speed=45 * MPH))
-  assert tr.active and near(tr.target / MPH, 44)
+    tr.update(_no_car(v_ego=43.1 * MPH, set_speed=45 * MPH))
+  assert tr.active and near(tr.target / MPH, 44) and not tr.urgent
   # with the flag off (the old code): nothing
   with _Flag("RED_START_ENABLED", False):
     tr, started = _red_started()
@@ -2121,7 +2122,7 @@ def test_red_light_head_start_in_the_car_taps_once_a_second_silently():
 
 
 def test_red_light_head_start_needs_cruise_speed_no_lane_change_and_not_already_slowing():
-  for kw in (dict(v_ego=22 * MPH), dict(lane_change=True), dict(a_ego=-0.8), dict(brake_pressed=True), dict(gas_pressed=True),
+  for kw in (dict(v_ego=14 * MPH), dict(lane_change=True), dict(a_ego=-0.8), dict(brake_pressed=True), dict(gas_pressed=True),
              dict(cruise_enabled=False)):
     tr = scs.StoppedCarTrigger()
     for _ in range(60):
@@ -2151,12 +2152,20 @@ def test_red_light_gone_releases_after_1_s_and_the_speed_comes_back():
     n += 1
     assert n < 200
   assert abs(n - scs.RED_DROPOUT / scs.DT_CTRL) <= 3 and tr.release_reason == scs.RED_GONE and tr.restore_now
-  # a slower car in our lane at the release: the restore stays gentle
+  # a slower car in our lane at the release: the restore stays gentle; that car (not sure yet) starts the unsure car's
+  # taps at once, not after UNSURE_REARM (drive 52: the light went at 187.8 s, the queue car was seen at 188.0)
   tr, _ = _red_started()
   slower = dict(red_light=False, lead_status=True, lead_prob=0.6, lead_d=90.0, lead_v=20 * MPH, lead_y=0.2, model_accel=0.1)
-  for _ in range(150):
-    tr.update(_no_car(**slower))
-  assert not tr.active and tr.release_reason == scs.RED_GONE and not tr.restore_now
+  n = 0
+  while tr.update(_no_car(**slower)):
+    n += 1
+    assert n < 200
+  assert tr.release_reason == scs.RED_GONE and not tr.restore_now
+  n = 0
+  while not tr.update(_no_car(**slower)):
+    n += 1
+    assert n < 400
+  assert tr.kind == scs.SLOW_UNSURE and n <= scs.UNSURE_HOLD / scs.DT_CTRL + 2, n
   # the harness: 45 -> 42 for a 3 s light, then back to 45 within a few seconds
   r, rel = _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1800, lead=_NoCar(200), max_drop=10,
                                  model=lambda f: -0.1, red=lambda f: 100 <= f < 600))
@@ -2377,3 +2386,148 @@ def test_a_guarded_stop_ahead_is_released_by_the_driver_and_the_light_latch_hold
   # the planner's own gates are untouched: the warning condition is the same as before
   sw = _stop_warning()
   assert scs.WARN_OWN_SLOWING_ACCEL == sw.OWN_SLOWDOWN_ACCEL
+
+
+# ---- drive 52: the cruise still accelerating into slow traffic (CATCH_UP_*), the tap episodes from 15 mph ----
+
+def test_unsure_car_with_the_cruise_still_accelerating_brings_the_set_speed_to_our_speed_first():
+  # 30 mph under a 45 set speed: the first drop to 30 (urgent: a SET- hold or fast taps), then the taps to 25, 5 below
+  # our speed (the old cap, 5 below the set speed, let the car accelerate to 40)
+  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and near(tr.target / MPH, 30) and tr.urgent
+  assert tr.catch_up and tr.caught_up
+  tr.update(_u(v_ego=30.5 * MPH, set_speed=31 * MPH))           # landed within 1 mph: the taps, the cap from our speed
+  assert tr.active and not tr.catch_up and not tr.urgent and near(tr.target / MPH, 25)
+  # presses lost (or Test mode): after CATCH_UP_TIME the taps' target anyway
+  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  for _ in range(int(scs.CATCH_UP_TIME / scs.DT_CTRL) + 1):
+    tr.update(_u(v_ego=30 * MPH, set_speed=45 * MPH))
+  assert tr.active and not tr.catch_up and near(tr.target / MPH, 25)
+  # never below the floor: 21 mph under 35 -> 21, then the car's minimum (not 16)
+  tr = _unsure_started(v_ego=21 * MPH, set_speed=35 * MPH, lead_d=80.0)
+  assert near(tr.target / MPH, 21) and tr.urgent
+  tr.update(_u(v_ego=21 * MPH, set_speed=21 * MPH, lead_d=80.0))
+  assert near(tr.target / MPH, FLOOR_MPH) and not tr.urgent
+  # not seen: hold (no lowering), as for the taps
+  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  for _ in range(int(scs.EARLY_DROPOUT / scs.DT_CTRL) + 2):
+    tr.update(_u(v_ego=30 * MPH, set_speed=40 * MPH, lead_status=False))
+  assert tr.active and tr.target >= 99 and not tr.urgent
+  with _Flag("CATCH_UP_ENABLED", False):                         # the old rule: 5 below max(speed, set)
+    tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  assert near(tr.target / MPH, 40) and not tr.urgent
+
+
+def test_unsure_car_from_15_mph():
+  # drive 52, t 188-191: a car in our lane at 77-87 m, 9-16 mph, 55-76 % a car, at 23.5-24.4 mph (the old minimum: 25)
+  tr = _unsure_started(v_ego=23.8 * MPH, set_speed=35 * MPH, lead_prob=0.66, lead_d=81.0, lead_v=11 * MPH, lead_y=0.2)
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and near(tr.target / MPH, 23.8) and tr.urgent
+  tr = _unsure_started(v_ego=14 * MPH, lead_d=60.0)
+  assert not tr.active
+
+
+class _Drive52(StoppedLead):
+  """Drive 52 from t 188.0: the queue car in our lane 81 m ahead at ~11 mph (9-16), 55-76 % a car, 98 % from 193.3."""
+  def state(self, f, car):
+    return (True, 0.66 if f * T.DT < 5.3 else 0.98, self.d, self.v, 0.2)
+
+
+def _drive_52(*flags):
+  # 23.8 mph, set 35, the cruise accelerating (0.6 m/s^2) and slowing as measured (0.19 m/s^2 per m/s, 1 s late); the
+  # model slows and the plan says stop from 3.0 s (191.0, our stop ahead start on the drive); the driver braked at 8 s
+  car = Car(35, dash_offset_mph=0.0, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0, accel=0.6)
+  car.v_ego = 23.8 * MPH
+  lead = _Drive52(81.0, v_mph=11.0)
+  saved = [(k, getattr(scs, k, None)) for k, _ in flags]
+  for k, v in flags:
+    setattr(scs, k, v)
+  try:
+    r = run(car, NO_CURVE, 800, lead=lead, max_drop=10, model=lambda f: -0.6 if f >= 300 else -0.2, plan=lambda f: f >= 300,
+            setup=MEASURED)
+  finally:
+    for k, v in saved:
+      setattr(scs, k, v)
+  return r, lead
+
+
+def test_drive_52_replay_accelerating_toward_a_slow_car_the_set_speed_comes_down_to_our_speed_first():
+  # on the drive (the old code): nothing until 25 mph, then the cap 30: the car went on accelerating 24 -> 29 mph and the
+  # driver braked at 25.7 mph 25 m behind the queue car (up to 4.3 m/s^2)
+  r, lead = _drive_52()
+  old, old_lead = _drive_52(("CATCH_UP_ENABLED", False), ("UNSURE_MIN_SPEED", 25 * MPH))
+  first = first_frame(r)
+  assert first is not None and first <= 100, first                 # 0.3 s cruise settle + 0.5 s unsure hold
+  assert r["kinds"][first] == scs.SLOW_UNSURE
+  ch = _sets_changes(r)
+  down = next(k for k, s in ch if s <= 25.0 + 1e-6)                # the first drop: 35 -> 25 (our speed) ...
+  assert down - first <= 150 and r["holds"] and r["holds"][0] == first, (ch, r["holds"][:3])   # ... one SET- hold
+  assert r["min"] >= FLOOR_MPH - 1e-6
+  assert max(r["vs"]) / MPH <= 25.5 and max(old["vs"]) / MPH >= 28.5, (max(r["vs"]) / MPH, max(old["vs"]) / MPH)
+  # where the driver braked: slower and farther back
+  assert r["vs"][-1] / MPH <= old["vs"][-1] / MPH - 3.0, (r["vs"][-1] / MPH, old["vs"][-1] / MPH)
+  assert lead.d >= old_lead.d + 6.0, (lead.d, old_lead.d)
+
+
+def _rolling_then_red(v_mph, set_mph, rolling_s=15.0, red_s=2.5, **kw):
+  """Stopped 1 s, rolling `rolling_s` at v_mph (no light), then the light on: (trigger, frame the head start began)."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(100):
+    tr.update(_no_car(red_light=False, v_ego=0.0, set_speed=set_mph * MPH))
+  for _ in range(int(rolling_s / scs.DT_CTRL)):
+    tr.update(_no_car(red_light=False, v_ego=v_mph * MPH, set_speed=set_mph * MPH))
+  started = None
+  for n in range(int(red_s / scs.DT_CTRL)):
+    if tr.update(_no_car(v_ego=v_mph * MPH, set_speed=set_mph * MPH, **kw)) and started is None:
+      started = n
+  return tr, started
+
+
+def test_red_light_head_start_at_20_mph_brings_the_set_speed_down_then_steps():
+  # drive 52, t 182.3-185.8: redLight on 3.5 s at 20-24 mph with the set speed at 35 (the old minimum: 25 mph)
+  tr, started = _rolling_then_red(20, 35)
+  assert started is not None and abs(started - scs.RED_ON_TIME / scs.DT_CTRL) <= 2, started
+  assert tr.kind == scs.RED_LIGHT and tr.catch_up and tr.urgent and near(tr.target / MPH, 20)
+  tr.update(_no_car(v_ego=20.4 * MPH, set_speed=21 * MPH))      # the drop landed: one 1 mph step at once ...
+  assert not tr.catch_up and not tr.urgent and near(tr.target / MPH, 19)
+  for _ in range(105):                                          # ... then the cap: the car's minimum (20 - 5 is below it)
+    tr.update(_no_car(v_ego=20.0 * MPH, set_speed=19 * MPH))
+  assert tr.active and near(tr.target / MPH, FLOOR_MPH)
+  # the set speed near our speed: as before (one step below max(speed, set) at once)
+  tr, _ = _rolling_then_red(20, 21)
+  assert tr.active and not tr.catch_up and not tr.urgent and near(tr.target / MPH, 20)
+  # below 15 mph: nothing; a light that came on soon after a stop: nothing below 25 mph (drives 4d t 1434, 50 t 233),
+  # as before above it
+  tr, started = _rolling_then_red(14, 35)
+  assert started is None
+  tr, started = _rolling_then_red(20, 35, rolling_s=8.0)
+  assert started is None and any("after the last stop" in b for b in tr.blockers(_no_car(v_ego=20 * MPH)))
+  tr, started = _rolling_then_red(30, 35, rolling_s=8.0)
+  assert started is not None and tr.kind == scs.RED_LIGHT
+
+
+def _red_accelerating(*flags):
+  car = Car(35, dash_offset_mph=0.0, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0, accel=0.6)
+  car.v_ego = 21.0 * MPH
+  saved = [(k, getattr(scs, k, None)) for k, _ in flags]
+  for k, v in flags:
+    setattr(scs, k, v)
+  try:
+    return run(car, NO_CURVE, 1200, lead=_NoCar(200), max_drop=10, model=lambda f: -0.1, red=lambda f: True, setup=MEASURED)
+  finally:
+    for k, v in saved:
+      setattr(scs, k, v)
+
+
+def test_red_light_head_start_in_the_car_with_the_cruise_accelerating_drops_to_our_speed_then_steps():
+  # 21 mph and accelerating under a 35 set speed, the light on (the harness's trigger starts at the light: the last stop
+  # was long before, RED_AFTER_STOP off): after 2 s one SET- hold down to our speed, then 1 mph a second to 5 below it
+  r = _red_accelerating(("RED_AFTER_STOP", 0.0))
+  old = _red_accelerating(("RED_AFTER_STOP", 0.0), ("CATCH_UP_ENABLED", False), ("RED_MIN_SPEED", 25 * MPH))
+  first = first_frame(r)
+  assert 195 <= first <= 210 and r["holds"] and r["holds"][0] == first, (first, r["holds"][:3])
+  ch = _sets_changes(r)
+  assert next(k for k, s in ch if s <= 25.0 + 1e-6) - first <= 150, ch
+  taps = [(k, s) for k, s in ch if s < 25.0 - 1e-6]
+  assert all(abs(a[1] - b[1]) <= 1.0 + 1e-6 for a, b in zip(taps[:-1], taps[1:], strict=True)), ch    # then 1 mph steps
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["min"] <= 20.0 + 1e-6, r["min"]        # 5 below ~24 mph, not 5 below 35
+  assert max(r["vs"]) / MPH <= 25.5 and max(old["vs"]) / MPH >= 29.0, (max(r["vs"]) / MPH, max(old["vs"]) / MPH)
