@@ -2666,3 +2666,95 @@ class _FnLead(StoppedLead):
     self.frame += 1
     s = self.fn(self.frame)
     self.d = max(self.d - (car.v_ego - (s[1] * MPH if s is not None else car.v_ego)) * T.DT, 0.0)
+
+
+def _drive54_g(lost=(2, 3)):
+  """Drive 54, t 1242-1252: the restore had just set 50 at 41.5 mph (still accelerating), the light detector came on, the
+  head start's catch-up tapped fast and the car ignored two of its taps, then the planned stop (redLight backed) took
+  over in floor mode. Returns (run result, frame the stop ahead start began)."""
+  car = Car(50, dash_offset_mph=0.0, accel=0.6, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0,
+            min_set_mph=CAR_MIN_MPH, lag=12, lose=lambda n: n in lost)
+  car.v_ego = 41.5 * MPH
+  r = run(car, NO_CURVE, 1100, lead=_NoCar(200), max_drop=10, model=lambda f: -0.6 if f >= 250 else -0.1,
+          plan=lambda f: f >= 250, red=lambda f: True)
+  start = next(k for k, kind in enumerate(r["kinds"]) if kind == scs.STOP_AHEAD)
+  return r, start
+
+
+def test_drive_54_g_lost_taps_do_not_keep_the_floor_hold_from_starting():
+  # on the drive the two lost taps stayed "in flight" for the whole stop (every newer landing was booked to the oldest
+  # press), so the floor hold never started: 49 -> 33 by 1 mph taps in 6.5 s. Now the hold starts once only lost taps
+  # are in flight and the set speed is at the floor ~4 s after the stop ahead start
+  r, start = _drive54_g()
+  assert r["trigger"].floor_mode and r["trigger"].kind == scs.STOP_AHEAD
+  assert any(cs.SET_MINUS == h["direction"] for h in r["logic"].hold_log), "a SET- hold"
+  first_hold = min(r["holds"])
+  assert first_hold - start <= int(0.6 / T.DT), (start, first_hold)
+  at_floor = next(k for k, s in enumerate(r["sets"]) if s / MPH <= 20.5)
+  assert (at_floor - start) * T.DT <= 4.5, (start, at_floor)
+  assert r["min"] >= CAR_MIN_MPH - 1e-6
+  # the same with no taps lost (control) and with four lost
+  for lost in ((), (2, 3, 5, 6)):
+    r2, start2 = _drive54_g(lost)
+    at_floor2 = next(k for k, s in enumerate(r2["sets"]) if s / MPH <= 20.5)
+    assert (at_floor2 - start2) * T.DT <= 4.5, (lost, start2, at_floor2)
+
+
+def _si(set_mph):
+  return cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=set_mph * MPH, v_ego=45 * MPH, gas_pressed=False,
+                           brake_pressed=False, standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0,
+                           other_button_active=False)
+
+
+def test_lost_taps_stay_counted_but_do_not_block_a_hold():
+  # three taps 0.4 s apart, only the last lands: the two before it stay in flight for the limits (they may still land
+  # late: a slow car answers after PENDING_TIMEOUT), but once past PENDING_TIMEOUT they no longer keep a hold back
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.last_set_speed = 45 * MPH
+  for f in (100, 140, 180):
+    lg.frame = f
+    lg._send(cs.SET_MINUS)
+  lg.frame = 190
+  lg._observe_set_speed(_si(44))
+  assert len(lg.inflight) == 2 and lg.pending is None
+  assert not lg._only_lost_in_flight(cs.SET_MINUS)            # the newest is still young (it is the one left)
+  lg.frame = 180 + cs._frames(cs.PENDING_TIMEOUT)
+  assert lg._only_lost_in_flight(cs.SET_MINUS) and not lg._only_lost_in_flight(cs.SET_PLUS)
+  lg.inflight[-1].hold = True                                 # a hold in flight always blocks
+  assert not lg._only_lost_in_flight(cs.SET_MINUS)
+
+
+def test_a_lost_restore_tap_does_not_keep_the_restore_hold_from_starting():
+  # drive 54, t 427-434: the restore's SET+ taps on the gas lost some and up to 3 stayed "in flight"; off the gas the
+  # restore hold needed nothing in flight. Here the last tap on the gas (our 5th press) is lost: the SET+ hold still
+  # starts ~0.3 s later, not 1 mph taps all the way back
+  ev = {600: lambda s, c: s.__setitem__("gas", True), 700: lambda s, c: s.__setitem__("gas", False)}
+  r = run(Car(45, dash_offset_mph=0.0, lose=lambda n: n == 5), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10, events=ev,
+          model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400, red=lambda f: 100 <= f < 400)
+  ups = [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups and 700 < ups[0] <= 760, ups
+  assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
+
+
+def test_a_confirmed_floor_stop_waits_for_a_press_in_flight_then_holds():
+  # (STOP_HOLD_WAIT) a fresh press of ours still in flight when the floor stop wants its hold: no 1 mph taps meanwhile,
+  # the hold once it is past PENDING_TIMEOUT
+  lg = cs.CurveSlowdownLogic(False, 10)
+
+  def si():
+    return cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=45 * MPH, v_ego=45 * MPH, gas_pressed=False,
+                             brake_pressed=False, standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0,
+                             other_button_active=False, stop_active=True, stop_target=cs.STOP_MIN_SET_SPEED, stop_urgent=True)
+  idle = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=45 * MPH, v_ego=45 * MPH, gas_pressed=False,
+                           brake_pressed=False, standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0,
+                           other_button_active=False)
+  for _ in range(100):
+    assert lg.update(idle) == (None, None)
+  lg.inflight.append(cs.Press(cs.SET_MINUS, lg.frame))      # (its pending window already given up on)
+  sent = []
+  for _ in range(60):
+    b, _ = lg.update(si())
+    if b is not None:
+      sent.append((lg.frame, lg.last_action))
+  waited = cs._frames(cs.PENDING_TIMEOUT)
+  assert sent and sent[0][1] == "hold" and sent[0][0] - 100 >= waited, sent

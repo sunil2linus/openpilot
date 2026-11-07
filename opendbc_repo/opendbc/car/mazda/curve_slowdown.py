@@ -72,6 +72,16 @@ LATE_FACTOR = 4                       # once the car's answer time is known, a p
 MIN_IN_FLIGHT_WINDOW = 1.0            # s: a press is never forgotten sooner than this
 DRIVER_RECENT = 1.5                   # s after the driver's last SET+/SET- edge (or while held): changes are theirs
 MAX_IN_FLIGHT = 3                     # presses that may be unaccounted for before we stop sending
+# Lost taps (drive 54, t 1244.6-1252): the red light head start's fast taps lost two (the car ignored them); every newer
+# landing is booked to the oldest press, so two presses stayed "in flight" for the whole stop and the confirmed floor
+# hold (which needed nothing in flight) never started: 49 -> 33 by 1 mph taps in 6.5 s instead of one hold to 19. A hold
+# (stop, firm curve or restore) may now start while only our own taps in its direction past PENDING_TIMEOUT are in
+# flight: they stay in flight (the limits still assume they land, a late landing is booked as before, the hold's bound
+# counts them) and only no longer keep the hold back. A confirmed floor stop that would hold but for a fresh press in
+# flight waits for it up to STOP_HOLD_WAIT instead of tapping meanwhile. (Moving such taps to `expired` once a newer
+# one lands was tried: with answers slower than PENDING_TIMEOUT the late one then lands uncounted and the randomized
+# limit tests go 1 step past the driver's speed / max drop.)
+STOP_HOLD_WAIT = 0.3                  # s
 NO_EFFECT_LIMIT = 6                   # presses in a row with no effect before backing off (1 in 4 ignored is normal)
 NO_EFFECT_BACKOFF = 10.0              # s to wait after that before trying again
 NO_EFFECT_TRIPS = 3                   # back-offs before giving up (speed left alone)
@@ -345,6 +355,7 @@ class CurveSlowdownLogic:
     self.curve_holds = 0             # SET- holds for the current curve (CURVE_HOLDS)
     self.hold_kind = None            # "stop" / "curve" / "restore": what the hold in progress is for
     self.hold_bound = None           # set speed the current hold must not cross
+    self.hold_wait_frame = None      # frame a confirmed floor stop began waiting for a press in flight (STOP_HOLD_WAIT)
     self.hold_margin = False         # the current hold is a restore hold (keeps a quantum of margin, see RESTORE_HOLD_*)
     self.stop_episode = False        # we lowered for a stopped car: the restore may use SET+ holds
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
@@ -400,6 +411,15 @@ class CurveSlowdownLogic:
       if p.direction == direction:
         return ("ours", k)
     return None
+
+  def _lost_taps(self, direction, before):
+    """Our taps in `direction` in flight, sent PENDING_TIMEOUT or more before frame `before`, not landed (ignored)."""
+    return [p for p in self.inflight if p.direction == direction and not p.hold and not p.jump and p.remaining > 0 and
+            before - p.frame >= _frames(PENDING_TIMEOUT)]
+
+  def _only_lost_in_flight(self, direction):
+    """Nothing in flight but lost taps of ours in `direction`: they do not keep a hold from starting (STOP_HOLD_WAIT)."""
+    return bool(self.inflight) and len(self._lost_taps(direction, self.frame)) == len(self.inflight)
 
   @property
   def latency(self):
@@ -1167,7 +1187,18 @@ class CurveSlowdownLogic:
     worst = (q + self._hold_reserve()) * self.step      # tap + first quantum + pending quantum + measured overrun
     hold = False
     self.hold_margin = False
-    if self.holds_allowed and not self.inflight and not jump and not i.gas_pressed:
+    flight_ok = not self.inflight or self._only_lost_in_flight(button)
+    # a confirmed floor stop that would hold now but for a fresh press in flight waits for it (STOP_HOLD_WAIT)
+    if (want_lower and reason == "stop" and i.stop_urgent and self.holds_allowed and not flight_ok and not jump and
+        not i.gas_pressed and self.holds_this_episode < MAX_STOP_HOLDS and
+        set_speed - worst >= max(target, STOP_MIN_SET_SPEED) - self.half_step):
+      if self.hold_wait_frame is None:
+        self.hold_wait_frame = self.frame
+      if self.frame - self.hold_wait_frame < _frames(STOP_HOLD_WAIT):
+        return None, None
+    else:
+      self.hold_wait_frame = None
+    if self.holds_allowed and flight_ok and not jump and not i.gas_pressed:
       # stop holds only when urgent (confirmed and close: floor mode); an unconfirmed early start or a far stopped car
       # taps (this used to follow from the wide overrun margin, now it is explicit)
       if want_lower and reason == "stop" and i.stop_urgent and self.holds_this_episode < MAX_STOP_HOLDS:
@@ -1216,6 +1247,8 @@ class CurveSlowdownLogic:
       self.stop_episode = True
     if button == SET_MINUS and self.anchor is None:
       self.anchor = i.set_speed      # the driver's speed, before our first press moves it
+    if hold:
+      self.hold_wait_frame = None
     if hold and self.phase_lock and not self.new_wheel:
       self._start_hold(button)        # its first frame goes out with the next wheel frame
       off = None
