@@ -199,12 +199,13 @@ class CSC:
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
         limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False,
-        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0, other=lambda f: False):
+        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0, other=lambda f: False, map_curve=None):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check).
   red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
   limit(f) / cap(f) / undo(f) / ceiling(f): the speed limit follower's raise / lower limit cap / undo / provisional
-  ceiling (m/s, 0 none), called in that order."""
+  ceiling (m/s, 0 none), called in that order.
+  map_curve(f): a followed map curve instead of the camera mimic: (active, target m/s) or None (curve_track on while active)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -224,6 +225,9 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
       csc.update(curve_fn(f), car.set_speed, car.v_ego)
     hist.append((csc.active, csc.speed))
     pa, ps = hist[max(0, len(hist) - 1 - plan_lag)]
+    mc = map_curve(f) if map_curve is not None else None
+    if map_curve is not None:
+      pa, ps = (True, mc[1]) if mc is not None and mc[0] else (False, 0.0)
     stop_active, stop_target, stop_urgent, restore_now, hold_restore = False, 0.0, False, False, False
     if st["gas"]:
       car.gas_frame = car.frame
@@ -259,7 +263,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
                             stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
                             stop_slower_ahead=bool(lead is not None and trigger.slower_after_red and stop_mode == 2),
-                            limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f), limit_ceiling=ceiling(f))
+                            limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f), limit_ceiling=ceiling(f),
+                            curve_track=bool(map_curve is not None and pa))
     btn, off = logic.update(inp)
     if btn is not None:
       assert 0 <= off < 16

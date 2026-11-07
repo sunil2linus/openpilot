@@ -1427,14 +1427,40 @@ def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
     assert tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
   assert not tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
   assert tr.release_reason.startswith("stop ahead cleared") and tr.restore_now
-  # the model stays a little negative: released once the latch runs out (LATCH_HOLD)
+  # the model stays a little negative: released once the planned stop has been gone STOP_AHEAD_GONE_TIME (drive 54, t
+  # 758.65: the plan gone at 761.8, released only at 764.66 when the latch ran out) ...
   tr = scs.StoppedCarTrigger()
   _started_past_the_warning(tr)
   n = 0
   while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
     n += 1
     assert n < 1000
-  assert abs(n - scs.LATCH_HOLD / scs.DT_CTRL) <= 3 and tr.release_reason.startswith("stop ahead cleared")
+  assert abs(n - scs.STOP_AHEAD_GONE_TIME / scs.DT_CTRL) <= 3 and tr.release_reason.startswith("stop ahead cleared")
+  assert tr.restore_now
+  # ... a planned stop that blinks off for less than that keeps it
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
+  for k in range(400):
+    assert tr.update(_latched_inputs(lead_status=False, plan_stop=(k % 100) >= 80, model_accel=-0.2))
+  # ... and with a slower car in our lane (not sure enough to be the stop's car yet) it waits for the latch (LATCH_HOLD)
+  slower = dict(lead_status=True, lead_prob=0.15, lead_d=110.0, lead_v=15 * MPH, lead_y=0.1, plan_stop=False,
+                model_accel=-0.2)
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
+  n = 0
+  while tr.update(_latched_inputs(**slower)):
+    n += 1
+    assert n < 1000
+  assert abs(n - scs.LATCH_HOLD / scs.DT_CTRL) <= 3 and tr.release_reason.startswith("stop ahead cleared"), n
+  # with the flag off (the old code): the latch
+  with _Flag("STOP_AHEAD_GONE_ENABLED", False):
+    tr = scs.StoppedCarTrigger()
+    _started_past_the_warning(tr)
+    n = 0
+    while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
+      n += 1
+      assert n < 1000
+  assert abs(n - scs.LATCH_HOLD / scs.DT_CTRL) <= 3
   # and not again for the same stop: the condition must be gone WARN_REARM first
   tr2 = scs.StoppedCarTrigger()
   while not tr2.update(_latched_inputs(lead_status=False)):
@@ -2758,3 +2784,35 @@ def test_a_confirmed_floor_stop_waits_for_a_press_in_flight_then_holds():
       sent.append((lg.frame, lg.last_action))
   waited = cs._frames(cs.PENDING_TIMEOUT)
   assert sent and sent[0][1] == "hold" and sent[0][0] - 100 >= waited, sent
+
+
+def _stop_ahead_in_a_map_curve():
+  return _releases(lambda: run(Car(45, dash_offset_mph=0.0), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10,
+                               model=lambda f: -0.6 if 200 <= f < 500 else -0.2, plan=lambda f: 200 <= f < 500,
+                               red=lambda f: 200 <= f < 500, map_curve=lambda f: (True, 40 * MPH)))
+
+
+def test_drive_54_e_stop_ahead_gone_releases_after_1_s_and_restores_with_a_hold_up_to_the_curve():
+  # drive 54, t 758.65: the floor hold for a planned stop that went away (the model still a little negative), inside a
+  # followed 42 mph map curve: released only when the latch ran out (2.9 s after the plan), then 1 mph taps 19 -> 26.
+  # Now: released 1 s after the plan, and the restore takes a SET+ hold up to 5 below the curve's target, then taps to
+  # it, never above it
+  r, rel = _stop_ahead_in_a_map_curve()
+  assert rel and rel[0][1].startswith("stop ahead cleared") and rel[0][2]
+  assert abs(rel[0][0] - 500 - scs.STOP_AHEAD_GONE_TIME / scs.DT_CTRL) <= 3, rel
+  ups = [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups and ups[0]["frame"] > rel[0][0] and ups[0]["bound_mph"] <= 40 - 5 + 1e-6, ups
+  after = [s / MPH for s in r["sets"][rel[0][0]:]]
+  assert max(after) <= 40 + 1e-6 and near(r["final"], 40)
+  at35 = next(k for k, s in enumerate(r["sets"]) if k > rel[0][0] and s / MPH >= 35 - 1e-6)
+  # the old rule (taps only inside a curve): 35 reached about 1 s later
+  old = cs.RESTORE_IN_CURVE_HOLD
+  cs.RESTORE_IN_CURVE_HOLD = False
+  try:
+    r2, rel2 = _stop_ahead_in_a_map_curve()
+  finally:
+    cs.RESTORE_IN_CURVE_HOLD = old
+  assert not [h for h in r2["logic"].hold_log if h["direction"] == cs.SET_PLUS]
+  at35_old = next(k for k, s in enumerate(r2["sets"]) if k > rel2[0][0] and s / MPH >= 35 - 1e-6)
+  assert at35_old - at35 >= 80, (at35, at35_old)
+  assert max(s / MPH for s in r2["sets"][rel2[0][0]:]) <= 40 + 1e-6

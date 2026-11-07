@@ -208,6 +208,11 @@ CURVE_GAS_RESTORE = True
 CURVE_HOLD_ENABLED = True
 CURVE_HOLD_MIN_QUANTA = 2
 CURVE_HOLDS = 1
+# A restore asked for at once (restore_pending: a stop ahead that cleared, a red light gone) while a followed map curve's
+# target is on: the restore hold (RESTORE_HOLD_MIN_GAIN) runs up to the curve's target with its usual margin below it,
+# then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
+# 764.7-768: 19 -> 26 in 3.3 s in a 42 mph curve, the car slowing 35 -> 30, 20 s before the real stop).
+RESTORE_IN_CURVE_HOLD = True
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -353,7 +358,7 @@ class CurveSlowdownLogic:
     self.hold_log = []               # [dict] one per hold, for the per-event log
     self.holds_this_episode = 0      # SET- holds for the current stopped car (HOLD_GOALS_MPH)
     self.curve_holds = 0             # SET- holds for the current curve (CURVE_HOLDS)
-    self.hold_kind = None            # "stop" / "curve" / "restore": what the hold in progress is for
+    self.hold_kind = None            # "stop" / "curve" / "restore" / "restore_curve": what the hold in progress is for
     self.hold_bound = None           # set speed the current hold must not cross
     self.hold_wait_frame = None      # frame a confirmed floor stop began waiting for a press in flight (STOP_HOLD_WAIT)
     self.hold_margin = False         # the current hold is a restore hold (keeps a quantum of margin, see RESTORE_HOLD_*)
@@ -1029,8 +1034,12 @@ class CurveSlowdownLogic:
       # follower going back up to the curve's speed)
       kind = "curve" if self.hold_kind == "curve" else "stop"
       target_rose = d == SET_MINUS and reason == kind and target > self.hold_bound + self.half_step
+      # (a restore hold inside a followed map curve, RESTORE_IN_CURVE_HOLD: only the curve may be on, its target still at
+      # or above the hold's bound)
+      curve_ok = (self.hold_kind == "restore_curve" and reason == "curve" and i.curve_track and
+                  target >= self.hold_bound - self.half_step)
       reason_gone = (reason != kind or target_rose or (kind == "curve" and not i.curve_hold)) if d == SET_MINUS else \
-                    (reason is not None or offset <= 0 or self._ceiling() is not None or
+                    ((reason is not None and not curve_ok) or offset <= 0 or self._ceiling() is not None or
                      (i.stop_slower_ahead and self.stop_episode))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
@@ -1188,6 +1197,11 @@ class CurveSlowdownLogic:
     hold = False
     self.hold_margin = False
     flight_ok = not self.inflight or self._only_lost_in_flight(button)
+    # a restore asked for at once (a stop ahead that cleared, a red light gone) inside a followed map curve: a SET+ hold
+    # up to the curve's target, never above it (RESTORE_IN_CURVE_HOLD; drive 54 t 764.7-768: 19 -> 26 by taps in a 42
+    # mph curve while the car slowed 35 -> 30)
+    in_curve = (RESTORE_IN_CURVE_HOLD and i.csc_active and i.curve_track and reason == "curve" and target is not None and
+                self.restore_pending and not raise_in_curve)
     # a confirmed floor stop that would hold now but for a fresh press in flight waits for it (STOP_HOLD_WAIT)
     if (want_lower and reason == "stop" and i.stop_urgent and self.holds_allowed and not flight_ok and not jump and
         not i.gas_pressed and self.holds_this_episode < MAX_STOP_HOLDS and
@@ -1222,14 +1236,18 @@ class CurveSlowdownLogic:
           self.hold_bound = hard
           self.curve_holds += 1
           self.hold_kind = "curve"
-      elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
+      elif (button == SET_PLUS and not want_lower and (all_over or self.restore_pending) and
+            (not i.csc_active or in_curve) and
             (not self.stop_episode or fast_stop or i.fast_restore) and self._ceiling() is None and
             not (i.stop_slower_ahead and self.stop_episode)):
         # one rule for every restore hold (RESTORE_HOLD_MIN_GAIN): a stop episode only when its car has clearly
         # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins (and
         # taps while a lower limit's cap or ceiling is pending, or a slower car is in our lane after a red light gone: they
         # release a hold)
+        # (inside a followed map curve: bounded by the curve's target as well, never above it: RESTORE_IN_CURVE_HOLD)
         driver_steps = int(round(top / self.step))
+        if in_curve:
+          driver_steps = min(driver_steps, int(math.floor(target / self.step + 1e-3)))
         set_steps = int(round(set_speed / self.step))
         margin = self._up_overrun() * q                      # what may still land after the release
         bound_steps = ((driver_steps - margin) // q) * q     # a multiple of the quantum, that far below
@@ -1242,7 +1260,7 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True
-          self.hold_kind = "restore"
+          self.hold_kind = "restore_curve" if in_curve else "restore"
     if want_lower and reason == "stop":
       self.stop_episode = True
     if button == SET_MINUS and self.anchor is None:

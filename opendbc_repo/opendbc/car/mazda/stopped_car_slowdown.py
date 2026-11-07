@@ -350,6 +350,14 @@ CATCH_UP_LOW_SPEED = 25 * MS_PER_MPH
 # a car confirms the stop (the early start's EARLY_CONFIRM_* rule) or the plan has shown the stop WARN_GUARD_PLAN_HOLD
 # continuously (LATCH_DROPOUT gaps). All 7 genuine warnings (drives 4f, 50) had redLight on at our start: unchanged.
 WARN_GUARD_ENABLED = True
+# A stop ahead (no car) whose planned stop is gone this long, with no slower car in our lane (any confidence the unsure
+# car takes), is released at once (restore_now), without waiting for the model to want to speed up (GO_TIME) or the latch
+# to run out (LATCH_HOLD). Drive 54, t 758.65: the floor hold for a slowdown the model planned ~115 m ahead (the queue was
+# 266 m ahead), the plan gone at 761.8 (for good at 762.5), released only at 764.66 with the car at 35 mph and still
+# slowing. The genuine stops ahead of drive 54 (t 210, 373, 1245) had no plan gap over 0.07 s. A new start on the
+# warning still needs its condition gone WARN_REARM first (no down-up-down for the same stop).
+STOP_AHEAD_GONE_ENABLED = True
+STOP_AHEAD_GONE_TIME = 1.0   # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
 WARN_GUARD_PLAN_HOLD = 4.0   # s
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
@@ -878,7 +886,9 @@ class StoppedCarTrigger:
         self._release("ego stopped behind the lead")
       elif self.warn_pending and not self._warn_still_planned(i):
         self._release(STOP_AHEAD_UNCONFIRMED)
-      elif self.go_frames >= _frames(GO_TIME) or not self.latched:
+      elif (self.go_frames >= _frames(GO_TIME) or not self.latched or
+            (STOP_AHEAD_GONE_ENABLED and self.frame - self.last_plan_stop >= _frames(STOP_AHEAD_GONE_TIME) and
+             not self._slower_in_lane(i))):
         self._release("stop ahead cleared (no stop planned)")
     elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
       if self.kind == STOP_AHEAD:
