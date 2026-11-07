@@ -131,6 +131,84 @@ PASS_BUFFER = 2400         # planner cycles of driving kept for the pass window 
 # frogpilotPlan.mapNavExit
 NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
 
+# ---- navigation exits watched past the split (the owner's exit design) ----
+# The exit navigation matched is watched until its start is WATCH_END behind: the car side's plan needs to know, also
+# while the GPS match is doubtful at the split (drive 53: trust 2 from the split until the link was matched 137 m past it),
+# whether the car is on the exit's link or still on the highway. The map's own shapes are compared with the car: the
+# nearest highway road shape and the nearest shape of the exit's link (and of the branches of a fork on it) within
+# SHAPE_RANGE, by distance and by heading. starpilotPlan.mapExitShape: 2 when we are closer to the link AND our heading is
+# closer to the link's bearing, 1 the same for the highway, 0 neither (no answer: the car side keeps counting the
+# distance driven). One frame's answer; the car side wants it sustained.
+EXIT_SHAPE_NONE, EXIT_SHAPE_HIGHWAY, EXIT_SHAPE_LINK = 0, 1, 2
+SHAPE_RANGE = 40.0         # m
+SHAPE_HEADING = 60.0       # deg: a shape turned more than this from our heading is not the road we are on
+WATCH_END = 600.0          # m behind its start (or this much more than navigation's range ahead): forgotten
+WATCH_KEEP = 3             # exits watched at most (a reroute, the next maneuver)
+WATCH_NEAR = 600.0         # m: the shape check is for the watched exit whose start is nearest, within this
+# Forks on an exit link (a 2-lane exit that splits into a left and a right branch): another link starting on the exit's
+# own link, FORK_MIN past its start. Until the car is seen on one branch (the shapes, as above, between the branches,
+# sustained FORK_CONFIRM past the fork) the exit's curve is the lower of both branches'; after, only the taken branch's.
+FORK_NEAR = 12.0           # m from the exit's link shape
+FORK_MIN = 30.0            # m past the exit's start (a link from the split itself is another exit)
+FORK_CONFIRM = 1.0         # s
+FORK_SEEN = 15.0           # m: the fork's branches are told apart once the fork is this close or behind
+# starpilotPlan.mapExitFork: 0 none, 1 not decided yet, 2 decided (navigation's branch, or navigation did not say), 3
+# decided: the other branch than navigation's
+FORK_NONE, FORK_OPEN, FORK_NAV, FORK_OTHER = 0, 1, 2, 3
+
+
+def near_shapes(grid, lat, lon, bearing, chains):
+  """{chain id: (m, deg)} the nearest road shape of each of `chains` within SHAPE_RANGE whose direction is within
+  SHAPE_HEADING of our heading (either way along it unless one-way) and that difference; "hwy": the same for any highway
+  (motorway / trunk) shape. bearing None: any direction (the difference is then 0)."""
+  out = {}
+  if not grid or lat is None:
+    return out
+  cla, clo = int(math.floor(lat * MATCH_CELL)), int(math.floor(lon * MATCH_CELL))
+  kx = math.radians(1.0) * EARTH_R * math.cos(math.radians(lat))
+  ky = math.radians(1.0) * EARTH_R
+  for dla in (-1, 0, 1):
+    for dlo in (-1, 0, 1):
+      for la1, lo1, la2, lo2, _wid, cid, one, cls in (seg for ri in grid for seg in ri.segments(cell_key(cla + dla, clo + dlo))):
+        key = cid if cid in chains else ("hwy" if cls in HIGHWAY_CLASSES else None)
+        if key is None:
+          continue
+        ax, ay = (lo1 - lon) * kx, (la1 - lat) * ky
+        bx, by = (lo2 - lon) * kx, (la2 - lat) * ky
+        dx, dy = bx - ax, by - ay
+        ll = dx * dx + dy * dy
+        if ll < 1e-6:
+          continue
+        t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll))
+        d = math.hypot(ax + t * dx, ay + t * dy)
+        if d > SHAPE_RANGE:
+          continue
+        diff = 0.0
+        if bearing is not None:
+          diff = abs((math.degrees(math.atan2(dx, dy)) - bearing + 180.0) % 360.0 - 180.0)
+          if not one:
+            diff = min(diff, 180.0 - diff)
+          if diff > SHAPE_HEADING:
+            continue
+        if key not in out or d < out[key][0]:
+          out[key] = (d, diff)
+  return out
+
+
+def shape_verdict(a, b):
+  """1 when shape a is closer AND heads closer to our heading than shape b, -1 the other way, 0 neither (or unknown)."""
+  if a is None and b is None:
+    return 0
+  if b is None:
+    return 1
+  if a is None:
+    return -1
+  if a[0] < b[0] and a[1] < b[1]:
+    return 1
+  if b[0] < a[0] and b[1] < a[1]:
+    return -1
+  return 0
+
 
 def nav_side(modifier):
   """Side of a navigation maneuver from its modifier ("slight right", "left", ...): -1 left, 1 right, 0 unknown."""
@@ -1195,6 +1273,7 @@ class MapCurves:
     self.odo_ok = False          # update() has been given the speed (the planner always; offline callers may not)
     self.entered = {}            # ramp curve s_a -> odo at its entry, on the ramp chain `entered_chain`
     self.entered_chain = 0
+    self.watches = []            # navigation exits watched past the split (_watch_add), newest last
     self.reset()
 
   def reset(self):
@@ -1227,6 +1306,13 @@ class MapCurves:
     self.paused = False          # GpsTrust paused: nothing planned from the map
     self.held = None             # (curve, distance) found but not acted on: the road match is not trusted
     self.trust_status = TRUST_OK # starpilotPlan.mapGpsTrust
+    self.watch = None            # the watched exit the mapExit* fields are about this frame
+    self.exit_shape = EXIT_SHAPE_NONE
+    self.exit_link = (0.0, 0.0)  # (m, deg) to the exit link's nearest shape (0, 0 none)
+    self.exit_hwy = (0.0, 0.0)   # ... the highway's
+    self.exit_fork = FORK_NONE
+    self.exit_curve = None       # the watched exit's next curve (forks decided) and the m to its entry
+    self.exit_curve_dist = 0.0
 
   # ---- the road ahead ----
   def _road(self, way_id, is_forward):
@@ -1340,6 +1426,8 @@ class MapCurves:
         self.paused = True
         return                   # no curve, ramp or exit: all of them come from the position
       shaky = trust.shaky
+    # the watched exit (also while the match is doubtful: the shapes themselves tell the link from the highway)
+    self._watch_update(lat, lon, bearing, max(float((gps or {}).get("dt", 0.05)), 0.0))
     road = self._road(way_id, is_forward) if way_id else None
     if road is not None:
       cid, increasing, s0, s1 = road
@@ -1347,6 +1435,8 @@ class MapCurves:
       if cid != self.entered_chain:
         self.entered, self.entered_chain = {}, cid      # another road: its ramp curves are new
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
+      if self.watches:
+        cands = self._fork_filter(cid, cands)
       if cands:
         cands = self.veto.filter(self, cid, cands, camera, shaky)
       if cands:
@@ -1374,6 +1464,20 @@ class MapCurves:
         self.ramp_end_dist = dist_m(lat, lon, *end)
     if nav is not None and not (trust is not None and trust.low):
       self._nav_exit(lat, lon, bearing, *nav)
+    if nav is not None and self.on_ramp:
+      self._nav_fork(lat, lon, bearing, *nav)
+
+  def _nav_fork(self, lat, lon, bearing, mtype, modifier, distance):
+    """On a watched exit's link: navigation's next maneuver at one of its forks says which branch it takes (logs, and
+    mapExitFork 3 when the car took the other one)."""
+    side = nav_side(modifier)
+    w = self.watch
+    if w is None or not side or mtype not in NAV_EXIT_TYPES + ("turn", "continue"):
+      return
+    for f in w["forks"]:
+      ok, d = ahead(lat, lon, bearing, *f["at"])
+      if f["res"] is None and ok and abs(d - distance) <= max(NAV_MATCH_MIN, NAV_MATCH_TOL * distance):
+        f["nav"] = side
 
   def _nav_exit(self, lat, lon, bearing, mtype, modifier, distance):
     if mtype not in NAV_EXIT_TYPES or not (0 < distance <= NAV_EXIT_RANGE) or self.on_ramp:
@@ -1399,18 +1503,174 @@ class MapCurves:
       self.nav_exit, self.nav_exit_dist = NAV_EXIT_NO_DATA, distance
       return
     self.nav_ramp, self.nav_exit_dist = best, distance
+    w = self._watch_add(best)
     curves = self.store.curves.get(best["chain"], [])
-    if best["travel"] == "ba":
-      curves = sorted(curves, key=lambda c: -c["s_b"])
+    chain_len = self.store.chains.get(best["chain"], {}).get("len", 0.0)
+    # (each with its m from the split along the exit; the branches of its forks count too, from the fork: until the car
+    # is on one, the lower speed of both governs)
+    curves = [(c, c["s_a"] if best["travel"] == "ab" else chain_len - c["s_b"]) for c in curves]
+    for f in (w["forks"] if w["chain"] == best["chain"] else []):
+      curves += [(c, f["from_start"] + s) for c, s in self._branch_curves(f)]
     if curves:
-      chain_len = self.store.chains.get(best["chain"], {}).get("len", 0.0)
-      def to_entry(c):
-        return c["s_a"] if best["travel"] == "ab" else chain_len - c["s_b"]
-      c = min(curves, key=lambda c: plan_speed(c["r"], distance + to_entry(c), c.get("adv", 0.0), decel=self.decel))
-      self.nav_curve, self.nav_curve_dist = c, distance + to_entry(c)
+      c, s = min(curves, key=lambda cs: plan_speed(cs[0]["r"], distance + cs[1], cs[0].get("adv", 0.0), decel=self.decel))
+      self.nav_curve, self.nav_curve_dist = c, distance + s
       self.nav_exit = NAV_EXIT_CURVES
     else:
       self.nav_exit = NAV_EXIT_NO_CURVES
+
+  # ---- the watched navigation exit (past the split, forks) ----
+  def _watch_add(self, r, side=0):
+    """Watch the exit `r` navigation matched (its forks found once). A branch of a watched exit's fork (navigation's
+    next maneuver on the link, before the road match is on it) is not a new exit: it says which branch navigation
+    takes (side: the maneuver's side)."""
+    for w in self.watches:
+      if w["ramp"] is r or w["ramp"].get("chain") == r.get("chain"):
+        return w
+      for f in w["forks"]:
+        if f["chain"] == r.get("chain"):
+          f["nav"] = f["side"]
+          return w
+    w = {"ramp": r, "chain": r["chain"], "forks": self._forks(r), "entered": {}}
+    self.watches = (self.watches + [w])[-WATCH_KEEP:]
+    return w
+
+  def _forks(self, r):
+    """The links that start on exit `r`'s own link at least FORK_MIN past its start: its branches."""
+    grid = self.store.grid
+    out = []
+    for o in self.store.ramps_all:
+      if o is r or o.get("chain") == r.get("chain") or o["travel"] == "both":
+        continue
+      d0 = dist_m(*r["start"], *o["start"])
+      if d0 < FORK_MIN or d0 > float(r.get("len", 0.0)) + FORK_NEAR:
+        continue
+      la, lo = o["start"]
+      brg = bearing_to(la, lo, *o["end"])
+      near = near_shapes(grid, la, lo, None, {r["chain"]})
+      hit = near.get(r["chain"])
+      if hit is None or hit[0] > FORK_NEAR:
+        continue
+      # which side the branch leaves to: its bearing toward its end against the exit link's toward its own end
+      turn = (brg - bearing_to(la, lo, *r["end"]) + 540.0) % 360.0 - 180.0
+      out.append({"ramp": o, "chain": o["chain"], "at": (la, lo), "from_start": d0, "side": 1 if turn > 0 else -1,
+                  "res": None, "t": 0.0, "pending": None, "nav": 0})
+    return out
+
+  def _branch_curves(self, fork):
+    """The fork's own branch's curves, each with its m from the branch's start along it."""
+    o = fork["ramp"]
+    curves = self.store.curves.get(o["chain"], [])
+    chain_len = self.store.chains.get(o["chain"], {}).get("len", 0.0)
+    return [(c, (c["s_a"] if o["travel"] == "ab" else chain_len - c["s_b"])) for c in curves]
+
+  def _beyond(self, w, fork, c):
+    """A curve of the exit's own link that is past the fork (its continuing branch's)."""
+    entry = c["a"] if w["ramp"]["travel"] == "ab" else c["b"]
+    return dist_m(*w["ramp"]["start"], *entry) > fork["from_start"] - 5.0
+
+  def _exit_candidates(self, w, own):
+    """The curves of the watched exit that may still come: (curve, its chain) of the exit's own link (`own`: those of
+    its chain) and of the branches, by the forks decided so far (FORK_*): a branch not taken is never one of them."""
+    out = []
+    for c in own:
+      if any(f["res"] == "side" and self._beyond(w, f, c) for f in w["forks"]):
+        continue                  # the continuing branch of a fork that went the other way
+      out.append(c)
+    for f in w["forks"]:
+      if f["res"] in (None, "side"):
+        out += [c for c, _ in self._branch_curves(f)]
+    return out
+
+  def _fork_update(self, w, lat, lon, bearing, dt):
+    """Decide the forks the car has reached: the shapes of the two branches past the fork (sustained FORK_CONFIRM)."""
+    grid = self.store.grid
+    for f in w["forks"]:
+      if f["res"] is not None:
+        continue
+      ok, d = ahead(lat, lon, bearing, *f["at"])
+      if ok and d > FORK_SEEN:
+        f["t"], f["pending"] = 0.0, None
+        continue
+      if not ok and d > WATCH_END:
+        continue
+      near = near_shapes(grid, lat, lon, bearing, {f["chain"], w["chain"]})
+      v = shape_verdict(near.get(f["chain"]), near.get(w["chain"]))
+      pick = "side" if v > 0 else ("cont" if v < 0 else None)
+      if pick is None:
+        continue                  # (no answer this frame: the count goes on)
+      f["t"] = f["t"] + dt if pick == f["pending"] else dt
+      f["pending"] = pick
+      if f["t"] >= FORK_CONFIRM - 1e-6:
+        f["res"] = pick
+
+  def _watch_update(self, lat, lon, bearing, dt):
+    """The shape check and the exit's curve for the watched exit whose start is nearest (starpilotPlan.mapExit*)."""
+    keep = []
+    for w in self.watches:
+      ok, d = ahead(lat, lon, bearing, *w["ramp"]["start"])
+      if (not ok and d > WATCH_END + float(w["ramp"].get("len", 0.0))) or (ok and d > NAV_EXIT_RANGE + WATCH_END):
+        continue
+      keep.append((d, w))
+    self.watches = [w for _, w in keep]
+    if not keep:
+      return
+    d, w = min(keep, key=lambda dw: dw[0])
+    if d > WATCH_NEAR + float(w["ramp"].get("len", 0.0)):
+      return
+    self.watch = w
+    chains = {w["chain"]} | {f["chain"] for f in w["forks"]}
+    near = near_shapes(self.store.grid, lat, lon, bearing, chains)
+    links = [near[c] for c in chains if c in near]
+    link = min(links, key=lambda dh: dh[0]) if links else None
+    hwy = near.get("hwy")
+    v = shape_verdict(link, hwy)
+    self.exit_shape = EXIT_SHAPE_LINK if v > 0 else (EXIT_SHAPE_HIGHWAY if v < 0 else EXIT_SHAPE_NONE)
+    self.exit_link = link or (0.0, 0.0)
+    self.exit_hwy = hwy or (0.0, 0.0)
+    self._fork_update(w, lat, lon, bearing, dt)
+    if w["forks"]:
+      self.exit_fork = FORK_OPEN if any(f["res"] is None for f in w["forks"]) else (
+        FORK_OTHER if any(f["nav"] and ((f["nav"] == f["side"]) != (f["res"] == "side")) for f in w["forks"]) else FORK_NAV)
+    # the exit's next curve from here: straight-line ahead (a curve we reached is "in it" for its length)
+    best, best_d, best_speed = None, 0.0, float("inf")
+    cands = self._exit_candidates(w, self.store.curves.get(w["chain"], []))
+    travel_ab = {w["chain"]: w["ramp"]["travel"] == "ab", **{f["chain"]: f["ramp"]["travel"] == "ab" for f in w["forks"]}}
+    for c in cands:
+      key = (c.get("chain"), c["s_a"])
+      if key in w["entered"]:
+        if self.odo - w["entered"][key] < c["len"]:
+          d_e = 0.0
+        else:
+          continue
+      else:
+        ab = travel_ab.get(c.get("chain"), True)
+        entry, exit_ = (c["a"], c["b"]) if ab else (c["b"], c["a"])
+        ok, d_e = ahead(lat, lon, bearing, *entry)
+        if not ok:
+          ok_x, d_x = ahead(lat, lon, bearing, *exit_)
+          if not ok_x or d_x > c["len"] + 60:
+            continue
+          d_e = 0.0
+        if d_e <= NEAR and self.odo_ok:
+          w["entered"][key] = self.odo + d_e
+      sp = plan_speed(c["r"], d_e, c.get("adv", 0.0), decel=self.decel)
+      if sp < best_speed:
+        best, best_d, best_speed = c, d_e, sp
+    if best is not None:
+      self.exit_curve, self.exit_curve_dist = best, best_d
+
+  def _fork_filter(self, cid, cands):
+    """On a watched exit's own link: its continuing branch's curves go once a fork went the other way, and the
+    branches of a fork not decided yet (or taken) count as curves ahead (the lower speed governs until it is)."""
+    w = next((w for w in self.watches if w["chain"] == cid and w["forks"]), None)
+    if w is None:
+      return cands
+    keep = {id(c) for c in self._exit_candidates(w, [c for c, _ in cands])}
+    out = [(c, d) for c, d in cands if id(c) in keep]
+    ex = self.exit_curve if self.watch is w else None
+    if ex is not None and ex.get("chain") != cid and all(c is not ex for c, _ in out):
+      out.append((ex, self.exit_curve_dist))
+    return out
 
 
 class MapCurvesPlanner:
@@ -1756,3 +2016,11 @@ class MapCurvesPlanner:
       plan.mapNavCurveRadius = float(mc.nav_curve["r"])
       plan.mapNavCurveDistance = float(mc.nav_curve_dist)
       plan.mapNavCurveAdvisory = float(mc.nav_curve.get("adv", 0.0) or 0.0)
+    plan.mapExitShape = int(mc.exit_shape)
+    plan.mapExitLinkDist, plan.mapExitLinkHeading = (float(v) for v in mc.exit_link)
+    plan.mapExitHighwayDist, plan.mapExitHighwayHeading = (float(v) for v in mc.exit_hwy)
+    plan.mapExitFork = int(mc.exit_fork)
+    if mc.exit_curve is not None:
+      plan.mapExitCurveRadius = float(mc.exit_curve["r"])
+      plan.mapExitCurveDistance = float(mc.exit_curve_dist)
+      plan.mapExitCurveAdvisory = float(mc.exit_curve.get("adv", 0.0) or 0.0)

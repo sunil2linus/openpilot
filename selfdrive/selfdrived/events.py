@@ -1293,6 +1293,16 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: map_paused_alert,
   },
 
+  # Mazda navigation exit (map curves On): the stock cruise cannot slow enough for the exit's curve (its ~0.9 m/s^2
+  # from the exit speed at the split, or from here once on the ramp): the driver brakes. Same chime as the stop warnings.
+  StarPilotEventName.mapExitCurveBrake: {
+    ET.PERMANENT: Alert(
+      "EXIT CURVE - BRAKE",
+      "Cruise cannot slow enough for the ramp curve",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stopChime, 3.),
+  },
+
   StarPilotEventName.mazdaStockLkasOff: {
     ET.PERMANENT: Alert(
       "Car's Lane Keep Assist is off",

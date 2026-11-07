@@ -158,6 +158,20 @@ MAP_FOLLOW_MAX_DECEL = 0.6    # m/s^2: a 7.9 mph gap at MAP_FOLLOW_GAIN
 MAP_SETTLE_HYST = 1.0 * MS_PER_MPH  # m/s: once settled, only this much above the settle speed asks for a gap again (no churn)
 MAP_MIN_ROOM = 5.0            # m: the required decel is never computed over less than this (a curve we are nearly in)
 MAP_FOLLOW_BUDGET = 40        # SET- presses for one followed curve (max drop + undershoot + ignored presses, also in km/h)
+# Firm follow (ramp curves and navigation exits only, owner's exit design): when the room left needs more than
+# MAP_FOLLOW_MAX_DECEL, the set speed is taken well below so the stock cruise slows at its strongest. Measured: the
+# cruise slows ~0.19 m/s^2 per m/s of gap, capped at ~1.0 m/s^2 (drives 44-53: a set speed held far below gave 0.9-1.0,
+# never more), so a gap of ~13 mph at MAP_FOLLOW_GAIN already gives all it has. The command keeps that gap as the car
+# slows, at most FIRM_UNDERSHOOT below the curve's speed (the ramp floor still holds), and steps back up to the curve's
+# speed FIRM_SETTLE_TIME of the current slowdown early (the taps up take ~1-2 s and the cruise answers a second later).
+FIRM_MAX_DECEL = 1.0          # m/s^2
+FIRM_UNDERSHOOT = 8 * MS_PER_MPH  # m/s
+FIRM_SETTLE_TIME = 1.6        # s
+
+
+def cruise_decel(gap):
+  """The stock cruise's slowdown (m/s^2) with the set speed `gap` m/s below the true speed (measured, see above)."""
+  return min(max(gap, 0.0) * 0.19, FIRM_MAX_DECEL)
 
 
 def map_curve_speed(radius, distance, lat_accel, advisory=0.0, reaction_speed=0.0, decel=MAP_DECEL,
@@ -218,29 +232,52 @@ class MapCurveTarget:
 class MapCurveFollower:
   """The set speed to command for the curve (road, ramp or exit) MapCurveTarget made active: map_follow_speed, never
   above the plan, and only ever going down until the car is nearly at the curve's speed (then up to it), so the buttons
-  are not churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends."""
+  are not churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends.
 
-  def __init__(self):
+  max_decel / undershoot / lead_time: the follow's own bounds (the gentle slowdown before an exit's split uses smaller
+  ones). firm: may turn firm (FIRM_*) when the room left needs more than max_decel (ramp curves, exits)."""
+
+  def __init__(self, max_decel=MAP_FOLLOW_MAX_DECEL, undershoot=MAP_UNDERSHOOT, lead_time=MAP_LEAD_TIME, firm=False):
+    self.max_decel, self.undershoot, self.lead_time, self.can_firm = max_decel, undershoot, lead_time, firm
     self.cmd = None
     self.v_curve = None
     self.settled = False          # the car is (nearly) at the curve's speed: the command is the curve's speed
+    self.firm = False             # this curve needs the cruise's strongest slowdown (FIRM_*)
 
   def reset(self):
     self.cmd = self.v_curve = None
-    self.settled = False
+    self.settled = self.firm = False
+
+  @property
+  def low(self):
+    """The lowest the command may go (m/s): the curve's speed less the undershoot in use."""
+    return (self.v_curve or 0.0) - (FIRM_UNDERSHOOT if self.firm else self.undershoot)
 
   def update(self, v_ego, v_curve, distance, plan_speed):
     if self.v_curve is None or abs(v_curve - self.v_curve) > 0.05:
-      self.cmd, self.settled = None, False   # a new curve (or its speed changed: curve memory, the max drop floor moved)
+      self.cmd, self.settled, self.firm = None, False, False   # a new curve (or its speed changed)
     self.v_curve = v_curve
-    if v_ego <= v_curve + MAP_SETTLE:
+    settle = MAP_SETTLE
+    if self.firm and self.cmd is not None:
+      # the car keeps slowing at the current gap's rate while the taps go up and the cruise answers
+      settle = max(MAP_SETTLE, cruise_decel(v_ego - self.cmd) * FIRM_SETTLE_TIME)
+    if v_ego <= v_curve + settle:
       self.settled = True
-    elif v_ego > v_curve + MAP_SETTLE + MAP_SETTLE_HYST:
+    elif v_ego > v_curve + settle + MAP_SETTLE_HYST:
       self.settled = False        # clearly too fast again (a downhill, a slow landing): ask for a gap again
     if self.settled:
       self.cmd = v_curve
+      return self.cmd
+    room = max(distance - v_curve * self.lead_time - v_ego * MAP_FOLLOW_DEAD_TIME, MAP_MIN_ROOM)
+    if self.can_firm and not self.firm and (v_ego ** 2 - v_curve ** 2) / (2 * room) > self.max_decel:
+      self.firm, self.cmd = True, None
+    if self.firm:
+      want = map_follow_speed(v_ego, v_curve, distance, lead_time=self.lead_time, max_decel=FIRM_MAX_DECEL,
+                              undershoot=FIRM_UNDERSHOOT, settle=0.0)
     else:
-      want = min(map_follow_speed(v_ego, v_curve, distance), plan_speed)   # the plan is never below the curve's speed
-      if self.cmd is None or want < self.cmd:
-        self.cmd = want           # down with the car only (small rises of the command do not move the buttons)
+      want = map_follow_speed(v_ego, v_curve, distance, lead_time=self.lead_time, max_decel=self.max_decel,
+                              undershoot=self.undershoot)
+    want = min(want, plan_speed)  # the plan is never below the curve's speed
+    if self.cmd is None or want < self.cmd:
+      self.cmd = want             # down with the car only (small rises of the command do not move the buttons)
     return self.cmd

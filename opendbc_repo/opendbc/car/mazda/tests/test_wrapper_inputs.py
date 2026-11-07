@@ -198,21 +198,98 @@ def test_wrapper_gives_the_provisional_ceiling_in_on_mode_only_and_logs_it(tmp_p
     assert len(hold) == 1 and abs(hold[0]["limit_mph"] - 40) < 1e-6 and hold[0]["mode"] == ("on" if mode == 2 else "test")
 
 
-def test_wrapper_counts_a_carried_exit_on_through_a_planner_gap_and_passes_the_gas(tmp_path, monkeypatch):
+def test_wrapper_counts_the_exit_plan_on_through_a_planner_gap_and_passes_the_gas(tmp_path, monkeypatch):
   # review: the carried exit distance was counted only while starpilotPlan was alive (a gap stretched the slowdown):
-  # now by the car's own speed (vEgo x dt) meanwhile
+  # the exit plan's odometer goes on by the car's own speed (vEgo x dt) meanwhile
   c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
-  c.map_control.carry = [30.0, 300.0]
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust = 2, 1, 0
+  plan.mapNavExit, plan.mapNavExitDistance, plan.mapNavExitSide = 1, 250.0, 1
+  plan.mapNavCurveRadius, plan.mapNavCurveDistance = 95.0, 520.0
+  c.update(W.CC, W.car_state(44, 45), None, None, False)
+  rem = c.map_control.exit_rem
+  assert c.map_control.plan is not None and abs(rem - 250.0) < 1.0
   sm.alive["starpilotPlan"] = False
   _drive(c, 100, v_mph=44)
   moved = 44 * MPH * 100 * cs.DT_CTRL
-  assert abs(c.map_control.carry[0] - (30.0 - moved)) < 1e-3 and abs(c.map_control.carry[1] - (300.0 - moved)) < 1e-3
-  # planner back, past the exit point on the motorway (not yet EXIT_STAY_MARGIN), his foot on the gas: the exit is dropped
+  assert abs(c.map_control.exit_rem - (rem - moved)) < 1e-3, (c.map_control.exit_rem, rem - moved)
+  # planner back, near the exit point, his foot on the gas: his decision (the exit slowing ends)
   sm.alive["starpilotPlan"] = True
-  plan = sm.msgs["starpilotPlan"]
-  plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust = 2, 1, 0
-  c.map_control.carry = [-20.0, 250.0]
   c.update(W.CC, W.car_state(44, 45), None, None, False)
-  assert c.map_control.carry is not None
+  assert not c.map_control.plan.declined
   c.update(W.CC, W.car_state(44, 45, gas=True), None, None, False)
-  assert c.map_control.carry is None
+  assert c.map_control.plan.declined
+
+
+def _lane_model(m, right_edge=True):
+  xs = [0.0, 3.0, 6.75, 12.0, 18.75, 27.0, 48.0]
+  line = lambda y: SimpleNamespace(x=xs, y=[y] * len(xs))  # noqa: E731
+  m.laneLines = [line(-5.4), line(-1.8), line(1.8), line(5.4)]
+  m.laneLineProbs = [0.8, 0.9, 0.9, 0.0 if right_edge else 0.8]
+  m.roadEdges = [line(-8.0), line(2.8 if right_edge else 8.0)]
+  m.roadEdgeStds = [0.3, 0.3]
+
+
+def test_wrapper_reads_the_exit_setting_feeds_the_lane_view_and_raises_the_brake_alert(tmp_path, monkeypatch):
+  for raw, want in ((None, 0), ("2", 2), ("3", 3), ("x", 0), ("9", 0)):
+    sm = W.FakeSM()
+    monkeypatch.setattr(messaging, "SubMaster", lambda services, sm=sm: sm)
+    CP = SimpleNamespace(flags=MazdaSafetyFlags.GEN1, carFingerprint="MAZDA_CX5", maxLateralAccel=1.09)
+    c = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False, "MazdaExitSplitSpeed": raw}), curve_enabled=False, map_mode=2)
+    assert c.map_control.split_mode == want, (raw, c.map_control.split_mode)
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  _lane_model(sm.msgs["modelV2"])
+  sm.updated["modelV2"] = True
+  _drive(c, 150)
+  assert c.map_control.lane.edge[1] and not c.map_control.lane.edge[-1]
+  _lane_model(sm.msgs["modelV2"], right_edge=False)
+  _drive(c, 250)
+  assert not c.map_control.lane.edge[1]
+  # a model without lane lines (or a malformed one) never breaks the wrapper
+  sm.msgs["modelV2"].laneLines = []
+  _drive(c, 10)
+  # "Exit curve - brake": the flag for EXIT_CHIME_HOLD (starpilotCarState.mazdaExitCurveBrake), one record
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  c.map_control.chime_count += 1
+  c.map_control.chime_why = "before the split"
+  c.update(W.CC, W.car_state(44, 45), None, None, False)
+  assert c.exit_brake_alert
+  _drive(c, int(c.EXIT_CHIME_HOLD / cs.DT_CTRL))
+  assert not c.exit_brake_alert
+  brake = [d for k, d in records if k == "mapExitBrake"]
+  assert len(brake) == 1 and brake[0]["mode"] == "on" and brake[0]["why"] == "before the split"
+  # Test mode: logged, no alert
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=1)
+  sm.msgs["starpilotPlan"].mapCurveMode = 1
+  c.map_control.chime_count += 1
+  c.update(W.CC, W.car_state(44, 45), None, None, False)
+  assert not c.exit_brake_alert and [d for k, d in records if k == "mapExitBrake"][0]["mode"] == "test"
+
+
+def test_wrapper_logs_each_navigation_exit_with_the_lane_and_shape_checks(tmp_path, monkeypatch):
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  opened, closed = [], []
+  monkeypatch.setattr(c.recorder, "open", lambda kind, t, summary, **kw: (opened.append((kind, summary)), {"kind": kind})[1])
+  monkeypatch.setattr(c.recorder, "close", lambda ev, t, extra=None: closed.append((ev["kind"], extra)))
+  rows = []
+  monkeypatch.setattr(c.recorder, "add_row", lambda t, values: rows.append(values))
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust, plan.slcSpeedLimit = 2, 1, 0, 70 * MPH
+  plan.mapNavExit, plan.mapNavExitDistance, plan.mapNavExitSide = 1, 900.0, 1
+  plan.mapNavCurveRadius, plan.mapNavCurveDistance = 95.0, 1170.0
+  plan.mapExitShape, plan.mapExitLinkDist, plan.mapExitHighwayDist = 1, 0.0, 5.5
+  _drive(c, 10)
+  assert not [k for k, _ in opened if k == "mapExit"]             # 900 m out: not yet (EXIT_LOG_BEFORE)
+  plan.mapNavExitDistance = 500.0
+  _drive(c, 10)
+  ex = [s for k, s in opened if k == "mapExit"]
+  assert len(ex) == 1 and abs(ex[0]["exit_m"] - 500) < 2 and ex[0]["side"] == 1 and abs(ex[0]["limit_mph"] - 70) < 1e-6
+  assert not any(k in s for s in ex for k in ("lat", "lon", "latitude", "longitude"))
+  cols = c.EVENT_COLUMNS
+  assert len(rows[-1]) == len(cols) and rows[-1][cols.index("exit_shape")] == 1 and rows[-1][cols.index("exit_state")] == "planned"
+  # missed: the plan ends, the event closes with its result
+  c.map_control._end("missed", restore=True)
+  _drive(c, 5)
+  done = [e for k, e in closed if k == "mapExit"]
+  assert len(done) == 1 and done[0]["result"] == "missed" and done[0]["ended"] == "missed"

@@ -92,6 +92,12 @@ class StarPilotEvents:
         cloudlog.exception("stop warning failed, disabled for this drive")
         self.stop_warning = None
 
+    # Mazda navigation exit: "Exit curve - brake" once per rising edge of the card's flag (map_curve_control chime)
+    exit_brake = bool(getattr(sm["starpilotCarState"], "mazdaExitCurveBrake", False))
+    if exit_brake and not getattr(self, "prev_exit_brake", False):
+      self.events.add(StarPilotEventName.mapExitCurveBrake)
+    self.prev_exit_brake = exit_brake
+
     if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
       self.mazda_lkas_off_shown = True
       self.events.add(StarPilotEventName.mazdaStockLkasOff)

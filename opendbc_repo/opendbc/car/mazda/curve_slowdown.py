@@ -190,6 +190,14 @@ CURVE_NO_ACCEL = True
 # as well: SET+ jumps to the current speed (never one that could land above the driver's speed, see GAS_JUMP_*), then
 # taps.
 CURVE_GAS_RESTORE = True
+# A firm map curve (a ramp curve or an exit with too little room for the usual follow, curve_target.FIRM_*): the set
+# speed has to go ~13 mph under the speed at once for the cruise's strongest slowdown (~1.0 m/s^2); taps take ~0.3 s a
+# mph (one unconfirmed at a time), a SET- hold ~0.12 s (1 mph, then 5 mph every 0.6 s). So a firm curve that wants at
+# least CURVE_HOLD_MIN_QUANTA below the set speed takes one SET- hold toward it (bounded by the target with the hold's
+# overrun margin, as a stop hold), then taps; at most CURVE_HOLDS per curve.
+CURVE_HOLD_ENABLED = True
+CURVE_HOLD_MIN_QUANTA = 2
+CURVE_HOLDS = 1
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -227,6 +235,9 @@ class SlowdownInputs:
   # the camera's curve target governs on a link (map_curve_control.CurveMix.no_accel): inside the curve the set speed is
   # never left more than a step above the current speed, so the cruise does not speed up in it (CURVE_NO_ACCEL)
   curve_no_accel: bool = False
+  # (with curve_track) the followed curve is firm (map_curve_control.MapOutput.firm): a SET- hold may take the set speed
+  # down to its command (CURVE_HOLD_*)
+  curve_hold: bool = False
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
@@ -331,6 +342,8 @@ class CurveSlowdownLogic:
     self.hold_measured = False
     self.hold_log = []               # [dict] one per hold, for the per-event log
     self.holds_this_episode = 0      # SET- holds for the current stopped car (HOLD_GOALS_MPH)
+    self.curve_holds = 0             # SET- holds for the current curve (CURVE_HOLDS)
+    self.hold_kind = None            # "stop" / "curve" / "restore": what the hold in progress is for
     self.hold_bound = None           # set speed the current hold must not cross
     self.hold_margin = False         # the current hold is a restore hold (keeps a quantum of margin, see RESTORE_HOLD_*)
     self.stop_episode = False        # we lowered for a stopped car: the restore may use SET+ holds
@@ -896,6 +909,7 @@ class CurveSlowdownLogic:
     all_over = self.reason_free_frames >= _frames(restore_delay)
     if curve_over:
       self.lower_presses = 0
+      self.curve_holds = 0
     if not i.stop_active:
       self.stop_presses = 0
     if all_over:
@@ -991,15 +1005,17 @@ class CurveSlowdownLogic:
         overrun = (1 + (self._down_overrun() if d == SET_MINUS else self._up_overrun())) * q * self.step
         crosses = ((i.set_speed - overrun < self.hold_bound - self.half_step) if d == SET_MINUS else
                    (i.set_speed + overrun > self.hold_bound + self.half_step))
-      # a SET- hold also stops when the target rises above its bound (the radar took over the car ahead)
-      target_rose = d == SET_MINUS and reason == "stop" and target > self.hold_bound + self.half_step
-      reason_gone = (reason != "stop" or target_rose) if d == SET_MINUS else \
+      # a SET- hold also stops when the target rises above its bound (the radar took over the car ahead; a firm curve's
+      # follower going back up to the curve's speed)
+      kind = "curve" if self.hold_kind == "curve" else "stop"
+      target_rose = d == SET_MINUS and reason == kind and target > self.hold_bound + self.half_step
+      reason_gone = (reason != kind or target_rose or (kind == "curve" and not i.curve_hold)) if d == SET_MINUS else \
                     (reason is not None or offset <= 0 or self._ceiling() is not None or
                      (i.stop_slower_ahead and self.stop_episode))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
-        if target_rose:
+        if target_rose and kind == "stop":
           self.holds_this_episode = max(0, self.holds_this_episode - 1)   # the floor hold stays available
         if not crosses and self.hold.frames_sent:
           # stopped between two landings (its reason went, a pedal, ...): the quantum the car was about to step can
@@ -1165,6 +1181,16 @@ class CurveSlowdownLogic:
             goal = HOLD_GOALS_MPH[k] * (1.609344 if self.step < MS_PER_MPH else 1.0) * self.step
             self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
+          self.hold_kind = "stop"
+      elif (CURVE_HOLD_ENABLED and want_lower and reason == "curve" and i.curve_track and i.curve_hold and
+            self.curve_holds < CURVE_HOLDS and set_speed - target >= CURVE_HOLD_MIN_QUANTA * q * self.step - 1e-3):
+        # a firm map curve: one hold toward its command; the release keeps the overrun margin above it, as a stop hold's
+        hard = max(target, MIN_SET_SPEED)
+        hold = set_speed - worst >= hard - self.half_step
+        if hold:
+          self.hold_bound = hard
+          self.curve_holds += 1
+          self.hold_kind = "curve"
       elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
             (not self.stop_episode or fast_stop or i.fast_restore) and self._ceiling() is None and
             not (i.stop_slower_ahead and self.stop_episode)):
@@ -1185,6 +1211,7 @@ class CurveSlowdownLogic:
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True
+          self.hold_kind = "restore"
     if want_lower and reason == "stop":
       self.stop_episode = True
     if button == SET_MINUS and self.anchor is None:
@@ -1222,12 +1249,21 @@ class CurveSlowdown:
                    "stop_active", "stop_target_mph", "stop_urgent", "stop_required", "stop_ttc", "stop_floor", "offset", "in_flight",
                    "hold", "press", "driver_btn", "blocked", "restoring",
                    "map_mode", "map_status", "map_dist", "map_r", "map_active", "map_mph", "map_why", "on_ramp",
-                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_intent", "map_adv_mph",
+                   "ramp_type", "ramp_to_mph", "ramp_to_hwy", "ramp_end", "nav_exit", "nav_dist", "nav_r", "blinker", "exit_state", "map_adv_mph",
                    "map_veto", "gps_trust", "gps_acc", "decel_learn", "answer_frames",
                    "anchor_mph", "plan_stop", "plan_ratio", "stop_latched", "stop_early",
                    "lead_v_f", "radar_stable", "radar_follow", "radar_hold",
                    "lead_y_path", "leaving", "clear_ahead", "warn_cond", "warn_s", "warn_start", "stop_kind",
-                   "slc_mph", "slc_src", "limit_stable_mph", "limit_offer_mph", "limit_raise_mph"]
+                   "slc_mph", "slc_src", "limit_stable_mph", "limit_offer_mph", "limit_raise_mph",
+                   # navigation exits (map_curve_control.ExitPlan, LaneView; the planner's shape check): see EXIT_LOG_*
+                   "exit_rem", "exit_shape", "shape_link_m", "shape_hwy_m", "shape_link_deg", "shape_hwy_deg", "exit_fork",
+                   "exit_curve_r", "exit_curve_d", "lane_probs", "edge_gap_l", "edge_gap_r", "lane_edge", "lane_change"]
+  # The exit log (owner's request): one "mapExit" event per navigation exit, from EXIT_LOG_BEFORE before its exit point
+  # to EXIT_LOG_AFTER past it (or the plan's end), with the rows above, so a drive can show what the camera's lane check,
+  # the shape check and the confirmation did. No GPS position in it.
+  EXIT_LOG_BEFORE = 600.0         # m
+  EXIT_LOG_AFTER = 300.0          # m
+  EXIT_CHIME_HOLD = 1.0           # s the brake alert flag stays up (the planner reads it at 20 Hz)
 
   def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0, limit_mode=0, follow_mode=0):
     import cereal.messaging as messaging
@@ -1273,9 +1309,18 @@ class CurveSlowdown:
     self.map_control = None
     self.map_out = None
     self.map_event = None
+    self.exit_event = None
+    self.exit_brake_frames = 0       # "Exit curve - brake": frames the flag stays up (starpilotCarState.mazdaExitCurveBrake)
+    self.lane_frame = 0              # frame the camera's lanes were last read
     if map_mode:
       from opendbc.car.mazda.map_curve_control import MapCurveControl
-      self.map_control = MapCurveControl(self.lat_limit, self.decel_used)
+      try:
+        raw = params.get("MazdaExitSplitSpeed", encoding="utf8")
+        split_mode = 0 if raw is None or raw == "" else int(raw)
+      except (TypeError, ValueError, AttributeError):
+        split_mode = 0               # (an older params build without the key: the default, the highway's limit)
+      self.map_control = MapCurveControl(self.lat_limit, self.decel_used, split_mode=split_mode,
+                                         metric=bool(params.get_bool("IsMetric")))
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
     self.learner = None
@@ -1461,8 +1506,15 @@ class CurveSlowdown:
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive, blinker)
     curve_active = curve_active and self.curve_enabled
 
+    # The camera's view of our lane for navigation exits (map_curve_control.LaneView), read when the model updates
+    if self.map_control is not None:
+      try:
+        self._lanes()
+      except Exception:
+        self.map_control.lane.update(DT_CTRL, False)
     # Map curves (Test: computed and logged only; On: combined with the camera curve target)
     curve_floor, curve_budget, fast_restore, curve_track, curve_raise = 0.0, 0, False, False, False
+    curve_hold = False
     curve_no_accel = False                 # only on a link, which only the map knows (CurveMix.no_accel, CURVE_NO_ACCEL)
     self.map_out = None
     if self.map_control is not None and plan_alive:
@@ -1478,7 +1530,19 @@ class CurveSlowdown:
         curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise = self.curve_mix.update(
           curve_active, curve_speed, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step, MIN_SET_SPEED))
         curve_no_accel = self.curve_mix.no_accel
+        curve_hold = self.curve_mix.firm
         fast_restore = mo.fast_restore
+      if mo.chime:
+        # "Exit curve - brake" (On only: Test logs it); the planner raises the alert from starpilotCarState
+        self.exit_brake_frames = int(self.EXIT_CHIME_HOLD / DT_CTRL) if self.map_mode == MAP_ON else 0
+        if self.recorder is not None:
+          try:
+            import time
+            self.recorder.record("mapExitBrake", time.monotonic(), {
+              "mode": "on" if self.map_mode == MAP_ON else "test", "why": self.map_control.chime_why,
+              "vEgo_mph": v_ego / MS_PER_MPH, "exit_m": self.map_control.exit_rem or 0.0}, min_gap=0.0, signals=False)
+          except Exception:
+            pass
     elif self.map_control is not None:
       # a planner gap: a carried exit is still counted on by the car's own speed (review: counted only while the
       # planner was alive, a gap stretched the slowdown past the exit point)
@@ -1523,6 +1587,7 @@ class CurveSlowdown:
       curve_track=curve_track,
       curve_raise=curve_raise,
       curve_no_accel=curve_no_accel,
+      curve_hold=curve_hold,
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -1542,6 +1607,8 @@ class CurveSlowdown:
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
+    if self.exit_brake_frames > 0:
+      self.exit_brake_frames -= 1
     if self.limit_follow is not None:
       try:
         self._limit_bookkeeping(inputs)
@@ -1810,6 +1877,90 @@ class CurveSlowdown:
       pass
 
   # ---- map curve logs ----
+  @property
+  def exit_brake_alert(self):
+    """starpilotCarState.mazdaExitCurveBrake: up for EXIT_CHIME_HOLD after each "Exit curve - brake" chime (On)."""
+    return self.exit_brake_frames > 0
+
+  def _lanes(self):
+    """Feed the camera's lane lines and road edges near the car to the exit lane check (LaneView)."""
+    from opendbc.car.mazda.map_curve_control import LANE_NEAR_X
+    lane = self.map_control.lane
+    if not self._alive('modelV2'):
+      lane.update(DT_CTRL, False)
+      self.lane_frame = self.frame
+      return
+    if not self.sm.updated['modelV2']:
+      return
+    dt = max(self.frame - self.lane_frame, 1) * DT_CTRL
+    self.lane_frame = self.frame
+    m = self.sm['modelV2']
+
+    def near(line):
+      xs, ys = list(line.x), list(line.y)
+      pts = [y for x, y in zip(xs, ys, strict=False) if x <= LANE_NEAR_X]
+      return sum(pts) / len(pts) if pts else (ys[0] if ys else 0.0)
+    lines, edges = list(m.laneLines), list(m.roadEdges)
+    if len(lines) < 4 or len(edges) < 2:
+      lane.update(dt, False)
+      return
+    lane.update(dt, True, list(m.laneLineProbs), [near(x) for x in lines], [near(e) for e in edges],
+                list(m.roadEdgeStds))
+
+  def _exit_row(self, plan):
+    mc = self.map_control
+    if mc is None or plan is None:
+      return (0.0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, "", 0.0, 0.0, 0, 0)
+    ln = mc.lane
+    rem = mc.exit_rem
+    edge = (2 if ln.edge[-1] and ln.edge[1] else (1 if ln.edge[1] else (-1 if ln.edge[-1] else 0)))
+    g = lambda k: float(getattr(plan, k, 0.0) or 0.0)  # noqa: E731
+    return (round(rem, 1) if rem is not None else 0.0, int(getattr(plan, "mapExitShape", 0) or 0), g("mapExitLinkDist"),
+            g("mapExitHighwayDist"), g("mapExitLinkHeading"), g("mapExitHighwayHeading"), int(getattr(plan, "mapExitFork", 0) or 0),
+            g("mapExitCurveRadius"), g("mapExitCurveDistance"), "/".join(f"{p:.2f}" for p in ln.probs),
+            round(ln.gaps[0], 2), round(ln.gaps[1], 2), edge, ln.change)
+
+  def _exit_episode(self, t, i, plan):
+    """One "mapExit" event per navigation exit (EXIT_LOG_*): what the lane check, the shape check and the confirmation
+    did around the split."""
+    mc = self.map_control
+    if self.recorder is None or mc is None:
+      return
+    p, rem = mc.plan, mc.exit_rem
+    if self.exit_event is None and p is not None and rem is not None and -self.EXIT_LOG_AFTER < rem <= self.EXIT_LOG_BEFORE:
+      self.exit_event = self.recorder.open("mapExit", t, {
+        "mode": "test" if self.map_mode == 1 else "on", "exit_m": round(rem, 1), "side": p.side,
+        "limit_mph": p.limit / MS_PER_MPH, "split_mph": mc.split_speed(p) / MS_PER_MPH, "split_setting": mc.split_mode,
+        "curve_r": p.curve[0], "curve_after_split_m": round(p.curve[1] - p.exit_at, 1) if p.curve[0] > 0 else 0.0,
+        "set_mph": i.set_speed / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH, "signalled": p.signalled,
+        "lane_edge": bool(p.side and mc.lane.edge.get(p.side, False))})
+      self.exit_track = {"plan": p, "edge_s": 0.0, "sig_s": 0.0, "v_split": None, "rem_confirm": None, "chimes": mc.chime_count,
+                         "min_v": i.v_ego, "brake": False}
+    if self.exit_event is None:
+      return
+    tr = self.exit_track
+    q = tr["plan"]
+    tr["min_v"] = min(tr["min_v"], i.v_ego)
+    tr["brake"] |= i.brake_pressed
+    here = q.exit_at - mc.odo
+    if q.side and mc.lane.edge.get(q.side, False) and here > 0:
+      tr["edge_s"] += DT_CTRL
+    if q.signalled and here > 0:
+      tr["sig_s"] += DT_CTRL
+    if tr["v_split"] is None and here <= 0:
+      tr["v_split"] = i.v_ego / MS_PER_MPH
+    if tr["rem_confirm"] is None and q.confirmed:
+      tr["rem_confirm"] = round(here, 1)
+    if mc.plan is not q or here < -self.EXIT_LOG_AFTER:
+      self.recorder.close(self.exit_event, t, {
+        "result": "confirmed" if q.confirmed else ("declined" if q.declined else (q.why or "past the log window")),
+        "ended": q.why, "declined": q.declined, "confirmed_m_from_exit_point": tr["rem_confirm"],
+        "v_at_split_mph": tr["v_split"], "min_speed_mph": tr["min_v"] / MS_PER_MPH, "driver_braked": tr["brake"],
+        "edge_lane_s": round(tr["edge_s"], 1), "signalled_s": round(tr["sig_s"], 1),
+        "chimes": mc.chime_count - tr["chimes"], "chime_why": mc.chime_why if mc.chime_count > tr["chimes"] else "",
+        "set_mph_after": i.set_speed / MS_PER_MPH})
+      self.exit_event = None
+
   def _map_row(self, plan):
     mo = self.map_out
     if plan is None or self.map_control is None:
@@ -1818,7 +1969,7 @@ class CurveSlowdown:
             bool(mo.active) if mo else False, (mo.speed / MS_PER_MPH if mo and mo.active else 0.0), (mo.why if mo else ""),
             bool(plan.mapOnRamp), int(plan.mapRampType), float(plan.mapRampToSpeed) / MS_PER_MPH, bool(plan.mapRampToHighway),
             float(plan.mapRampEndDistance), int(plan.mapNavExit), float(plan.mapNavExitDistance), float(plan.mapNavCurveRadius),
-            bool(getattr(self, "_blinker", False)), bool(self.map_control.exit_intent),
+            bool(getattr(self, "_blinker", False)), self.map_control.state(),
             float(getattr(plan, "mapCurveAdvisory", 0.0)) / MS_PER_MPH, int(getattr(plan, "mapCurveVeto", 0)),
             int(getattr(plan, "mapGpsTrust", 0)), float(getattr(plan, "mapGpsAccuracy", 0.0)))
 
@@ -1973,7 +2124,8 @@ class CurveSlowdown:
         float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0) / MS_PER_MPH if plan is not None else 0.0,
         str(getattr(plan, "slcSpeedLimitSource", "") or "") if plan is not None else "",
         self.limit_follow.stable_speed / MS_PER_MPH if self.limit_follow else 0.0,
-        self.limit_follow.offer_speed / MS_PER_MPH if self.limit_follow else 0.0, self.limit_want / MS_PER_MPH))
+        self.limit_follow.offer_speed / MS_PER_MPH if self.limit_follow else 0.0, self.limit_want / MS_PER_MPH,
+        *self._exit_row(plan)))
     if lg.driver_events:
       # driver set speed changes while we managed it (what happened to the restore): one summary-only event per
       # frame (drive 44: five 400-row events in a few seconds helped make card lag); the episode events have the rows
@@ -1984,6 +2136,7 @@ class CurveSlowdown:
       self.recorder.record("driverSetChange", t, summary, min_gap=0.0, signals=False)
     lg.driver_events = []
     self._map_episode(t, i, plan)
+    self._exit_episode(t, i, plan)
     # curve slowdown episode: from the first SET- for a curve to the restore being complete
     if self.curve_event is None and button == SET_MINUS and lg.last_action in ("tap", "hold") and not stop_active and i.csc_active:
       self.curve_event = self.recorder.open("curveSlowdown", t, {

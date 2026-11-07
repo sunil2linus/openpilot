@@ -507,6 +507,14 @@ class VehicleSettingsManagerView(PanelManagerView):
         ("MazdaStopWarningChime", tr_noop("Stop Warning Chime"), (tr_noop("5%"), tr_noop("10%"), tr_noop("20%"), tr_noop("30%")), 0)):
       get_value, on_click = choice(key, labels, default)
       tiles.append({"title": tr(title), "get_value": get_value, "on_click": on_click})
+    get_value, on_click = choice("MazdaExitSplitSpeed", (tr_noop("Highway limit"), tr_noop("Limit + 5"), tr_noop("Limit + 10"),
+                                                         tr_noop("Off")), 0)
+    tiles.append({
+      "title": tr("Exit Speed at Split"),
+      "subtitle": tr("With navigation: slow gently to this speed at the exit's split (in the exit lane only, never faster)."),
+      "get_value": get_value,
+      "on_click": on_click,
+    })
     get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
     tiles.append({
       "title": tr("Model Follow (Test)"),

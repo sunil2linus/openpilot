@@ -195,51 +195,58 @@ def nav(d, side=1, **kw):
   return F(nav_exit=1, nav_exit_distance=d, nav_curve_radius=45, nav_curve_distance=d + 100, nav_exit_side=side, **kw)
 
 
-def test_navigation_exit_needs_a_turn_signal():
+def test_navigation_exit_is_planned_without_a_signal_slowed_for_only_in_an_exit_lane():
+  # owner: navigation is the base (he often stays in the lane that becomes the exit lane without signalling); before
+  # the split only the gentle slowdown to the exit speed at the split (the highway's limit here), only in an exit lane
+  hw = dict(road_class=1, limit=70 * MPH)
   c = CTL.MapCurveControl(3.0)
-  for d in range(1400, 0, -10):           # navigation alone never slows
-    assert not c.update(nav(d), 70 * MPH, 0).active
-  out = c.update(nav(400), 70 * MPH, 1)
-  assert out.active and out.why == "nav exit" and out.floor > 0
-
-
-def test_early_signal_is_remembered_after_it_goes_off():
+  for d in range(1400, 100, -10):                          # not in an exit lane: nothing before the split
+    assert not c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH).active
+  assert c.plan is not None and not c.plan.confirmed
   c = CTL.MapCurveControl(3.0)
-  assert not c.update(nav(1300), 70 * MPH, 1).active    # signal 0.8 mile before: too far to slow yet
-  for d in range(1290, 900, -10):                          # moved into the exit lane, signal off
-    assert not c.update(nav(d), 70 * MPH, 0).active
-  acted = [c.update(nav(d), 70 * MPH, 0).active for d in range(900, 0, -10)]
-  assert any(acted) and c.exit_intent
-  first = 900 - 10 * acted.index(True)
-  # starts only as early as the 45 m curve needs (planned at MAP_DECEL like any map curve since drive 53: ~900 m out
-  # from 70 mph for a 22 mph curve 1000 m ahead; with the old 0.5 m/s^2 ~810 m)
-  assert 400 <= first <= 910, first
+  c.lane.edge[1] = True                                    # the camera: next to the right road edge
+  acted = [c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH) for d in range(1400, 100, -10)]
+  on = [o for o in acted if o.active]
+  assert on and all(o.why == "exit split" and o.speed >= 70 * MPH - 1e-6 for o in on), [o.speed / MPH for o in on][:5]
 
 
-def test_signal_the_wrong_way_or_passing_the_exit_forgets_it():
+def test_an_early_signal_is_remembered_after_it_goes_off():
+  hw = dict(road_class=1, limit=70 * MPH)
   c = CTL.MapCurveControl(3.0)
-  c.update(nav(800), 70 * MPH, -1)                         # lane change to the left: not this right exit
-  assert not c.exit_intent
-  c.update(nav(800), 70 * MPH, 1)
-  c.update(nav(790), 70 * MPH, -1)                         # changed their mind
-  assert not c.exit_intent
-  c.update(nav(400), 70 * MPH, 1)
-  assert c.exit_intent
-  for _ in range(int(CTL.NAV_GRACE / CTL.DT_CTRL) + 5):    # passed the exit: navigation no longer shows it
-    out = c.update(F(nav_exit=3), 70 * MPH, 0)
-  assert not c.exit_intent and not out.active
-  assert not c.update(nav(300), 70 * MPH, 0).active        # the next exit needs its own signal
+  assert not c.update(nav(1300, **hw), 80 * MPH, 1, v_ego=80 * MPH).active   # signal 0.8 mile before: too far to slow yet
+  acted = [c.update(nav(d, **hw), 80 * MPH, 0, v_ego=80 * MPH).active for d in range(1290, 0, -10)]
+  assert any(acted) and c.plan.signalled
+  first = 1290 - 10 * acted.index(True)
+  assert 350 <= first <= 600, first                         # only as far out as the gentle plan 80 -> 70 needs (~550 m)
 
 
-def test_unknown_side_accepts_either_signal_and_ramp_takes_over():
+def test_the_other_signal_near_the_exit_or_navigation_dropping_it_far_away_ends_the_plan():
+  hw = dict(road_class=1, limit=70 * MPH)
   c = CTL.MapCurveControl(3.0)
-  c.update(nav(500, side=0), 70 * MPH, -1)
-  assert c.exit_intent
-  assert c.update(F(nav_exit=0), 70 * MPH, 0).active       # split: map match not on the ramp yet, plan kept
-  out = c.update(F(status=2, radius=45, distance=150, on_ramp=True, ramp_type=1), 70 * MPH, 0)
-  assert c.exit_intent and out.active and out.why == "nav exit"   # just matched to the ramp: the exit plan still holds
-  out = on_ramp_for(c, HOLD, 60 * MPH, status=2, radius=45, distance=140, on_ramp=True, ramp_type=1)
-  assert not c.exit_intent and out.active and out.why == "ramp"
+  c.update(nav(800, **hw), 80 * MPH, -1, v_ego=33.0)       # a lane change to the left far from it: not a decision yet
+  assert c.plan is not None and not c.plan.declined
+  c.update(nav(250, **hw), 80 * MPH, 1, v_ego=33.0)
+  assert c.plan.signalled
+  c.update(nav(240, **hw), 80 * MPH, -1, v_ego=33.0)       # changed his mind near it
+  assert c.plan.declined and not c.update(nav(230, **hw), 80 * MPH, 0, v_ego=33.0).active
+  c = CTL.MapCurveControl(3.0)
+  c.update(nav(800, **hw), 80 * MPH, 1, v_ego=33.0)
+  for _ in range(int(CTL.NAV_GRACE / CTL.DT_CTRL) + 5):    # rerouted: navigation no longer shows it, far from it
+    out = c.update(F(nav_exit=3, **hw), 80 * MPH, 0, v_ego=1.0)
+  assert c.plan is None and not out.active
+
+
+def test_unknown_side_takes_either_signal_and_the_ramp_takes_over():
+  c = CTL.MapCurveControl(3.0)
+  c.update(nav(500, side=0, road_class=1, limit=70 * MPH), 80 * MPH, -1, v_ego=33.0)
+  assert c.plan.signalled
+  assert c.update(F(nav_exit=0, road_class=1), 80 * MPH, 0, v_ego=33.0) is not None and c.plan is not None   # cleared: kept
+  c.odo = c.plan.exit_at + 5.0
+  for _ in range(60):                                      # the shapes: the link (EXIT_CONFIRM_TIME)
+    c.update(F(road_class=1, exit_shape=2, exit_curve_radius=45, exit_curve_distance=150), 60 * MPH, 0, v_ego=10.0)
+  assert c.plan.confirmed
+  out = on_ramp_for(c, HOLD + 1, 60 * MPH, status=2, radius=45, distance=140, on_ramp=True, ramp_type=1, road_class=2)
+  assert c.plan is None and c.last_plan.why == "on the ramp" and out.active and out.why == "ramp"
 
 
 def test_planner_reads_the_exit_side():
@@ -903,7 +910,8 @@ def drive_53(fields, frames, set_mph, v_mph=None, max_drop=10, signal=None, came
     inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=foot is not None,
                             brake_pressed=False, standstill=False, plan_alive=True, csc_active=active, csc_speed=min(speed, 100.0),
                             other_button_active=False, driver_button=None, curve_floor=floor, curve_budget=budget,
-                            curve_track=track, curve_raise=raise_ok, curve_no_accel=mix.no_accel, fast_restore=mo.fast_restore)
+                            curve_track=track, curve_raise=raise_ok, curve_no_accel=mix.no_accel, curve_hold=mix.firm,
+                            fast_restore=mo.fast_restore)
     btn, _ = logic.update(inp)
     if btn is not None:
       presses.append((f, round(x), btn, logic.last_action, round(car.set_speed / MPH), round(car.v_ego / MPH, 1)))
@@ -932,168 +940,44 @@ def _plus_between(r, lo, hi):
   return [p for p in r["presses"] if lo <= p[1] < hi and p[2] == cs.SET_PLUS and p[3] != "raise"]
 
 
-def _exit_53(stay_on=False, doubt=137.0):
-  """Drive 53, t 1149-1181: 57 mph, navigation announces an exit 352 m ahead (its tightest curve 95 m, 32 mph, 622 m
-  ahead), the driver signals right. Navigation's exit clears 46 m before the exit point (GPS doubtful at the split,
-  then the next maneuver); the link is matched 137 m past the exit point, its curve held (doubtful match) until 56 m
-  before it, then matched on the ramp. GPS trust 2 (another road close by) from the clear to then (t 1161.2-1170.2).
-  stay_on: the car stays on the motorway instead, the match doubtful until `doubt` m past the exit point."""
-  exit_x, curve_x = 352.0, 622.0
-
-  def fields(x):
-    if x < exit_x - 46:
-      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_curve_radius=95.0, nav_curve_distance=curve_x - x,
-               nav_exit_side=1, road_class=1)
-    if stay_on:
-      return F(road_class=1, gps_trust=2 if x < exit_x + doubt else 0)
-    if x < exit_x + 137:
-      return F(road_class=1, gps_trust=2)
-    ramp = dict(road_class=2, on_ramp=True, ramp_type=1, ramp_to_speed=45 * MPH, ramp_end_distance=max(curve_x + 230 - x, 0.0))
-    if x < curve_x - 56:
-      return F(status=5, radius=95.0, distance=curve_x - x, road_class=2, gps_trust=2)
-    if x < curve_x + 127:
-      return F(status=2, radius=95.0, distance=max(curve_x - x, 0.0), **ramp)
-    return F(**ramp)
-  return fields, (lambda x: 1 if x < 60 else 0), exit_x, curve_x
+# Drive 53's exits with the owner's exit design (navigation's plan, the slowdown to the exit speed at the split, the
+# shape confirmation, the missed exit, his decisions, the brake chime): test_exit_plan.py.
 
 
-def test_drive_53_e1_an_exit_cleared_at_the_split_keeps_its_speed_onto_the_ramp():
-  # the hold released when navigation's exit cleared 46 m before the exit point: the restore took the set speed 49 -> 70
-  # while the car took the exit, the ramp curve's SET- came far too late and the owner braked from 56 mph before the
-  # 95 m curve. Now the exit is carried on by the distance driven: no SET+ before the curve, slowing on toward it
-  fields, signal, exit_x, curve_x = _exit_53()
-  r = drive_53(fields, 5000, 57, signal=signal)
-  v_c = math.sqrt(2.2 * 95.0) / MPH
-  assert _plus_between(r, exit_x - 46, curve_x - 10) == [], _plus_between(r, exit_x - 46, curve_x - 10)
-  assert _at(r, exit_x + 137, "sets") <= 45, _at(r, exit_x + 137, "sets")          # on the link: still slowing (was 70)
-  assert _at(r, curve_x) <= v_c + 1.5, (_at(r, curve_x), v_c)                       # at the curve's speed at its entry
-  in_curve = [v for v, xx in zip(r["vs"], r["xs"], strict=True) if curve_x <= xx < curve_x + 127]
-  assert min(in_curve) >= v_c - 2.0 and min(r["sets"]) >= 25 - 1e-6, (min(in_curve), min(r["sets"]))
-
-
-def _stay_cost(r, exit_x, set_mph):
-  """(the lowest speed past the exit point, s spent more than 10 mph under the driver's speed past it, the SET- past
-  the exit point)"""
-  past = [v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= exit_x]
-  minus = [p for p in r["presses"] if p[1] >= exit_x and p[2] == cs.SET_MINUS]
-  return min(past), sum(1 for v in past if v < set_mph - 10) * T.DT, minus
-
-
-def test_drive_53_e1_an_exit_cleared_while_we_stay_on_the_motorway_restores_after_the_margin():
-  # the same exit, but the car stays on the motorway. Review: the carried plan went on slowing toward the exit's
-  # 32 mph curve until EXIT_PASS_MARGIN (250 m) past the exit point: 30-50 s far under the traffic's speed. Now, past
-  # the exit point, on the motorway with the match not doubtful: no further SET-, and the speed comes back
-  # EXIT_STAY_MARGIN past the exit point (never above the driver's speed)
-  # doubtful as long as the exit's link match took (the slowdown goes on to there: it may be the ramp) / not at all
-  for doubt, v_low, s_max in ((137.0, 34.0, 22.0), (0.0, 40.0, 13.0)):
-    fields, signal, exit_x, _ = _exit_53(stay_on=True, doubt=doubt)
-    r = drive_53(fields, 6000, 57, signal=signal)
-    restore_at = exit_x + max(doubt, CTL.EXIT_STAY_MARGIN)
-    assert _plus_between(r, 0, restore_at - 10) == [], (doubt, _plus_between(r, 0, restore_at - 10))
-    assert _plus_between(r, restore_at - 10, restore_at + 60), (doubt, "the restore starts once past the margin")
-    assert abs(r["sets"][-1] - 57) < 1e-6 and max(r["sets"]) <= 57 + 1e-6, (r["sets"][-1], max(r["sets"]))
-    assert not r["ctl"].exit_intent and r["ctl"].carry is None
-    # how slow, how long: was 32 mph and 28 s more than 10 mph under 57 past the exit point (now 35.6 / 19.8 s and 42 /
-    # 11.5 s)
-    v_min, slow_s, minus = _stay_cost(r, exit_x, 57)
-    assert v_min >= v_low and slow_s <= s_max, (doubt, v_min, slow_s)
-    if doubt == 0.0:
-      assert minus == [], minus                                  # held from the exit point on
-
-
-def test_staying_on_the_motorway_his_foot_on_the_gas_ends_the_carried_exit_at_once():
-  # still doubtful (the restore would wait to EXIT_PASS_MARGIN), but he presses the gas 30 m past the exit point
-  fields, signal, exit_x, _ = _exit_53(stay_on=True, doubt=1000.0)
-  r = drive_53(fields, 6000, 57, signal=signal, gas=lambda x: 0.0 if exit_x + 30 <= x < exit_x + 33 else None)
-  assert r["ctl"].carry is None and _plus_between(r, exit_x + 30, exit_x + 120), "the restore starts on the gas"
-  assert _plus_between(r, 0, exit_x + 30) == []
-  # before the exit point the gas changes nothing (he may be in the exit lane)
-  r2 = drive_53(fields, 3000, 57, signal=signal, gas=lambda x: 0.0 if exit_x - 30 <= x < exit_x - 27 else None)
-  assert _plus_between(r2, 0, exit_x + 100) == [], _plus_between(r2, 0, exit_x + 100)
-
-
-def _next_exit(ann, signal_b=None, signal_until=60.0):
-  """Signalled for exit A (352 m ahead, cleared 46 m before it), stays on the motorway; navigation then announces exit B
-  1600 m past A (a reroute, or the next maneuver) from `ann` m past A. signal_b: m where a new signal for B starts."""
-  exit_a, curve_a = 352.0, 622.0
+def test_after_a_missed_exit_navigations_next_exit_is_planned_on_its_own():
+  # (was: a new exit after a carried one needs a new signal; no signal is needed for any exit now.) Exit A missed (the
+  # shapes say "highway" past its exit point), navigation reroutes to exit B 1600 m on: B is its own plan, A is never
+  # taken on again
+  exit_a = 352.0
   exit_b = exit_a + 1600
 
   def fields(x):
+    hw = dict(road_class=1, limit=70 * MPH)
     if x < exit_a - 46:
-      return F(nav_exit=1, nav_exit_distance=exit_a - x, nav_curve_radius=95.0, nav_curve_distance=curve_a - x,
-               nav_exit_side=1, road_class=1)
-    if exit_a + ann <= x < exit_b:
+      return F(nav_exit=1, nav_exit_distance=exit_a - x, nav_curve_radius=95.0, nav_curve_distance=exit_a + 270 - x,
+               nav_exit_side=1, exit_shape=1, **hw)
+    if x < exit_a + 300:
+      return F(exit_shape=1 if x > exit_a + 40 else 0, **hw)
+    if x < exit_b:
       return F(nav_exit=1, nav_exit_distance=exit_b - x, nav_curve_radius=60.0, nav_curve_distance=exit_b + 200 - x,
-               nav_exit_side=1, road_class=1)
-    return F(road_class=1)
-
-  def signal(x):
-    return 1 if (x < signal_until or (signal_b is not None and signal_b <= x < signal_b + 60)) else 0
-  return fields, signal, exit_a, exit_b
-
-
-def test_a_new_exit_after_a_carried_one_needs_a_new_signal():
-  # review (nextexit.py): the intent stayed on through the carry, so navigation's next exit (B, after a reroute) was
-  # planned with no signal for it: 70 -> 37-38 mph on the motorway. The intent ends when the carry starts
-  for ann in (5.0, 240.0):
-    fields, signal, exit_a, exit_b = _next_exit(ann)
-    r = drive_53(fields, 14000, 70, signal=signal)
-    on_b = [v for v, xx in zip(r["vs"], r["xs"], strict=True) if exit_a + 600 <= xx < exit_b]
-    assert min(on_b) >= 69, (ann, min(on_b))
-    assert [p for p in r["presses"] if exit_a + 300 <= p[1] < exit_b and p[2] == cs.SET_MINUS] == []
-    assert not r["ctl"].exit_intent
-  # the signal still on when the carry starts and through B's announcement: not a new one
-  fields, signal, exit_a, exit_b = _next_exit(5.0, signal_until=352.0 + 30)
-  r = drive_53(fields, 14000, 70, signal=signal)
-  assert min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if exit_a + 600 <= xx < exit_b) >= 69
-  # a new signal for B: B is planned (slowing toward it)
-  fields, signal, exit_a, exit_b = _next_exit(5.0, signal_b=352.0 + 700)
-  r = drive_53(fields, 14000, 70, signal=signal)
-  assert _at(r, exit_b) <= 60, _at(r, exit_b)
+               nav_exit_side=1, exit_shape=1, **hw)
+    return F(**hw)
+  r = drive_53(fields, 5500, 70)
+  ctl = r["ctl"]
+  assert ctl.plan is not None and abs(ctl.plan.exit_at - exit_b) < 2, (ctl.plan and ctl.plan.exit_at)
+  assert ctl.last_plan.why == "missed" and abs(ctl.last_plan.exit_at - exit_a) < 2
+  assert min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx < exit_b - 600) >= 69   # (not in an exit lane: no slowing)
 
 
-def test_drive_53_e2_an_exit_plans_its_curve_with_the_follower_and_does_not_stall_while_held():
-  # drive 53, t 390-421: 75 mph, the signal 267 m before the exit point, its 85 m curve (31 mph) 780 m ahead. The exit
-  # cleared 9 m before the exit point, the link was matched 34 m past it with its curve held for 4 s (no SET- then:
-  # the plan was dropped after NAV_GRACE), then the ramp curve's 0.5 m/s^2 staircase left the set speed 5-9 mph under
-  # the speed: the car entered the curve at 38-39 mph ("Turn Exceeds Steering Limit"). Needed from 59 mph 325 m out:
-  # ~0.8 m/s^2, so the plan has to run all the way from the signal
-  exit_x, curve_x = 267.0, 780.0
-
-  def fields(x):
-    if x < exit_x - 9:
-      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_curve_radius=85.0, nav_curve_distance=curve_x - x,
-               nav_exit_side=1, road_class=1)
-    if x < exit_x + 34:
-      return F(road_class=1)
-    if x < curve_x - 325:
-      return F(status=5, radius=85.0, distance=curve_x - x, road_class=2)
-    ramp = dict(road_class=2, on_ramp=True, ramp_type=1, ramp_to_speed=50 * MPH, ramp_end_distance=max(curve_x + 190 - x, 0.0))
-    if x < curve_x + 120:
-      return F(status=2, radius=85.0, distance=max(curve_x - x, 0.0), **ramp)
-    return F(**ramp)
-  r = drive_53(fields, 4500, 75, signal=lambda x: 1 if x < 40 else 0)
-  v_c = math.sqrt(2.2 * 85.0) / MPH
-  assert _at(r, curve_x) <= v_c + 1.5, (_at(r, curve_x), v_c)
-  assert _plus_between(r, 0, curve_x - 10) == [], _plus_between(r, 0, curve_x - 10)
-  held = [p for p in r["presses"] if exit_x + 34 <= p[1] < curve_x - 325]
-  assert len(held) >= 3 and all(p[2] == cs.SET_MINUS for p in held), held   # slowing on while the curve is held
-  assert min(r["sets"]) >= 25 - 1e-6
-
-
-def test_a_planner_gap_does_not_stretch_a_carried_exit():
-  # review: the carried exit was counted only while the planner was alive; the wrapper now counts it on by the car's
-  # own speed meanwhile (MapCurveControl.drive)
+def test_a_planner_gap_does_not_stretch_the_exit_plan():
+  # the exit plan is counted by the control's own odometer: vEgo x dt in update, and through a planner gap the wrapper
+  # counts it on by the car's own speed (MapCurveControl.drive)
   ctl = CTL.MapCurveControl(3.0, CTL.MAP_DECEL)
-  ctl.carry = [30.0, 300.0]
+  ctl.update(nav(300.0, road_class=1), 30.0, 0, v_ego=20.0)
+  rem = ctl.exit_rem
   for _ in range(100):
     ctl.drive(20.0 * CTL.DT_CTRL)
-  assert abs(ctl.carry[0] + (20.0 - 30.0)) < 1e-6 and abs(ctl.carry[1] - 280.0) < 1e-6, ctl.carry
-  # not carried yet (navigation's exit still to be cleared, NAV_GRACE): the distance since its last announcement
-  ctl = CTL.MapCurveControl(3.0, CTL.MAP_DECEL)
-  ctl.exit_intent = True
-  ctl.drive(5.0)
-  assert ctl.carry is None and abs(ctl.since_nav - 5.0) < 1e-6
+  assert abs(ctl.exit_rem - (rem - 20.0)) < 1e-6, ctl.exit_rem
 
 
 def test_a_street_slip_lane_keeps_the_max_drop_floor():
@@ -1391,8 +1275,15 @@ def test_tiles_are_parsed_in_steps_with_the_same_result():
           "roads": [{"w": 1, "c": 2, "k": 9, "p": [1, -2, 3, 4]}] * 3000, "meta": {"built": "x"}, "n": None}
   for text in (json.dumps(tile), json.dumps(tile, indent=1), json.dumps({}), json.dumps({"curves": []})):
     assert MC.load_json_in_steps(text) == json.loads(text)
-  # other threads get to run while a big tile is parsed (the planner loop must never stall for the whole parse)
-  text, ticks, done = json.dumps(tile), [], threading.Event()
+  # other threads get to run while a big tile is parsed (the planner loop must never stall for the whole parse). A tile
+  # big enough that one parse without yielding would stall the other thread far longer than 50 ms; a stall that long
+  # may still happen now and then on a loaded machine (the scheduler, the garbage collector), so a few are allowed
+  # (the parser not yielding would give one per parse)
+  big = {k: (v * 10 if isinstance(v, list) else v) for k, v in tile.items()}
+  text, ticks, done = json.dumps(big), [], threading.Event()
+  t0 = _t.perf_counter()
+  json.loads(text)
+  assert _t.perf_counter() - t0 > 0.005                  # (the plain parse takes a while: the check below means something)
 
   def other():
     while not done.is_set():
@@ -1400,12 +1291,14 @@ def test_tiles_are_parsed_in_steps_with_the_same_result():
       _t.sleep(0.001)
   th = threading.Thread(target=other)
   th.start()
-  for _ in range(20):
+  parses = 8
+  for _ in range(parses):
     MC.load_json_in_steps(text)
   done.set()
   th.join()
   gaps = [b - a for a, b in zip(ticks, ticks[1:], strict=False)]
-  assert max(gaps) < 0.05, max(gaps)
+  long = [round(g, 3) for g in gaps if g >= 0.05]
+  assert len(long) <= parses // 4, long
 
 
 def test_the_background_loader_uses_the_stepped_parser(tmp_path):

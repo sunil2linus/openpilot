@@ -122,6 +122,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   curveSlowdownInFlight @32 :Int8;   # our SET presses not yet seen on the set speed
   mazdaStockLkasOff @33 :Bool;       # Mazda + TI: the camera reports its LKAS off at speed (only the TI steers)
   mazdaStopSlowdownActive @34 :Bool; # Mazda stopped car / stop ahead slowdown (On) is lowering the set speed
+  mazdaExitCurveBrake @35 :Bool;     # Mazda navigation exit: the cruise cannot slow enough for the exit's curve, brake (On)
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -209,6 +210,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mapExitNoCurveData @45;
     mazdaStockLkasOff @46;
     mapCurvesPaused @47;
+    mapExitCurveBrake @48;
   }
 }
 
@@ -283,6 +285,16 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveSource @65 :UInt8;         # governing curve's radius from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap
   mapGpsTrust @66 :UInt8;            # GPS trust for map curves: 0 ok, 1 shaky, 2 low (curves held), 3 paused: accuracy, 4 paused: not on a known road
   mapGpsAccuracy @67 :Float32;       # m, the GPS chip's own error estimate (0 unknown)
+  # the navigation exit watched past the split (map_curves.MapCurves._watch_update)
+  mapExitShape @68 :UInt8;           # 0 no answer, 1 the car matches the highway's shape, 2 the exit link's (position and heading)
+  mapExitLinkDist @69 :Float32;      # m to the exit link's nearest shape (0 none in range)
+  mapExitLinkHeading @70 :Float32;   # deg between our heading and it
+  mapExitHighwayDist @71 :Float32;   # m to the highway's nearest shape (0 none in range)
+  mapExitHighwayHeading @72 :Float32;
+  mapExitFork @73 :UInt8;            # a fork on the exit: 0 none, 1 not decided yet, 2 decided, 3 decided: not navigation's branch
+  mapExitCurveRadius @74 :Float32;   # the exit's next curve from here (forks decided; the lower branch until then), 0 none
+  mapExitCurveDistance @75 :Float32; # m to its entry
+  mapExitCurveAdvisory @76 :Float32; # m/s, its advisory sign (0 none)
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {
