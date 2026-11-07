@@ -2391,18 +2391,28 @@ def test_a_guarded_stop_ahead_is_released_by_the_driver_and_the_light_latch_hold
 # ---- drive 52: the cruise still accelerating into slow traffic (CATCH_UP_*), the tap episodes from 15 mph ----
 
 def test_unsure_car_with_the_cruise_still_accelerating_brings_the_set_speed_to_our_speed_first():
-  # 30 mph under a 45 set speed: the first drop to 30 (urgent: a SET- hold or fast taps), then the taps to 25, 5 below
-  # our speed (the old cap, 5 below the set speed, let the car accelerate to 40)
-  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
-  assert tr.active and tr.kind == scs.SLOW_UNSURE and near(tr.target / MPH, 30) and tr.urgent
+  # 22 mph under a 40 set speed: the first drop to 22 (urgent: a SET- hold or fast taps), then the taps to 17 -> the
+  # floor, 5 below our speed (the old cap, 5 below the set speed, let the car accelerate to 35)
+  tr = _unsure_started(v_ego=22 * MPH, set_speed=40 * MPH)
+  assert tr.active and tr.kind == scs.SLOW_UNSURE and near(tr.target / MPH, 22) and tr.urgent
   assert tr.catch_up and tr.caught_up
-  tr.update(_u(v_ego=30.5 * MPH, set_speed=31 * MPH))           # landed within 1 mph: the taps, the cap from our speed
-  assert tr.active and not tr.catch_up and not tr.urgent and near(tr.target / MPH, 25)
+  tr.update(_u(v_ego=22.5 * MPH, set_speed=23 * MPH))           # landed within 1 mph: the taps, the cap from our speed
+  assert tr.active and not tr.catch_up and not tr.urgent and near(tr.target / MPH, FLOOR_MPH)
   # presses lost (or Test mode): after CATCH_UP_TIME the taps' target anyway
-  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  tr = _unsure_started(v_ego=22 * MPH, set_speed=40 * MPH)
   for _ in range(int(scs.CATCH_UP_TIME / scs.DT_CTRL) + 1):
-    tr.update(_u(v_ego=30 * MPH, set_speed=45 * MPH))
-  assert tr.active and not tr.catch_up and near(tr.target / MPH, 25)
+    tr.update(_u(v_ego=22 * MPH, set_speed=40 * MPH))
+  assert tr.active and not tr.catch_up and near(tr.target / MPH, FLOOR_MPH)
+  # from 25 mph the cap stays 5 below max(speed, set) (drive 4f t 156): 30 under 45, the first drop stops at 40 ...
+  tr = _unsure_started(v_ego=30 * MPH, set_speed=45 * MPH)
+  assert tr.active and tr.catch_up and tr.urgent and near(tr.target / MPH, 40)
+  tr.update(_u(v_ego=30.5 * MPH, set_speed=41 * MPH))
+  assert tr.active and not tr.catch_up and not tr.urgent and near(tr.target / MPH, 40)
+  # ... and 42 under 45: the drop to 42 (stop accelerating), then the taps to 40
+  tr = _unsure_started(v_ego=42 * MPH, set_speed=45 * MPH)
+  assert tr.active and tr.catch_up and tr.urgent and near(tr.target / MPH, 42)
+  tr.update(_u(v_ego=42 * MPH, set_speed=43 * MPH))
+  assert tr.active and not tr.catch_up and near(tr.target / MPH, 40)
   # never below the floor: 21 mph under 35 -> 21, then the car's minimum (not 16)
   tr = _unsure_started(v_ego=21 * MPH, set_speed=35 * MPH, lead_d=80.0)
   assert near(tr.target / MPH, 21) and tr.urgent
@@ -2531,3 +2541,128 @@ def test_red_light_head_start_in_the_car_with_the_cruise_accelerating_drops_to_o
   assert all(abs(a[1] - b[1]) <= 1.0 + 1e-6 for a, b in zip(taps[:-1], taps[1:], strict=True)), ch    # then 1 mph steps
   assert r["min"] >= FLOOR_MPH - 1e-6 and r["min"] <= 20.0 + 1e-6, r["min"]        # 5 below ~24 mph, not 5 below 35
   assert max(r["vs"]) / MPH <= 25.5 and max(old["vs"]) / MPH >= 29.0, (max(r["vs"]) / MPH, max(old["vs"]) / MPH)
+
+
+# ---- review of the drive 52 changes: the light on through a stop, false alarms at speed, unsure cars below 25 mph,
+# the red light gone restore ----
+
+def _mcar(set_mph, v_mph, accel=0.6):
+  c = Car(set_mph, dash_offset_mph=0.0, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0, accel=accel)
+  c.v_ego = v_mph * MPH
+  return c
+
+
+def test_a_light_on_through_our_stop_is_no_head_start_while_we_pull_away_under_it():
+  # review a8: the light on 1-3 s before our stop, through it and while we pull away (1 m/s^2, set 45): its onset was
+  # counted with the time we had been rolling before the stop (60 s), so the head start came at 15 mph (a SET- hold
+  # 45 -> 25, then the hold back up); drive 4f t 1122.6-1131 had such a light (cruise off)
+  def pull_away(before_s, after_s, fresh_after=None):
+    tr = scs.StoppedCarTrigger()
+    for _ in range(6000):
+      tr.update(_no_car(red_light=False, v_ego=40 * MPH, set_speed=45 * MPH, a_ego=0.3))
+    n = int(40 * MPH / 1.5 * 100)
+    for k in range(n):
+      tr.update(_no_car(red_light=(n - k) <= before_s * 100, v_ego=max(0.0, 40 * MPH - 1.5 * k / 100), set_speed=45 * MPH,
+                        a_ego=-1.5))
+    for _ in range(300):
+      tr.update(_no_car(red_light=True, v_ego=0.0, set_speed=45 * MPH, a_ego=0.0))
+    for k in range(2500):
+      red = k < after_s * 100 or (fresh_after is not None and k >= fresh_after * 100)
+      if tr.update(_no_car(red_light=red, v_ego=min(k / 100, 22 * MPH), set_speed=45 * MPH, a_ego=1.0)):
+        return k
+    return None
+  for before_s, after_s in ((3.0, 10.0), (3.0, 8.0), (1.0, 8.0)):
+    assert pull_away(before_s, after_s) is None, (before_s, after_s)
+  # a light that comes on again 12 s or more after we roll (below 25 mph): the head start, as on drive 52
+  k = pull_away(3.0, 6.0, fresh_after=13.0)
+  assert k is not None and k >= 1300 + scs.RED_ON_TIME * 100 - 5, k
+
+
+def test_a_false_red_light_at_25_mph_or_more_costs_at_most_5_mph():
+  # drive 4f t 154-171 (review a9): a false redLight for 15 s, no stop, while the cruise accelerates 37.7 -> 45 after a
+  # curve: the drop to our speed and 5 more cost 45 -> 34 (11 mph, ~10 s to come back); the old cap: 40
+  r = run(_mcar(45, 37.7, accel=0.5), NO_CURVE, 3500, lead=_NoCar(200), max_drop=10, model=lambda f: -0.1,
+          red=lambda f: f < 1700, setup=MEASURED)
+  assert abs(r["min"] - 40) < 0.01 and abs(r["final"] - 45) < 0.01, (r["min"], r["final"])
+  assert min(r["vs"][200:]) / MPH >= 38.5, min(r["vs"][200:]) / MPH
+  first = first_frame(r)
+  assert next(k for k, s in _sets_changes(r) if s <= 40 + 1e-6) - first <= 200    # the drop at once, not 1 mph a second
+  # (below 25 mph the drop to our speed and 5 below it stay: test_red_light_head_start_in_the_car_with_the_cruise_...)
+
+
+class _AccelLead(StoppedLead):
+  """A low-confidence car ahead pulling away from a light: v0 mph, accelerating at `acc` m/s^2 from frame `start`,
+  reported by radarState aLeadK (lead.a)."""
+  def __init__(self, d0, v0, acc, prob=0.5, start=0):
+    super().__init__(d0, v_mph=v0, prob=prob, y=0.2)
+    self.acc, self.start, self.a = acc, start, 0.0
+
+  def tick(self, car):
+    self.frame += 1
+    self.a = self.acc if (self.frame >= self.start and self.v < 45 * MPH) else 0.0
+    self.v = min(self.v + self.a * T.DT, 45 * MPH)
+    self.d = max(self.d - (car.v_ego - self.v) * T.DT, 0.0)
+
+
+def test_an_unsure_car_below_25_mph_that_is_accelerating_does_nothing():
+  # review a2: pulling away from a light at 16 mph under a 45 set, a low-confidence car 40-60 m ahead accelerating away
+  # from 2-4 mph: the first drop took the set 45 -> 19
+  for v0, acc, d0 in ((4, 1.0, 60), (4, 0.6, 60), (2, 1.5, 40)):
+    r = run(_mcar(45, 16.0, accel=1.0), NO_CURVE, 2500, lead=_AccelLead(d0, v0, acc), max_drop=10, model=lambda f: 0.3,
+            setup=MEASURED)
+    slow = [f for f, v in enumerate(r["vs"]) if v < 25 * MPH]
+    assert not any(r["kinds"][f] for f in slow), (v0, acc, d0)
+    assert r["min"] >= 40 - 1e-6, (v0, acc, d0, r["min"])          # (at 25 mph and more: the old 5 mph cap)
+  # it starts accelerating after our start: released within ~1.5 s, the speed back
+  r = run(_mcar(45, 16.0, accel=1.0), NO_CURVE, 2500, lead=_AccelLead(60, 4, 0.6, start=150), max_drop=10,
+          model=lambda f: 0.3, setup=MEASURED)
+  act = [f for f, k in enumerate(r["kinds"]) if k]
+  end = next(f for f in range(act[0], len(r["kinds"])) if not r["kinds"][f])
+  assert act[0] < 150 and end < 150 + 200 and r["vs"][end] < 25 * MPH, (act[0], end)
+  assert r["min"] > FLOOR_MPH + 5                                  # (HEAD: the floor)
+  # a slow car that is not accelerating still starts it (drive 52's queue car, aLeadK -0.2..-0.6)
+  r = run(_mcar(45, 16.0, accel=1.0), NO_CURVE, 600, lead=_AccelLead(60, 4, -0.3), max_drop=10, model=lambda f: 0.3,
+          setup=MEASURED)
+  assert any(r["kinds"][:200]) and r["min"] < 25
+
+
+def test_the_red_light_gone_restore_taps_with_a_slower_car_in_our_lane():
+  # review a1 (below 25 mph): the head start 45 -> our speed, the light goes, a low-confidence slower car in our lane (the
+  # queue the light was for) seen at the release or just after: the restore must not go up past our speed into it
+  def a1(unsure_at):
+    def fn(f):
+      return None if f < unsure_at else (0.3, 5.0, 0.2)
+    car = _mcar(45, 17.0)
+    with _Flag("RED_AFTER_STOP", 0.0):
+      return run(car, NO_CURVE, 2500, lead=_FnLead(90.0, fn), max_drop=10, model=lambda f: -0.1, red=lambda f: 100 <= f < 700,
+                 setup=MEASURED)
+  for unsure_at, top in ((750, None), (805, None), (900, 25.0)):
+    r = a1(unsure_at)
+    rel = next(f for f in range(1, len(r["kinds"])) if r["kinds"][f - 1] == scs.RED_LIGHT and r["kinds"][f] is None)
+    start = next(f for f, k in enumerate(r["kinds"]) if k == scs.SLOW_UNSURE)
+    seen = max(unsure_at, rel)
+    ups = [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and h["frame"] >= seen]
+    assert ups == [], (unsure_at, ups)                            # no SET+ hold once the car is there ...
+    taps = [f for f, b in r["presses"] if b == cs.SET_PLUS and seen <= f <= start]
+    assert taps == [], (unsure_at, taps)                          # ... nor taps: never past our speed into it
+    if top is not None:                                           # (a hold already sent stops at its next quantum)
+      assert max(r["sets"][seen:start + 1]) / MPH <= top + 1e-6, (unsure_at, max(r["sets"][seen:start + 1]) / MPH)
+  # no car: the restore after the light goes still holds back up at once
+  r = a1(10**9)
+  assert [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS] and abs(r["final"] - 45) < 0.01
+
+
+class _FnLead(StoppedLead):
+  """fn(f) -> None (no car) or (prob, v_mph, y); the distance integrates from d0 with the car's speed."""
+  def __init__(self, d0, fn):
+    super().__init__(d0)
+    self.fn = fn
+
+  def state(self, f, car):
+    s = self.fn(f)
+    return (False, 0.0, 0.0, 0.0, 0.0) if s is None else (True, s[0], self.d, s[1] * MPH, s[2])
+
+  def tick(self, car):
+    self.frame += 1
+    s = self.fn(self.frame)
+    self.d = max(self.d - (car.v_ego - (s[1] * MPH if s is not None else car.v_ego)) * T.DT, 0.0)

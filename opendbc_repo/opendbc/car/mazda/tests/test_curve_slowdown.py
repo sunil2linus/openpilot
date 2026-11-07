@@ -251,6 +251,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             radar_lead=bool(lead is not None and trigger.radar_stable),
                             stop_clear_ahead=bool(lead is not None and trigger.clear_ahead and stop_mode == 2),
                             stop_pulling_away=bool(lead is not None and trigger.pulling_away and stop_mode == 2),
+                            stop_slower_ahead=bool(lead is not None and trigger.slower_after_red and stop_mode == 2),
                             limit_raise=limit(f), limit_cap=cap(f), limit_undo=undo(f))
     btn, off = logic.update(inp)
     if btn is not None:

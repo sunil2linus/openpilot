@@ -27,7 +27,8 @@ Two ways in:
   * "red light (head start)": the stop-light detector alone, on for 2 s: 1 mph taps, at most 5 mph, until one of the
     above takes over or the light goes (RED_*). "slow car (unsure)": a low-confidence slower car, the same taps (UNSURE_*).
     Both from 15 mph; with the cruise still accelerating (set speed well above ours) the set speed first comes down to
-    our speed, and the 5 mph are counted from there (CATCH_UP_*).
+    our speed, and below 25 mph the 5 mph are counted from there (CATCH_UP_*; from 25 mph never more than 5 below the
+    set speed). Below 25 mph the unsure car also needs the car ahead not accelerating (UNSURE_LOW_*).
 
 This module holds the triggers (conservative, to avoid phantom slowdowns), the target and the
 urgency; it has no openpilot dependencies so it can be unit tested. Settings
@@ -207,6 +208,13 @@ UNSURE_MAX_DROP = 5 * MS_PER_MPH
 UNSURE_LOST_TIME = 1.0       # s
 UNSURE_SURE_TIME = 1.0       # s sure (MIN_PROB) without a stop start taking over: a slower moving car, the MRCC's
 UNSURE_REARM = 3.0           # s after an unsure release before another
+# Below CATCH_UP_LOW_SPEED the unsure car also needs the car ahead not accelerating, for its start and while it runs
+# (review a2: pulling away from a light at 16 mph under a 45 set, a low-confidence car 40-60 m ahead accelerating
+# from 2-6 mph: the first drop took the set 45 -> 19, the car ~13 mph slower 10 s later than without it). Drive 52's
+# queue car (t 187.9-193.9, why the minimum is 15 mph): aLeadK -0.19..-0.60 throughout. Once the camera is sure of the
+# car, the pull-away release (PULL_AWAY_ACCEL_*) ends such an episode too.
+UNSURE_LOW_MAX_ACCEL = 0.3   # m/s^2: radarState aLeadK, filtered over UNSURE_LOW_ACCEL_TAU from the car's first frame
+UNSURE_LOW_ACCEL_TAU = 0.5   # s
 SLOW_UNSURE = "slow car (unsure)"
 UNSURE_GONE = "unsure car gone"
 UNSURE_NOT_STOP = "car confirmed, not a stop"
@@ -302,11 +310,18 @@ RED_MIN_SPEED = 15 * MS_PER_MPH
 # pulling away from a stop, no stop after it (drive 4d t 1432-1438, on 7.8 s after the stop, 17-24 mph, set 55; drive 50
 # t 226-234, on 1.7 s after the stop, the cruise resumed at 19.8 mph, set 43); with the first drop to our speed each
 # would have held the car near 20 mph for 2-5 s. Drive 52: the light came on 17.8 s after its last stop. (An onset is
-# the light on after RED_DROPOUT off.)
+# the light on after RED_DROPOUT off; a light already on when we stopped counts as coming on when we roll again: review
+# a8, the same light on through the stop and while pulling away gave a SET- hold 45 -> 25 at 15 mph; drive 4f t 1122.6-
+# 1131, redLight on from before the stop up to 15 mph, cruise off.)
 RED_LOW_SPEED = WARN_MIN_SPEED
 RED_AFTER_STOP = 12.0        # s
 RED_LIGHT = "red light (head start)"
 RED_GONE = "red light gone"
+# When the light goes (drive 52: it went at 187.8 s, the queue car was in our lane at 188.0, 55-76 % a car), a slower
+# car in our lane of any confidence the unsure car would take counts as "slower car ahead": no restore at once, and while
+# it is there after the release no SET+ of ours (a hold in progress stops), so the restore never goes past our speed
+# into it (review a1: a car seen 1 s after the release found our SET+ hold going 27 -> 35 at 29 mph, the unsure car's
+# first SET- 1.5 s later, HOLD_SETTLE). The controller gets it as stop_slower_ahead (slower_after_red).
 
 # The cruise still accelerating when a tap episode starts (drive 52, t 188-196): set 35 at 23.5-24.4 mph with a slow car
 # ahead; the unsure cap max(speed, set) - 5 = 30 let the car go on accelerating, 24 -> 29 mph by 193.0 (our stop ahead
@@ -321,6 +336,11 @@ RED_GONE = "red light gone"
 CATCH_UP_ENABLED = True
 CATCH_UP_GAP = 2 * MS_PER_MPH
 CATCH_UP_TIME = 3.0          # s
+# ... at CATCH_UP_LOW_SPEED or more the cap stays the old one, max(speed, set) - 5 mph, and the first drop stops there
+# when that is above our speed: a false alarm at speed costs 5 mph at most, as before (drive 4f t 156: a false redLight
+# for 15 s, no stop, 38.8-39.8 mph under a 45 set after a curve; the cap from our speed cost 45 -> 34, 11 mph, ~10 s to
+# come back; the old head start 45 -> 40, 1 mph a second)
+CATCH_UP_LOW_SPEED = 25 * MS_PER_MPH
 
 # False stop ahead guard (drive 50, t 107-114, 42 mph: a green light with a car turning across; the plan said stop, the
 # set speed went 45 -> 19 and the car lost ~12 mph before the restore; redLight had been on for only ~0.5 s and was off
@@ -486,6 +506,8 @@ class StoppedCarTrigger:
     self.unsure_sure_frames = 0
     self.unsure_target = 0.0
     self.unsure_release_frame = -10_000
+    self.unsure_a_f = 0.0            # the car ahead's aLeadK, filtered from its first frame (UNSURE_LOW_*)
+    self.unsure_low = False          # this unsure episode began below CATCH_UP_LOW_SPEED
     self.hold_restore = False        # latched and not active: keep the lowered set speed (no SET+) for now
     # the car ahead's speed, filtered (VLEAD_*)
     self.lead_v_hist = []            # [(frame, vLead)]
@@ -543,6 +565,7 @@ class StoppedCarTrigger:
     self.red_onset_rolling = 0       # ... when the light last came on
     self.red_base = 0.0              # the head start's reference speed (max(ours, set), or ours: CATCH_UP_*) and its cap
     self.red_cap = 0.0
+    self.slower_after_red = False    # not active since a red light gone release, a slower car in our lane (RED_GONE)
     # a tap episode that began with the cruise still accelerating (CATCH_UP_*)
     self.catch_up = False            # the first drop (to our speed at the start) is under way
     self.caught_up = False           # this episode began with it (logs)
@@ -557,6 +580,8 @@ class StoppedCarTrigger:
     self.rolling_frames = 0 if i.v_ego < EGO_STOPPED_SPEED else self.rolling_frames + 1
     if i.red_light and self.red_gap > _frames(RED_DROPOUT):
       self.red_onset_rolling = self.rolling_frames
+    # a light on before / through our stop counts as coming on when we start rolling again (review a8)
+    self.red_onset_rolling = min(self.red_onset_rolling, self.rolling_frames)
     if i.red_light:
       self.red_frames += 1
       self.red_gap = 0
@@ -588,10 +613,13 @@ class StoppedCarTrigger:
         self.left_car = False
         self.overridden = False
         self.lead_a_f = i.lead_a
+      if self.prev_lead_d is None or abs(i.lead_d - self.prev_lead_d) > LEAD_JUMP:
+        self.unsure_a_f = i.lead_a           # (UNSURE_LOW_*) a car (re)appeared or another one: its own from here
       self.prev_lead_d = i.lead_d
       self.lead_v_hist.append((self.frame, i.lead_v))
       alpha = DT_CTRL / (MOVING_LEAD_TAU + DT_CTRL)
       self.lead_a_f += alpha * (i.lead_a - self.lead_a_f)
+      self.unsure_a_f += DT_CTRL / (UNSURE_LOW_ACCEL_TAU + DT_CTRL) * (i.lead_a - self.unsure_a_f)
     else:
       self.prev_lead_d = None
     self.lead_v_hist = [(f, v) for f, v in self.lead_v_hist if self.frame - f < _frames(VLEAD_WINDOW)]
@@ -996,6 +1024,7 @@ class StoppedCarTrigger:
     pull = not self.active and (not seen or self.lead_v_f >= i.v_ego + PULL_AWAY or self._pulling_away_accel(i))
     self.pull_frames = self.pull_frames + 1 if pull else 0
     self.pulling_away = self.pull_frames >= _frames(PULL_AWAY_TIME)
+    self.slower_after_red = bool(not self.active and self.release_reason == RED_GONE and self._slower_in_lane(i))
     return self.active
 
   def _start(self, i, lead_ok, early_start, warn_start):
@@ -1045,13 +1074,19 @@ class StoppedCarTrigger:
     self.pull_accel_frames = 0
     self.release_reason = None
 
-  def _unsure_car(self, i):
-    """The triangle: a car the camera shows (any confidence) in our path, much slower than us (UNSURE_*)."""
+  def _unsure_car(self, i, any_prob=False):
+    """The triangle: a car the camera shows (any confidence) in our path, much slower than us (UNSURE_*). any_prob: a
+    car the camera is sure of counts too (the red light gone restore, RED_GONE)."""
     return (UNSURE_ENABLED and not self.left_car and not self.overridden and not self.radar_follow and
             i.lead_alive and i.lead_status and 0 < i.lead_d <= UNSURE_MAX_DISTANCE and
             abs(self._y_path(i)) <= UNSURE_LATERAL and i.v_ego - self.lead_v_f >= UNSURE_SLOWER and
             self.lead_v_f > -STOPPED_SPEED and          # not an oncoming car (review)
-            i.v_ego >= UNSURE_MIN_SPEED and i.lead_prob < MIN_PROB)
+            i.v_ego >= UNSURE_MIN_SPEED and (any_prob or i.lead_prob < MIN_PROB) and
+            (i.v_ego >= CATCH_UP_LOW_SPEED or (self.unsure_a_f <= UNSURE_LOW_MAX_ACCEL and not self._pulling_away_accel(i))))
+
+  def _slower_in_lane(self, i):
+    """A slower car in our lane for the red light gone restore: the clear-ahead check's, or one the unsure car takes."""
+    return self._slower_car_ahead(i) or self._unsure_car(i, any_prob=True)
 
   def _start_red(self, i):
     """The red light head start: 1 mph steps while only the stop-light detector says stop (RED_*)."""
@@ -1062,8 +1097,7 @@ class StoppedCarTrigger:
     self.confirm_frames, self.confirm_frame = 0, -1
     self.floor_mode = False
     self.unsure_from = False
-    self.red_base = self._tap_reference(i)
-    self.red_cap = max(self.red_base - RED_MAX_DROP, FLOOR_SPEED)
+    self.red_base, self.red_cap = self._tap_reference(i, RED_MAX_DROP)
     self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
     self.leave_frames = 0
     self.clear_release = False
@@ -1075,13 +1109,22 @@ class StoppedCarTrigger:
     self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
     self.release_reason = None
 
-  def _tap_reference(self, i):
-    """A red light head start / unsure car start: its reference speed. The set speed more than CATCH_UP_GAP above ours
-    (the cruise still accelerating): our speed, and the first action is the drop to it; otherwise max(ours, set)."""
+  def _tap_reference(self, i, max_drop):
+    """A red light head start / unsure car start: (its reference speed, its cap). The set speed more than CATCH_UP_GAP
+    above ours (the cruise still accelerating): the first action is the drop to our speed and the cap is max_drop below
+    it; from CATCH_UP_LOW_SPEED the cap stays max(ours, set) - max_drop and the first drop stops there if that is above
+    our speed. Otherwise max(ours, set), the cap max_drop below it."""
     self.catch_up = self.caught_up = bool(CATCH_UP_ENABLED and i.set_speed > i.v_ego + CATCH_UP_GAP)
     self.catch_frame = self.step_frame = self.frame
-    self.tap_base = i.v_ego if self.catch_up else max(i.v_ego, i.set_speed)
-    return self.tap_base
+    ref = max(i.v_ego, i.set_speed)
+    cap = ref - max_drop
+    if self.catch_up and i.v_ego < CATCH_UP_LOW_SPEED:
+      ref = i.v_ego
+      cap = ref - max_drop
+    elif self.catch_up:
+      ref = max(i.v_ego, cap)
+    self.tap_base = ref
+    return ref, max(cap, FLOOR_SPEED)
 
   def _update_catch_up(self, i):
     """The first drop is done once the set speed is within 1 mph of the reference speed, or after CATCH_UP_TIME; the
@@ -1100,8 +1143,9 @@ class StoppedCarTrigger:
     elif i.v_ego < EGO_STOPPED_SPEED:
       self._release("ego stopped behind the lead")
     elif self.red_gap > _frames(RED_DROPOUT):
-      # the light is gone (green, or the detector changed its mind): the speed back at once unless a slower car is ahead
-      self._release(RED_GONE, not self._slower_car_ahead(i))
+      # the light is gone (green, or the detector changed its mind): the speed back at once unless a slower car (any
+      # confidence the unsure car takes) is in our lane
+      self._release(RED_GONE, not self._slower_in_lane(i))
 
   def _start_unsure(self, i):
     self.active = True
@@ -1113,7 +1157,9 @@ class StoppedCarTrigger:
     self.unsure_from = False
     # below the set speed (review: v_ego 30 mph under a 45 set gave 13 taps), never below our speed less the cap; with
     # the cruise still accelerating, the drop to our speed first and the cap below our speed (CATCH_UP_*)
-    self.unsure_target = max(self._tap_reference(i) - UNSURE_MAX_DROP, FLOOR_SPEED)
+    _, self.unsure_target = self._tap_reference(i, UNSURE_MAX_DROP)
+    self.unsure_low = i.v_ego < CATCH_UP_LOW_SPEED
+    self.pull_accel_frames = 0
     self.unsure_off_frames = self.unsure_sure_frames = 0
     self.y_base = abs(self.y_f) if (self.y_f is not None and i.lead_status) else None
     self.leave_frames = 0
@@ -1132,8 +1178,10 @@ class StoppedCarTrigger:
     self.lost_frames = 0 if seen else self.lost_frames + 1
     stopping = i.plan_stop or self._model_slowing(i) or i.lead_a <= -RADAR_MATCH_LEAD_DECEL
     away = seen and (abs(self._y_path(i)) > UNSURE_LATERAL + 0.5 or
-                     (i.v_ego - self.lead_v_f < GO_SLOWER and not stopping))
+                     (i.v_ego - self.lead_v_f < GO_SLOWER and not stopping) or
+                     (self.unsure_low and self.unsure_a_f > UNSURE_LOW_MAX_ACCEL and not stopping))
     self.unsure_off_frames = self.unsure_off_frames + 1 if away else 0
+    self.pull_accel_frames = self.pull_accel_frames + 1 if (seen and self._pulling_away_accel(i)) else 0
     # sure and moving: a slower moving car (the MRCC follows it); sure and stopped: keep the taps' target until a
     # stop start takes over (review: a stopped car on a curve, raw yRel 1.4, was released and the speed restored)
     sure = seen and i.lead_prob >= MIN_PROB and self.lead_v_f > STOPPED_SPEED
@@ -1142,6 +1190,8 @@ class StoppedCarTrigger:
       self._release("driver on the gas", False)
     elif not gates:
       self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
+    elif self.unsure_low and self.pull_accel_frames >= _frames(PULL_AWAY_ACCEL_TIME):
+      self._release(PULLING_AWAY)
     elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
       self._release("radar following the car ahead at our speed")
     elif self.unsure_off_frames >= _frames(UNSURE_LOST_TIME):

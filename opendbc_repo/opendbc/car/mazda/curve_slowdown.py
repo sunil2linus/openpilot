@@ -222,6 +222,9 @@ class SlowdownInputs:
   stop_clear_ahead: bool = False
   # stopped car trigger: no car ahead in our lane, or it is pulling away from us (restores at any speed)
   stop_pulling_away: bool = False
+  # stopped car trigger: after a red light gone release a slower car (any confidence) is in our lane: no SET+ hold, no
+  # SET+ at all until it is gone or the stop slowdown takes it on (stopped_car_slowdown RED_GONE, slower_after_red)
+  stop_slower_ahead: bool = False
 
 
 @dataclass
@@ -944,7 +947,8 @@ class CurveSlowdownLogic:
       # a SET- hold also stops when the target rises above its bound (the radar took over the car ahead)
       target_rose = d == SET_MINUS and reason == "stop" and target > self.hold_bound + self.half_step
       reason_gone = (reason != "stop" or target_rose) if d == SET_MINUS else \
-                    (reason is not None or offset <= 0 or self._cap() is not None)
+                    (reason is not None or offset <= 0 or self._cap() is not None or
+                     (i.stop_slower_ahead and self.stop_episode))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
           self.frame - self.hold.frame >= _frames(HOLD_MAX_SECONDS) or crosses):
@@ -1023,6 +1027,11 @@ class CurveSlowdownLogic:
     top = driver_speed if ceiling is None else min(driver_speed, ceiling)
     if ceiling is not None:
       up_ok = up_ok and set_speed + self.step <= top + 1e-3
+    # no SET+ of ours while a slower car is in our lane after a red light gone release (the queue the light was for): the
+    # stop slowdown takes it on 0.5 s later, and a SET+ still in flight then holds its first SET- back (drive 52 closed
+    # loop: a tap 25 -> 26 at 188.36, at our speed, put the first SET- 0.5 s later)
+    if i.stop_slower_ahead and self.stop_episode:
+      up_ok = False
     if want_lower:
       self.restoring = False
       button = SET_MINUS
@@ -1102,10 +1111,12 @@ class CurveSlowdownLogic:
             self.hold_bound = max(hard, set_speed - goal - self.step)   # the goal (plus the button-down tap) shapes the release
           self.holds_this_episode += 1
       elif (button == SET_PLUS and not want_lower and not i.csc_active and (all_over or self.restore_pending) and
-            (not self.stop_episode or fast_stop or i.fast_restore) and self._cap() is None):
+            (not self.stop_episode or fast_stop or i.fast_restore) and self._cap() is None and
+            not (i.stop_slower_ahead and self.stop_episode)):
         # one rule for every restore hold (RESTORE_HOLD_MIN_GAIN): a stop episode only when its car has clearly
         # gone (restore_now) or the radar follows a car; a lost / left-lane release taps so a re-trigger wins (and
-        # taps while a lower limit's cap is pending: it releases a hold)
+        # taps while a lower limit's cap is pending, or a slower car is in our lane after a red light gone: they
+        # release a hold)
         driver_steps = int(round(top / self.step))
         set_steps = int(round(set_speed / self.step))
         margin = self._up_overrun() * q                      # what may still land after the release
@@ -1426,6 +1437,7 @@ class CurveSlowdown:
       radar_lead=bool(self.trigger.radar_stable),
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
       stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
+      stop_slower_ahead=bool(self.trigger.slower_after_red) and self.stop_mode == ON,
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
