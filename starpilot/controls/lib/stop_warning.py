@@ -12,7 +12,8 @@ Two independent warnings, each with its own setting (0 = off, 1 = test, 2 = on):
   * Stopped car ahead: the lead car is stopped or nearly stopped, we are closing in fast,
     and the car is not slowing down. While our own stop slowdown runs (or a stop ahead
     warning just showed), it comes as soon as stopping needs more than the stock cruise
-    gives (OWN_*), whatever the time to collision.
+    gives (OWN_*), whatever the time to collision. The same warning also takes a moving but
+    much slower car that needs more braking than we are doing (SLOW_LEAD_*): "CAR AHEAD - BRAKE".
 
 Test mode never makes a sound: it only appends a line to LOG_PATH each time the warning would
 have fired, so false alarms (e.g. at green lights) can be reviewed before turning sound on.
@@ -69,6 +70,23 @@ LEAD_DEBOUNCE = 0.5             # s
 # fires at ~319-319.5 s (85-96 m) instead of 321.8. Everything else is unchanged.
 OWN_STOP_RECENT = 10.0          # s
 OWN_LEAD_MIN_PROB = 0.6
+
+# A moving but much slower car (Mazda, drive 52, t 193.5-196.0, night, a queue at a light that had turned green): the car
+# ahead was 98-100 % a car in our lane (yRel -0.5..-0.8), 50 -> 30 m, at 7-9 mph (3.2-4 m/s: above LEAD_STOPPED_SPEED, so
+# no warning) while we were at 27-29 mph, the set speed at the floor and no radar lock: the stock cruise slowed only
+# 0.3-0.7 m/s^2 and the driver braked at 196.0 (25 m, up to 4.3 m/s^2). Matching its speed LEAD_BUFFER behind it needed
+# 0.97 m/s^2 at 194.0, 1.11 at 194.5, 1.32 at 195.0. The stopped car warning now also takes a car that moves but is
+# SLOW_LEAD_CLOSING or more slower than us, once matching its speed needs SLOW_LEAD_DECEL or more and the car is not
+# already slowing nearly that hard (aEgo filtered above -(required - SLOW_LEAD_DECEL_MARGIN): the radar cruise tracking
+# that car brakes for it itself, the driver too). The rest is the stopped car's rule: in our lane, LEAD_MIN_PROB
+# (OWN_LEAD_MIN_PROB and no time to collision rule while own_stop()), LEAD_MIN_SPEED, LEAD_MAX_TTC, LEAD_DEBOUNCE, and
+# the same event and gate (one warning per event, MIN_GAP); the alert says "CAR AHEAD - BRAKE" (lead_warning_text).
+SLOW_LEAD_ENABLED = True
+SLOW_LEAD_CLOSING = 4.0         # m/s
+SLOW_LEAD_DECEL = 1.1           # m/s^2
+SLOW_LEAD_DECEL_MARGIN = 0.3    # m/s^2
+STOPPED_LEAD_TEXT = "STOPPED CAR AHEAD - BRAKE"
+SLOW_LEAD_TEXT = "CAR AHEAD - BRAKE"
 
 NOT_SLOWING_ACCEL = -0.5        # m/s^2: slower than this means the car is already braking ...
 # ... but not when it is our own stop slowdown (Mazda: the set speed lowered for this stop, starpilotCarState.
@@ -141,6 +159,12 @@ class Detection:
   lead_d: float = 0.0
   lead_y: float = 0.0
   lead_relevant: bool = False
+  moving: bool = False          # STOPPED_LEAD for a moving but much slower car (SLOW_LEAD_*)
+
+
+def lead_warning_text(lead_v):
+  """The stopped car warning's alert text for the car ahead's speed (m/s): it also warns for a much slower moving car."""
+  return STOPPED_LEAD_TEXT if lead_v <= LEAD_STOPPED_SPEED else SLOW_LEAD_TEXT
 
 
 class _Gate:
@@ -247,14 +271,25 @@ class StopWarningLogic:
     own = self.own_stop(i)
     if not i.lead_status or i.lead_prob < (OWN_LEAD_MIN_PROB if own else LEAD_MIN_PROB) or i.v_ego < LEAD_MIN_SPEED:
       return None
-    if i.lead_v > LEAD_STOPPED_SPEED or i.lead_d <= 0 or abs(i.lead_y) > LEAD_MAX_LATERAL:
+    if i.lead_d <= 0 or abs(i.lead_y) > LEAD_MAX_LATERAL:
       return None
     closing, ttc, required = self.lead_metrics(i)
-    if closing < LEAD_MIN_CLOSING:
+    if ttc > LEAD_MAX_TTC and not own:
       return None
-    if (ttc > LEAD_MAX_TTC and not own) or required < LEAD_DECEL:
+    if i.lead_v > LEAD_STOPPED_SPEED:
+      return self.slow_lead(i, closing, ttc, required)
+    if closing < LEAD_MIN_CLOSING or required < LEAD_DECEL:
       return None
     return Detection(STOPPED_LEAD, i.lead_d, required, ttc, i.lead_v, i.lead_prob)
+
+  def slow_lead(self, i, closing, ttc, required):
+    """The stopped car rule's moving case: a much slower car that needs more braking than we are doing (SLOW_LEAD_*)."""
+    if not SLOW_LEAD_ENABLED or closing < SLOW_LEAD_CLOSING or required < SLOW_LEAD_DECEL or not self._not_slowing_for(required):
+      return None
+    return Detection(STOPPED_LEAD, i.lead_d, required, ttc, i.lead_v, i.lead_prob, moving=True)
+
+  def _not_slowing_for(self, required):
+    return self.a_filtered is None or self.a_filtered > -(required - SLOW_LEAD_DECEL_MARGIN)
 
   # ---- diagnostics for the per-event logs (what blocked a candidate) ----
   def common_blockers(self, i, mode):
@@ -303,15 +338,19 @@ class StopWarningLogic:
         out.append(f"prob {i.lead_prob:.2f} < {min_prob}")
       if abs(i.lead_y) > LEAD_MAX_LATERAL:
         out.append(f"yRel {i.lead_y:.1f} > {LEAD_MAX_LATERAL}")
-      if i.lead_v > LEAD_STOPPED_SPEED:
+      moving = i.lead_v > LEAD_STOPPED_SPEED
+      if moving and not SLOW_LEAD_ENABLED:
         out.append(f"vLead {i.lead_v:.1f} > {LEAD_STOPPED_SPEED} m/s")
       closing, ttc, required = self.lead_metrics(i)
-      if closing < LEAD_MIN_CLOSING:
-        out.append(f"closing {closing:.1f} < {LEAD_MIN_CLOSING} m/s")
+      min_closing, min_decel = (SLOW_LEAD_CLOSING, SLOW_LEAD_DECEL) if moving else (LEAD_MIN_CLOSING, LEAD_DECEL)
+      if closing < min_closing:
+        out.append(f"closing {closing:.1f} < {min_closing} m/s")
       if ttc > LEAD_MAX_TTC and not own:
         out.append(f"ttc {ttc:.1f} > {LEAD_MAX_TTC} s")
-      if required < LEAD_DECEL:
-        out.append(f"required decel {required:.2f} < {LEAD_DECEL}")
+      if required < min_decel:
+        out.append(f"required decel {required:.2f} < {min_decel}")
+      if moving and SLOW_LEAD_ENABLED and not self._not_slowing_for(required):
+        out.append(f"slower car: already slowing aEgo {self.a_filtered:.2f} <= -{required - SLOW_LEAD_DECEL_MARGIN:.2f}")
     if i.v_ego < LEAD_MIN_SPEED:
       out.append(f"speed {i.v_ego / MS_PER_MPH:.1f} < {LEAD_MIN_SPEED / MS_PER_MPH:.0f} mph")
     if not out:
@@ -592,7 +631,7 @@ class StopWarning:
         "distance_m": det.distance, "required_decel": det.required_decel, "time_s": det.time,
         "lead_status": det.lead_status, "lead_d": det.lead_d, "lead_v": det.lead_speed, "lead_prob": det.lead_prob,
         "lead_y": det.lead_y, "lead_relevant": det.lead_relevant, "plan_min_mps": plan_min, "plan_ratio": ratio,
-        "own_slowdown": i.own_slowdown, "gps": self._gps()})
+        "own_slowdown": i.own_slowdown, "slower_moving_car": det.moving, "gps": self._gps()})
     # near-misses: a candidate was seen but the warning did not fire
     if self.modes[STOP_AHEAD] != OFF:
       cand = (not i.standstill and i.v_ego >= self.NEAR_MISS_STOP_AHEAD_SPEED and plan is not None and

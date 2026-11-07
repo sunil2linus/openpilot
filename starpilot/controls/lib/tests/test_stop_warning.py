@@ -457,8 +457,9 @@ def test_own_slowdown_warns_as_soon_as_stopping_needs_more_than_the_cruise_gives
   assert run(repeat(inputs(45, lead=lead), 3)) == []                               # without our slowdown: as before
   out = run(repeat(_own(inputs(45, lead=lead)), 3))
   assert [k for _, k, _ in out] == [sw.STOPPED_LEAD] and out[0][0] == sw._frames(sw.LEAD_DEBOUNCE) - 1, out
-  # the other rules stay: a moving car, the next lane, barely closing, far (little braking needed), too unsure
-  for kw in (dict(lead=(95, 8, 0.65)), dict(lead=(95, 0, 0.65), lead_y=1.5), dict(lead=(95, 37, 0.9)), dict(lead=(220, 0, 0.9)),
+  # the other rules stay: the next lane, barely closing, far (little braking needed), too unsure; a car moving at 25 mph
+  # 95 m ahead needs only 0.55 m/s^2 (a car at 8 mph there needs 1.5: the slower moving car rule, below)
+  for kw in (dict(lead=(95, 25, 0.65)), dict(lead=(95, 0, 0.65), lead_y=1.5), dict(lead=(95, 37, 0.9)), dict(lead=(220, 0, 0.9)),
              dict(lead=(95, 0, 0.5))):
     assert run(repeat(_own(inputs(45, **kw)), 3)) == [], kw
   # the brake and the car already braking hard (the radar cruise / driver) still silence it; a lowered set speed does not
@@ -536,3 +537,100 @@ def test_drive_50_replay_the_brake_warning_comes_1_4_s_sooner_with_our_slowdown_
   assert _drive_50(own=False) == []
   fired = _drive_50(own=False, a_ego=0.0)
   assert len(fired) == 1 and fired[0][0] >= 14.2 and fired[0][2] <= 55.0, fired
+
+
+# ---------------- a moving but much slower car (SLOW_LEAD_*): "CAR AHEAD - BRAKE" ----------------
+
+# drive 52 (t = s after 190.0, night, a queue at a light that had turned green): our stop ahead slowdown from 1.0 s (own
+# slowdown), the set speed at the floor from 3.0 s, no radar lock; the queue car (radarState leadOne, qlog samples):
+# (t, vEgo mph, aEgo, lead status, dRel m, vLead mph, yRel m, modelProb). The driver braked at 6.0 s (25.7 mph, 25 m).
+DRIVE_52_LEAD = [
+  (2.62, 28.8, 0.40, 1, 86.7, 7.4, -1.03, 0.61), (2.89, 29.0, 0.20, 1, 83.5, 12.2, -1.52, 0.59),
+  (3.13, 29.0, 0.02, 1, 46.6, 14.3, -0.45, 0.99), (3.37, 28.9, -0.09, 1, 50.4, 7.2, -0.53, 0.98),
+  (3.63, 28.8, -0.30, 1, 46.9, 13.9, -0.59, 0.98), (3.88, 28.4, -0.65, 1, 43.1, 9.1, -0.68, 0.98),
+  (4.13, 28.2, -0.60, 1, 39.8, 8.4, -0.73, 0.98), (4.38, 27.8, -0.51, 1, 39.0, 8.1, -0.77, 0.99),
+  (4.63, 27.5, -0.60, 1, 42.5, 5.7, -0.93, 0.99), (4.88, 27.1, 0.00, 1, 31.5, 8.2, -0.74, 1.00),
+  (5.13, 26.8, -0.42, 1, 32.2, 7.5, -0.76, 0.99), (5.38, 26.6, -0.48, 1, 29.9, 8.2, -0.75, 1.00),
+  (5.63, 26.2, -0.50, 1, 31.2, 4.4, -0.66, 0.99), (5.88, 26.0, -0.61, 1, 24.9, 6.6, -0.49, 1.00),
+]
+
+
+def _drive_52(own=True, a_ego=None):
+  """20 Hz from 2.6 s to 6.0 s, the samples held until the next: the stopped car warnings (t, moving, d, required)."""
+  logic = sw.StopWarningLogic()
+  fired = []
+  for n in range(int(2.6 / sw.DT), int(6.0 / sw.DT)):
+    t = n * sw.DT
+    row = max((r for r in DRIVE_52_LEAD if r[0] <= t), key=lambda r: r[0], default=None)
+    if row is None:
+      continue
+    i = sw.StopWarningInputs(cruise_enabled=True, v_ego=row[1] * MPH, a_ego=row[2] if a_ego is None else a_ego,
+                             brake_pressed=False, standstill=False, own_slowdown=own)
+    i.lead_status, i.lead_d, i.lead_v, i.lead_y, i.lead_prob = True, row[4], row[5] * MPH, row[6], row[7]
+    for det, _ in logic.update(i, {sw.STOP_AHEAD: sw.OFF, sw.STOPPED_LEAD: sw.ON}):
+      fired.append((round(t, 2), det.kind, det.moving, round(det.distance, 1), round(det.required_decel, 2)))
+  return fired
+
+
+def test_drive_52_replay_a_much_slower_moving_car_warns_at_194_5_to_195():
+  # the car ahead at 6-9 mph (above the stopped car's 2 m/s): no warning on the drive; matching its speed needed 1.11
+  # m/s^2 at 194.5 and 1.32 at 195.0 while the car slowed 0.4-0.7
+  fired = _drive_52()
+  assert len(fired) == 1 and fired[0][1] == sw.STOPPED_LEAD and fired[0][2], fired
+  assert 4.5 <= fired[0][0] <= 5.0 and fired[0][4] >= sw.SLOW_LEAD_DECEL, fired
+  orig = sw.SLOW_LEAD_ENABLED
+  sw.SLOW_LEAD_ENABLED = False                     # the old rule: nothing
+  try:
+    assert _drive_52() == []
+  finally:
+    sw.SLOW_LEAD_ENABLED = orig
+  # without our slowdown: the usual time to collision rule (4 s), and the car not slowing (-0.5): 195.4 s, 30 m
+  fired = _drive_52(own=False, a_ego=0.0)
+  assert len(fired) == 1 and 5.3 <= fired[0][0] <= 5.6, fired
+  # the alert: "CAR AHEAD - BRAKE" for a moving car, as before for a stopped one
+  assert sw.lead_warning_text(8.2 * MPH) == "CAR AHEAD - BRAKE" and sw.lead_warning_text(0.5) == "STOPPED CAR AHEAD - BRAKE"
+
+
+def test_slower_moving_car_rules():
+  # 40 mph, a car 50 m ahead at 15 mph, 95 %, in our lane: 11.2 m/s closing, 1.39 m/s^2 to match it, 4.5 s: with our
+  # slowdown on it warns (moving), without it the time to collision rule waits
+  lead = (50, 15, 0.95)
+  out = run(repeat(_own(inputs(40, lead=lead)), 3))
+  assert [k for _, k, _ in out] == [sw.STOPPED_LEAD] and out[0][0] == sw._frames(sw.LEAD_DEBOUNCE) - 1, out
+  assert run(repeat(inputs(40, lead=lead), 3)) == []
+  assert run(repeat(inputs(40, lead=(40, 15, 0.95)), 3)) != []                    # 3.6 s: the usual rule
+  # not for: the next lane, a car only 3.6 m/s slower, little braking needed (1.0 < 1.1), below 20 mph, too unsure
+  for kw in (dict(lead=lead, lead_y=1.5), dict(lead=(30, 32, 0.95)), dict(lead=(70, 15, 0.95)), dict(lead=(60, 10, 0.95), v_mph=19),
+             dict(lead=(50, 15, 0.55))):
+    v = kw.pop("v_mph", 40)
+    assert run(repeat(_own(inputs(v, **kw)), 3)) == [], kw
+  # already slowing nearly as hard as needed (the radar cruise braking for the car it tracks, or the driver): silent
+  assert run(repeat(_own(inputs(40, a_ego=-1.2, lead=lead)), 3)) == []          # 1.2 of the 1.39 needed
+  assert run(repeat(_own(inputs(40, a_ego=-0.9, lead=lead)), 3)) != []          # the lowered set speed's ~0.9: warn
+  # the detection is marked moving; a stopped car is not; the blockers say why
+  logic = sw.StopWarningLogic()
+  i = _own(inputs(40, lead=lead))
+  logic.update(i, BOTH_ON)
+  assert logic.stopped_lead(i).moving and not logic.stopped_lead(_own(inputs(40, lead=(60, 0, 0.95)))).moving
+  i = _own(inputs(40, a_ego=-1.2, lead=lead))
+  for _ in range(40):
+    logic.update(i, BOTH_ON)
+  assert any("slower car: already slowing" in b for b in logic.stopped_lead_blockers(i, sw.ON))
+
+
+def test_radar_cruise_following_a_slower_car_down_is_not_warned():
+  # 45 mph closing on a car at 15 mph from 75 m (1.28 m/s^2 to match it), our slowdown on. The radar cruise tracking it
+  # brakes at what is needed (5 % more): no warning. Only our lowered set speed (0.6 m/s^2): the need grows, it warns.
+  def approach(radar):
+    v, d, vl, seq = 45 * MPH, 75.0, 15 * MPH, []
+    for _ in range(int(8.0 / sw.DT)):
+      closing = v - vl
+      need = closing ** 2 / (2 * max(d - sw.LEAD_BUFFER, 1.0)) if closing > 0 else 0.0
+      a = (-1.05 * need if radar else -0.6) if closing > 0 else 0.0
+      seq.append(_own(sw.StopWarningInputs(cruise_enabled=True, v_ego=v, a_ego=a, brake_pressed=False, standstill=False,
+                                           lead_status=True, lead_d=d, lead_v=vl, lead_prob=0.95, lead_y=0.1)))
+      v = max(v + a * sw.DT, vl)
+      d -= (v - vl) * sw.DT
+    return run(seq)
+  assert approach(radar=True) == []
+  assert [k for _, k, _ in approach(radar=False)] == [sw.STOPPED_LEAD]

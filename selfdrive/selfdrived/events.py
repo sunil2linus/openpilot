@@ -260,6 +260,22 @@ def _map_curve_needs(radius: float, advisory: float) -> float:
   return needs
 
 
+def stopped_lead_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                       personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  # the stopped car warning also warns for a much slower moving car (stop_warning.SLOW_LEAD_*): "CAR AHEAD - BRAKE" then,
+  # from the same lead the planner's warning used (radarState leadOne)
+  try:
+    from openpilot.starpilot.controls.lib.stop_warning import lead_warning_text
+    text = lead_warning_text(float(sm["radarState"].leadOne.vLead))
+  except Exception:
+    text = "STOPPED CAR AHEAD - BRAKE"
+  return Alert(
+    text,
+    "Cruise may not stop for this",
+    AlertStatus.userPrompt, AlertSize.mid,
+    Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stopChime, 3.)
+
+
 def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
   sp = sm["starpilotPlan"]
   what = "Ramp curve" if sp.mapCurveStatus == 2 else "Map curve"
@@ -1253,11 +1269,7 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   StarPilotEventName.stoppedLeadWarning: {
-    ET.PERMANENT: Alert(
-      "STOPPED CAR AHEAD - BRAKE",
-      "Cruise may not stop for this",
-      AlertStatus.userPrompt, AlertSize.mid,
-      Priority.HIGH, VisualAlert.none, StarPilotAudibleAlert.stopChime, 3.),
+    ET.PERMANENT: stopped_lead_alert,     # "STOPPED CAR AHEAD - BRAKE", or "CAR AHEAD - BRAKE" for a much slower moving car
   },
 
   # Mazda map curves (MazdaMapCurves: Test or On)
