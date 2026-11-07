@@ -23,8 +23,9 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
   """limit(f) mph (0 none, km/h when metric), road(f) class, name(f) mapd's road name, nav(f) (its limit, m to its next
   maneuver, a turn), cruise(f) on, vcap(f) the car ahead (m/s or None), gas(f) his foot (m/s he takes the car to, or
   None), driver(f) his button (SET_MINUS / SET_PLUS / None). settled: the follower has seen the road (cruise on) 20 s
-  before frame 0 (no fresh engage). street_active: Map Curves On with Speed Limit Follow On (False: Map Curves Test,
-  the wrapper's _street_active)."""
+  before frame 0 (no fresh engage). street_active (bool or f -> bool): Map Curves On with Speed Limit Follow On (False:
+  Map Curves Test, the planner's mode not On: the wrapper's _street_active; a paused slowdown holds the restore)."""
+  street_on = street_active if callable(street_active) else (lambda f, a=street_active: a)
   step = KPH if metric else MPH
   car = T.Car(set_mph * step / MPH, dash_offset_mph=0.0, lag=10, accel=0.6, step=step, **TM.MEASURED_CRUISE)
   car.set_speed, car.v_ego = set_mph * step, (v_mph if v_mph is not None else set_mph) * step
@@ -52,24 +53,22 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
       car.driver_button, car.driver_button_until = b, car.frame + 10
       car.set_speed += step if b == cs.SET_PLUS else -step
     drv = (logic.anchor if logic.anchor is not None else car.set_speed) if on else 0.0
-    f_.street_active = street_active
+    f_.street_active = street_on(fr)
     want = f_.update(li(fr, on, drv, nav(fr))) if follower else 0.0
-    if follower and not street_active and f_.lower is not None:
-      f_.lower_finished("test: logged only")
     lim = limit(fr)
     fld = F(road_class=road(fr), limit=lim * step if lim else 0.0, gps_trust=trust(fr))
     driver_speed = car.set_speed + logic.offset * logic.step if on else 0.0
     foot = gas(fr)
     mo = ctl.update(fld, driver_speed, 0, v_ego=car.v_ego, max_drop=md, gas=foot is not None,
                     set_speed=car.set_speed if on else None, driver_set=car.driver_button_now() is not None,
-                    limit_lower=f_.lower_speed if follower and street_active else 0.0,
+                    limit_lower=f_.lower_speed if follower and street_on(fr) else 0.0,
                     limit_lower_gas=bool(follower and f_.lower is not None and f_.lower.kind == "lower"))
     if ctl.lower_event is not None:
       f_.lower_finished(ctl.lower_event, car.set_speed / step if on else None)
       ctl.lower_event = None
     active, speed, floor, budget, track, raise_ok = mix.update(False, CTL.NO_CURVE, mo,
                                                                drop_floor=max(driver_speed - md, cs.MIN_SET_SPEED))
-    if mo.adopt and logic.offset > 0:
+    if mo.adopt and cs.adopt_forgets(logic, mo, car.set_speed):
       logic._forget()
       r["adopted"].append(fr)
     inp = cs.SlowdownInputs(enabled=True, cruise_enabled=on, set_speed=car.set_speed, v_ego=car.v_ego,
@@ -78,6 +77,7 @@ def street_sim(frames, limit, set_mph, v_mph=None, road=lambda f: 7, name=lambda
                             driver_button=car.driver_button_now(), curve_floor=floor, curve_budget=budget,
                             curve_track=track, curve_raise=raise_ok, curve_no_accel=mix.no_accel, curve_hold=mix.firm,
                             fast_restore=mo.fast_restore, btn_counter=(fr // 10) % 16, limit_raise=want,
+                            hold_restore=bool(follower and f_.paused),
                             limit_cap=f_.cap_speed if follower else 0.0, limit_undo=f_.undo_speed if follower else 0.0,
                             limit_ceiling=f_.ceiling_speed if follower else 0.0,
                             street_lower=bool(mo.street and track and abs(speed - mo.speed) < 1e-3))
@@ -448,3 +448,78 @@ def test_review2_map_curves_test_never_slows():
   assert _minus(r) == [] and r["f"].lower is None and abs(r["sets"][-1] - 50) < 1e-6
   r = street_sim(4000, lambda f: 45, 75, street_active=False, **_engage())
   assert r["presses"] == [] and abs(r["sets"][-1] - 75) < 1e-6
+
+
+# ---------------- third review ----------------
+
+def test_review3_the_fallback_guard_is_the_cars_speed_not_his_set_speed():
+  # RES at 75 with the car at 20 mph on a street with no limit (was: nothing, his 75 stayed): down to 43
+  r = street_sim(6000, lambda f: 0, 75, v_mph=20, vcap=lambda f: 20 * MPH if f < 1500 else None, **_engage())
+  assert abs(r["sets"][-1] - 43) < 1e-6 and r["logic"].anchor is None, (r["sets"][-1], _reasons(r))
+  # the car at 60 (a street match beside a highway): no fallback
+  r = street_sim(4000, lambda f: 0, 60, v_mph=60, vcap=lambda f: 60 * MPH, **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 60) < 1e-6
+
+
+def test_review3_navigation_alone_never_takes_him_under_the_fallback():
+  # drive 54 (t 1155-1225): navigation's 25 lingering with no map limit; SET at 45: 43 (was: 30)
+  r = street_sim(6000, lambda f: 0, 45, v_mph=40, nav=lambda f: (25.0, 800.0, False), **_engage())
+  assert abs(r["sets"][-1] - 43) < 1e-6, (r["sets"][-1], _reasons(r))
+  # ... at 70 mph: not a street's speed, nothing
+  r = street_sim(4000, lambda f: 0, 75, v_mph=70, vcap=lambda f: 70 * MPH, nav=lambda f: (25.0, 800.0, False),
+                 **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 75) < 1e-6
+  # navigation's 70 lingering, his 75 at 30 mph: its 75 is not under his speed: nothing (never a raise either)
+  r = street_sim(6000, lambda f: 0, 75, v_mph=30, nav=lambda f: (70.0, 800.0, False), **_engage())
+  assert r["presses"] == [] and abs(r["sets"][-1] - 75) < 1e-6
+  r = street_sim(6000, lambda f: 0, 40, v_mph=30, nav=lambda f: (45.0, 800.0, False), **_engage())
+  assert _plus(r) == [] and abs(r["sets"][-1] - 40) < 1e-6
+
+
+def test_review3_adopt_forgets_an_anchor_just_under_the_reached_street_speed_not_rule_4s_undo():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  mo = CTL.MapOutput(adopt=True, adopt_target=43 * MPH)
+  lg.anchor, lg.last_set_speed = 42 * MPH, 43 * MPH          # (our landing re-anchored one step under: drive 54, 745.2)
+  assert cs.adopt_forgets(lg, mo, 43 * MPH)
+  # rule 4's undo (the anchor his speed before our raise, under the set speed): kept with no street speed just reached
+  assert not cs.adopt_forgets(lg, CTL.MapOutput(adopt=True), 43 * MPH)
+  assert not cs.adopt_forgets(lg, mo, 47 * MPH)
+  lg.anchor, lg.last_set_speed = 50 * MPH, 43 * MPH          # a restore pending above it: forgotten (as before)
+  assert cs.adopt_forgets(lg, CTL.MapOutput(adopt=True), 43 * MPH)
+  # the map control: the target while its adopt lasts (2 frames), then 0
+  c = CTL.MapCurveControl(3.0)
+  outs = [c.update(F(road_class=7, limit=45 * MPH), 50 * MPH, 0, v_ego=20.0, set_speed=40 * MPH,
+                   limit_lower=40 * MPH if k == 0 else 0.0) for k in range(4)]
+  assert [round(o.adopt_target / MPH) for o in outs] == [40, 40, 0, 0], [o.adopt_target / MPH for o in outs]
+
+
+def test_review3_one_frame_of_a_link_class_does_not_end_the_match():
+  # RES at 75 on the 45 street; one frame of class 2 (a link, near a ramp: drive 53 t 443) mid-way: still to 50
+  base = dict(v_mph=30, vcap=lambda f: 30 * MPH)
+  r = street_sim(5000, lambda f: 45, 75, road=lambda f: 2 if f == 800 else 7, **base, **_engage())
+  assert "cancel: not on a street" not in _reasons(r) and abs(r["sets"][-1] - 50) < 1e-6, _reasons(r)
+  # 3 s of it: cancelled (his 75 comes back); his next RES (cruise off / on) re-opens the match: 50
+  link = lambda f: 2 if 800 <= f < 1100 else 7  # noqa: E731
+  r = street_sim(4000, lambda f: 45, 75, road=link, **base, **_engage())
+  assert "cancel: not on a street" in _reasons(r) and r["sets"][-1] > 70, (r["sets"][-1], _reasons(r))
+  r = street_sim(8000, lambda f: 45, 75, road=link, cruise=lambda f: f >= ENGAGE and not (4000 <= f < 4100),
+                 settled=False, **base)
+  assert abs(r["sets"][-1] - 50) < 1e-6 and _reasons(r).count("start: cruise on, down") == 2, _reasons(r)
+
+
+def test_review3_a_map_curve_mode_flip_mid_way_pauses_the_slowdown():
+  # RES at 75 on the 45 street; the planner's map curve mode not On for 5 s mid-way: nothing pressed meanwhile (no
+  # restore back up), then on to 50 (was: cancelled, his 75 restored)
+  base = dict(v_mph=30, vcap=lambda f: 30 * MPH)
+  r = street_sim(800, lambda f: 45, 75, **base, **_engage())
+  mid = r["sets"][-1]
+  assert 52 <= mid < 75, mid
+  pause = lambda f: not (800 <= f < 1300)  # noqa: E731
+  r = street_sim(5000, lambda f: 45, 75, street_active=pause, **base, **_engage())
+  assert not [p for p in r["presses"] if 815 <= p[0] < 1300], [p for p in r["presses"] if 815 <= p[0] < 1300]
+  assert max(r["sets"][800:1300]) <= mid + 1e-6
+  assert abs(r["sets"][-1] - 50) < 1e-6 and "done" in _reasons(r), (r["sets"][-1], _reasons(r))
+  # his SET while paused: his
+  r = street_sim(5000, lambda f: 45, 75, street_active=pause, driver=lambda f: cs.SET_MINUS if f == 1000 else None,
+                 **base, **_engage())
+  assert "cancel: his SET" in _reasons(r) and _minus(r, 1300) == [] and _plus(r, 1000) == [], _reasons(r)

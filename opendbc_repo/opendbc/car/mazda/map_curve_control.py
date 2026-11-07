@@ -485,6 +485,9 @@ class MapOutput:
   # the governing target is the street speed (the exit's street, limit_lower): the controller may press from KEEP_SPEED
   # (SlowdownInputs.street_lower)
   street: bool = False
+  # m/s: the street speed just reached and adopted (0 none): the wrapper also forgets a set speed above the anchor at it
+  # (our last press landing in the adopt frame re-anchored one step under it: drive 54, t 745.2, 43 -> 42)
+  adopt_target: float = 0.0
 
 
 class ExitPlan:
@@ -612,6 +615,7 @@ class MapCurveControl:
     self.done_at = None             # m of the odometer: the exit point of a plan that ended (no re-adoption)
     self.restore_frames = 0         # fast restore asked for this many frames more (RESTORE_PULSE)
     self.adopt_frames = 0           # the set speed becomes his for this many frames more (an exit never resolved)
+    self.adopt_target = 0.0         # m/s: _street_end's target while its adopt lasts
     self.hwy_limit = (0.0, 0.0)     # the highway's steady posted limit (m/s) and the odometer where it became steady
     self.lim_new, self.lim_s = 0.0, 0.0
     self.chime_count = 0            # "Exit curve - brake" chimes so far (the wrapper raises the alert on a change)
@@ -1016,6 +1020,8 @@ class MapCurveControl:
     self.model.tick(DT_CTRL)
     if self.adopt_frames > 0:
       self.adopt_frames -= 1
+      if self.adopt_frames == 0:
+        self.adopt_target = 0.0
     if self.restore_frames > 0:
       self.restore_frames -= 1
     if f.on_ramp:
@@ -1145,6 +1151,7 @@ class MapCurveControl:
     self.on_street_exit = (exit_to_street and (progress or f.road_class != 0)) or (self.on_street_exit and f.on_ramp)
     out.why = why
     out.street = street
+    out.adopt_target = self.adopt_target if self.adopt_frames > 0 else 0.0
     out.chime = self.chime_count != getattr(self, "_chimes_out", 0)
     self._chimes_out = self.chime_count
     return out
@@ -1233,6 +1240,7 @@ class MapCurveControl:
            "his speed under it" if (set_v < target and driver_speed <= target + EXIT_STREET_DONE) else "")
     if why and (at or why == "cancel: his SET" or (gas_why and set_v >= target - EXIT_STREET_DONE)):
       self.adopt_frames = max(self.adopt_frames, ADOPT_LANDED_FRAMES)
+      self.adopt_target = set_v if at else 0.0
     return why
 
   def _street_cmd(self, target, set_v, v_ego):

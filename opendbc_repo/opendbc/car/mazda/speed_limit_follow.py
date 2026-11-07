@@ -60,9 +60,9 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    road's speed limit"): cruise turned on (SET or RES) on a street, the road class steady ENGAGE_ROAD_STEADY with GPS
    trust 0: the steady limit plus the Street Speed offset becomes his speed (up: an offer the controller raises to, down:
    `lower`, the map control's paced slowdown, then his; his gas does not end it). No map limit: navigation's alone (up
-   to NAV_ALONE_MAX) only down, to it plus the offset; nothing known: only down, to STREET_FALLBACK, and only from at
-   most FALLBACK_MAX_SPEED. His SET within ENGAGE_WINDOW first: his. This also covers his RES after an exit
-   (map_curve_control's street rule while cruise is on). Rules 8 and 9 act only with Map Curves On (street_active).
+   to NAV_ALONE_MAX) only down, to the higher of it plus the offset and STREET_FALLBACK; nothing known: only down, to
+   STREET_FALLBACK; the fallback only with the car at most FALLBACK_MAX_SPEED. His SET within ENGAGE_WINDOW first:
+   his. This also covers his RES after an exit (map_curve_control's street rule while cruise is on). Rules 8 and 9 act only with Map Curves On (street_active).
    No target under STREET_FLOOR (the controller's 25 mph curve floor: a 20 mph / 30 km/h zone ends at 25 / 41).
 9. Slow for a lower limit (setting MazdaSlowLowerLimit, default on): on a street a lower limit steady LOWER_STEADY
    (LOWER_BIG_STEADY for a drop of more than LOWER_BIG_DROP) with GPS trust 0 on every frame, the road name unchanged
@@ -232,6 +232,9 @@ STREET_OFFSET_DEFAULT = 2
 STREET_FALLBACK = (43, 70)   # mph / km/h: no limit known (map_curve_control.STREET_FALLBACK)
 # Rule 8, match on engage
 ENGAGE_ROAD_STEADY = 2.0     # s the road class known (a street) and GPS trust 0 before it decides
+# rules 8 / 9 under way end off a street only once the road class has said so this long (third review: one frame of a
+# link class near a ramp, drive 53 t 443, ended the match and the restore took his stored 75 back)
+LOWER_NOT_STREET_TIME = 2.0  # s
 ENGAGE_WINDOW = 15.0         # s after cruise came on it may still decide (the road / trust becoming steady)
 ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "his SET after it"
 # the limit itself steady this long with GPS trust 0 on every frame of it (drive 55, t 627: his RES at a junction while the
@@ -253,7 +256,8 @@ NAV_STREET_MAX = (55, 90)    # mph / km/h
 # ... but with no map limit at all, navigation's up to this counts as the limit (second review: a 65 road with no map
 # limit, SET at 70 -> the 43 fallback): it may cap him at it plus the offset, never raise him on it alone
 NAV_ALONE_MAX = (70, 112)    # mph / km/h
-# Rule 8's fallback only below this (second review: no speed guard; map_curve_control.EXIT_STREET_MAX_V-like)
+# Rule 8's fallback only with the car at most this fast (second review: no speed guard; as map_curve_control's
+# EXIT_STREET_MAX_V)
 FALLBACK_MAX_SPEED = (50, 80)  # mph / km/h
 # The lowest street speed: the controller never takes a curve target under 25 mph (curve_slowdown.MIN_SET_SPEED); a
 # 20 mph / 30 km/h zone ends here (second review: a lower target never finished)
@@ -633,12 +637,15 @@ class SpeedLimitFollower:
       self.engage_frame = self.frame
     lw = self.lower
     if lw is not None:
-      if not self._street():
-        self.lower = None
-        self._log("speedLimitSlow", "cancel: not on a street", lw.new, lw.target, d)
+      kind = "speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch"
+      if not self._street() and self.frame - self.road_since >= _frames(LOWER_NOT_STREET_TIME):
+        self.lower = None              # (a later RES re-opens rule 8, as after cruise off)
+        self._log(kind, "cancel: not on a street", lw.new, lw.target, d)
       elif lw.kind == "lower" and reported != lw.new and reported is not None and reported > lw.new:
         self.lower = None              # the limit back up before he got there: his speed (the anchor) comes back
         self._log("speedLimitSlow", "undo: the limit back up before it got there", reported, lw.driver, d)
+      elif not self.street_active and i.driver_set:
+        self.lower_finished("cancel: his SET")       # (paused: the map control does not see it)
       return
     if not self.street_active:
       self.engage_frame = None
@@ -677,13 +684,15 @@ class SpeedLimitFollower:
         self.engage_frame = None
         return
     elif reported is None and self.unknown_frames >= steady:
-      # no map limit: navigation's alone (up to NAV_ALONE_MAX) only caps him at it plus the offset; nothing at all: only
-      # down, to the fallback, and only from a street's speed (FALLBACK_MAX_SPEED)
+      # no map limit: only down, to the fallback; navigation's alone (NAV_LIMIT_MIN up to NAV_ALONE_MAX) only keeps him
+      # at or above it, at its limit plus the offset (third review: drive 54, t 1155-1225, its 25 lingered ~70 s over
+      # three roads, a primary road at 31 mph: never under the fallback on it). The fallback only at a street's speed:
+      # the car at most FALLBACK_MAX_SPEED (third review: was his set speed; RES 75 at 20 mph kept 75)
       tgt, limit = self.fallback, None
       sources = "none: fallback"
       if nav is not None:
-        tgt, limit, sources = nav + self._add(), nav, "nav only"
-      elif d > self.fallback_max + 0.5:
+        tgt, limit, sources = max(nav + self._add(), self.fallback), nav, "nav only"
+      if tgt <= self.fallback + 0.5 and i.v_ego > (self.fallback_max + 0.5) * self.step:
         self.engage_frame = None
         return
       if d <= tgt + 0.5:
@@ -741,6 +750,12 @@ class SpeedLimitFollower:
       self.lowered = Offer(lw.old, lw.new, lw.source, self.frame, "lower", lw.driver, tgt=lw.tgt, own=lw.own)
     self._log("speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch", why, lw.new, lw.target,
               d_now if d_now is not None else lw.driver)
+
+  @property
+  def paused(self):
+    """Rules 8 / 9's slowdown waits (third review: the planner's map curve mode flipped mid-way): kept, nothing
+    pressed (the wrapper holds the restore), carried on when they act again."""
+    return self.lower is not None and not self.street_active
 
   @property
   def lower_speed(self):

@@ -328,7 +328,7 @@ def drive_exit(fields, frames, set_mph, v_mph=None, split_mode=0, metric=False, 
                             curve_no_accel=mix.no_accel, curve_hold=mix.firm, fast_restore=mo.fast_restore,
                             btn_counter=(f // 10) % 16,    # the wheel's 10 Hz frames (holds are phase locked to them)
                             street_lower=bool(mo.street and track and abs(speed - mo.speed) < 1e-3))
-    if mo.adopt and logic.offset > 0:
+    if mo.adopt and cs.adopt_forgets(logic, mo, car.set_speed):
       logic._forget()             # (as the wrapper does: the set speed becomes his)
     btn, _ = logic.update(inp)
     if btn is not None:

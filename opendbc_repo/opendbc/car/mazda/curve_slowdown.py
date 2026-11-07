@@ -1314,6 +1314,16 @@ class CurveSlowdownLogic:
     return button, off
 
 
+def adopt_forgets(lg, mo, set_speed):
+  """map_curve_control's adopt (the set speed becomes his) forgets the controller's anchor: a restore pending above it,
+  or (third review, drive 54 t 745.2) an anchor one step under the street speed just reached (our last press landing in
+  the adopt frame re-anchors under it: then a SET- 43 -> 42). Not any anchor under the set speed: rule 4's undo lives
+  there (anchor under the set: SET- taps back to his speed before our raise), on a street after an exit too."""
+  if lg.offset > 0:
+    return True
+  return lg.offset < 0 and mo.adopt_target > 0 and abs(set_speed - mo.adopt_target) < lg.half_step
+
+
 class CurveSlowdown:
   """Card-side wrapper: reads starpilotPlan and radarState, runs the stopped car trigger and the
   shared set speed controller, builds the CAN messages and writes the per-event logs."""
@@ -1643,7 +1653,7 @@ class CurveSlowdown:
           self.limit_follow.lower_finished(self.map_control.lower_event,
                                            (set_speed / self.limit_follow.step) if set_speed > 0 else None)
         self.map_control.lower_event = None
-      if mo.adopt and lg.offset > 0 and self.map_mode == MAP_ON:
+      if mo.adopt and self.map_mode == MAP_ON and adopt_forgets(lg, mo, set_speed):
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
       if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
         # a followed road curve: the camera's target counts at the lowest it has been in it, so the follower's step
@@ -1697,8 +1707,6 @@ class CurveSlowdown:
       # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
       self.limit_follow.street_active = self._street_active(plan)
       self.limit_want = self.limit_follow.update(li)
-      if not self.limit_follow.street_active and self.limit_follow.lower is not None:
-        self.limit_follow.lower_finished("test: logged only")      # (Test: nothing carried out)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
     limit_ceiling = self.limit_follow.ceiling_speed if self.limit_follow is not None else 0.0
@@ -1728,7 +1736,9 @@ class CurveSlowdown:
       stop_target=float(self.trigger.target),
       stop_urgent=bool(self.trigger.urgent),
       stop_restore_now=bool(self.trigger.restore_now) and self.stop_mode == ON,
-      hold_restore=bool(self.trigger.hold_restore) and self.stop_mode == ON,
+      # (a stop planned ahead; rules 8 / 9's slowdown paused: the planner's map curve mode not On mid-way, third review)
+      hold_restore=(bool(self.trigger.hold_restore) and self.stop_mode == ON) or bool(
+        self.limit_follow is not None and self.limit_follow.paused),
       btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       radar_lead=bool(self.trigger.radar_stable),
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
