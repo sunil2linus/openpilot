@@ -50,9 +50,13 @@ class CarController(CarControllerBase):
         map_mode = mode("MazdaMapCurves")
         # needs StarPilot's Show Speed Limits so starpilotPlan carries the posted limit (speed_limit_follow.py)
         limit_mode = mode("MazdaSpeedLimitFollow")
-        if curve_enabled or stop_mode or learning or map_mode or limit_mode:
+        # the model follower: Test (log only) unless turned off; it never presses (model_follow.py)
+        from opendbc.car.mazda.model_follow import mode_from_params
+        follow_mode = mode_from_params(self.params)
+        if curve_enabled or stop_mode or learning or map_mode or limit_mode or follow_mode:
           self.curve_slowdown = CurveSlowdown(CP, self.params, curve_enabled=curve_enabled, stop_mode=stop_mode,
-                                              learning=learning, map_mode=map_mode, limit_mode=limit_mode)
+                                              learning=learning, map_mode=map_mode, limit_mode=limit_mode,
+                                              follow_mode=follow_mode)
       except Exception:
         carlog.exception("mazda set speed slowdown init failed, disabled")
         self.curve_slowdown = None

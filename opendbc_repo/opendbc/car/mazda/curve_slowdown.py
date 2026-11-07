@@ -1174,7 +1174,7 @@ class CurveSlowdown:
                    "lead_y_path", "leaving", "clear_ahead", "warn_cond", "warn_s", "warn_start", "stop_kind",
                    "slc_mph", "slc_src", "limit_stable_mph", "limit_offer_mph", "limit_raise_mph"]
 
-  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0, limit_mode=0):
+  def __init__(self, CP, params, curve_enabled=True, stop_mode=0, learning=False, map_mode=0, limit_mode=0, follow_mode=0):
     import cereal.messaging as messaging
     from opendbc.car.mazda.values import MazdaSafetyFlags
     from opendbc.car.mazda.curve_target import CurveTarget, lateral_limit
@@ -1224,6 +1224,8 @@ class CurveSlowdown:
     self.curve_mix = CurveMix(CURVE_MARGIN)
     self.learner = None
     services = ['starpilotPlan', 'radarState', 'modelV2']
+    if follow_mode:
+      services.append('drivingModelData')   # the model follower's fallback for the model's accel (model_follow.py)
     if learning:
       try:
         from opendbc.car.mazda.curve_learner import CurveLearner
@@ -1246,6 +1248,12 @@ class CurveSlowdown:
       self.near_miss = NearMissTracker(self.recorder, "stoppedCarSlowdown")
     except Exception:
       self.recorder = None
+    self.follow = None
+    if follow_mode:
+      try:
+        self._init_model_follow(params)
+      except Exception:
+        self.follow = None
 
   def _alive(self, service):
     return bool(self.sm.alive[service] and self.sm.recv_frame[service] > 0)
@@ -1330,14 +1338,17 @@ class CurveSlowdown:
     from opendbc.car.mazda.stopped_car_slowdown import plan_stop
     p_stop, p_ratio, p_d = False, 1.0, 0.0
     path_x, path_y, model_length, lane_change = [], [], 0.0, False
+    vel_t, vel_x = [], []                          # the model's velocity plan (also the model follower's)
     if self._alive('modelV2'):
       try:
         m = self.sm['modelV2']
         path_x, path_y = list(m.position.x), list(m.position.y)
         model_length = float(path_x[-1]) if path_x else 0.0
-        p_stop, p_ratio, p_d = plan_stop(list(m.velocity.t), list(m.velocity.x), path_x, v_ego)
+        vel_t, vel_x = list(m.velocity.t), list(m.velocity.x)
+        p_stop, p_ratio, p_d = plan_stop(vel_t, vel_x, path_x, v_ego)
       except Exception:
         p_stop, p_ratio, p_d = False, 1.0, 0.0     # a malformed plan only loses the red-light latch
+        vel_t, vel_x = [], []
       try:
         lane_change = str(self.sm['modelV2'].meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
       except Exception:
@@ -1463,10 +1474,188 @@ class CurveSlowdown:
         self._learn(CC, CS, v_ego, cruise_enabled, blinker)
       except Exception:
         self.learner = None   # never let the learner affect anything else
+    if self.follow is not None and self.frame % self.FOLLOW_EVERY == 0:
+      # Test only: works out and logs the set speed the model would want; its result never reaches `button`
+      try:
+        self._model_follow(CS, stop_inputs, cruise_enabled, v_ego, vel_t, vel_x, curve_active)
+      except Exception as e:
+        self._model_follow_failed(e)
     if button is None:
       return []
     btn = Buttons.SET_MINUS if button == SET_MINUS else Buttons.SET_PLUS
     return [mazdacan.create_button_cmd(packer, CP, CS.crz_btns_counter + offset, btn)]
+
+  # ---- model follower (TEST ONLY, model_follow.py: logs the set speed it would command, never presses) ----
+  FOLLOW_EVERY = 5                # frames: 20 Hz
+  FOLLOW_ROW_EVERY = 10           # frames: a signals row at 10 Hz
+  FOLLOW_SUMMARY_EVERY = 300.0    # s of cruise between two drive summary lines (also one at every cruise off)
+  FOLLOW_SUMMARY_CSV = "model_follow_drives.csv"
+  FOLLOW_SUMMARY_MAX_BYTES = 1_000_000
+  # the episode's signals.csv (no GPS); speeds mph, the model's accel m/s^2
+  FOLLOW_COLUMNS = ["vEgo_mph", "aEgo", "cruise", "set_mph", "driver_mph", "follow_mph", "target_mph", "reason", "model_a",
+                    "model_a_f", "req_decel", "v_look_mph", "src", "lead", "lead_d", "lead_v_mph", "lead_prob", "red_light",
+                    "features", "brake", "gas", "driver_btn", "taps"]
+  # one line per write; a drive's last line has its totals (drive_start_wall tells the drives apart)
+  FOLLOW_SUMMARY_COLUMNS = ["drive_start_wall", "t_wall", "route", "mode", "metric", "cruise_on_s", "follow_below_s", "lowers",
+                            "changes", "would_taps", "would_actions", "episodes", "episodes_written", "episodes_skipped",
+                            "follower_lower_eps", "actual_lower_eps", "src_modelV2_s", "src_drivingModelData_s", "no_model_s",
+                            "plan_used_s", "ticks", "call_avg_us", "call_max_us", "error"]
+
+  def _init_model_follow(self, params):
+    import time
+    from opendbc.car.mazda.model_follow import ModelFollower, EpisodeTracker, DT
+    self.follow = ModelFollower(params.get_bool("IsMetric"), dt=DT)
+    self.follow_eps = EpisodeTracker()
+    self.follow_event = None
+    self.follow_params = params
+    self.follow_metric = bool(params.get_bool("IsMetric"))
+    self.follow_start_wall = time.time()
+    self.follow_error = ""
+    self.follow_stats = {"cruise_on_s": 0.0, "v2": 0.0, "dmd": 0.0, "none": 0.0, "plan": 0.0, "ticks": 0, "us_sum": 0.0,
+                         "us_max": 0.0}
+    self.follow_prev_cruise = False
+    self.follow_since_write = 0.0
+    self.follow_rec = None
+    try:
+      from openpilot.starpilot.common.feature_events import EventRecorder
+      self.follow_rec = EventRecorder(self.FOLLOW_COLUMNS, hz=10, params=params)
+    except Exception:
+      self.follow_rec = None
+
+  def _follow_features(self, curve_active):
+    """Which of our features are on now, e.g. "stop:stopped car+curve+ours"."""
+    lg = self.logic
+    parts = []
+    if self.trigger.active and self.stop_mode:
+      parts.append(f"stop:{self.trigger.kind}")
+    if curve_active:
+      parts.append("curve")
+    if self.map_out is not None and self.map_out.active:
+      parts.append("map")
+    if self.limit_want > 0 or (self.limit_follow is not None and self.limit_follow.cap is not None):
+      parts.append("limit")
+    if lg.offset != 0 or lg.inflight:
+      parts.append("ours")
+    return "+".join(parts)
+
+  def _model_follow(self, CS, si, cruise_enabled, v_ego, vel_t, vel_x, curve_active):
+    import time
+    c0 = time.perf_counter()
+    lg = self.logic
+    st = self.follow_stats
+    t = time.monotonic()
+    dt = self.FOLLOW_EVERY * DT_CTRL
+    set_speed = float(CS.out.cruiseState.speed) if cruise_enabled else 0.0
+    driver = (lg.anchor if lg.anchor is not None else set_speed) if set_speed > 0 else 0.0
+    src, accel, plan_t, plan_v = "", None, None, None
+    if si.model_alive:
+      src, accel = "v2", si.model_accel
+      if len(vel_t) >= 2:
+        plan_t, plan_v = vel_t, vel_x
+    else:
+      try:
+        if self.sm.alive['drivingModelData'] and self.sm.recv_frame['drivingModelData'] > 0:
+          src, accel = "dmd", float(self.sm['drivingModelData'].action.desiredAcceleration)
+      except Exception:
+        src, accel = "", None    # not subscribed (or no such service): no model, the follower is off
+    f = self.follow
+    cmd = f.update(v_ego, driver, cruise_enabled, accel, plan_t, plan_v, radar_lead=bool(getattr(CS, "radar_has_lead", False)))
+    if cruise_enabled:
+      st["cruise_on_s"] += dt
+      self.follow_since_write += dt
+      st["v2" if src == "v2" else ("dmd" if src == "dmd" else "none")] += dt
+      if f.used_plan:
+        st["plan"] += dt
+    brake, gas = bool(CS.out.brakePressed), bool(CS.out.gasPressed)
+    driver_btn = bool(getattr(CS, "crz_set_minus", False) or getattr(CS, "crz_set_plus", False))
+    features = self._follow_features(curve_active)
+    model_a = accel if accel is not None else 0.0
+    rec = self.follow_rec
+    # the episodes run on the car's own clock (frames); the event log on the monotonic clock of its rows
+    acts = self.follow_eps.update(self.frame * DT_CTRL, cruise_enabled, v_ego, si.a_ego, cmd, set_speed, driver, model_a, f.reason, f.presses,
+                                  f.press_actions, si.lead_status, si.lead_d, si.lead_v, si.lead_prob, si.red_light, features,
+                                  brake, gas, driver_btn)
+    if rec is not None:
+      if self.frame % self.FOLLOW_ROW_EVERY == 0 or f.presses:
+        rec.add_row(t, (v_ego / MS_PER_MPH, si.a_ego, cruise_enabled, set_speed / MS_PER_MPH, driver / MS_PER_MPH, cmd / MS_PER_MPH,
+                        f.target / MS_PER_MPH, f.reason, model_a, f.a_f if f.a_f is not None else 0.0, f.req, f.v_look / MS_PER_MPH,
+                        src, si.lead_status, si.lead_d, si.lead_v / MS_PER_MPH, si.lead_prob, si.red_light, features, brake, gas,
+                        driver_btn, f.presses))
+      for kind, summary in acts or ():
+        if kind == "open":
+          summary.update({"src": src, "plan_used": f.used_plan, "metric": self.follow_metric})
+          self.follow_event = rec.open("modelFollow", t, summary)
+        elif self.follow_event is not None:
+          rec.close(self.follow_event, t, summary)
+          self.follow_event = None
+      rec.tick(t)
+    # the drive summary line: at every cruise off, and every FOLLOW_SUMMARY_EVERY s of cruise
+    if (self.follow_prev_cruise and not cruise_enabled) or self.follow_since_write >= self.FOLLOW_SUMMARY_EVERY:
+      self.follow_since_write = 0.0
+      self._write_follow_summary()
+    self.follow_prev_cruise = cruise_enabled
+    us = (time.perf_counter() - c0) * 1e6
+    st["ticks"] += 1
+    st["us_sum"] += us
+    if us > st["us_max"]:
+      st["us_max"] = us
+
+  def _model_follow_failed(self, e):
+    """Any exception in the follower: off for the rest of the drive, said once (carlog, an event, the summary line)."""
+    import time
+    self.follow = None
+    try:
+      self.follow_error = f"{type(e).__name__}: {e}"[:200].replace(",", ";").replace("\n", " ")
+      from opendbc.car.carlog import carlog
+      carlog.exception("mazda model follower failed, off for this drive")
+    except Exception:
+      pass
+    try:
+      if self.recorder is not None:
+        self.recorder.record("modelFollowError", time.monotonic(), {"error": self.follow_error}, signals=False)
+      self._write_follow_summary()
+    except Exception:
+      pass
+
+  def _follow_summary_row(self):
+    import time
+    st, eps = self.follow_stats, self.follow_eps
+    f = self.follow
+    ticks = max(st["ticks"], 1)
+    return {"drive_start_wall": f"{self.follow_start_wall:.0f}", "t_wall": f"{time.time():.0f}", "mode": "test",
+            "metric": int(self.follow_metric), "cruise_on_s": round(st["cruise_on_s"], 1),
+            "follow_below_s": round(f.below_time, 1) if f else "", "lowers": f.lowers if f else "",
+            "changes": f.changes if f else "", "would_taps": f.taps if f else "", "would_actions": f.actions if f else "",
+            "episodes": eps.episodes, "episodes_written": eps.written, "episodes_skipped": eps.skipped,
+            "follower_lower_eps": eps.follower_lower, "actual_lower_eps": eps.actual_lower,
+            "src_modelV2_s": round(st["v2"], 1), "src_drivingModelData_s": round(st["dmd"], 1), "no_model_s": round(st["none"], 1),
+            "plan_used_s": round(st["plan"], 1), "ticks": st["ticks"], "call_avg_us": round(st["us_sum"] / ticks, 1),
+            "call_max_us": round(st["us_max"], 1), "error": self.follow_error}
+
+  def _write_follow_summary(self):
+    import threading
+    row = self._follow_summary_row()
+    threading.Thread(target=self._write_follow_line, args=(row,), daemon=True).start()
+
+  def _write_follow_line(self, row):
+    import os
+    try:
+      try:
+        row["route"] = str(self.follow_params.get("CurrentRoute", encoding="utf8") or "")
+      except Exception:
+        row["route"] = ""
+      root = self._learning_dir()
+      os.makedirs(root, exist_ok=True)
+      path = os.path.join(root, self.FOLLOW_SUMMARY_CSV)
+      if os.path.exists(path) and os.path.getsize(path) > self.FOLLOW_SUMMARY_MAX_BYTES:
+        os.replace(path, path + ".1")
+      new = not os.path.exists(path)
+      with open(path, "a") as fh:
+        if new:
+          fh.write(",".join(self.FOLLOW_SUMMARY_COLUMNS) + "\n")
+        fh.write(",".join(str(row.get(k, "")).replace(",", ";") for k in self.FOLLOW_SUMMARY_COLUMNS) + "\n")
+    except Exception:
+      pass
 
   # ---- curve learner (log only; called inside try/except) ----
   LEARNING_CSV = "curve_learning.csv"

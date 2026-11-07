@@ -57,6 +57,9 @@ WRITE_PAUSE = 0.005             # ... then the writer pauses this long (s), so t
 PRUNE_EVERY = 600.0             # s between two prunes of the event folder
 NEAR_MISS_SUFFIX = "_nearMiss"  # events of this kind are rate limited and pruned first
 NEAR_MISS_MIN_GAP = 20.0        # s between two near-miss events of the same kind
+# pruned first, with the near-misses: the Mazda model follower's test-only episodes (opendbc mazda/model_follow.py), so
+# they never push out the real events
+PRUNE_FIRST_SUFFIXES = (NEAR_MISS_SUFFIX, "_modelFollow")
 USE_WRITER_PROCESS = True       # write in a separate process (see Rules); False = the old writer thread
 PIPE_CHUNK_ROWS = 20            # rows pickled per tick by the caller
 PUMP_MIN_GAP = 0.004            # s: at most one pipe message per this, per process (several recorders share it)
@@ -505,14 +508,14 @@ def _folder_size(path):
 
 def prune(root, max_bytes=MAX_BYTES, max_events=MAX_EVENTS):
   """Delete event folders until the count and the total size are within the caps:
-  the oldest near-misses first, then the oldest of the rest."""
+  the oldest near-misses (and test-only model follower episodes) first, then the oldest of the rest."""
   try:
     entries = sorted(e for e in os.listdir(root) if os.path.isdir(os.path.join(root, e)))
     sizes = {e: _folder_size(os.path.join(root, e)) for e in entries}
     total = sum(sizes.values())
     removed = 0
     while entries and (len(entries) > max_events or total > max_bytes):
-      victim = next((e for e in entries if NEAR_MISS_SUFFIX in e), entries[0])
+      victim = next((e for e in entries if any(s in e for s in PRUNE_FIRST_SUFFIXES)), entries[0])
       entries.remove(victim)
       shutil.rmtree(os.path.join(root, victim), ignore_errors=True)
       total -= sizes[victim]

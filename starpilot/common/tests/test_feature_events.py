@@ -192,6 +192,15 @@ def test_near_miss_rate_limit_and_pruned_first():
     assert [f.endswith("_stopAhead") or f.endswith("_stopAhead_2") for f in folders(d)] == [True, True], folders(d)
 
 
+def test_model_follow_episodes_are_pruned_first():
+  with tempfile.TemporaryDirectory() as d:
+    for name in ("2026-01-01_00-00-00_modelFollow", "2026-01-01_00-00-01_stopAhead", "2026-01-01_00-00-02_modelFollow",
+                 "2026-01-01_00-00-03_stoppedCarSlowdown"):
+      os.makedirs(os.path.join(d, name))
+    assert fe.prune(d, max_events=2) == 2
+    assert folders(d) == ["2026-01-01_00-00-01_stopAhead", "2026-01-01_00-00-03_stoppedCarSlowdown"]
+
+
 def test_long_open_episode_is_written_anyway():
   with tempfile.TemporaryDirectory() as d:
     rec = make(d)

@@ -481,7 +481,10 @@ class VehicleSettingsManagerView(PanelManagerView):
           v = params.get_int(key, return_default=True, default=default)
         except Exception:
           v = default
-        params.put_int(key, (v + 1) % len(labels) if 0 <= v < len(labels) else default)
+        try:
+          params.put_int(key, (v + 1) % len(labels) if 0 <= v < len(labels) else default)
+        except Exception:
+          pass                     # a key the params build on the device does not know yet: the tap does nothing
       return get_value, on_click
 
     modes = (tr_noop("Off"), tr_noop("Test"), tr_noop("On"))
@@ -504,6 +507,13 @@ class VehicleSettingsManagerView(PanelManagerView):
         ("MazdaStopWarningChime", tr_noop("Stop Warning Chime"), (tr_noop("5%"), tr_noop("10%"), tr_noop("20%"), tr_noop("30%")), 0)):
       get_value, on_click = choice(key, labels, default)
       tiles.append({"title": tr(title), "get_value": get_value, "on_click": on_click})
+    get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
+    tiles.append({
+      "title": tr("Model Follow (Test)"),
+      "subtitle": tr("Logs the set speed the driving model would want, to compare with what happened. Never presses a button."),
+      "get_value": get_value,
+      "on_click": on_click,
+    })
     tiles.append({
       "title": tr("Map Build States"),
       "subtitle": tr("Tick states to build their curve files in full while parked, wherever the car is (a trip); the rest only within range."),
