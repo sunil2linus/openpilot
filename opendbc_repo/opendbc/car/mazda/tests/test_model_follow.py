@@ -282,12 +282,14 @@ def test_wrapper_logs_episodes_and_never_changes_what_is_sent(tmp_path, monkeypa
   assert opened[0][1]["src"] == "v2" and opened[0][1]["mode"] == "test"
   assert len(closed) == 1 and closed[0]["ended_by"] in ("back within 1 mph", "cruise off")
   path = tmp_path / "events" / c.FOLLOW_SUMMARY_CSV           # the drive summary line, written at cruise off
-  for _ in range(200):
+  import time
+  lines = []
+  for _ in range(500):                                         # written by a thread: wait for the whole line, not the file
     if path.exists():
-      break
-    import time
+      lines = path.read_text().splitlines()
+      if len(lines) >= 2 and lines[1].count(",") == len(c.FOLLOW_SUMMARY_COLUMNS) - 1:
+        break
     time.sleep(0.01)
-  lines = path.read_text().splitlines()
   assert lines[0].split(",") == c.FOLLOW_SUMMARY_COLUMNS and len(lines) == 2
   row = dict(zip(c.FOLLOW_SUMMARY_COLUMNS, lines[1].split(","), strict=True))
   assert row["mode"] == "test" and int(row["lowers"]) == 1 and int(row["episodes"]) == 1 and float(row["call_avg_us"]) > 0
