@@ -211,7 +211,9 @@ def test_early_signal_is_remembered_after_it_goes_off():
   acted = [c.update(nav(d), 70 * MPH, 0).active for d in range(900, 0, -10)]
   assert any(acted) and c.exit_intent
   first = 900 - 10 * acted.index(True)
-  assert 400 <= first <= 850, first                        # starts only as early as the 45 m curve needs
+  # starts only as early as the 45 m curve needs (planned at MAP_DECEL like any map curve since drive 53: ~900 m out
+  # from 70 mph for a 22 mph curve 1000 m ahead; with the old 0.5 m/s^2 ~810 m)
+  assert 400 <= first <= 910, first
 
 
 def test_signal_the_wrong_way_or_passing_the_exit_forgets_it():
@@ -670,13 +672,15 @@ def test_follower_command_and_plan_shapes():
   assert f.update(v_c + CT.MAP_SETTLE + CT.MAP_SETTLE_HYST + 0.1, v_c, 10.0, v_c + 2.0) < v_c    # clearly too fast: a gap again
   f.update(19.0, v_c + 1.0, 150.0, 19.0)                               # another curve speed: starts over
   assert f.cmd is not None and not f.settled
-  # ramp curves and exits keep the staircase plan (no follower, no undershoot floor)
+  # ramp curves: without the true speed the plan alone; with it their own follower since drive 53, the ramp floor and
+  # budget (never the Max Drop, never under 25 mph)
   c = CTL.MapCurveControl(3.0)
   out = on_ramp_for(c, HOLD + 1, 70 * MPH, status=2, radius=45, distance=80, on_ramp=True, ramp_type=1)
   assert out.active and not out.track and abs(out.floor - 25 * MPH) < 1e-9
   for _ in range(3):
     out = c.update(F(status=2, radius=45, distance=80, on_ramp=True, ramp_type=1), 70 * MPH, 0, v_ego=30.0, max_drop=md)
-  assert out.active and not out.track and abs(out.floor - 25 * MPH) < 1e-9 and abs(out.speed - c.curve.speed) < 1e-9
+  assert out.active and out.track and out.why == "ramp" and abs(out.floor - 25 * MPH) < 1e-9 and out.budget == CTL.RAMP_BUDGET
+  assert out.speed <= c.curve.speed + 1e-9 and abs(out.curve_speed - math.sqrt(2.2 * 45)) < 1e-9
 
 
 def test_a_road_curve_stops_governing_after_its_apex_when_the_camera_slowdown_is_on():
@@ -871,6 +875,276 @@ def test_the_step_back_up_waits_for_the_follower_to_settle():
   raises = [p for p in r["presses"] if p[3] == "raise"]
   assert raises and all(p[5] <= v_c + (CT.MAP_SETTLE + CT.MAP_SETTLE_HYST) / MPH for p in raises), raises
   assert r["seq"].count("PM") == 0, r["seq"]
+
+
+# ---------------- drive 53: exits, ramps and a ramp loop at night with navigation ----------------
+# Closed loop on the measured cruise with the map control, the camera curve mix and the controller, as the wrapper
+# runs them (curve_no_accel from CurveMix). x is the distance driven from the start; fields(x) the map fields there.
+
+def drive_53(fields, frames, set_mph, v_mph=None, max_drop=10, signal=None, camera=None, gas=None, lead=None):
+  """signal(x): -1 / 0 / 1; camera(x): the camera curve target (m/s) or None; gas(x): the speed (m/s) the driver's foot
+  holds, None off the gas; lead(x): the most the car ahead lets us drive (m/s), None for no car ahead."""
+  car = T.Car(set_mph, dash_offset_mph=0.0, lag=10, accel=0.6, step=MPH, **MEASURED_CRUISE)
+  car.set_speed, car.v_ego = set_mph * MPH, (v_mph or set_mph) * MPH
+  logic = cs.CurveSlowdownLogic(False, max_drop)
+  ctl = CTL.MapCurveControl(3.0, CTL.MAP_DECEL)
+  mix = CTL.CurveMix(cs.CURVE_MARGIN)
+  md = logic.max_drop_steps * logic.step
+  x = 0.0
+  presses, sets, vs, xs = [], [], [], []
+  for f in range(frames):
+    fld = fields(x)
+    driver = car.set_speed + logic.offset * logic.step
+    mo = ctl.update(fld, driver, signal(x) if signal else 0, v_ego=car.v_ego, max_drop=md)
+    cam = camera(x) if camera else None
+    active, speed, floor, budget, track, raise_ok = mix.update(cam is not None, cam if cam is not None else CTL.NO_CURVE, mo,
+                                                               drop_floor=max(driver - md, cs.MIN_SET_SPEED))
+    foot = gas(x) if gas else None
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=foot is not None,
+                            brake_pressed=False, standstill=False, plan_alive=True, csc_active=active, csc_speed=min(speed, 100.0),
+                            other_button_active=False, driver_button=None, curve_floor=floor, curve_budget=budget,
+                            curve_track=track, curve_raise=raise_ok, curve_no_accel=mix.no_accel, fast_restore=mo.fast_restore)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      presses.append((f, round(x), btn, logic.last_action, round(car.set_speed / MPH), round(car.v_ego / MPH, 1)))
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    if foot is not None:
+      car.gas_frame = car.frame
+    car.tick()
+    if foot is not None:
+      car.v_ego = max(car.v_ego, foot)
+    cap = lead(x) if lead else None
+    if cap is not None:
+      car.v_ego = min(car.v_ego, cap)
+    x += car.v_ego * T.DT
+    sets.append(car.set_speed / MPH)
+    vs.append(car.v_ego / MPH)
+    xs.append(x)
+  return dict(presses=presses, sets=sets, vs=vs, xs=xs, logic=logic, ctl=ctl)
+
+
+def _at(r, x_at, key="vs"):
+  return next(v for v, xx in zip(r[key], r["xs"], strict=True) if xx >= x_at)
+
+
+def _plus_between(r, lo, hi):
+  """our SET+ between lo and hi m driven, other than a follower's step back up to its curve's speed"""
+  return [p for p in r["presses"] if lo <= p[1] < hi and p[2] == cs.SET_PLUS and p[3] != "raise"]
+
+
+def _exit_53(stay_on=False):
+  """Drive 53, t 1149-1181: 57 mph, navigation announces an exit 352 m ahead (its tightest curve 95 m, 32 mph, 622 m
+  ahead), the driver signals right. Navigation's exit clears 46 m before the exit point (GPS doubtful at the split,
+  then the next maneuver); the link is matched 137 m past the exit point, its curve held (doubtful match) until 56 m
+  before it, then matched on the ramp. stay_on: the car stays on the motorway instead."""
+  exit_x, curve_x = 352.0, 622.0
+
+  def fields(x):
+    if x < exit_x - 46:
+      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_curve_radius=95.0, nav_curve_distance=curve_x - x,
+               nav_exit_side=1, road_class=1)
+    if stay_on or x < exit_x + 137:
+      return F(road_class=1)
+    ramp = dict(road_class=2, on_ramp=True, ramp_type=1, ramp_to_speed=45 * MPH, ramp_end_distance=max(curve_x + 230 - x, 0.0))
+    if x < curve_x - 56:
+      return F(status=5, radius=95.0, distance=curve_x - x, road_class=2)
+    if x < curve_x + 127:
+      return F(status=2, radius=95.0, distance=max(curve_x - x, 0.0), **ramp)
+    return F(**ramp)
+  return fields, (lambda x: 1 if x < 60 else 0), exit_x, curve_x
+
+
+def test_drive_53_e1_an_exit_cleared_at_the_split_keeps_its_speed_onto_the_ramp():
+  # the hold released when navigation's exit cleared 46 m before the exit point: the restore took the set speed 49 -> 70
+  # while the car took the exit, the ramp curve's SET- came far too late and the owner braked from 56 mph before the
+  # 95 m curve. Now the exit is carried on by the distance driven: no SET+ before the curve, slowing on toward it
+  fields, signal, exit_x, curve_x = _exit_53()
+  r = drive_53(fields, 5000, 57, signal=signal)
+  v_c = math.sqrt(2.2 * 95.0) / MPH
+  assert _plus_between(r, exit_x - 46, curve_x - 10) == [], _plus_between(r, exit_x - 46, curve_x - 10)
+  assert _at(r, exit_x + 137, "sets") <= 45, _at(r, exit_x + 137, "sets")          # on the link: still slowing (was 70)
+  assert _at(r, curve_x) <= v_c + 1.5, (_at(r, curve_x), v_c)                       # at the curve's speed at its entry
+  in_curve = [v for v, xx in zip(r["vs"], r["xs"], strict=True) if curve_x <= xx < curve_x + 127]
+  assert min(in_curve) >= v_c - 2.0 and min(r["sets"]) >= 25 - 1e-6, (min(in_curve), min(r["sets"]))
+
+
+def test_drive_53_e1_an_exit_cleared_while_we_stay_on_the_motorway_restores_after_the_margin():
+  # the same exit, but the car stays on the motorway: the exit's speed is kept until EXIT_PASS_MARGIN past the exit
+  # point, then the driver's speed comes back (never above it)
+  fields, signal, exit_x, _ = _exit_53(stay_on=True)
+  r = drive_53(fields, 6000, 57, signal=signal)
+  restore_at = exit_x + CTL.EXIT_PASS_MARGIN
+  assert _plus_between(r, 0, restore_at - 10) == [], _plus_between(r, 0, restore_at - 10)
+  assert _plus_between(r, restore_at - 10, restore_at + 60), "the restore starts once past the margin"
+  assert abs(r["sets"][-1] - 57) < 1e-6 and max(r["sets"]) <= 57 + 1e-6, (r["sets"][-1], max(r["sets"]))
+  assert not r["ctl"].exit_intent and r["ctl"].carry is None
+
+
+def test_drive_53_e2_an_exit_plans_its_curve_with_the_follower_and_does_not_stall_while_held():
+  # drive 53, t 390-421: 75 mph, the signal 267 m before the exit point, its 85 m curve (31 mph) 780 m ahead. The exit
+  # cleared 9 m before the exit point, the link was matched 34 m past it with its curve held for 4 s (no SET- then:
+  # the plan was dropped after NAV_GRACE), then the ramp curve's 0.5 m/s^2 staircase left the set speed 5-9 mph under
+  # the speed: the car entered the curve at 38-39 mph ("Turn Exceeds Steering Limit"). Needed from 59 mph 325 m out:
+  # ~0.8 m/s^2, so the plan has to run all the way from the signal
+  exit_x, curve_x = 267.0, 780.0
+
+  def fields(x):
+    if x < exit_x - 9:
+      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_curve_radius=85.0, nav_curve_distance=curve_x - x,
+               nav_exit_side=1, road_class=1)
+    if x < exit_x + 34:
+      return F(road_class=1)
+    if x < curve_x - 325:
+      return F(status=5, radius=85.0, distance=curve_x - x, road_class=2)
+    ramp = dict(road_class=2, on_ramp=True, ramp_type=1, ramp_to_speed=50 * MPH, ramp_end_distance=max(curve_x + 190 - x, 0.0))
+    if x < curve_x + 120:
+      return F(status=2, radius=85.0, distance=max(curve_x - x, 0.0), **ramp)
+    return F(**ramp)
+  r = drive_53(fields, 4500, 75, signal=lambda x: 1 if x < 40 else 0)
+  v_c = math.sqrt(2.2 * 85.0) / MPH
+  assert _at(r, curve_x) <= v_c + 1.5, (_at(r, curve_x), v_c)
+  assert _plus_between(r, 0, curve_x - 10) == [], _plus_between(r, 0, curve_x - 10)
+  held = [p for p in r["presses"] if exit_x + 34 <= p[1] < curve_x - 325]
+  assert len(held) >= 3 and all(p[2] == cs.SET_MINUS for p in held), held   # slowing on while the curve is held
+  assert min(r["sets"]) >= 25 - 1e-6
+
+
+def _loop_53(link=True, gas=False):
+  """Drive 53, t 1015-1060: driver's speed 50 (Max Drop 10), behind a car at 27-28 mph onto the on-ramp loop to M-59
+  (71 m, ~330 m long, camera target 32.6 mph at 3 m/s^2). The map matched the link 15 m before the loop, held its curve,
+  matched it 8 m before the loop and lost it inside (status 0, still on the ramp). The car ahead speeds up to 33 mph
+  in the loop. gas: after the loop the driver accelerates onto the motorway (27 -> 45 mph, lifts for 40 m, then on to
+  49 mph)."""
+  loop_x, loop_len = 120.0, 330.0
+  end_x = loop_x + loop_len
+
+  def fields(x):
+    if x >= end_x + 20:
+      return F(road_class=1)
+    cls = 2 if (link and x >= loop_x - 15) else 5
+    if x < loop_x - 30:
+      return F(road_class=cls)
+    if x < loop_x - 8:
+      return F(status=5, radius=71.0, distance=loop_x - x, road_class=cls)
+    ramp = dict(on_ramp=link, ramp_type=2, ramp_to_highway=True, ramp_end_distance=end_x + 20 - x, road_class=cls)
+    if x < loop_x + 5:
+      return F(status=2 if link else 0, radius=71.0 if link else 0.0, distance=max(loop_x - x, 0.0), **ramp)
+    return F(**ramp)
+
+  def camera(x):
+    return math.sqrt(3.0 * 71.0) if loop_x - 60 <= x < end_x + 30 else None    # the loop's end straightens out
+
+  def lead(x):
+    if x < loop_x:
+      return 27.5 * MPH
+    if x < end_x:
+      return min(27.5 + 6.0 * (x - loop_x) / 200.0, 33.0) * MPH
+    return None
+
+  def foot(x):
+    g0 = end_x + 32                  # on the gas right as the curve ends (drive 53: steering straight at ~1050, gas 1050.3)
+    if not gas or x < g0:
+      return None
+    v = math.sqrt((27.0 * MPH) ** 2 + 2 * 1.6 * (x - g0))
+    if v < 45 * MPH:
+      return v
+    g1 = g0 + ((45 * MPH) ** 2 - (27 * MPH) ** 2) / (2 * 1.6)
+    if x < g1 + 40:
+      return None                    # lifted for 40 m
+    return min(math.sqrt((44 * MPH) ** 2 + 2 * 0.7 * (x - g1 - 40)), 49 * MPH)
+  return fields, camera, lead, foot, loop_x, end_x
+
+
+def test_drive_53_e3_in_a_ramp_loop_behind_a_car_the_set_speed_never_lets_the_car_speed_up():
+  # the camera curve slowdown stopped at the Max Drop floor (40 mph with the driver's 50) while the car went 27-28 into
+  # the loop: the cruise followed the car ahead up to 32 mph in it ("Turn Exceeds Steering Limit" twice). On a link the
+  # camera takes the ramp floor, and in the curve the set speed is never left above the car's speed
+  fields, camera, lead, _, loop_x, end_x = _loop_53()
+  r = drive_53(fields, 3800, 50, v_mph=31, signal=None, camera=camera, lead=lead)
+  v_in = _at(r, loop_x)
+  loop = [(sp, v) for sp, v, xx in zip(r["sets"], r["vs"], r["xs"], strict=True) if loop_x + 40 <= xx < end_x - 30]
+  assert max(v for _, v in loop) <= v_in + 1.5, (v_in, max(v for _, v in loop))       # no speeding up in the loop
+  assert all(sp <= v + 1.5 for sp, v in loop), max(sp - v for sp, v in loop)            # was 11-12 mph above it
+  assert min(r["sets"]) >= 25 - 1e-6
+
+
+def test_drive_53_e3_negatives_the_max_drop_still_holds_on_a_normal_road_and_ramps_keep_their_floor():
+  # the same curve and car ahead on a normal road (no link): the camera slowdown stops at the Max Drop floor as before
+  fields, camera, lead, _, loop_x, end_x = _loop_53(link=False)
+  r = drive_53(fields, 3800, 50, v_mph=31, camera=camera, lead=lead)
+  assert min(r["sets"]) >= 40 - 1e-6 and min(r["sets"]) <= 40 + 1e-6, min(r["sets"])
+  # a link with a camera target of 18 mph, the car behind a car at 30 mph: never under the ramp floor
+  r = drive_53(lambda x: F(road_class=2), 2500, 50, v_mph=30, camera=lambda x: 18 * MPH, lead=lambda x: 30 * MPH)
+  assert 25 - 1e-6 <= min(r["sets"]) <= 26 + 1e-6, min(r["sets"])
+  # a followed ramp curve tighter than 25 mph (45 m): never under the ramp floor either
+  r = drive_53(lambda x: F(status=2, radius=45.0, distance=max(600.0 - x, 0.0), on_ramp=True, ramp_type=1, road_class=2)
+               if x < 700 else F(on_ramp=True, ramp_type=1, road_class=2), 5000, 60)
+  assert 25 - 1e-6 <= min(r["sets"]) <= 26 + 1e-6, min(r["sets"])
+  assert _at(r, 600.0) <= 26.5, _at(r, 600.0)
+
+
+def test_drive_53_e4_after_the_ramp_loop_the_restore_runs_on_the_gas():
+  # after the loop the set speed stayed 29 with the driver's 50 while he accelerated onto M-59 on the gas (the curve's
+  # "over" timer was frozen on the gas): when he lifted the car slowed toward 29. Now the restore goes on the gas too:
+  # SET+ jumps to the current speed (never one that could land above the driver's speed), so lifting holds the speed
+  fields, camera, lead, foot, loop_x, end_x = _loop_53(gas=True)
+  r = drive_53(fields, 6500, 50, v_mph=31, camera=camera, lead=lead, gas=foot)
+  g0 = end_x + 32
+  lift = next(xx for xx in r["xs"] if xx > g0 and foot(xx) is None)
+  assert _at(r, lift, "sets") >= _at(r, lift) - 3.0, (_at(r, lift, "sets"), _at(r, lift))
+  after_lift = [v for v, xx in zip(r["vs"], r["xs"], strict=True) if lift <= xx < lift + 40]
+  assert min(after_lift) >= _at(r, lift) - 1.0, (min(after_lift), _at(r, lift))       # no slowing toward 29 (was -0.77 m/s^2)
+  assert max(r["sets"]) <= 50 + 1e-6 and abs(r["sets"][-1] - 50) < 1e-6, (max(r["sets"]), r["sets"][-1])
+  on_gas = [p for p in r["presses"] if g0 + 5 < p[1] < lift]
+  assert len(on_gas) >= 3 and all(p[2] == cs.SET_PLUS for p in on_gas), on_gas          # the restore ran on the gas
+
+
+def _loop_scene():
+  """An on-ramp leaving a street, a right loop of 71 m turning 243 deg, joining a motorway (drive 53, onto M-59)."""
+  st = G.way(20, G.straight(0, -300, 0, 300), name="South Rochester Road", cls=5, speed_mph=50)
+  loop = G.arc(71.0, 60, 71.0, 180, 180 - 243.0)
+  ex, ey = loop[-1]
+  pts = G.straight(0, 0, 0, 60)[:-1] + loop + G.straight(ex, ey, 243.0, 80)[1:]
+  ramp = G.way(21, pts, name="", cls=2, speed_mph=45, oneway=True)
+  h = math.radians(243.0)
+  mw = G.way(22, G.straight(pts[-1][0] - math.sin(h) * 200, pts[-1][1] - math.cos(h) * 200, 243.0, 1200), name="", cls=1, speed_mph=70)
+  mw.ref = "M 59"
+  ramp.lat[-1], ramp.lon[-1] = mw.lat[10], mw.lon[10]
+  ramp.end = B.key(mw.lat[10], mw.lon[10])
+  ramp.lat[0], ramp.lon[0] = st.lat[-1], st.lon[-1]
+  ramp.start = st.end = B.key(st.lat[-1], st.lon[-1])
+  return {w.id: w for w in (st, ramp, mw)}, pts
+
+
+def test_drive_53_a_ramp_loop_is_the_curve_we_are_in_until_driven_and_never_ahead_again():
+  # the straight-line "ahead" test lost the loop 1 s after its entry (its exit point beside / behind the car: status 0
+  # for 9 s in the loop) and, after ~250 deg, found its own entry "ahead" again (173 m: a curve behind us kept the set
+  # speed at 29 at the end of the ramp). With the distance driven (the planner's speed x time) it is the one we are in
+  # from its entry until its length is driven, then never again on this ramp
+  ways, pts = _loop_scene()
+  root, curves, _ = write_files(ways)
+  loop = [c for c in curves if c.get("ramp")]
+  assert len(loop) == 1 and abs(loop[0]["r"] - 71) < 3 and loop[0]["len"] > 250
+  m = planner(root)
+  travelled, seen = 0.0, []
+  for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+    seg = math.hypot(x1 - x0, y1 - y0)
+    brg = (math.degrees(math.atan2(x1 - x0, y1 - y0)) + 360.0) % 360.0
+    for i in range(max(1, int(seg / 0.66))):
+      la, lo = pos(x0 + (x1 - x0) * i * 0.66 / seg, y0 + (y1 - y0) * i * 0.66 / seg)
+      m.update(la, lo, brg, 21, True, gps={"dt": 0.05, "v_ego": 13.2})
+      travelled += 0.66
+      seen.append((travelled, m.status, m.distance if m.curve is not None else None))
+  entry = next(t for t, st, d in seen if st == MC.STATUS_RAMP_CURVE and d == 0.0)
+  inside = [(st, d) for t, st, d in seen if entry <= t < entry + loop[0]["len"] - 20]
+  assert all(st == MC.STATUS_RAMP_CURVE and d == 0.0 for st, d in inside), sorted({(st, d) for st, d in inside if d != 0.0 or st != 2})[:5]
+  after = [(st, d) for t, st, d in seen if t >= entry + loop[0]["len"] + 15]
+  assert after and all(st == MC.STATUS_NONE for st, _ in after), after[:5]          # not "ahead" again
+  # without the distance driven (no gps speed: the offline callers) the old geometric rules are unchanged
+  m = planner(root)
+  la, lo = pos(0, 30)
+  m.update(la, lo, 0.0, 21, True)
+  assert m.status == MC.STATUS_RAMP_CURVE and m.distance > 15 and not m.entered
 
 
 # ---------------- curve memory ----------------

@@ -61,6 +61,12 @@ AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our he
 NEAR = 15.0               # m
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
+# Ramp loops (drive 53, the on-ramp loop onto M-59: 71 m, 243 deg, 386 m long): "ahead" is a straight-line bearing test,
+# so inside a loop its exit point is beside or behind the car for most of it, and the curve was lost 1 s after its
+# entry (status 0 for 9 s in the loop, the camera's Max Drop floor alone held the set speed 11 mph above the car); after
+# ~250 deg its own entry point came back "ahead" (173 m, a curve that was behind us), which kept the set speed at 29 for
+# 4 s more at the end of the ramp. A ramp curve whose entry the car has reached is therefore "the one we are in" until
+# the car has driven its length (the distance driven: the planner's speed x time), and never ahead again on that ramp.
 TILE_KEEP = 25            # squares kept in memory
 RESCAN_SECONDS = 120.0    # how often the curve_map folder is checked for new files (curve_mapd builds them while parked)
 MATCH_DIST = 20.0         # m: the car is on a road shape within this distance (GPS error + road width)
@@ -1185,6 +1191,10 @@ class MapCurves:
     self.decel = decel           # the cruise's slowdown for the plan (PLAN_DECEL)
     self.floor = 0.0             # m/s: the driver's max drop floor this cycle (max_drop_floor; the car side plans with it too)
     self.veto = CurveVeto()      # camera check (acts only when update() gets a camera view)
+    self.odo = 0.0               # m driven (update()'s gps speed x time)
+    self.odo_ok = False          # update() has been given the speed (the planner always; offline callers may not)
+    self.entered = {}            # ramp curve s_a -> odo at its entry, on the ramp chain `entered_chain`
+    self.entered_chain = 0
     self.reset()
 
   def reset(self):
@@ -1236,6 +1246,10 @@ class MapCurves:
     out = []
     inside_exit = float("inf")
     for c in self.store.curves.get(cid, []):
+      if self.odo_ok and c.get("ramp") and c["s_a"] in self.entered:
+        if self.odo - self.entered[c["s_a"]] < c["len"]:
+          out.append((c, 0.0))    # in it by the distance driven since its entry (a loop's exit is not "ahead")
+        continue                  # entered once: never ahead again on this ramp (a loop's own entry comes back ahead)
       entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
       s_entry, s_exit = (c["s_a"], c["s_b"]) if increasing else (c["s_b"], c["s_a"])
       if increasing and (s_exit < s0 or s_entry > s1 + LOOKAHEAD):
@@ -1252,6 +1266,8 @@ class MapCurves:
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
           out.append((c, d_entry))
+          if self.odo_ok and c.get("ramp") and on_this_way and d_entry <= NEAR:
+            self.entered[c["s_a"]] = self.odo + d_entry
           if not c.get("ramp") and d_entry < self.next_entry:
             self.next_entry, self.next_curve = d_entry, c
       elif ex_ahead and d_exit > NEAR and d_exit <= c["len"] + 60:
@@ -1265,6 +1281,8 @@ class MapCurves:
           if not ap_ahead and d_apex > APEX_PASSED:
             continue              # past the apex: the next curve (if any) governs, or none (the speed comes back)
         out.append((c, 0.0))      # in the curve
+        if self.odo_ok and c.get("ramp"):
+          self.entered[c["s_a"]] = self.odo
     return out
 
   def direction(self, c):
@@ -1305,6 +1323,9 @@ class MapCurves:
     gps = {"dt", "v_ego", "acc", "rel", "ambiguous"}."""
     self.reset()
     self.veto.tick()
+    if gps is not None:
+      self.odo += max(float(gps.get("dt", 0.05)), 0.0) * max(float(gps.get("v_ego", 0.0)), 0.0)
+      self.odo_ok = True
     if lat is None:
       return
     self.store.update(lat, lon)
@@ -1323,6 +1344,8 @@ class MapCurves:
     if road is not None:
       cid, increasing, s0, s1 = road
       self.chain_id, self.increasing = cid, increasing
+      if cid != self.entered_chain:
+        self.entered, self.entered_chain = {}, cid      # another road: its ramp curves are new
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if cands:
         cands = self.veto.filter(self, cid, cands, camera, shaky)

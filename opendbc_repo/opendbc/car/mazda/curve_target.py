@@ -126,15 +126,16 @@ MAP_LATERAL_ACCEL = 2.2       # m/s^2: map curves are planned at most at this (r
 # plan is now firm (MAP_DECEL) and the set speed is commanded below the plan (MapCurveFollower, below) so the cruise
 # delivers that decel: the slowdown starts about half as far out and the car is still at the curve's speed
 # MAP_LEAD_TIME before the entry.
+# Ramp curves and navigation exits plan with it too since drive 53 (their 0.5 m/s^2 staircase left the set speed only
+# 5-9 mph under the speed: the car slowed 0.4-0.8 m/s^2 and entered an 85 m exit curve at 38-39 mph for 31).
 MAP_DECEL = 0.45              # m/s^2: what a 5-6 mph set speed gap gives on this cruise (6-8 mph: 0.66 m/s^2 measured)
-MAP_RAMP_DECEL = 0.5          # m/s^2 for exits and ramp curves: the room is short, the drop bigger (the cruise slows harder)
 MAP_LEAD_TIME = 1.0           # s: be at the curve's speed this long before its entry (slow before the curve, not in it)
 MAP_REACTION_TIME = 1.5       # s: the stock cruise starts slowing about this long after a SET- press
 ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advisory sign the map has for the curve
 # map curves start at the first 1 mph step (the map does not flicker, and a later start would need a bigger, quicker
 # drop to catch up)
 MAP_START_GAP = 1.0 * MS_PER_MPH  # m/s
-# The follower (road curves only; ramps, exits and the camera curve slowdown keep their staircase):
+# The follower (road curves, ramp curves and navigation exits; the camera curve slowdown keeps its staircase):
 #  * MAP_FOLLOW_GAIN: the measured 0.19 m/s^2 per m/s of gap, taken a little lower so the gap asked for errs on the
 #    firm side (a bigger gap slows more; the undershoot bounds below keep it in check).
 #  * MAP_FOLLOW_DEAD_TIME: the cruise answers a set speed change about a second later; the room counted on for the
@@ -215,9 +216,9 @@ class MapCurveTarget:
 
 
 class MapCurveFollower:
-  """The set speed to command for the road curve MapCurveTarget made active: map_follow_speed, never above the plan,
-  and only ever going down until the car is nearly at the curve's speed (then up to it), so the buttons are not
-  churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends."""
+  """The set speed to command for the curve (road, ramp or exit) MapCurveTarget made active: map_follow_speed, never
+  above the plan, and only ever going down until the car is nearly at the curve's speed (then up to it), so the buttons
+  are not churned by small changes of the required decel. Forgotten when the curve changes or the slowdown ends."""
 
   def __init__(self):
     self.cmd = None

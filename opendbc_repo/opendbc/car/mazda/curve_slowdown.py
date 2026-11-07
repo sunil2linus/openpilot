@@ -170,6 +170,21 @@ GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= 
 # a normal step, holds allowed. Still never a SET+ that could land above the driver's speed if it did jump, and a
 # landing on the current speed from a SET+ of ours off the gas is still booked as ours (JUMP_OFF_GAS_CLAIM).
 GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed during which a SET+ may still jump
+# Never speed up inside a curve (drive 53, the on-ramp loop onto M-59, t 1019-1030): behind a car the set speed sat at
+# 39-41 while the car went 27-28 mph into a 71 m loop; the cruise followed the car ahead up to 32 mph in the loop
+# ("Turn Exceeds Steering Limit" twice). While the camera's curve target governs, the target is also never above the
+# current speed plus half a step, so the set speed ends at most a step above it. On this car the true speed holds at or
+# a little above the dash set speed (drive 53: set 29 -> 29.4-29.5 mph, set 75 -> 75.0-75.9), so this does not chase the
+# speed down; the floor (the Max Drop on a normal road, the ramp floor on a link) still holds. A followed map curve
+# (curve_track) has its own rule: never above the curve's speed, back up to it once the car is nearly there.
+CURVE_NO_ACCEL = True
+# The curve's restore on the gas (drive 53, t 1035-1060): after the on-ramp loop the set speed stayed 29 with the
+# driver's 50 while he drove onto M-59 on the gas (27 -> 49 mph); the curve's "over" timer is frozen on the gas, so the
+# restore only came at 1060.9, 11 s after the loop, and when he lifted at 1056 the car slowed toward 29 (-0.8 m/s^2).
+# Our own curve target does not depend on the pedal, so once it has been off for RESTORE_DELAY (counted on the gas
+# too) the restore goes on the gas as well: SET+ jumps to the current speed (never one that could land above the
+# driver's speed, see GAS_JUMP_*), then taps.
+CURVE_GAS_RESTORE = True
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -204,6 +219,9 @@ class SlowdownInputs:
   # that curve, margin included, when that is lower: map_curve_control.CurveMix)
   curve_track: bool = False
   curve_raise: bool = False       # (with curve_track) the follower has settled at the curve's speed: the raise may go
+  # the camera's curve target governs (map_curve_control.CurveMix.no_accel): inside the curve the set speed is never
+  # left more than a step above the current speed, so the cruise does not speed up in it (CURVE_NO_ACCEL)
+  curve_no_accel: bool = False
   fast_restore: bool = False      # restore at once with SET+ holds (a ramp merging onto a highway)
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
@@ -254,6 +272,7 @@ class CurveSlowdownLogic:
     self.last_set_speed = None       # last set speed seen while cruise was engaged
     self.cruise_on_frames = 0
     self.curve_free_frames = _frames(RESTORE_DELAY)
+    self.curve_free_gas = _frames(RESTORE_DELAY)       # the same, counted on the gas too (CURVE_GAS_RESTORE)
     self.reason_free_frames = _frames(RESTORE_DELAY)   # frames with neither the curve nor a stopped car active
 
     # The driver's speed: the set speed they had before our presses moved it (None: we are not managing it).
@@ -808,6 +827,8 @@ class CurveSlowdownLogic:
       self.prev_csc_active = i.csc_active
       self.curve_free_frames = 0 if i.csc_active else self.curve_free_frames + 1
       self.reason_free_frames = 0 if (i.csc_active or i.stop_active or i.hold_restore) else self.reason_free_frames + 1
+    if i.plan_alive:
+      self.curve_free_gas = 0 if i.csc_active else self.curve_free_gas + 1
     # The posted limit back down soon after our raise (speed_limit_follow.py rule 4, review: a raise for a wrong road's
     # limit, 60 on a 45 road, was never taken back): if the driver has not touched his speed since our raise and no stop
     # / curve slowdown owns the set speed, his speed goes back to what it was before and the restore below lowers the set
@@ -922,7 +943,10 @@ class CurveSlowdownLogic:
         floor = max(i.curve_floor, MIN_SET_SPEED)
       else:
         floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
-      targets.append(("curve", max(i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN), floor)))
+      curve_t = i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN)
+      if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
+        curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
+      targets.append(("curve", max(curve_t, floor)))
     if i.stop_active:
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
     reason, target = min(targets, key=lambda rt: rt[1]) if targets else (None, None)
@@ -1013,8 +1037,12 @@ class CurveSlowdownLogic:
       want_lower = budget_ok and room >= (2 if self.restoring else 1) and not restore_only
 
     # on the gas the stop reasons' "over" timer is frozen (reason_free_frames): a clear stop restore still may go
+    # a curve's restore on the gas (CURVE_GAS_RESTORE): the curve target off for RESTORE_DELAY, on the gas too, and
+    # nothing of a stop in it
+    curve_gas = (CURVE_GAS_RESTORE and self.curve_free_gas >= _frames(RESTORE_DELAY) and not self.stop_episode and
+                 not i.hold_restore and self.stop_presses == 0)
     gas_restore = (GAS_JUMP_ENABLED and i.gas_pressed and not i.csc_active and not i.stop_active and
-                   (self.restore_pending or i.stop_clear_ahead))
+                   (self.restore_pending or i.stop_clear_ahead or curve_gas))
     button = None
     raise_in_curve = False
     dwell_ok = self.frame - self.last_minus_frame >= _frames(MIN_DWELL)
@@ -1390,6 +1418,7 @@ class CurveSlowdown:
 
     # Map curves (Test: computed and logged only; On: combined with the camera curve target)
     curve_floor, curve_budget, fast_restore, curve_track, curve_raise = 0.0, 0, False, False, False
+    curve_no_accel = curve_active          # the camera's target alone governs (CURVE_NO_ACCEL)
     self.map_out = None
     if self.map_control is not None and plan_alive:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
@@ -1403,6 +1432,7 @@ class CurveSlowdown:
         # back up never follows the camera's target up (CurveMix)
         curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise = self.curve_mix.update(
           curve_active, curve_speed, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step, MIN_SET_SPEED))
+        curve_no_accel = self.curve_mix.no_accel
         fast_restore = mo.fast_restore
 
     # Posted limit (speed_limit_follow.py; Test: logged only). The driver's speed is the anchor itself, else the set
@@ -1436,6 +1466,7 @@ class CurveSlowdown:
       curve_budget=curve_budget,
       curve_track=curve_track,
       curve_raise=curve_raise,
+      curve_no_accel=curve_no_accel,
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
