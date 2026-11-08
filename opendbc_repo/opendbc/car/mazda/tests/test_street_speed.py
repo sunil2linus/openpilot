@@ -538,3 +538,23 @@ def test_final_no_set_minus_of_rules_8_9_while_off_a_street_and_a_long_pause_end
   r = street_sim(800 + int((slf.LOWER_PAUSE_MAX + 2) / DT), lambda f: 45, 75, street_active=off, **base, **_engage())
   assert "cancel: paused too long" in _reasons(r), _reasons(r)
   assert not r["f"].paused
+
+
+def test_drive_56_rule_8_goes_up_when_the_set_speed_is_already_under_the_streets_speed():
+  # drive 56 t 729: RES on a 45 street with the stored highway 80 (a restore pending): rule 8 started "down" to 50, the
+  # set speed was 43 already ("his speed under it") and stayed 43. Rule 8 is up or down: it now goes up to 50
+  f = slf.SpeedLimitFollower(False, street_mode=2)
+  f.lower = slf.Offer(None, 45, "Map Data", 0, "match", 80, tgt=50)
+  f.lower_finished("his speed under it", 43)
+  assert f.lower is None and f.offer is not None and f.offer.kind == "match" and f.offer.target == 50 and f.offer.driver == 43
+  # done at it, or his own SET: nothing more
+  for why, d in (("done", 50), ("cancel: his SET", 43)):
+    f = slf.SpeedLimitFollower(False, street_mode=2)
+    f.lower = slf.Offer(None, 45, "Map Data", 0, "match", 80, tgt=50)
+    f.lower_finished(why, d)
+    assert f.offer is None, why
+  # rule 9 (a lower limit) with his speed under it: his
+  f = slf.SpeedLimitFollower(False, street_mode=2)
+  f.lower = slf.Offer(50, 45, "Map Data", 0, "lower", 55, tgt=50)
+  f.lower_finished("his speed under it", 43)
+  assert f.offer is None

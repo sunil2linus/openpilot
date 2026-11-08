@@ -448,6 +448,7 @@ class MapFields:
   exit_hwy_bend: float = 0.0      # mapExitHighwayBend / mapExitLinkBend / mapExitBendValid (ModelPath)
   exit_link_bend: float = 0.0
   exit_bend_valid: bool = False
+  onramp_ahead: bool = False      # mapOnRampAhead: the ramp curve is an on-ramp's first curve, before the turn onto it
 
   @staticmethod
   def from_plan(plan):
@@ -463,7 +464,7 @@ class MapFields:
                      int(g("mapGpsTrust", 0)), float(g("slcSpeedLimit") or 0.0), int(g("mapExitShape", 0)),
                      float(g("mapExitCurveRadius")), float(g("mapExitCurveDistance")), float(g("mapExitCurveAdvisory")),
                      int(g("mapExitFork", 0)), float(g("mapExitStart")), float(g("mapExitHighwayBend")),
-                     float(g("mapExitLinkBend")), bool(g("mapExitBendValid", False)))
+                     float(g("mapExitLinkBend")), bool(g("mapExitBendValid", False)), bool(g("mapOnRampAhead", False)))
 
 
 @dataclass
@@ -1058,14 +1059,16 @@ class MapCurveControl:
     out.link = on_link and self.link_hwy
     # only 1 and 2 are curves to act on: 4 (paused, GPS not trusted) and 5 (held, road match not trusted) are "no
     # curve" on purpose, so the speed comes back as for any curve that ends (a navigation exit plan is the exception)
-    radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and ramp_held) else 0.0
+    # (an on-ramp's first curve before the turn onto it, by navigation or his signal: as a ramp curve, mapOnRampAhead)
+    onramp = f.status == STATUS_RAMP_CURVE and f.onramp_ahead and not f.on_ramp and f.road_class not in HIGHWAY_CLASSES
+    radius = f.radius if f.status == STATUS_CURVE or (f.status == STATUS_RAMP_CURVE and (ramp_held or onramp)) else 0.0
     road_curve = f.status == STATUS_CURVE and not f.on_ramp
     # a road curve is never planned below the driver's Curve Max Drop (the controller would not go there anyway, and
     # planning for a lower speed only starts the slowdown earlier than that speed needs)
     floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
                               lead_time=MAP_ROAD_LEAD_TIME if road_curve else MAP_LEAD_TIME)
-    ramp_curve = a and f.status == STATUS_RAMP_CURVE and f.on_ramp
+    ramp_curve = a and f.status == STATUS_RAMP_CURVE and (f.on_ramp or onramp)
     speed, why = NO_CURVE, ""
     if a:
       speed, why = sp, ("ramp" if ramp_curve else "curve")

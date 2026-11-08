@@ -213,6 +213,9 @@ CURVE_HOLDS = 2
 # landed, the budget was used up at 47 mph with the exit curve's 30 still to come (the driver braked hard). Sent presses
 # are still capped at this many times the budget (a car that answers none of them).
 CURVE_BUDGET_SENT_FACTOR = 3
+# No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
+HWY_ROAD_CLASSES = (1, 3)
+CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
 # A restore asked for at once (restore_pending: a stop ahead that cleared, a red light gone) while a followed map curve's
 # target is on: the restore hold (RESTORE_HOLD_MIN_GAIN) runs up to the curve's target with its usual margin below it,
 # then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
@@ -1252,7 +1255,11 @@ class CurveSlowdownLogic:
         return None, None
     else:
       self.hold_wait_frame = None
-    if self.holds_allowed and flight_ok and not jump and not i.gas_pressed:
+    # a restore hold also on his gas while the set speed is not below the car's speed (no jump to the current speed):
+    # drive 56 t 774-788, the merge after the Crooks Rd loop, he was on the gas and the restore went 40 -> 70 by 1 mph
+    # taps (17 s); a hold never goes above his speed either way
+    gas_hold_ok = not i.gas_pressed or (button == SET_PLUS and not want_lower and not faster)
+    if self.holds_allowed and flight_ok and not jump and gas_hold_ok:
       # stop holds only when urgent (confirmed and close: floor mode); an unconfirmed early start or a far stopped car
       # taps (this used to follow from the wide overrun margin, now it is explicit)
       if want_lower and reason == "stop" and i.stop_urgent and self.holds_this_episode < MAX_STOP_HOLDS:
@@ -1604,6 +1611,17 @@ class CurveSlowdown:
         lane_change = str(self.sm['modelV2'].meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
       except Exception:
         lane_change = False
+    # no camera-only stop (the model's planned stop, the stop-light detector) on a highway at highway speed: drives 56 / 59,
+    # a "red light" at an exit split at 55-60 mph took the set speed 58 -> 45 (a stopped or slower car seen by the radar
+    # still counts)
+    red_ok = True
+    try:
+      rc = int(getattr(plan, "mapRoadClass", 0)) if self._alive('starpilotPlan') else 0
+      red_ok = not (rc in HWY_ROAD_CLASSES and v_ego > CAMERA_STOP_HWY_MAX_SPEED)
+    except Exception:
+      red_ok = True
+    if not red_ok:
+      p_stop = False
     from opendbc.car.mazda.stopped_car_slowdown import lead_path_offset
     lead_y_path = (lead_path_offset(float(lead.dRel), float(lead.yRel), path_x, path_y)
                    if (lead.status and path_x) else float(lead.yRel))
@@ -1617,7 +1635,7 @@ class CurveSlowdown:
       model_length=model_length, lane_change=lane_change, gas_pressed=bool(CS.out.gasPressed),
       set_speed=float(CS.out.cruiseState.speed) if cruise_enabled else 0.0,
       # the stop-light detector (the red light head start / the false stop guard); False while the plan is not alive
-      red_light=bool(getattr(plan, "redLight", False)) if self._alive('starpilotPlan') else False)
+      red_light=bool(getattr(plan, "redLight", False)) and red_ok if self._alive('starpilotPlan') else False)
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed

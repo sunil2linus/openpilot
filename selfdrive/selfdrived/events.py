@@ -320,9 +320,9 @@ def map_paused_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaste
 def map_exit_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality, starpilot_toggles: SimpleNamespace) -> Alert:
   sp = sm["starpilotPlan"]
   if sp.mapNavCurveRadius > 0:
-    text = f"Exit ahead · curve data · needs {get_display_speed(_map_curve_needs(sp.mapNavCurveRadius, sp.mapNavCurveAdvisory), metric)}"
+    text = f"Exit ahead · ramp curve {get_display_speed(_map_curve_needs(sp.mapNavCurveRadius, sp.mapNavCurveAdvisory), metric)}"
   else:
-    text = "Exit ahead · curve data · no sharp curves"
+    text = "Exit ahead · no sharp ramp curves"
   return Alert(
     text,
     "",

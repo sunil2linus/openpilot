@@ -60,6 +60,20 @@ DEFAULT_MAX_DROP_MPH = 10
 ADVISORY_OVER = 10 * 0.44704   # m/s: a curve with a yellow advisory sign in the map is never planned faster than sign + this
 AHEAD_COS = 0.2           # a point is ahead when it is within ~78 deg of our heading
 NEAR = 15.0               # m
+# On a ramp onto a highway a ramp curve stops governing this far before its end (owner, drives 56 / 59: "the moment we
+# are almost at the end of the curve we should start increasing the speed"; the Rochester Rd loop held 27 mph until the
+# loop's very end, then the merge was short): the cruise takes ~1-2 s to answer, the camera curve slowdown still has
+# what is left of the curve
+RAMP_HWY_RELEASE = 60.0   # m
+# On-ramps from a street (owner, drive 56: the Crooks Rd loop onto M-59, a ~27 mph curve 40 m into the ramp, entered from
+# 46 mph with a hard brake; the Mound Rd ramp, navigation announced "on ramp" 400 m out, entered at 40 for a 29 mph
+# curve): before the turn onto a ramp that leads to a highway, its first curve is planned like a ramp curve, when
+#   * navigation's next maneuver is that ramp (type in ONRAMP_NAV_TYPES, matched at its start within NAV_MATCH_*), or
+#   * his turn signal is on toward it and its start is at most ONRAMP_SIGNAL_RANGE ahead (no navigation needed).
+ONRAMP_NAV_TYPES = ("on ramp", "turn", "ramp", "merge")
+ONRAMP_NAV_RANGE = 600.0      # m
+ONRAMP_SIGNAL_RANGE = 150.0   # m
+ONRAMP_SIDE_SIN = 0.34        # the ramp leaves at least ~20 deg toward a side (its first curve's entry from its start): that side
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 # Ramp loops (drive 53, the on-ramp loop onto M-59: 71 m, 243 deg, 386 m long): "ahead" is a straight-line bearing test,
@@ -1397,6 +1411,7 @@ class MapCurves:
     self.advisory = 0.0
     self.on_ramp = False
     self.ramp = None
+    self.onramp_ahead = False      # the governing curve is an on-ramp's first curve, before the turn onto it
     self.ramp_end_dist = 0.0
     self.nav_exit = NAV_NONE
     self.nav_exit_dist = 0.0
@@ -1448,7 +1463,10 @@ class MapCurves:
     inside_exit = float("inf")
     for c in self.store.curves.get(cid, []):
       if self.odo_ok and c.get("ramp") and c["s_a"] in self.entered:
-        if self.odo - self.entered[c["s_a"]] < c["len"]:
+        left = c["len"] - (self.odo - self.entered[c["s_a"]])
+        r_here = self.store.ramps.get(cid)          # (on_ramp is only known after this, each update)
+        to_hwy = bool(r_here is not None and ((r_here.get("to") or {}).get("cls") in HIGHWAY_CLASSES))
+        if left > (RAMP_HWY_RELEASE if to_hwy else 0.0):
           out.append((c, 0.0))    # in it by the distance driven since its entry (a loop's exit is not "ahead")
         continue                  # entered once: never ahead again on this ramp (a loop's own entry comes back ahead)
       entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
@@ -1579,10 +1597,61 @@ class MapCurves:
         self.on_ramp, self.ramp = True, ramp
         end = ramp["end"] if ramp["travel"] != "both" or increasing else ramp["start"]
         self.ramp_end_dist = dist_m(lat, lon, *end)
+    # (also when the street itself has no curve record: a straight street is no chain)
+    if not self.on_ramp and (gps or {}).get("street") and not (trust is not None and trust.low) and self.data_here:
+      self._onramp_ahead(lat, lon, bearing, nav, int((gps or {}).get("signal", 0)))
     if nav is not None and not (trust is not None and trust.low):
       self._nav_exit(lat, lon, bearing, *nav)
     if nav is not None and self.on_ramp:
       self._nav_fork(lat, lon, bearing, *nav)
+
+  def _onramp_ahead(self, lat, lon, bearing, nav, signal):
+    """On a street: the first curve of an on-ramp (to a highway) we are about to turn onto, by navigation or by the turn
+    signal (ONRAMP_*), governs when it needs a lower speed than the curve found so far (status STATUS_RAMP_CURVE,
+    onramp_ahead: the car side plans it as a ramp curve before the ramp is matched)."""
+    nav_ok = nav is not None and nav[0] in ONRAMP_NAV_TYPES and 0 < nav[2] <= ONRAMP_NAV_RANGE
+    if not nav_ok and not signal:
+      return
+    best = None
+    for r in self.store.ramps_all:
+      if r["type"] == "exit" or r["travel"] == "both" or (r.get("to") or {}).get("cls") not in HIGHWAY_CLASSES:
+        continue
+      start = r["start"] if r["travel"] == "ab" else r["end"]
+      ok, d = ahead(lat, lon, bearing, *start)
+      if not ok or d > ONRAMP_NAV_RANGE:
+        continue
+      chain_len = self.store.chains.get(r["chain"], {}).get("len", 0.0)
+      firsts = sorted(((c["s_a"] if r["travel"] == "ab" else chain_len - c["s_b"]), c)
+                      for c in self.store.curves.get(r["chain"], []))
+      if not firsts:
+        continue
+      s_first, c_first = firsts[0]
+      entry = (c_first["a"] if r["travel"] == "ab" else c_first["b"]) if s_first > NEAR else (r["end"] if r["travel"] == "ab" else r["start"])
+      lean = math.sin(math.radians(bearing_to(*start, *entry) - bearing))   # + the ramp leaves to our right
+      side = 1 if lean > ONRAMP_SIDE_SIN else (-1 if lean < -ONRAMP_SIDE_SIN else 0)
+      by_nav = nav_ok and abs(d - nav[2]) <= max(NAV_MATCH_MIN, NAV_MATCH_TOL * nav[2]) and \
+        (nav_side(nav[1]) in (0, side) or side == 0)
+      by_signal = signal != 0 and side == signal and d <= ONRAMP_SIGNAL_RANGE
+      if not (by_nav or by_signal):
+        continue
+      for s_c, c in firsts:
+        if s_c < 0 or s_c > ONRAMP_NAV_RANGE:
+          continue
+        v = plan_speed(c["r"], d + s_c, c.get("adv", 0.0), decel=self.decel, floor=0.0, lead_time=PLAN_LEAD_TIME)
+        if best is None or v < best[0]:
+          best = (v, c, d + s_c)
+    if best is None:
+      return
+    v, c, dd = best
+    if self.curve is not None:
+      cur = plan_speed(self.radius, self.distance, self.advisory, decel=self.decel,
+                       floor=0.0 if self.status == STATUS_RAMP_CURVE else self.floor,
+                       lead_time=PLAN_LEAD_TIME if self.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME)
+      if cur <= v:
+        return
+    self.curve, self.distance, self.radius = c, dd, c["r"]
+    self.advisory = float(c.get("adv", 0.0) or 0.0)
+    self.status, self.source, self.onramp_ahead = STATUS_RAMP_CURVE, 0, True
 
   def _nav_fork(self, lat, lon, bearing, mtype, modifier, distance):
     """On a watched exit's link: navigation's next maneuver at one of its forks says which branch it takes (logs, and
@@ -1844,6 +1913,15 @@ class MapCurvesPlanner:
     if self.mc is not None:
       self.mc.decel = self.decel
 
+  @staticmethod
+  def _signal(sm):
+    """His turn signal: 1 right, -1 left, 0 none (never raises)."""
+    try:
+      cs = sm["carState"]
+      return 1 if cs.rightBlinker else (-1 if cs.leftBlinker else 0)
+    except Exception:
+      return 0
+
   def _floor(self, set_speed):
     return max_drop_floor(set_speed, self.max_drop_mph, self.metric)
 
@@ -1914,7 +1992,9 @@ class MapCurvesPlanner:
     self.mc.floor = floor
     self.mc.update(gps_position["latitude"], gps_position["longitude"], gps_position["bearing"], way_id, is_forward, nav,
                    camera=camera, trust=self.trust,
-                   gps={"dt": dt, "v_ego": v_ego, "acc": acc, "rel": rel, "ambiguous": self.matcher.ambiguous})
+                   gps={"dt": dt, "v_ego": v_ego, "acc": acc, "rel": rel, "ambiguous": self.matcher.ambiguous,
+                        "signal": self._signal(sm),
+                        "street": bool(self.road_class) and self.road_class not in HIGHWAY_CLASSES + LINK_CLASSES})
     mc = self.mc
     if self.trust.paused and not was_paused and mc.data_here and (not self.pause_announced or self.prev_slowing):
       self.pause_announced = True
@@ -2143,6 +2223,7 @@ class MapCurvesPlanner:
                                       0.0 if mc.status == STATUS_RAMP_CURVE else mc.floor))
     plan.mapCurveName = (mc.curve or {}).get("name", "") or ""
     plan.mapOnRamp = bool(mc.on_ramp)
+    plan.mapOnRampAhead = bool(getattr(mc, "onramp_ahead", False))
     r = mc.ramp if mc.on_ramp else mc.nav_ramp
     if r is not None:
       plan.mapRampType = RAMP_TYPES.get(r["type"], 4)

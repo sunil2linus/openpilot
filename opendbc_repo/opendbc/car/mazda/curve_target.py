@@ -166,7 +166,7 @@ MAP_FOLLOW_BUDGET = 40        # SET- presses for one followed curve (max drop + 
 # MAP_ROAD_LEAD_TIME before the entry (car side and planner), and the follower asks for no lower set speed while the car
 # already slows at least as hard as the room left needs (aEgo filtered over MAP_ROAD_ACCEL_TAU, MapCurveFollower
 # closed_loop): a cruise that answers harder than the model is not pushed further.
-MAP_ROAD_UNDERSHOOT = 3 * MS_PER_MPH   # m/s
+MAP_ROAD_UNDERSHOOT = 1 * MS_PER_MPH           # m/s (drives 56 / 59: was 3 mph, the set went 45 -> 32 -> 35 for a 35 curve)
 MAP_ROAD_LEAD_TIME = 0.5      # s
 MAP_ROAD_ACCEL_TAU = 0.5      # s
 # Firm follow (ramp curves and navigation exits only, owner's exit design): when the room left needs more than

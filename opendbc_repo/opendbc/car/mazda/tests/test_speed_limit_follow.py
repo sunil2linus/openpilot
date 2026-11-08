@@ -867,6 +867,18 @@ def test_drive_53_ramp_2_the_merge_waits_for_the_loops_curve_then_goes_to_the_hi
   assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6
 
 
+def test_drive_59_a_merge_from_27_mph_is_not_refused_for_its_jump():
+  # drive 59, both merges refused: "merge: jump 43 > 30 mph" (set 27 after a light) and "jump 35 > 30 mph"; he held
+  # SET+ to 70 himself. Any street speed onto the highway's limit is a merge (no jump limit)
+  for street in (27, 35):
+    ramp = _Ramp(street=street)
+    r, c, _ = _merge_sim(ramp, _car53(street, street), 6000,
+                         events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
+    assert c.raises and abs(c.raises[0][1] - 70) < 1e-6 and c.kinds[0] == "merge", (street, c.raises, _reasons(c))
+    assert not any("jump" in x for x in _reasons(c))
+    assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6, (street, r["final"])
+
+
 def test_merge_negatives():
   car = lambda: _car53(45, 45)  # noqa: E731
   ev = lambda ramp: {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)}  # noqa: E731

@@ -306,6 +306,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapNavSpeedLimit @82 :Float32;     # m/s, navInstruction.speedLimit (Mapbox), 0 none (junk under 15 mph / 24 km/h, stale > 3 s)
   mapNavManeuverDistance @83 :Float32;  # m to navigation's next maneuver, 0 none
   mapNavManeuverTurn @84 :Bool;      # that maneuver is a turn (turn, end of road, roundabout)
+  mapOnRampAhead @85 :Bool;          # the ramp curve (status 2) is an on-ramp's first curve, before the turn onto it (navigation or signal)
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

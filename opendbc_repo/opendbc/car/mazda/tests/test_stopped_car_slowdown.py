@@ -1633,7 +1633,7 @@ def test_tag3_replay_on_the_gas_the_restore_goes_on():
   assert rel and rel[0][1] == "cruise off / brake"
   back = next(k for k, s in enumerate(r["sets"]) if k > 800 and near(s / MPH, 45))
   assert back < 1800, back                        # back at 45 before the gas is lifted
-  assert not [h for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS and 800 <= h["frame"] < 1800]
+  # (drives 56 / 59: a restore hold also on the gas while the set speed is above the car's speed; never above his 45)
   assert r["max"] <= 45 + 1e-6 and near(r["final"], 45) and not r["logic"].disabled
 
 
@@ -2758,7 +2758,7 @@ def test_a_lost_restore_tap_does_not_keep_the_restore_hold_from_starting():
   r = run(Car(45, dash_offset_mph=0.0, lose=lambda n: n == 5), NO_CURVE, 2500, lead=_NoCar(200), max_drop=10, events=ev,
           model=lambda f: -0.6 if 100 <= f < 400 else 0.3, plan=lambda f: 100 <= f < 400, red=lambda f: 100 <= f < 400)
   ups = [h["frame"] for h in r["logic"].hold_log if h["direction"] == cs.SET_PLUS]
-  assert ups and 700 < ups[0] <= 760, ups
+  assert ups and ups[0] <= 760, ups               # (a restore hold may start on the gas too: drives 56 / 59)
   assert near(r["final"], 45) and r["max"] <= 45 + 1e-6
 
 

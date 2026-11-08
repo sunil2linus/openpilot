@@ -758,6 +758,11 @@ class SpeedLimitFollower:
       self.lowered = Offer(lw.old, lw.new, lw.source, self.frame, "lower", lw.driver, tgt=lw.tgt, own=lw.own)
     self._log("speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch", why, lw.new, lw.target,
               d_now if d_now is not None else lw.driver)
+    if lw.kind == "match" and why == "his speed under it" and d_now is not None and d_now < lw.target - 0.5:
+      # rule 8 is up or down: the stored speed was above the street's (a restore pending) but the set speed is already
+      # under it, so it goes up to it (drive 56 t 729: set 43 on a 45 street with +5 = 50 left at 43)
+      self.offer = Offer(None, lw.new, lw.source, self.frame, "match", d_now, tgt=lw.target)
+      self._log("speedLimitMatch", "start: cruise on, up (set under it)", lw.new, lw.target, d_now)
 
   @property
   def paused(self):
@@ -852,8 +857,8 @@ class SpeedLimitFollower:
       why = f"next limit {n} is not a highway limit"
     elif d > self.surface_max + 0.5:
       why = f"driver's speed {round(d)} is not a street's (more than {self.surface_max})"
-    elif (n - d) * unit_mph > LIMIT_MAX_JUMP_MPH + 0.5:
-      why = f"jump {round(n - d)} > {LIMIT_MAX_JUMP_MPH} mph"
+    # (no jump limit: drive 59, both merges refused, "jump 43 > 30" and "jump 35 > 30": from a light or a loop at 25-35
+    # mph onto a 70 highway is the normal merge; the link to a highway, its highway limit and GPS trust 0 are the checks)
     if why:
       self.merge_done = True
       self._not_followed(None, n, "Map Data", "merge: " + why)

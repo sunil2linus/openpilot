@@ -140,6 +140,25 @@ def test_wrapper_builds_the_new_trigger_inputs(tmp_path, monkeypatch):
   assert seen[-1].lead_y_path == -2.0 and seen[-1].model_length == 0.0
 
 
+def test_no_camera_only_stop_on_a_highway_at_highway_speed(tmp_path, monkeypatch):
+  # drives 56 / 59: a "red light" at an exit split at 55-60 mph took the set speed 58 -> 45. On a motorway above 50 mph
+  # the stop-light detector and the model's planned stop are not given to the stop trigger; on a street they are
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0)
+  plan = sm.msgs["starpilotPlan"]
+  plan.redLight = True
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 1
+  _drive(c, 2, set_mph=60, v_mph=60)
+  assert not seen[-1].red_light and not seen[-1].plan_stop
+  _drive(c, 2, set_mph=45, v_mph=45)                 # slower than 50 on the motorway (a queue): as before
+  assert seen[-1].red_light
+  plan.mapRoadClass = 5
+  _drive(c, 2, set_mph=60, v_mph=60)                 # a street at 60: as before
+  assert seen[-1].red_light
+
+
 def _mapd(sm, limit_mph, dist):
   sm.msgs["mapdOut"] = SimpleNamespace(nextSpeedLimit=limit_mph * MPH, nextSpeedLimitDistance=dist)
   sm.alive["mapdOut"], sm.recv_frame["mapdOut"], sm.updated["mapdOut"] = True, 1, True
