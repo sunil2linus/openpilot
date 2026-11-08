@@ -207,7 +207,12 @@ CURVE_GAS_RESTORE = True
 # overrun margin, as a stop hold), then taps; at most CURVE_HOLDS per curve.
 CURVE_HOLD_ENABLED = True
 CURVE_HOLD_MIN_QUANTA = 2
-CURVE_HOLDS = 1
+CURVE_HOLDS = 2
+# A ramp's / exit's SET- budget (MapOutput.budget, RAMP_BUDGET) counts the steps that landed, not the presses sent: drive
+# 56 t 880-910 (an exit from 80 mph, the set speed needed 30): 60 presses sent, about half ignored by the car, only 33
+# landed, the budget was used up at 47 mph with the exit curve's 30 still to come (the driver braked hard). Sent presses
+# are still capped at this many times the budget (a car that answers none of them).
+CURVE_BUDGET_SENT_FACTOR = 3
 # A restore asked for at once (restore_pending: a stop ahead that cleared, a red light gone) while a followed map curve's
 # target is on: the restore hold (RESTORE_HOLD_MIN_GAIN) runs up to the curve's target with its usual margin below it,
 # then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
@@ -1125,8 +1130,14 @@ class CurveSlowdownLogic:
     if reason is not None and not self.blocked:
       # How many more steps down this wants (re-lowering while restoring needs 2 steps).
       room = int((set_speed - target + 1e-3) // self.step)
-      budget_ok = (self.lower_presses < max(self.max_lower_presses, i.curve_budget)) if reason == "curve" else \
-                  (self.stop_presses < MAX_STOP_PRESSES)
+      if reason == "curve":
+        budget_ok = self.lower_presses < max(self.max_lower_presses, i.curve_budget)
+        if not budget_ok and i.curve_budget > self.max_lower_presses:
+          # (ramps and exits) the landed steps, plus what is in flight, against the budget (CURVE_BUDGET_SENT_FACTOR)
+          landed = max(self.offset, 0) + sum(1 for p in self.inflight if p.direction == SET_MINUS)
+          budget_ok = landed < i.curve_budget and self.lower_presses < CURVE_BUDGET_SENT_FACTOR * i.curve_budget
+      else:
+        budget_ok = self.stop_presses < MAX_STOP_PRESSES
       want_lower = budget_ok and room >= (2 if self.restoring else 1) and not restore_only
 
     # on the gas the stop reasons' "over" timer is frozen (reason_free_frames): a clear stop restore still may go
@@ -1227,9 +1238,14 @@ class CurveSlowdownLogic:
     in_curve = (RESTORE_IN_CURVE_HOLD and i.csc_active and i.curve_track and reason == "curve" and target is not None and
                 self.restore_pending and not raise_in_curve)
     # a confirmed floor stop that would hold now but for a fresh press in flight waits for it (STOP_HOLD_WAIT)
-    if (want_lower and reason == "stop" and i.stop_urgent and self.holds_allowed and not flight_ok and not jump and
-        not i.gas_pressed and self.holds_this_episode < MAX_STOP_HOLDS and
-        set_speed - worst >= max(target, STOP_MIN_SET_SPEED) - self.half_step):
+    # ... and so does a firm map curve's hold (drive 56 t 893-910: a firm exit ramp kept tapping with presses always in
+    # flight, about half of them ignored, and never held)
+    stop_wait = (want_lower and reason == "stop" and i.stop_urgent and self.holds_this_episode < MAX_STOP_HOLDS and
+                 set_speed - worst >= max(target, STOP_MIN_SET_SPEED) - self.half_step)
+    curve_wait = (CURVE_HOLD_ENABLED and want_lower and reason == "curve" and i.curve_track and i.curve_hold and
+                  self.curve_holds < CURVE_HOLDS and set_speed - target >= CURVE_HOLD_MIN_QUANTA * q * self.step - 1e-3 and
+                  set_speed - worst >= max(target, MIN_SET_SPEED) - self.half_step)
+    if ((stop_wait or curve_wait) and self.holds_allowed and not flight_ok and not jump and not i.gas_pressed):
       if self.hold_wait_frame is None:
         self.hold_wait_frame = self.frame
       if self.frame - self.hold_wait_frame < _frames(STOP_HOLD_WAIT):

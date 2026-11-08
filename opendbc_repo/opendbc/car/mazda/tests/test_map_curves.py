@@ -336,6 +336,42 @@ def test_ramp_goes_past_the_max_drop_but_not_below_25():
   assert 59.5 <= low / MPH <= 61, low / MPH        # a normal curve keeps the 10 mph max drop
 
 
+def drive_lossy(frames, fn, set_mph, lose):
+  car = T.Car(set_mph, dash_offset_mph=0.0, lag=10, lose=lose)
+  logic = cs.CurveSlowdownLogic(False, 10)
+  low = car.set_speed
+  for f in range(frames):
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, **fn(f, car))
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      if logic.last_action == "hold":
+        car.hold_frame(btn)
+      else:
+        car.press(btn)
+    car.tick()
+    low = min(low, car.set_speed)
+  return car, logic, low
+
+
+def test_drive_56_an_exit_from_80_with_half_the_taps_ignored_still_reaches_the_ramp_speed():
+  # drive 56 t 880-910: from 80 mph, 60 SET- presses sent, about half ignored, the budget (presses) used up at 47 mph
+  # for a 30 mph exit curve. The ramp budget counts landed steps; taps (not firm) and a firm follow both get there.
+  ramp = lambda f, c: dict(csc_active=True, csc_speed=30 * MPH, curve_floor=25 * MPH, curve_budget=60, curve_track=True)  # noqa: E731
+  car, logic, low = drive_lossy(6000, ramp, 80, lambda n: n % 2 == 0)
+  assert low / MPH <= 30.5, low / MPH
+  assert low / MPH >= 24.5
+  firm = lambda f, c: dict(csc_active=True, csc_speed=30 * MPH, curve_floor=25 * MPH, curve_budget=60, curve_track=True,  # noqa: E731
+                           curve_hold=True)
+  car, logic, low = drive_lossy(3000, firm, 80, lambda n: n % 2 == 0)
+  assert low / MPH <= 30.5 and low / MPH >= 24.5, low / MPH
+  assert any(h["direction"] == cs.SET_MINUS for h in logic.hold_log), "a firm exit holds"
+  # a car that answers no press at all: the presses stop (CURVE_BUDGET_SENT_FACTOR x the budget)
+  car, logic, low = drive_lossy(20000, ramp, 80, lambda n: True)
+  assert logic.lower_presses <= cs.CURVE_BUDGET_SENT_FACTOR * 60
+
+
 def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
   def fn(f, c):
     if f < 2500:
