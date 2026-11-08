@@ -235,6 +235,9 @@ ENGAGE_ROAD_STEADY = 2.0     # s the road class known (a street) and GPS trust 0
 # rules 8 / 9 under way end off a street only once the road class has said so this long (third review: one frame of a
 # link class near a ramp, drive 53 t 443, ended the match and the restore took his stored 75 back)
 LOWER_NOT_STREET_TIME = 2.0  # s
+# ... and while not on a street or not active (paused) nothing is pressed and the restore is held; a pause this long ends
+# it (no adopt): a restore is never held for good (final check: Map Curves / Speed Limit Follow turned off mid-way)
+LOWER_PAUSE_MAX = 10.0       # s
 ENGAGE_WINDOW = 15.0         # s after cruise came on it may still decide (the road / trust becoming steady)
 ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "his SET after it"
 # the limit itself steady this long with GPS trust 0 on every frame of it (drive 55, t 627: his RES at a junction while the
@@ -409,6 +412,7 @@ class SpeedLimitFollower:
     self.undo_frame = -1_000_000   # the last rule 4 undo (LIMIT_QUICK_AFTER_UNDO)
     # rules 8 / 9: the engage match, the slowdown for a lower limit (`lower`: an Offer the map control carries out)
     self.lower = None              # Offer: kind "match" or "lower", tgt the speed (steps), driver his speed before
+    self.pause_frames = 0          # frames `lower` has been paused (LOWER_PAUSE_MAX)
     self.lowered = None            # the last finished slowdown for a lower limit (LOWER_UNDO_TIME)
     self.lower_skip = None         # the limit a slowdown ended for by his decision: not again for it
     self.engage_frame = None       # cruise came on (rule 8 not decided yet)
@@ -638,7 +642,11 @@ class SpeedLimitFollower:
     lw = self.lower
     if lw is not None:
       kind = "speedLimitSlow" if lw.kind == "lower" else "speedLimitMatch"
-      if not self._street() and self.frame - self.road_since >= _frames(LOWER_NOT_STREET_TIME):
+      self.pause_frames = self.pause_frames + 1 if self.paused else 0
+      if self.pause_frames >= _frames(LOWER_PAUSE_MAX):
+        self.lower, self.pause_frames = None, 0
+        self._log(kind, "cancel: paused too long", lw.new, lw.target, d)
+      elif not self._street() and self.frame - self.road_since >= _frames(LOWER_NOT_STREET_TIME):
         self.lower = None              # (a later RES re-opens rule 8, as after cruise off)
         self._log(kind, "cancel: not on a street", lw.new, lw.target, d)
       elif lw.kind == "lower" and reported != lw.new and reported is not None and reported > lw.new:
@@ -755,12 +763,13 @@ class SpeedLimitFollower:
   def paused(self):
     """Rules 8 / 9's slowdown waits (third review: the planner's map curve mode flipped mid-way): kept, nothing
     pressed (the wrapper holds the restore), carried on when they act again."""
-    return self.lower is not None and not self.street_active
+    return self.lower is not None and (not self.street_active or not self._street())
 
   @property
   def lower_speed(self):
     """m/s: rules 8 / 9's speed for the map control's paced slowdown (0: none)."""
-    return self.lower.target * self.step if self.lower is not None else 0.0
+    # (paused, e.g. a link class for up to LOWER_NOT_STREET_TIME: no SET- of rules 8 / 9 off a street)
+    return self.lower.target * self.step if (self.lower is not None and not self.paused) else 0.0
 
   def _provisional(self, reported, d, i):
     """A lower limit reported now, not steady yet, with the driver's speed in rule 1's band of the limit before (the

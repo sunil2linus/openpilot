@@ -251,7 +251,10 @@ def test_wrapper_reads_slow_for_lower_limits_and_raises_its_alert_flag(monkeypat
   on, test = SimpleNamespace(mapCurveMode=2), SimpleNamespace(mapCurveMode=1)
   assert c._street_active(on) and not c._street_active(test) and c._limit_lower(test) == 0.0
   c.limit_follow.lower.kind = "lower"
+  c.limit_follow.road = 7          # (on a street: off one the slowdown is paused, nothing pressed)
   assert abs(c._limit_lower(on) - 30 * MPH) < 1e-6
+  c.limit_follow.road = 2
+  assert c._limit_lower(on) == 0.0
   c_test = cs.CurveSlowdown(CP, W.FakeParams({"IsMetric": False}), curve_enabled=False, map_mode=1, limit_mode=2)
   c_test.limit_follow.lower = Offer(45, 25, "Map Data", 0, "lower", 50, tgt=30)
   assert not c_test._street_active(on) and c_test._limit_lower(on) == 0.0

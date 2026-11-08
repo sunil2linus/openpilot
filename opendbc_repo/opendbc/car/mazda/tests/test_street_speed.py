@@ -523,3 +523,18 @@ def test_review3_a_map_curve_mode_flip_mid_way_pauses_the_slowdown():
   r = street_sim(5000, lambda f: 45, 75, street_active=pause, driver=lambda f: cs.SET_MINUS if f == 1000 else None,
                  **base, **_engage())
   assert "cancel: his SET" in _reasons(r) and _minus(r, 1300) == [] and _plus(r, 1000) == [], _reasons(r)
+
+
+def test_final_no_set_minus_of_rules_8_9_while_off_a_street_and_a_long_pause_ends():
+  # a link class for 3 s mid-way (a real move onto a ramp): rules 8 / 9 press nothing while it says "not a street"
+  # (the restore held meanwhile), then end (his speed comes back)
+  base = dict(v_mph=30, vcap=lambda f: 30 * MPH)
+  link = lambda f: 2 if 800 <= f < 1100 else 7  # noqa: E731
+  r = street_sim(4000, lambda f: 45, 75, road=link, **base, **_engage())
+  assert _minus(r, 815, 1100) == [], _minus(r, 815, 1100)
+  assert "cancel: not on a street" in _reasons(r)
+  # Map Curves not On for good mid-way: the paused slowdown ends after LOWER_PAUSE_MAX, the restore is not held for good
+  off = lambda f: f < 800  # noqa: E731
+  r = street_sim(800 + int((slf.LOWER_PAUSE_MAX + 2) / DT), lambda f: 45, 75, street_active=off, **base, **_engage())
+  assert "cancel: paused too long" in _reasons(r), _reasons(r)
+  assert not r["f"].paused
