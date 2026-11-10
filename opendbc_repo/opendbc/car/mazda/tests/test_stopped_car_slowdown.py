@@ -3017,3 +3017,62 @@ def test_restore_now_waits_while_a_stop_is_still_planned_ahead():
   assert not lg.restore_pending
   lg.update(cs.SlowdownInputs(**base, stop_restore_now=True))
   assert lg.restore_pending
+
+
+# ---------------- the floor hold's wait for a press in flight (STOP_HOLD_WAIT) ----------------
+
+def _floor_stop_with_presses_in_flight(frames=300):
+  """A confirmed floor stop from 55 mph that wants its hold while an earlier hold of ours (still settling) and one lost tap
+  are in flight; the car answers each tap 80 ms later and every landing is booked to the oldest press (the lost tap), so
+  the newest tap always looks fresh. Returns [(frame, action)] of what was sent."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  set_mph = [55.0]
+
+  def si(stop=True):
+    return cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=set_mph[0] * MPH, v_ego=55 * MPH,
+                             gas_pressed=False, brake_pressed=False, standstill=False, plan_alive=True, csc_active=False,
+                             csc_speed=0.0, other_button_active=False, stop_active=stop,
+                             stop_target=cs.STOP_MIN_SET_SPEED if stop else 0.0, stop_urgent=stop)
+  for _ in range(100):
+    lg.update(si(False))
+  lg.inflight.append(cs.Press(cs.SET_MINUS, lg.frame - 100))                    # a lost tap
+  h = cs.Press(cs.SET_MINUS, lg.frame - 20, reserve=6, remaining=6, landed=10, hold=True, frames_sent=1,
+               release_frame=lg.frame)
+  lg.inflight.append(h)                                                          # a hold of ours still settling
+  sent, lands = [], []
+  for _ in range(frames):
+    for f in [f for f in lands if f <= lg.frame]:
+      set_mph[0] -= 1
+      lands.remove(f)
+    b, _ = lg.update(si())
+    if b is not None:
+      sent.append((lg.frame, lg.last_action))
+      if lg.last_action != "hold":
+        lands.append(lg.frame + 8)
+  return sent
+
+
+def test_a_floor_stop_with_a_lost_tap_in_flight_still_holds():
+  # (the drive 69 analysis suspected that once STOP_HOLD_WAIT ran out, a lost tap would keep every newer tap "fresh" and
+  # the stop would tap all the way down; it cannot: a tap is lost PENDING_TIMEOUT after it was sent, sooner than the wait
+  # runs out, and nothing is sent while a hold of ours is in flight) the hold follows as soon as the settling hold is done
+  sent = _floor_stop_with_presses_in_flight()
+  holds = [f for f, a in sent if a == "hold"]
+  assert holds and not [f for f, a in sent if a != "hold" and f < holds[0]], sent
+
+
+def test_a_floor_stop_from_55_mph_with_a_lost_tap_holds():
+  # a red light at 55 mph: the head start's taps (one of them lost, the car slow to answer), then the planned stop in floor
+  # mode: one SET- hold within ~0.6 s of the stop ahead start, at the floor within ~5 s
+  for lost in ((1,), (2,), (1, 2)):
+    for lag in (12, 35):
+      car = Car(55, dash_offset_mph=0.0, accel=0.6, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0,
+                min_set_mph=CAR_MIN_MPH, lag=lag, lose=lambda n, lost=lost: n in lost)
+      car.v_ego = 55 * MPH
+      r = run(car, NO_CURVE, 1200, lead=_NoCar(200), max_drop=10, model=lambda f: -0.6 if f >= 251 else -0.2,
+              plan=lambda f: f >= 251, red=lambda f: True)
+      start = next(k for k, kind in enumerate(r["kinds"]) if kind == scs.STOP_AHEAD)
+      holds = [h for h in r["holds"] if h >= start]
+      assert holds and holds[0] - start <= int(0.6 / T.DT), (lost, lag, start, holds[:1])
+      at_floor = next(k for k, s in enumerate(r["sets"]) if s / MPH <= 20.5)
+      assert (at_floor - start) * T.DT <= 5.0, (lost, lag, start, at_floor)
