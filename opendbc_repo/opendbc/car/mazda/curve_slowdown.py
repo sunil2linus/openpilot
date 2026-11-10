@@ -1059,7 +1059,9 @@ class CurveSlowdownLogic:
       self.blocked_frame = None
       self.rearms += 1
 
-    if i.stop_restore_now and self.offset != 0:
+    # (not while a stop is still planned ahead either: drive 69, a release with the light and the plan still on restored
+    # 35 -> 45 toward the red light)
+    if i.stop_restore_now and self.offset != 0 and not i.hold_restore:
       self.restore_pending = True
     # (not while a planned stop holds the speed: review, a merge raise 45 -> 70 went up by SET+ holds with a stopped car
     # latched ahead)

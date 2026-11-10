@@ -358,6 +358,16 @@ WARN_GUARD_ENABLED = True
 # warning still needs its condition gone WARN_REARM first (no down-up-down for the same stop).
 STOP_AHEAD_GONE_ENABLED = True
 STOP_AHEAD_GONE_TIME = 1.0   # s
+STOP_AHEAD_CLEARED = "stop ahead cleared (no stop planned)"
+# ... but not while the stop-light detector is still on (drive 69, t 125-134, 244-248, 1193-1200, 1388: the planned stop
+# blinked off for 0.3-1 s under a red light, the episode was released and its restore took the set speed back up, the
+# light and the plan still on; the driver braked each time): a stop ahead (no car) is released as cleared / gone before the
+# warning only once redLight has been off RED_DROPOUT, or the plan has been gone STOP_AHEAD_RED_HOLD with the light on (a
+# false red light holds the slowdown that long at most). The driver's gas or brake still release it at once.
+STOP_AHEAD_RED_HOLD = 6.0    # s
+# After such a release the stop starts again at once (no WARN_REARM wait) while the light is (back) on and the planned
+# stop latched again, for REARM_ON_RED_TIME after the release.
+REARM_ON_RED_TIME = 10.0     # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
 WARN_GUARD_PLAN_HOLD = 4.0   # s
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
@@ -569,6 +579,8 @@ class StoppedCarTrigger:
     self.red_gap = _frames(RED_DROPOUT) + 1   # (off so far: a light on at the first frame is an onset)
     self.last_red_frame = -10_000
     self.red_latched = False         # an episode was released while the light was on: it must go off before a head start
+    self.rearm_on_red = False        # released as a stop ahead cleared / gone: a red light and the planned stop restart it
+    self.release_frame = -10_000     # (REARM_ON_RED_TIME)
     self.rolling_frames = 0          # frames since we were last stopped (RED_AFTER_STOP) ...
     self.red_onset_rolling = 0       # ... when the light last came on
     self.red_base = 0.0              # the head start's reference speed (max(ours, set), or ours: CATCH_UP_*) and its cap
@@ -862,6 +874,12 @@ class StoppedCarTrigger:
         self.unsure_gap += 1
         if self.unsure_gap > _frames(EARLY_DROPOUT):
           self.unsure_frames = 0
+      # the stop again at once after a stop ahead released as cleared / gone: the light (back) on, the plan latched again
+      red_rearm = (self.rearm_on_red and self.frame - self.release_frame <= _frames(REARM_ON_RED_TIME) and
+                   self.red_gap <= _frames(RED_START_DROPOUT) and self.latched and i.plan_stop and start_gates and
+                   i.v_ego >= WARN_MIN_SPEED)
+      if red_rearm:
+        warn_start = True
       if self.hold_frames >= _frames(HOLD_TIME) or early_start or warn_start:
         self._start(i, lead_ok, early_start, warn_start)
       elif unsure_on:
@@ -880,16 +898,20 @@ class StoppedCarTrigger:
       # stop, the MRCC keeps the gap to that car)
       going = i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop
       self.go_frames = self.go_frames + 1 if going else 0
+      # the light still on (STOP_AHEAD_RED_HOLD): no release as cleared / gone before the warning
+      red_holds = (self.red_gap < _frames(RED_DROPOUT) and
+                   self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD))
+      still_planned = self._warn_still_planned(i) if self.warn_pending else True
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
-      elif self.warn_pending and not self._warn_still_planned(i):
+      elif self.warn_pending and not still_planned and not red_holds:
         self._release(STOP_AHEAD_UNCONFIRMED)
-      elif (self.go_frames >= _frames(GO_TIME) or not self.latched or
-            (STOP_AHEAD_GONE_ENABLED and self.frame - self.last_plan_stop >= _frames(STOP_AHEAD_GONE_TIME) and
-             not self._slower_in_lane(i))):
-        self._release("stop ahead cleared (no stop planned)")
+      elif not red_holds and (self.go_frames >= _frames(GO_TIME) or not self.latched or
+                              (STOP_AHEAD_GONE_ENABLED and self.frame - self.last_plan_stop >= _frames(STOP_AHEAD_GONE_TIME) and
+                               not self._slower_in_lane(i))):
+        self._release(STOP_AHEAD_CLEARED)
     elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
       if self.kind == STOP_AHEAD:
         # the car for the planned stop appeared: from here on a stop with a car (confirmed / floor mode stay)
@@ -1041,6 +1063,7 @@ class StoppedCarTrigger:
     """A stopped car / stop with car / stop ahead episode starts (or takes over an unsure car episode)."""
     took_over = self.active and self.kind in TAP_KINDS
     from_red = took_over and self.kind == RED_LIGHT
+    self.rearm_on_red = False
     self.catch_up = False                      # (a tap episode's first drop: the new kind's own target from here)
     self.caught_up = self.caught_up and took_over
     self.active = True
@@ -1246,6 +1269,14 @@ class StoppedCarTrigger:
     self.warn_unsure = False
     self.catch_up = False
     self.red_latched = self.red_gap <= _frames(RED_DROPOUT)   # the light must go off before a red light head start
+    self.release_frame = self.frame
+    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED)
+    if restore_now and self.frame - self.last_plan_stop > _frames(LATCH_DROPOUT):
+      # a release that restores at once with no stop planned now: the latch goes with it, so the restore is not held
+      # back as "a stop planned ahead" (hold_restore, which the controller's restore_now respects); a plan that comes
+      # back latches again after LATCH_DEBOUNCE. With the planned stop still showing the latch stays and holds it.
+      self.latched = False
+      self.latch_frames = 0
     if reason != RED_GONE:
       # no unsure car start for UNSURE_REARM after any release but the head start's: when the light goes, a slower car
       # seen next is the queue the light was for (drive 52: the light went at 187.8 s, the car in our lane was seen at

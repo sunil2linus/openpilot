@@ -1424,15 +1424,15 @@ def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
   tr = scs.StoppedCarTrigger()
   _started_past_the_warning(tr)
   for _ in range(99):
-    assert tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
-  assert not tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=0.4))
+    assert tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=0.4))
+  assert not tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=0.4))
   assert tr.release_reason.startswith("stop ahead cleared") and tr.restore_now
   # the model stays a little negative: released once the planned stop has been gone STOP_AHEAD_GONE_TIME (drive 54, t
   # 758.65: the plan gone at 761.8, released only at 764.66 when the latch ran out) ...
   tr = scs.StoppedCarTrigger()
   _started_past_the_warning(tr)
   n = 0
-  while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
+  while tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=-0.2)):
     n += 1
     assert n < 1000
   assert abs(n - scs.STOP_AHEAD_GONE_TIME / scs.DT_CTRL) <= 3 and tr.release_reason.startswith("stop ahead cleared")
@@ -1443,7 +1443,7 @@ def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
   for k in range(400):
     assert tr.update(_latched_inputs(lead_status=False, plan_stop=(k % 100) >= 80, model_accel=-0.2))
   # ... and with a slower car in our lane (not sure enough to be the stop's car yet) it waits for the latch (LATCH_HOLD)
-  slower = dict(lead_status=True, lead_prob=0.15, lead_d=110.0, lead_v=15 * MPH, lead_y=0.1, plan_stop=False,
+  slower = dict(lead_status=True, lead_prob=0.15, lead_d=110.0, lead_v=15 * MPH, lead_y=0.1, plan_stop=False, red_light=False,
                 model_accel=-0.2)
   tr = scs.StoppedCarTrigger()
   _started_past_the_warning(tr)
@@ -1457,7 +1457,7 @@ def test_stop_ahead_releases_when_the_plan_clears_and_restores_at_once():
     tr = scs.StoppedCarTrigger()
     _started_past_the_warning(tr)
     n = 0
-    while tr.update(_latched_inputs(lead_status=False, plan_stop=False, model_accel=-0.2)):
+    while tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=-0.2)):
       n += 1
       assert n < 1000
   assert abs(n - scs.LATCH_HOLD / scs.DT_CTRL) <= 3
@@ -1738,13 +1738,16 @@ def test_an_overridden_car_counts_again_once_it_slows_a_lot_or_the_gas_is_off_a_
   assert any(tr.update(_sw(**slower)) for _ in range(100))
 
 
-def _warn_episode(plan_frames, then_frames=300, **kw):
-  """A stop ahead (no car) planned for plan_frames, then not: (trigger, frame it started, frame it released)."""
+def _warn_episode(plan_frames, then_frames=300, red_with_plan=False, **kw):
+  """A stop ahead (no car) planned for plan_frames, then not: (trigger, frame it started, frame it released).
+  red_with_plan: the stop-light detector on only while the stop is planned (else on throughout)."""
   tr = scs.StoppedCarTrigger()
   for _ in range(60):
     tr.update(_latched_inputs(lead_status=False, plan_stop=False))
   started = released = None
   for n in range(plan_frames + then_frames):
+    if red_with_plan:
+      kw["red_light"] = n < plan_frames
     on = tr.update(_latched_inputs(lead_status=False, plan_stop=n < plan_frames, **kw))
     if on and started is None:
       started = n
@@ -1757,10 +1760,16 @@ def _warn_episode(plan_frames, then_frames=300, **kw):
 def test_a_planned_stop_that_goes_away_before_the_warning_is_released_at_once():
   # review of the 0.5 s start: a 0.7 s plan dip (never a warning) started a floor hold that lasted until the stop
   # "cleared" (1.6-4.6 s); now it is released with the set speed restored within the warning's dropout
-  tr, started, released = _warn_episode(70)
+  # (the stop-light detector on with the plan only: released once it has been off RED_DROPOUT, drive 69)
+  tr, started, released = _warn_episode(70, red_with_plan=True)
   assert started is not None and abs(started - 50) <= 2
-  assert released is not None and released <= 70 + int(scs.WARN_DROPOUT / scs.DT_CTRL) + 2, released
+  assert released is not None and released <= 70 + int((scs.RED_DROPOUT + scs.WARN_DROPOUT) / scs.DT_CTRL) + 2, released
   assert tr.release_reason == scs.STOP_AHEAD_UNCONFIRMED and tr.restore_at_release
+  # ... but not while the stop-light detector is still on (drive 69 t 244-248, 1193-1200, 1388): held until the light has
+  # been off RED_DROPOUT, or STOP_AHEAD_RED_HOLD with no plan
+  tr, started, released = _warn_episode(70, then_frames=900)
+  assert started is not None and released is not None, (started, released)
+  assert abs(released - (70 + scs.STOP_AHEAD_RED_HOLD / scs.DT_CTRL)) <= 3, released
 
 
 def test_a_planned_stop_that_lasts_past_the_warning_is_not_released_by_the_dip_rule():
@@ -2919,3 +2928,92 @@ def test_holds_come_back_for_a_stop_after_the_decay():
   finally:
     cs.HOLD_MISS_FORGET = old
   assert not r2["holds"]
+
+
+# ---------------- drive 69: a stop ahead released while the red light is still on ----------------
+
+def _drive69_red(set_mph=45, plan=lambda f: f >= 140, red=lambda f: True, frames=1400, lost=(), lead=None, events=None):
+  """A red light at set_mph, no car (or `lead`): the head start, then the planned stop (redLight backed) in floor mode."""
+  car = Car(set_mph, dash_offset_mph=0.0, accel=0.6, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0,
+            min_set_mph=CAR_MIN_MPH, lag=12, lose=lambda n: n in lost)
+  car.v_ego = set_mph * MPH
+  return _releases(lambda: run(car, NO_CURVE, frames, lead=lead or _NoCar(200), max_drop=10, events=events,
+                               model=lambda f: -0.6 if plan(f) else -0.2, plan=plan, red=red))
+
+
+def test_drive_69_t125_a_plan_blink_under_a_red_light_does_not_release_or_restore():
+  # t 125-134: head start 125.5, the floor hold 45 -> 35 from 126.0; the plan blinked off at 126.6 for ~2 s, released
+  # at 127.5 ("stop ahead cleared") with the light on, then SET+ taps 35 -> 45 toward the red light (the driver braked)
+  plan = lambda f: 140 <= f < 200 or f >= 400       # noqa: E731
+  r, rel = _drive69_red(plan=plan)
+  assert not rel, rel
+  assert not [f for f, b in r["presses"] if b == cs.SET_PLUS] and not _plus_frames(r)
+  assert r["min"] <= 21 and r["min"] >= CAR_MIN_MPH - 1e-6
+  # the light goes green (redLight and the plan off): released 1 s after, the speed comes back
+  r2, rel2 = _drive69_red(plan=lambda f: 140 <= f < 600, red=lambda f: f < 600, frames=2500)
+  assert rel2 and rel2[0][1] == scs.STOP_AHEAD_CLEARED and rel2[0][2], rel2
+  assert abs(rel2[0][0] - 600 - scs.RED_DROPOUT / scs.DT_CTRL) <= 3, rel2
+  assert near(r2["final"], 45)
+
+
+def test_drive_69_t1193_a_flickering_plan_before_the_warning_under_a_red_light_is_not_released():
+  # t 1193-1200 (55 mph): the stop ahead start at 1193.4, the plan flickering, released at 1194.6 "gone before the
+  # warning" with the light on, the restore 46 -> 53, then a car 125 m ahead; the driver braked at 51 mph
+  plan = lambda f: f >= 150 and not (205 <= f < 260)   # noqa: E731   (before the fix: released at 231, SET+ from 371)
+  lead = StoppedLead(330, v_mph=31, present=lambda f: f >= 750)
+  r, rel = _drive69_red(55, plan=plan, lead=lead, frames=1100)
+  assert not [x for x in rel if x[1] in (scs.STOP_AHEAD_UNCONFIRMED, scs.STOP_AHEAD_CLEARED)], rel
+  assert not _plus_frames(r)
+  assert r["min"] <= 25
+
+
+def test_a_false_red_light_holds_the_stop_ahead_at_most_stop_ahead_red_hold():
+  # the detector stays on, the planned stop went away and no car: released STOP_AHEAD_RED_HOLD after the plan
+  r, rel = _drive69_red(plan=lambda f: 140 <= f < 300, frames=2000)
+  assert rel and rel[0][1] == scs.STOP_AHEAD_CLEARED and rel[0][2], rel
+  assert abs(rel[0][0] - 300 - scs.STOP_AHEAD_RED_HOLD / scs.DT_CTRL) <= 3, rel
+  assert near(r["final"], 45)
+
+
+def test_the_drivers_gas_still_releases_a_stop_ahead_under_a_red_light():
+  ev = {500: lambda s, c: s.__setitem__("gas", True)}
+  r, rel = _drive69_red(events=ev, frames=900)
+  assert rel and rel[0][1] == "driver on the gas", rel
+  assert rel[0][0] - 500 <= scs.GAS_RELEASE_TIME / scs.DT_CTRL + 3
+
+
+def test_after_a_cleared_release_the_stop_starts_again_at_once_when_the_light_and_plan_come_back():
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
+  n = 0
+  while tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=-0.2)):
+    n += 1
+    assert n < 1000
+  assert tr.release_reason == scs.STOP_AHEAD_CLEARED and tr.rearm_on_red and not tr.latched
+  assert not tr.hold_restore                     # the restore is not held back as "a stop planned ahead"
+  back = None
+  for k in range(250):
+    if tr.update(_latched_inputs(lead_status=False)):
+      back = k
+      break
+  # the latch (LATCH_DEBOUNCE) and the start: no WARN_REARM wait (3 s)
+  assert back is not None and back <= scs.LATCH_DEBOUNCE / scs.DT_CTRL + 5, back
+  assert tr.kind == scs.STOP_AHEAD and tr.floor_mode
+  # not after the driver's own release (brake): the WARN_REARM wait stays
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
+  tr.update(_latched_inputs(lead_status=False, brake_pressed=True))
+  assert not tr.active and not tr.rearm_on_red
+  for _ in range(250):
+    assert not tr.update(_latched_inputs(lead_status=False))
+
+
+def test_restore_now_waits_while_a_stop_is_still_planned_ahead():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.anchor, lg.last_set_speed = 45 * MPH, 35 * MPH
+  base = dict(enabled=True, cruise_enabled=True, set_speed=35 * MPH, v_ego=35 * MPH, gas_pressed=False, brake_pressed=False,
+              standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0, other_button_active=False)
+  lg.update(cs.SlowdownInputs(**base, stop_restore_now=True, hold_restore=True))
+  assert not lg.restore_pending
+  lg.update(cs.SlowdownInputs(**base, stop_restore_now=True))
+  assert lg.restore_pending
