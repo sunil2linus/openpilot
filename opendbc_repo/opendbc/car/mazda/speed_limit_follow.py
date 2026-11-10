@@ -221,6 +221,11 @@ MERGE_WATCH_TIME = 60.0      # s
 # began, raises the driver's speed to it (as a first limit: steady 5 s with GPS trust 0, cruise on since it appeared,
 # off the link). Open from the link's start until EXIT_TIME after the car got onto the street.
 EXIT_TIME = 60.0             # s
+# ... (drive 69 t 684-694: off the exit at 27 the street's 45 came 4.6 s after the turn onto it and was taken 5 s later,
+# while he pressed SET+ himself) on the street after an exit (not a turn) the limit is steady after this, and raised at
+# once then; with no limit reported at all, once the street has been matched this long with GPS trust 0 and cruise on,
+# his speed is raised to STREET_FALLBACK (only from below it; a limit reported later is rule 6 / 4 / 9 from there)
+EXIT_STEADY_TIME = 2.0       # s
 # Rule 7, after a turn onto another road: mapdOut's road name (not empty) changed and stayed this long ...
 TURN_NAME_STEADY = 2.0       # s
 TURN_EARLY = 2.0             # s: a limit whose first frame came this long before the name changed is the new road's
@@ -430,6 +435,8 @@ class SpeedLimitFollower:
     self.turned_frame = -1_000_000  # the last frame the heading watch said "turned"
     self.nav = None                # navigation's limit (steps, None: none usable) this frame
     self.stable_before = None      # the steady limit before the current one
+    self.exit_fb_frames = 0        # rule 6's fallback: frames on the exit's street with no limit, trust 0, cruise on
+    self.exit_fb_done = False      # ... offered once per exit
 
   def _steps(self, v):
     return v / self.step
@@ -518,6 +525,7 @@ class SpeedLimitFollower:
       self._new_limit(i, d)
     if self.rise is not None:
       self._steady_rise(i, d)
+    self._exit_fallback(i, d, reported)
     if (self.exit_start is not None and reported is not None and reported == self.stable and
         (self.turn_check or self.exit_retry == reported) and self.rise is None and
         not self._plausible(None, reported, i.source, i.gps_trust)):
@@ -559,6 +567,7 @@ class SpeedLimitFollower:
           self.frame, self.road, False, False, None)
         if self.road in HIGHWAY_CLASSES:
           self.exit_start, self.exit_street, self.exit_kind, self.exit_retry = self.frame, None, "exit", None
+          self.exit_fb_frames, self.exit_fb_done = 0, False
       self.road, self.road_since = c, self.frame
     if c in LINK_CLASSES:
       self.link_last = self.frame
@@ -586,7 +595,32 @@ class SpeedLimitFollower:
     c, st = self.candidate, self.stable
     if st is not None and c is not None and self.exit_start is None and st < c and self._rise_time(st, c) < LIMIT_STABLE_TIME:
       return LIMIT_RISE_QUICK_TIME
+    if self._exit_street_now():
+      return EXIT_STEADY_TIME
     return LIMIT_STABLE_TIME
+
+  def _exit_street_now(self):
+    """On the street after an exit from a highway (rule 6, not a turn's window): EXIT_STEADY_TIME."""
+    return (self.exit_start is not None and self.exit_kind == "exit" and self.exit_street is not None and
+            self._street())
+
+  def _exit_fallback(self, i, d, reported):
+    """Rule 6 with no limit known (EXIT_STEADY_TIME): his speed, below STREET_FALLBACK and his since the exit began
+    (no SET of his, cruise on since the street), raised to it once."""
+    ok = (self._exit_street_now() and reported is None and i.gps_trust <= LIMIT_FIRM_TRUST_MAX and d is not None and
+          self.cruise_off_frame < self.exit_street)
+    self.exit_fb_frames = self.exit_fb_frames + 1 if ok else 0
+    if (self.exit_fb_done or self.exit_fb_frames < _frames(EXIT_STEADY_TIME) or
+        self.frame - self.road_since < _frames(EXIT_STEADY_TIME) or self.rise is not None or self.offer is not None):
+      return
+    self.exit_fb_done = True
+    if d >= self.fallback - 0.5:
+      return                           # (at or above it: his)
+    if self.driver_set_frame >= self.exit_start:
+      self._not_followed(None, self.fallback, "fallback", f"after the exit: the driver set his speed ({round(d)}) himself")
+      return
+    self.offer = Offer(None, self.fallback, "fallback", self.frame, "exit", d, tgt=self.fallback)
+    self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
 
   def _turn(self, i):
     """Rule 7: mapdOut's road name changed (not empty) and stayed TURN_NAME_STEADY on a street: rule 6's window opens
@@ -1040,6 +1074,8 @@ class SpeedLimitFollower:
     GPS trust 0 on every frame of it, else LIMIT_RAISE_STABLE_TIME."""
     quick = (old not in (None, "exit") and 0 < new - old <= self.big_raise and self.candidate_trust <= LIMIT_FIRM_TRUST_MAX and
              self.frame - self.undo_frame > _frames(LIMIT_QUICK_AFTER_UNDO))
+    if old == "exit" and self.exit_kind == "exit" and self.exit_street is not None:
+      return EXIT_STEADY_TIME          # (the street after an exit; GPS trust 0 on every frame of it: _exit_raise)
     return LIMIT_RISE_QUICK_TIME if quick else LIMIT_RAISE_STABLE_TIME
 
   def _first_limit(self, new, start, d, i):

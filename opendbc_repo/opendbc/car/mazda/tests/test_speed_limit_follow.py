@@ -1091,7 +1091,7 @@ def test_drive_53_tag_457_after_an_exit_the_streets_limit_is_his_speed():
   r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap,
             undo=c.undo, ceiling=c.ceiling, setup=lambda lg: c.setup(lg, 75))
   assert c.raises and c.kinds == ["exit"] and abs(c.raises[0][1] - 50) < 1e-6, (c.raises, _reasons(c))
-  assert c.raises[0][0] >= ex.limit + slf.LIMIT_RAISE_STABLE_TIME * 100
+  assert c.raises[0][0] >= ex.limit + slf.EXIT_STEADY_TIME * 100      # (drive 69: 2 s on the street after an exit)
   assert abs(r["final"] - 50) < 0.01 and r["max"] <= 50 + 1e-6
   # the restore still pending (no street rule: his 75 kept): it stops at the street's 50, never 75 on the street
   car = _car53(19, 19)
@@ -1152,8 +1152,9 @@ def test_after_an_exit_a_wrong_first_limit_is_taken_back_by_the_streets_lower_on
 
 def test_after_an_exit_the_offer_ends_with_cruise_off():
   # review: a rule 6 offer survived cruise off and was taken 0.3 s after RES; cruise must stay on from when the limit
-  # appeared until it is taken (his brake held the offer at 3650, cancel at 3750, RES at 3950)
-  r, c = _exit_wrong_first(50, 50, 6, extra={3650: _brake_held, 3750: _cruise_off, 3950: _resume_now})
+  # appeared until it is taken (his brake held the offer at 3350, cancel at 3450, RES at 3650; offered at 3400, the
+  # street's limit steady EXIT_STEADY_TIME)
+  r, c = _exit_wrong_first(50, 50, 6, extra={3350: _brake_held, 3450: _cruise_off, 3650: _resume_now})
   assert any("after the exit: cruise off" in x for x in _reasons(c)), _reasons(c)
   # (rule 8, owner after drives 54 / 55: his RES on the known 50 street matches its limit: a "match", not rule 6's)
   assert c.kinds == ["match"] and abs(r["final"] - 50) < 0.01, (c.kinds, r["final"])
@@ -1363,3 +1364,45 @@ def test_rule_7_a_first_known_limit_on_the_new_road_raises_him_never_slows_him()
   # his speed above the new road's: never a SET- (a cap of a pending restore only)
   f, outs = _turned(0, 50, 35, 50)
   assert all(x == 0.0 for x in outs) and f.undo is None
+
+
+def _exit69(limit_at=None, street_mph=45, set_mph=27, trust=lambda f: 0, extra=None, street_mode=1):
+  """Drive 69 t 658-700: the highway (70), its exit (class 2) until 3000, then a street (class 0 for 1 s, then 7) with the
+  set speed adopted at 27 off the ramp; the street's 45 comes at `limit_at` (None: never). Street Speed +3."""
+  ex = _Exit(link=1000, street=3000, limit=limit_at if limit_at is not None else 10 ** 9, street_mph=street_mph)
+  car = _car53(set_mph, set_mph)
+  c = Coupled(car, ex.slc, road=ex.road, trust=trust, street_mode=street_mode)
+
+  # (the set speed already his: the ramp's slowdown adopted, map_curve_control's street rule)
+  r = T.run(car, NO_CURVE, 7000, events=c.events(extra), limit=c.limit, cap=c.cap, undo=c.undo, ceiling=c.ceiling,
+            setup=lambda lg: c.setup(lg))
+  return r, c
+
+
+def test_drive_69_after_an_exit_the_streets_limit_is_raised_to_2_s_after_it_is_steady():
+  # the street's 45 came 4.6 s after the turn onto it and was taken 5 s later (693.3), the driver pressed SET+ himself
+  r, c = _exit69(limit_at=3560)
+  ex = [(f, v) for (f, v), k in zip(c.raises, c.kinds, strict=True) if k == "exit"]
+  assert ex and abs(ex[-1][1] - 48) < 1e-6, (c.raises, c.kinds, _reasons(c))
+  assert ex[-1][0] <= 3560 + slf.EXIT_STEADY_TIME * 100 + 20, ex
+  assert abs(r["final"] - 48) < 0.01
+
+
+def test_drive_69_after_an_exit_with_no_limit_the_street_fallback_after_2_s():
+  r, c = _exit69()
+  assert c.kinds == ["exit"] and abs(c.raises[0][1] - slf.STREET_FALLBACK[0]) < 1e-6, (c.raises, _reasons(c))
+  assert c.raises[0][0] <= 3100 + slf.EXIT_STEADY_TIME * 100 + 20, c.raises      # (class 7 from 3100)
+  assert abs(r["final"] - 43) < 0.01 and r["max"] <= 43 + 1e-6
+  # a limit that comes after it: rule 6 from there (43 -> 48)
+  r, c = _exit69(limit_at=3600)
+  assert abs(r["final"] - 48) < 0.01, (c.raises, c.kinds, r["final"])
+  # never from above it, never with GPS trust above 0, never after his own SET since the exit began
+  r, c = _exit69(set_mph=45)
+  assert c.raises == [] and abs(r["final"] - 45) < 0.01
+  r, c = _exit69(trust=lambda f: 1)
+  assert c.raises == []
+  r, c = _exit69(extra={2500: lambda s, cr: cr.press(cs.SET_MINUS, who="driver")})
+  assert c.raises == [] and any("set his speed" in x for x in _reasons(c)), (c.raises, _reasons(c))
+  # metric: 70 km/h
+  f = slf.SpeedLimitFollower(True)
+  assert f.fallback == 70
