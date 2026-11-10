@@ -1363,3 +1363,30 @@ def test_rule_7_a_first_known_limit_on_the_new_road_raises_him_never_slows_him()
   # his speed above the new road's: never a SET- (a cap of a pending restore only)
   f, outs = _turned(0, 50, 35, 50)
   assert all(x == 0.0 for x in outs) and f.undo is None
+
+
+def test_a_rise_refused_only_for_the_gps_trust_is_tried_again_once_trust_is_0():
+  # rule 1, a 15 mph rise (45 -> 60) with trust 2 as it became steady: refused, then raised once the trust has been 0 for
+  # LIMIT_RAISE_STABLE_TIME (the limit still reported, his speed still in the band)
+  f = _settled(45)
+  out = _feed(f, RAISE + 10, 60, gps_trust=2)
+  assert out[-1] == 0.0 and "GPS trust 2" in f.events[-1][1]["reason"] and f.rise_retry == (45, 60)
+  out = _feed(f, RAISE - 5, 60)
+  assert all(x == 0.0 for x in out)
+  out = _feed(f, 20, 60)
+  assert abs(out[-1] / MPH - 60) < 1e-6 and f.rise_retry is None
+  # cruise off when the trust is back: decided when it is on again (his speed then)
+  f = _settled(45)
+  _feed(f, RAISE + 10, 60, gps_trust=2)
+  _feed(f, RAISE + 10, 60, cruise=False)
+  assert abs(_feed(f, 5, 60)[-1] / MPH - 60) < 1e-6
+  # another limit meanwhile: the retry goes (decided on its own)
+  f = _settled(45)
+  _feed(f, RAISE + 10, 60, gps_trust=2)
+  _feed(f, 3, 55, gps_trust=2)
+  assert f.rise_retry is None
+  # his speed out of the band by then: not followed
+  f = _settled(45)
+  _feed(f, RAISE + 10, 60, gps_trust=2)
+  out = _feed(f, RAISE + 10, 60, driver_mph=52)
+  assert out[-1] == 0.0 and "retry: driver's speed" in f.events[-1][1]["reason"]

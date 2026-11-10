@@ -569,3 +569,33 @@ def test_drive_66_a_lower_limit_is_counted_with_cruise_on_and_longer_after_a_tur
   f.update(slf.LimitInputs(25 * MPH, "Map Data", 0, 0.0, False, road_class=7, road_name="A"))
   assert f.cruise_frames == 0
   assert slf.LOWER_NEW_ROAD_STEADY >= 2 * slf.LOWER_STEADY
+
+
+def _drive69_t866(**kw):
+  """Drive 69, t 860-920 (frame 0 = t 860): a 45 street, a 4 s "35" from mapd's next limit at the junction (t 866-870),
+  then the road's 50 (t 871) with GPS trust 2 for 5 s (t 874-879), 0 after; his own speed 41; he braked behind a car the
+  radar did not see (cruise off t 883.7, stopped), RES at a standstill at t 890.5, moving again at t 900 (t 903.7 on the
+  drive; the simulated cruise pulls away slower than the car did, and the match must be taken within LIMIT_OFFER_TIME)."""
+  limit = lambda f: 45 if f < 600 else (35 if f < 1000 else 50)   # noqa: E731
+  trust = lambda f: 2 if 1400 <= f < 1900 else 0                                        # noqa: E731
+  return street_sim(7000, limit, 41, trust=trust, cruise=lambda f: not (2370 <= f < 3050),
+                    vcap=lambda f: 0.0 if 2370 <= f < 4000 else None, **kw)
+
+
+def test_drive_69_t866_the_match_on_engage_judges_the_recent_gps_trust():
+  # the limit's worst trust ever seen (2, eleven seconds before his RES) kept rule 8 from matching: the restore ended at
+  # his 41 and he set 50 himself. Trust 0 over the last ENGAGE_LIMIT_STEADY now counts: up to 50 + the street offset
+  r = _drive69_t866()
+  want = 50 + (r["f"]._add() * r["f"].step / MPH)
+  assert any("start: cruise on, up" in x for x in _reasons(r)), _reasons(r)
+  assert abs(r["sets"][-1] - want) < 1e-6, (r["sets"][-1], want, _reasons(r))
+  assert not _minus(r, 3050), _minus(r, 3050)[:3]
+  # trust 2 until after the RES: it waits for ENGAGE_LIMIT_STEADY of trust 0 (within ENGAGE_WINDOW), then matches ...
+  r2 = street_sim(5000, lambda f: 50, 41, trust=lambda f: 2 if f < 3000 else 0, cruise=lambda f: f >= 2950,
+                  settled=False)
+  starts = [fr for fr, k, x in r2["logs"] if "start: cruise on, up" in x]
+  assert starts and starts[0] >= 3000 + slf.ENGAGE_LIMIT_STEADY / DT - 2, starts
+  # ... and never while the trust stays low through the window
+  r3 = street_sim(5000, lambda f: 50, 41, trust=lambda f: 2 if f < 4700 else 0, cruise=lambda f: f >= 2950,
+                  settled=False)
+  assert not any("start: cruise on, up" in x for x in _reasons(r3)) and abs(r3["sets"][-1] - 41) < 1e-6

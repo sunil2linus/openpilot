@@ -411,6 +411,7 @@ class SpeedLimitFollower:
     self.driver_set_frame = -10_000  # the last frame the driver was on SET-/SET+
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
+    self.rise_retry = None         # rule 1: (old, new) refused only for the GPS trust: tried again once trust is 0 (steady)
     self.name, self.name_cand, self.name_frames = "", "", 0   # mapdOut's road name: steady, candidate, frames
     self.turn_check = False        # rule 7: the steady limit as the new road's once (the same value as the old road's)
     self.last_next = (0.0, -1.0)   # the next limit (m/s) and its distance (m) when the last offer was made (logs)
@@ -518,6 +519,8 @@ class SpeedLimitFollower:
       self._new_limit(i, d)
     if self.rise is not None:
       self._steady_rise(i, d)
+    if self.rise_retry is not None:
+      self._retry_rise(i, d)
     if (self.exit_start is not None and reported is not None and reported == self.stable and
         (self.turn_check or self.exit_retry == reported) and self.rise is None and
         not self._plausible(None, reported, i.source, i.gps_trust)):
@@ -681,7 +684,10 @@ class SpeedLimitFollower:
       return
     nav = self.nav
     if (reported is not None and reported == self.stable and reported == self.candidate and
-        self.candidate_frames >= _frames(ENGAGE_LIMIT_STEADY) and self.candidate_trust <= LIMIT_FIRM_TRUST_MAX):
+        self.candidate_frames >= _frames(ENGAGE_LIMIT_STEADY) and
+        # GPS trust 0 over the recent ENGAGE_LIMIT_STEADY (drive 69 t 890: trust 2 for 5 s long before his RES kept the
+        # limit's worst-ever trust at 2 and the match never came: back to his 41, not 50 + his offset)
+        (self.candidate_trust <= LIMIT_FIRM_TRUST_MAX or self.trust0_frames >= _frames(ENGAGE_LIMIT_STEADY))):
       lo = hi = reported
       sources = "map"
       if nav is not None:
@@ -1031,6 +1037,30 @@ class SpeedLimitFollower:
       why = f"driver's speed {round(d)} is not the old limit or up to {LIMIT_BAND * self.multiple} above"
     if why:
       self._not_followed(old, new, i.source, why)
+      if why.startswith("GPS trust"):
+        self.rise_retry = (old, new)   # (drive 69 t 875: trust 2 for 5 s as the 50 became steady; 0 from then on)
+    else:
+      self.offer = Offer(old, new, i.source, self.frame, "raise", d, tgt=new + add)
+      self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
+
+  def _retry_rise(self, i, d):
+    """Rule 1 refused only for the GPS trust: the same limit still reported (and steady), it is decided again once the
+    trust has been 0 for LIMIT_RAISE_STABLE_TIME with cruise on (the driver's speed then, as _steady_rise)."""
+    old, new = self.rise_retry
+    if self.candidate != new or self.stable != new or self.rise is not None:
+      self.rise_retry = None           # (another limit since: decided on its own)
+      return
+    if d is None or self.trust0_frames < _frames(LIMIT_RAISE_STABLE_TIME):
+      return                           # (cruise off: wait for it; the trust not steady yet)
+    self.rise_retry = None
+    add = self._add()
+    if abs(d - new - add) < 0.5 or d > new + add:
+      return                           # already there (or above)
+    why = self._plausible(old, new, i.source, 0, firm=new - old > self.big_raise)
+    if not why and not self._in_band(d, old):
+      why = f"driver's speed {round(d)} is not the old limit or up to {LIMIT_BAND * self.multiple} above"
+    if why:
+      self._not_followed(old, new, i.source, "retry: " + why)
     else:
       self.offer = Offer(old, new, i.source, self.frame, "raise", d, tgt=new + add)
       self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
