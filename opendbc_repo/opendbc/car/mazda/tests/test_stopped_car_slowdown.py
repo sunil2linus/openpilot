@@ -2968,10 +2968,18 @@ def test_drive_69_t1193_a_flickering_plan_before_the_warning_under_a_red_light_i
 
 
 def test_a_false_red_light_holds_the_stop_ahead_at_most_stop_ahead_red_hold():
-  # the detector stays on, the planned stop went away and no car: released STOP_AHEAD_RED_HOLD after the plan
-  r, rel = _drive69_red(plan=lambda f: 140 <= f < 300, frames=2000)
-  assert rel and rel[0][1] == scs.STOP_AHEAD_CLEARED and rel[0][2], rel
+  # the detector stays on, the planned stop went away and no car: released STOP_AHEAD_RED_HOLD after the plan, but with
+  # the light still on the lowered set speed stays (second review: no restore toward the light) until it goes off ...
+  r, rel = _drive69_red(plan=lambda f: 140 <= f < 300, red=lambda f: f < 1300, frames=2200)
+  assert rel and rel[0][1] == scs.STOP_AHEAD_CLEARED, rel
   assert abs(rel[0][0] - 300 - scs.STOP_AHEAD_RED_HOLD / scs.DT_CTRL) <= 3, rel
+  plus = _plus_frames(r)
+  assert plus and plus[0] >= 1300 + scs.RED_DROPOUT / scs.DT_CTRL, plus[:2]
+  assert near(r["final"], 45)
+  # ... or, a stuck flag, RED_RELEASE_HOLD_MAX after the release
+  r, rel = _drive69_red(plan=lambda f: 140 <= f < 300, frames=6000)
+  plus = _plus_frames(r)
+  assert plus and plus[0] >= rel[0][0] + scs.RED_RELEASE_HOLD_MAX / scs.DT_CTRL, (rel, plus[:2])
   assert near(r["final"], 45)
 
 
@@ -3105,8 +3113,9 @@ def _starts(r):
 
 def test_a_red_light_for_another_lane_holds_a_stop_ahead_at_most_stop_ahead_red_hold_max():
   # a red arrow while going straight / the cross street's red: the light stays on, the plan blinks (1.5 s on, 1.5 s off):
-  # released STOP_AHEAD_RED_HOLD_MAX after the first dropout under the light (once the plan is then gone for
-  # STOP_AHEAD_GONE_TIME), and every later episode the same; the restart at once is used once per REARM_CHAIN_TIME
+  # released once the plan has been absent STOP_AHEAD_RED_HOLD_MAX in all under the light (here ~16 s, then gone for
+  # STOP_AHEAD_GONE_TIME), and every later episode the same; the restart at once is used once per REARM_CHAIN_TIME. (With
+  # the light on the restore then waits, RED_RELEASE_HOLD_MAX at most: his gas is the way out of a red arrow)
   plan = lambda f: f >= 140 and (f - 140) % 300 < 150       # noqa: E731
   rearms = []
   orig = scs.StoppedCarTrigger.update
@@ -3125,12 +3134,13 @@ def test_a_red_light_for_another_lane_holds_a_stop_ahead_at_most_stop_ahead_red_
   cleared = [x for x in rel if x[1] == scs.STOP_AHEAD_CLEARED]
   assert cleared, rel
   first_drop = 290
-  assert first_drop + scs.STOP_AHEAD_RED_HOLD_MAX / scs.DT_CTRL <= cleared[0][0] <= \
-    first_drop + (scs.STOP_AHEAD_RED_HOLD_MAX + 3.0) / scs.DT_CTRL + 3, cleared
+  limit = 2 * scs.STOP_AHEAD_RED_HOLD_MAX + 3.0     # (the plan off half the time)
+  assert first_drop + 2 * scs.STOP_AHEAD_RED_HOLD_MAX / scs.DT_CTRL - 150 <= cleared[0][0] <= \
+    first_drop + limit / scs.DT_CTRL + 3, cleared
   starts = _starts(r)
   for s0 in starts:                               # (before: one episode held to the floor for the whole minute)
     end = next((x[0] for x in rel if x[0] > s0), len(r["kinds"]))
-    assert (end - s0) * T.DT <= 1.5 + scs.STOP_AHEAD_RED_HOLD_MAX + 3.0 or end == len(r["kinds"]), (s0, end, rel)
+    assert (end - s0) * T.DT <= 1.5 + limit or end == len(r["kinds"]), (s0, end, rel)
   assert all(b - a > scs.REARM_CHAIN_TIME / scs.DT_CTRL for a, b in zip(rearms, rearms[1:], strict=False)), rearms
 
 
@@ -3177,3 +3187,33 @@ def test_the_restart_at_once_happens_once_per_release_chain():
   tr3.rearm_used_frame -= int(scs.REARM_CHAIN_TIME / scs.DT_CTRL) + 1
   release(tr3)
   assert tr3.rearm_on_red and back(tr3) is not None
+
+
+def test_second_review_a_real_red_light_with_plan_blinks_is_not_released_and_never_restored_toward_it():
+  # the reviewer's probe: the light on throughout, the plan blinking off 0.4 s early and again 1.2 s (or 0.6 s) eight /
+  # nine seconds later; the 8 s cap counted from the first blink released it at the second, with a SET+ hold toward
+  # the light. The cap counts plan-absent time: no release, no SET+, the set speed stays at the floor
+  for plan in (lambda f: f >= 140 and not (340 <= f < 380) and not (1140 <= f < 1260),
+               lambda f: f >= 140 and not (340 <= f < 380) and not (1240 <= f < 1300)):
+    r, rel = _drive69_red(plan=plan, frames=2200)
+    assert not rel and not _plus_frames(r), (rel, _plus_frames(r)[:2])
+    assert r["final"] <= 20
+  # the plan gone for good near the line with the light still on (the camera losing it at 20-30 mph): released after
+  # STOP_AHEAD_RED_HOLD, but the set speed never goes up while the light is on
+  r, rel = _drive69_red(plan=lambda f: 140 <= f < 600, frames=2200)
+  assert rel and rel[0][1] == scs.STOP_AHEAD_CLEARED and not r["trigger"].restore_now, rel
+  assert not _plus_frames(r) and r["max"] <= 45 + 1e-6 and r["final"] <= 20
+  assert r["trigger"].hold_restore                       # (no SET+: the controller's restore waits)
+
+
+def test_after_a_release_under_a_red_light_his_gas_or_the_models_go_lets_the_restore_come():
+  ev = {1500: lambda s, c: s.__setitem__("gas", True), 1520: lambda s, c: s.__setitem__("gas", False)}
+  r, rel = _drive69_red(plan=lambda f: 140 <= f < 600, frames=2600, events=ev)
+  assert rel and _plus_frames(r) and _plus_frames(r)[0] >= 1500, _plus_frames(r)[:2]
+  car = Car(45, dash_offset_mph=0.0, accel=0.6, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0, min_set_mph=CAR_MIN_MPH,
+            lag=12)
+  model = lambda f: -0.6 if 140 <= f < 600 else (0.5 if f >= 1500 else -0.2)   # noqa: E731
+  r2, rel2 = _releases(lambda: run(car, NO_CURVE, 2600, lead=_NoCar(200), max_drop=10, red=lambda f: True,
+                                   plan=lambda f: 140 <= f < 600, model=model))
+  plus = _plus_frames(r2)
+  assert rel2 and plus and 1500 + scs.GO_TIME / scs.DT_CTRL <= plus[0] <= 2000, (rel2, plus[:2])

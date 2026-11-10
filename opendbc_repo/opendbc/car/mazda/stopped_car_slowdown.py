@@ -377,6 +377,15 @@ REARM_ON_RED_TIME = 10.0     # s
 # The restart at once happens once per release chain: not again until he braked / we stopped / the gas, or
 # REARM_CHAIN_TIME after it (a gappy detector would cycle down / up / down).
 STOP_AHEAD_RED_HOLD_MAX = 8.0   # s
+# (second review) ... counted as time WITH THE PLAN ABSENT under the light, summed over the episode: a real red light
+# approached for 10+ s with short plan blinks (0.4 s, then 1.2 s eight seconds later) is never near it, while a red arrow
+# for another lane (the plan off about half the time) reaches it in ~16 s. A gap of STOP_AHEAD_RED_HOLD continuous
+# seconds still ends it sooner.
+# A stop ahead released while the light is still on (by those limits) does not restore at once: the lowered set speed is
+# kept (hold_restore, no SET+) until the light has been off RED_DROPOUT, the driver's gas, or the model says go (GO_TIME),
+# at most RED_RELEASE_HOLD_MAX after the release (a stuck redLight flag). Real red light, the camera losing the planned
+# stop near the line at 20-30 mph: no release for 6 s of no plan, and after it the set speed stays where it is, never up.
+RED_RELEASE_HOLD_MAX = 20.0  # s
 REARM_CHAIN_TIME = 30.0      # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
 WARN_GUARD_PLAN_HOLD = 4.0   # s
@@ -593,7 +602,9 @@ class StoppedCarTrigger:
     self.rearm_on_red = False        # released as a stop ahead cleared / gone: a red light and the planned stop restart it
     self.release_frame = -10_000     # (REARM_ON_RED_TIME)
     self.rearm_used_frame = None     # the restart at once was used (once per release chain, REARM_CHAIN_TIME)
-    self.red_hold_since = None       # first planned-stop dropout under the light this episode (STOP_AHEAD_RED_HOLD_MAX)
+    self.red_absent_frames = 0       # frames with the plan absent under the light this episode (STOP_AHEAD_RED_HOLD_MAX)
+    self.red_release_frame = None    # a stop ahead released with the light still on: no restore yet (RED_RELEASE_HOLD_MAX)
+    self.go_free_frames = 0          # the model says go (as go_frames), counted while not active
     self.rolling_frames = 0          # frames since we were last stopped (RED_AFTER_STOP) ...
     self.red_onset_rolling = 0       # ... when the light last came on
     self.red_base = 0.0              # the head start's reference speed (max(ours, set), or ours: CATCH_UP_*) and its cap
@@ -916,12 +927,11 @@ class StoppedCarTrigger:
       # the light still on (STOP_AHEAD_RED_HOLD): no release as cleared / gone before the warning
       red_on = self.red_gap < _frames(RED_DROPOUT)
       if not red_on:
-        self.red_hold_since = None
-      elif not i.plan_stop and self.red_hold_since is None:
-        self.red_hold_since = self.frame
+        self.red_absent_frames = 0
+      elif not i.plan_stop:
+        self.red_absent_frames += 1
       red_holds = (red_on and self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD) and
-                   (self.red_hold_since is None or self.frame - self.red_hold_since < _frames(STOP_AHEAD_RED_HOLD_MAX)) and
-                   self.go_frames < _frames(GO_TIME))
+                   self.red_absent_frames < _frames(STOP_AHEAD_RED_HOLD_MAX) and self.go_frames < _frames(GO_TIME))
       still_planned = self._warn_still_planned(i) if self.warn_pending else True
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
@@ -1071,7 +1081,18 @@ class StoppedCarTrigger:
     self.radar_hold = self.active and handles
     if self.radar_hold:
       self.target, self.urgent = 100.0, False    # the MRCC handles the car ahead: no SET- (and no SET+ while active)
-    self.hold_restore = EARLY_START_ENABLED and self.latched and not self.active
+    # a stop ahead released with the light still on: no restore until it has gone, his gas, the model's go or the limit
+    going_free = i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop
+    self.go_free_frames = self.go_free_frames + 1 if (going_free and not self.active) else 0
+    if self.red_release_frame is not None and (
+        self.active or self.red_gap >= _frames(RED_DROPOUT) or i.gas_pressed or
+        self.go_free_frames >= _frames(GO_TIME) or self.frame - self.red_release_frame > _frames(RED_RELEASE_HOLD_MAX)):
+      # the light gone or the model's go: the restore at once (as the release would have); his gas: his; the limit: the
+      # normal (gentle) restore
+      self.restore_now = self.restore_now or (not self.active and (self.red_gap >= _frames(RED_DROPOUT) or
+                                                                 self.go_free_frames >= _frames(GO_TIME)))
+      self.red_release_frame = None
+    self.hold_restore = EARLY_START_ENABLED and (self.latched or self.red_release_frame is not None) and not self.active
     self.clear_ahead = bool(not self.active and self.clear_release and not self._slower_car_ahead(i))
     seen = i.lead_alive and i.lead_status and i.lead_prob >= CLEAR_MIN_PROB and abs(self._y_path(i)) <= CLEAR_LATERAL
     pull = not self.active and (not seen or self.lead_v_f >= i.v_ego + PULL_AWAY or self._pulling_away_accel(i))
@@ -1085,7 +1106,8 @@ class StoppedCarTrigger:
     took_over = self.active and self.kind in TAP_KINDS
     from_red = took_over and self.kind == RED_LIGHT
     self.rearm_on_red = False
-    self.red_hold_since = None
+    self.red_absent_frames = 0
+    self.red_release_frame = None
     self.catch_up = False                      # (a tap episode's first drop: the new kind's own target from here)
     self.caught_up = self.caught_up and took_over
     self.active = True
@@ -1278,6 +1300,9 @@ class StoppedCarTrigger:
     return self.warn_plan_gap <= _frames(WARN_DROPOUT)
 
   def _release(self, reason, restore_now=True):
+    if reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.red_gap < _frames(RED_DROPOUT):
+      restore_now = False              # (RED_RELEASE_HOLD_MAX) the light still on: the lowered set speed stays for now
+      self.red_release_frame = self.frame
     self.active = False
     self.hold_frames = 0
     self.moving_frames = 0
