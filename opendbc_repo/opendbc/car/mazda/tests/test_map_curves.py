@@ -2484,3 +2484,70 @@ def test_ramp_curves_are_planned_at_the_ramp_lateral_limit():
   assert abs(v(MC.ramp_radius(loop)) - math.sqrt(MC.RAMP_LAT * 68.0) / MPH) < 1e-6
   assert 29.5 <= v(MC.ramp_radius(loop)) <= 30.5 and abs(v(MC.ramp_radius(road)) - 27.4) < 0.1
   assert MC.RAMP_LAT <= 2.7
+
+
+def _loop_69(hold_s=None):
+  """Drive 69, t 510-560: the on-ramp loop (map 71 m, published 84 m at the ramp lateral limit) entered from a primary
+  road (class 5) with his right signal on (no camera curve). At the loop's entry GPS trust fell to 2 and the planner held
+  another curve (status 5, 212 m) for ~2 s, then matched the loop again with the ramp flag."""
+  entry = 200.0
+
+  def fields(x):
+    if x < entry - 10:
+      return F(status=2, radius=84.0, distance=entry - x, road_class=5, onramp_ahead=True)
+    if x < entry + 15:
+      return F(status=5, radius=212.0, distance=max(entry + 15 - x, 0.0), road_class=5, gps_trust=2)
+    return F(status=2, radius=84.0, distance=0.0, road_class=2, on_ramp=True, ramp_type=2, ramp_to_highway=True,
+             ramp_end_distance=max(entry + 400 - x, 1.0))
+  old = CTL.RAMP_STATUS_HOLD
+  try:
+    if hold_s is not None:
+      CTL.RAMP_STATUS_HOLD = hold_s
+    return drive_53(fields, 2500, 50, v_mph=40), entry
+  finally:
+    CTL.RAMP_STATUS_HOLD = old
+
+
+def test_drive_69_a_ramp_curve_lost_to_a_held_status_at_the_loop_entry_never_raises_the_set_speed():
+  # drive 69 t 529: GPS trust 2 at the loop's entry, the loop's curve became a held one (status 5) and the restore held
+  # SET+ 31 -> 35 where the car was at ~3.4 m/s^2. The ramp curve's last command is kept (RAMP_STATUS_HOLD)
+  r, entry = _loop_69()
+  assert not _plus_between(r, entry - 10, entry + 40), _plus_between(r, entry - 10, entry + 40)
+  held = [s for s, xx in zip(r["sets"], r["xs"], strict=True) if entry - 10 <= xx < entry + 15]
+  assert max(held) <= min(held) + 1.5, (min(held), max(held))     # neither up nor further down
+  assert max(held) <= math.sqrt(2.2 * 84.0) / MPH + 1.5
+  # without the hold (the old behaviour) the same scene restores inside the loop's entry
+  r0, _ = _loop_69(hold_s=0.0)
+  assert _plus_between(r0, entry - 10, entry + 40), "the scene exercises the restore"
+
+
+def test_a_ramp_curves_hold_ends_when_the_curve_ends_or_off_the_link():
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(on_ramp=True, ramp_type=2, ramp_to_highway=True, ramp_end_distance=400.0, road_class=2)
+  for _ in range(HOLD + 50):
+    out = c.update(F(status=2, radius=84.0, distance=0.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert out.active and out.track
+  out = c.update(F(status=5, radius=212.0, distance=10.0, **ramp), 50 * MPH, 0, v_ego=14.0, set_speed=31 * MPH)
+  assert out.active and out.why == "ramp hold" and not out.settled and abs(out.speed - 31 * MPH) < 1e-6
+  # a real end of the curve (status 0) lets go at once
+  out = c.update(F(**ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active
+  out = c.update(F(status=4, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active                                              # (forgotten)
+  # near the end of a ramp onto a highway (RAMP_STATUS_HWY_RELEASE) status 4 / 5 does not hold it
+  for _ in range(5):
+    c.update(F(status=2, radius=84.0, distance=0.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  ramp["ramp_end_distance"] = 100.0
+  out = c.update(F(status=5, radius=212.0, distance=10.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active
+  # off a link the hold lasts RAMP_STATUS_HOLD after the ramp curve last governed
+  c = CTL.MapCurveControl(3.0)
+  for _ in range(HOLD + 50):
+    c.update(F(status=2, radius=84.0, distance=50.0, road_class=5, onramp_ahead=True), 50 * MPH, 0, v_ego=14.0)
+  n = 0
+  while c.update(F(status=5, radius=212.0, distance=10.0, road_class=5), 50 * MPH, 0, v_ego=14.0).active:
+    assert c.onramp_now                                            # (an on-ramp's curve: no camera-only stops)
+    n += 1
+    assert n < 1000
+  assert not c.onramp_now
+  assert abs(n - CTL.RAMP_STATUS_HOLD / CTL.DT_CTRL) <= 2, n

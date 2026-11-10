@@ -437,3 +437,33 @@ def test_no_red_light_on_a_ramp_onto_a_highway(tmp_path, monkeypatch):
   plan.mapRampToHighway = False                      # an exit ramp to a street (a light at its end): as before
   _drive(c, 2, set_mph=30, v_mph=28)
   assert seen[-1].red_light
+
+
+def test_no_red_light_on_a_highways_link_entered_from_a_street_but_kept_on_an_exit(tmp_path, monkeypatch):
+  # drive 69 t 530: a "red light" in the on-ramp loop's entry before the ramp flag (MapCurveControl.onramp_now). An
+  # exit's link (entered from a highway) keeps them: it may end at a street's light, which he stops at
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 5                              # a street
+  _drive(c, 20, set_mph=30, v_mph=28)
+  plan.redLight = True
+  plan.mapRoadClass = 2                              # its motorway link (the ramp flag not on yet)
+  _drive(c, 3, set_mph=30, v_mph=28)
+  assert c.map_control.onramp_now and not seen[-1].red_light and not seen[-1].plan_stop
+  # an exit: from the highway onto its link, a light at the link's end
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 1
+  _drive(c, 20, set_mph=40, v_mph=38)
+  plan.redLight = True
+  plan.mapRoadClass, plan.mapOnRamp, plan.mapRampType = 2, True, 1
+  _drive(c, 3, set_mph=40, v_mph=38)
+  assert not c.map_control.onramp_now and seen[-1].red_light

@@ -1680,6 +1680,12 @@ class CurveSlowdown:
       # set speed 27 -> 22 for 20 s; no lights there)
       if self._alive('starpilotPlan') and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False):
         red_ok = False
+      # ... nor while the map control knows it is on (or just before) one: a highway's link entered from a street, an
+      # on-ramp's curve before the turn onto it, its ramp curve kept through a held status (drive 69 t 530: a "red
+      # light" in the loop's entry, matched as a primary road for a second; MapCurveControl.onramp_now). An exit's link
+      # (entered from a highway) keeps them: it may end at a street's light
+      if self.map_control is not None and self.map_control.onramp_now:
+        red_ok = False
     except Exception:
       red_ok = True
     if not red_ok:

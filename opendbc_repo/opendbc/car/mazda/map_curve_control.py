@@ -121,6 +121,14 @@ EXIT_STREET_DONE = 0.6 * MPH    # m/s: the set speed this close to the target: i
 ADOPT_LANDED_FRAMES = 2         # the street speed reached: adopted this frame and the next (_street_end)
 HWY_RESET = 1.0                 # s matched to a highway: the exit sequence starts over
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
+STATUS_PAUSED, STATUS_HELD = 4, 5   # the planner's: GPS not trusted / a curve found but the road match not trusted
+# A ramp curve lost to status 4 / 5 (drive 69 t 529: in the on-ramp loop's entry GPS trust fell to 2, the loop's 30 mph
+# curve became a held 212 m one, and with the camera curve off for his signal the restore held SET+ 31 -> 35 where the
+# car was at ~3.4 m/s^2): while on a link, or for RAMP_STATUS_HOLD after a ramp curve last governed, status 4 / 5 keeps
+# the ramp curve's last command (no SET+ above it; nothing lower than the set speed it found either). A ramp onto a
+# highway lets go of it RAMP_STATUS_HWY_RELEASE before its end, as the planner does (map_curves.RAMP_HWY_RELEASE).
+RAMP_STATUS_HOLD = 3.0           # s
+RAMP_STATUS_HWY_RELEASE = 120.0  # m
 RAMP_EXIT = 1
 HIGHWAY_CLASSES = (1, 3)        # motorway, trunk
 LINK_CLASSES = (2, 4, 6, 8, 10)  # motorway / trunk / primary / secondary / tertiary links (map_curves.LINK_CLASSES)
@@ -641,6 +649,13 @@ class MapCurveControl:
     self.ll_gas_s, self.ll_gas_v0 = 0.0, 0.0
     self.lower_event = None         # "done" / "cancel: ..." when it ended (the wrapper tells the follower)
     self.xs_target = NO_CURVE
+    self.ramp_last_cmd = None       # m/s: the last ramp curve's command (RAMP_STATUS_HOLD)
+    self.ramp_last_curve = NO_CURVE # m/s: ... and that curve's speed
+    self.ramp_last_frames = 0       # updates left in which status 4 / 5 still keeps it (off a link)
+    self.ramp_last_onramp = False   # ... that ramp curve was on (or before) a ramp onto a highway
+    # on (or just before) a ramp onto a highway, as far as known this update: the wrapper keeps camera-only stops (the
+    # stop-light detector, the model's planned stop) out there (CurveSlowdown.update's red_ok)
+    self.onramp_now = False
 
   @property
   def exit_rem(self):
@@ -1055,6 +1070,8 @@ class MapCurveControl:
         self._end("off")
       self.restore_frames = 0
       self.on_street_exit = f.on_ramp and self.on_street_exit
+      self.ramp_last_cmd, self.ramp_last_frames = None, 0
+      self.onramp_now = False
       return out
     out.link = on_link and self.link_hwy
     # only 1 and 2 are curves to act on: 4 (paused, GPS not trusted) and 5 (held, road match not trusted) are "no
@@ -1087,6 +1104,29 @@ class MapCurveControl:
       self.follower.reset()
       self.road_follower.reset()
       low = NO_CURVE
+    ramp_hold = False
+    # a ramp onto a highway: so mapped, an on-ramp's curve before the turn onto it, or a highway's link entered from a
+    # street (not from a highway: an exit's link may end at a street's light, which he stops at)
+    hwy_link = (f.on_ramp and f.ramp_to_highway) or onramp or \
+      (f.road_class in HIGHWAY_LINK_CLASSES and self.road_before not in (0,) + HIGHWAY_CLASSES)
+    if ramp_curve and track:
+      self.ramp_last_cmd, self.ramp_last_curve = speed, out.curve_speed
+      self.ramp_last_frames = int(RAMP_STATUS_HOLD / DT_CTRL)
+      self.ramp_last_onramp = hwy_link
+    elif self.ramp_last_cmd is not None:
+      self.ramp_last_frames = max(self.ramp_last_frames - 1, 0)
+      hwy_end = f.on_ramp and f.ramp_to_highway and 0.0 < f.ramp_end_distance <= RAMP_STATUS_HWY_RELEASE
+      # (also a ramp curve matched again whose ramp is not held yet, RAMP_HOLD: drive 69 t 530.8-531.8)
+      lost = f.status in (STATUS_PAUSED, STATUS_HELD) or (f.status == STATUS_RAMP_CURVE and radius <= 0.0)
+      if not a and lost and (on_link or self.ramp_last_frames > 0) and not hwy_end:
+        # (RAMP_STATUS_HOLD) its last command, or the set speed when that is above it: no raise, no further SET-
+        ramp_hold = True
+        speed = max(self.ramp_last_cmd, set_speed if set_speed is not None else 0.0)
+        why, track, settled, firm = "ramp hold", True, False, False
+        out.curve_speed, low = self.ramp_last_curve, speed
+      elif not lost or not (on_link or self.ramp_last_frames > 0) or hwy_end:
+        self.ramp_last_cmd, self.ramp_last_frames = None, 0   # the curve really ended (or the hold ran out)
+    self.onramp_now = hwy_link or (ramp_hold and self.ramp_last_onramp)
     self._highway_limit(f, on_link)
     cmd, nplan, ncurve, nwhy, nfol, nfirm = self._exit(f, driver_speed, v_ego, on_link, int(signal), gas)
     na = cmd < NO_CURVE
@@ -1132,12 +1172,12 @@ class MapCurveControl:
     if ll < NO_CURVE and ll < speed:
       speed, why, track, settled, firm = ll, "limit", True, ll_raise, ll_firm
       capped, low, street = True, ll, True
-    out.active = a or na or capped
+    out.active = a or na or capped or ramp_hold
     out.speed = speed
     out.track = track
     out.settled = track and settled
     out.firm = firm and track
-    if ramp_curve or na or capped:
+    if ramp_curve or na or capped or ramp_hold:
       # ramps and exits may go past the Max Drop, to the ramp floor; a followed one's undershoot stays as for a road
       # curve (MAP_UNDERSHOOT below the curve's speed, FIRM_UNDERSHOOT when firm), never under the ramp floor
       out.floor = max(RAMP_FLOOR, low) if track else RAMP_FLOOR
