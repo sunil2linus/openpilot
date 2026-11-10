@@ -482,3 +482,44 @@ def test_no_red_light_on_a_highways_link_entered_from_a_street_but_kept_on_an_ex
   plan.mapRoadClass, plan.mapOnRamp, plan.mapRampType = 2, True, 1
   _drive(c, 3, set_mph=40, v_mph=38)
   assert not c.map_control.onramp_now and seen[-1].red_light
+
+
+def test_a_running_stop_episode_keeps_the_red_light_when_the_on_ramp_gate_turns_on(tmp_path, monkeypatch):
+  # review: at a red light, his signal toward an on-ramp turned the camera stops off and released the stop (the set speed
+  # went up toward the light). A stop episode already running keeps seeing them
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 5
+  _drive(c, 20, set_mph=30, v_mph=28)
+  plan.redLight = True
+  plan.mapRoadClass, plan.mapOnRamp, plan.mapRampToHighway = 2, True, True
+  _drive(c, 3, set_mph=30, v_mph=28)
+  assert not seen[-1].red_light                                  # no episode: the gate keeps it out
+  for _ in range(3):
+    c.trigger.active = True                                      # (an episode running, as at the light)
+    _drive(c, 1, set_mph=30, v_mph=28)
+  assert seen[-1].red_light
+
+
+def test_on_a_link_his_signal_does_not_turn_the_camera_curve_off(tmp_path, monkeypatch):
+  # owner (drive 69 t 520-548): right signal through the whole loop, the camera curve off exactly when the GPS dropped
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  got = []
+  orig = c.curve_target.update
+  monkeypatch.setattr(c.curve_target, "update", lambda *a: (got.append(a[3]), orig(*a))[1])
+  state = W.car_state(28, 30)
+  state.out.rightBlinker = True
+  plan.mapRoadClass = 1                                         # a lane change on the highway: as before
+  for _ in range(5):
+    c.update(W.CC, state, None, None, False)
+  assert got[-1] is True
+  plan.mapRoadClass = 2                                         # on a link: the signal does not switch it off
+  for _ in range(100):
+    c.update(W.CC, state, None, None, False)
+  assert got[-1] is False

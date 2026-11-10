@@ -412,8 +412,11 @@ def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before
   # (35 -> 90 is longer than one hold may run, HOLD_MAX_SECONDS: a second one goes on)
   assert 1 <= len(ups) <= 2 and len(downs) == 1, logic.hold_log
   assert abs(downs[0]["bound_mph"] - 75) < 1e-6
-  up = next(f for f, s, v in log if s >= 90 - 0.01)
-  assert up - 400 <= 700, up                               # 35 -> 90 by one hold in ~6.6 s (the car's own hold rate)
+  # one hold up to the boost less the overrun margin (two quanta before the car's holds are measured: 85), then taps;
+  # it never passes the boost (review)
+  up = next(f for f, s, v in log if s >= 85 - 0.01)
+  assert up - 400 <= 650, up
+  assert next(f for f, s, v in log if s >= 95 - 0.01) - 400 <= 1000
   t73 = next(f for f, s, v in log if v >= 73)
   assert all(s >= 75 - 1e-6 for f, s, v in log if f >= t73), "never below the target"
   back = next(f for f, s, v in log if f > t73 and s <= 75 + 1e-6)
@@ -1602,12 +1605,12 @@ def test_drive_69_a_cap_lifts_when_full_clean_passes_measure_a_much_gentler_curv
   mem.add_pass(c, 250.0, t=5000.0, v=37.5 * MC.MPH, flags=["full"])
   assert abs(mem.speed_cap(c) - (cap0 + MC.CAP_JUMP)) < 0.02                          # up 5 mph (was 0.5)
   mem.add_pass(c, 250.0, t=9000.0, v=41.0 * MC.MPH, flags=["full"])
-  assert mem.speed_cap(c) is None                                                      # gone after two such passes
+  assert abs(mem.speed_cap(c) - (cap0 + 2 * MC.CAP_JUMP)) < 0.02                      # (review: up again, never removed)
   # the steering maxed out on a later pass: capped again (saturation stays authoritative), the count starts over
   mem.add_saturated_pass(c, 41.1 * MC.MPH, t=13000.0)
   assert abs(mem.speed_cap(c) - 37.0 * MC.MPH) < 0.02
   mem.add_pass(c, 250.0, t=17000.0, v=37.5 * MC.MPH, flags=["full"])
-  assert mem.speed_cap(c) is not None
+  assert abs(mem.speed_cap(c) - (cap0 + MC.CAP_JUMP)) < 0.02
   # a pass that was not full, or measured a radius near the cap's own: the old CAP_RISE only
   mem2 = MC.CurveMemory(str(tmp_path / "mem2.json"))
   mem2.add_saturated_pass(c, 41.1 * MC.MPH, t=1000.0)
@@ -2695,7 +2698,7 @@ def test_a_ramp_curves_hold_ends_when_the_curve_ends_or_off_the_link():
     c.update(F(status=2, radius=84.0, distance=50.0, road_class=5, onramp_ahead=True), 50 * MPH, 0, v_ego=14.0)
   n = 0
   while c.update(F(status=5, radius=212.0, distance=10.0, road_class=5), 50 * MPH, 0, v_ego=14.0).active:
-    assert c.onramp_now                                            # (an on-ramp's curve: no camera-only stops)
+    assert not c.onramp_now                                        # (review: still on the street, a light is his)
     n += 1
     assert n < 1000
   assert not c.onramp_now

@@ -1372,7 +1372,7 @@ def test_a_rise_refused_only_for_the_gps_trust_is_tried_again_once_trust_is_0():
   # LIMIT_RAISE_STABLE_TIME (the limit still reported, his speed still in the band)
   f = _settled(45)
   out = _feed(f, RAISE + 10, 60, gps_trust=2)
-  assert out[-1] == 0.0 and "GPS trust 2" in f.events[-1][1]["reason"] and f.rise_retry == (45, 60)
+  assert out[-1] == 0.0 and "GPS trust 2" in f.events[-1][1]["reason"] and f.rise_retry[:2] == (45, 60)
   out = _feed(f, RAISE - 5, 60)
   assert all(x == 0.0 for x in out)
   out = _feed(f, 20, 60)
@@ -1419,7 +1419,7 @@ def test_drive_69_after_an_exit_the_streets_limit_is_raised_to_2_s_after_it_is_s
 def test_drive_69_after_an_exit_with_no_limit_the_street_fallback_after_2_s():
   r, c = _exit69()
   assert c.kinds == ["exit"] and abs(c.raises[0][1] - slf.STREET_FALLBACK[0]) < 1e-6, (c.raises, _reasons(c))
-  assert c.raises[0][0] <= 3100 + slf.EXIT_STEADY_TIME * 100 + 20, c.raises      # (class 7 from 3100)
+  assert c.raises[0][0] <= 3100 + slf.EXIT_STREET_MATCH * 100 + 20, c.raises     # (class 7 from 3100; the street 3 s)
   assert abs(r["final"] - 43) < 0.01 and r["max"] <= 43 + 1e-6
   # a limit that comes after it: rule 6 from there (43 -> 48)
   r, c = _exit69(limit_at=3600)

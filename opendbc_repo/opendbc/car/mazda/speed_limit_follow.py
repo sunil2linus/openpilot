@@ -230,6 +230,11 @@ EXIT_TIME = 60.0             # s
 # once then; with no limit reported at all, once the street has been matched this long with GPS trust 0 and cruise on,
 # his speed is raised to STREET_FALLBACK (only from below it; a limit reported later is rule 6 / 4 / 9 from there)
 EXIT_STEADY_TIME = 2.0       # s
+# ... (review: a cross street snapped to at the ramp's end, a queue at its light) neither while a stop / red light
+# reason is on or a red light is seen, nor under EXIT_MIN_SPEED, and only with the street (its road name) matched
+# EXIT_STREET_MATCH without a change
+EXIT_MIN_SPEED = 15 * MS_PER_MPH  # m/s
+EXIT_STREET_MATCH = 3.0      # s
 # Rule 7, after a turn onto another road: mapdOut's road name (not empty) changed and stayed this long ...
 TURN_NAME_STEADY = 2.0       # s
 TURN_EARLY = 2.0             # s: a limit whose first frame came this long before the name changed is the new road's
@@ -341,6 +346,8 @@ class LimitInputs:
   # a restore of the controller's is pending (the set speed under its anchor): driver_speed is not the set speed he
   # chose (rule 9's undo never brings such a speed back above the limit)
   pending: bool = False
+  stop_active: bool = False # a stop reason (stopped car, stop ahead, red light head start) is on (rule 6's raise waits)
+  red_light: bool = False   # the stop-light detector sees a red light (rule 6's raise waits)
 
 
 @dataclass
@@ -421,7 +428,7 @@ class SpeedLimitFollower:
     self.driver_set_frame = -10_000  # the last frame the driver was on SET-/SET+
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
-    self.rise_retry = None         # rule 1: (old, new) refused only for the GPS trust: tried again once trust is 0 (steady)
+    self.rise_retry = None         # rule 1: (old, new, frame) refused only for the GPS trust: tried again once trust is 0
     self.name, self.name_cand, self.name_frames = "", "", 0   # mapdOut's road name: steady, candidate, frames
     self.turn_check = False        # rule 7: the steady limit as the new road's once (the same value as the old road's)
     self.last_next = (0.0, -1.0)   # the next limit (m/s) and its distance (m) when the last offer was made (logs)
@@ -443,6 +450,7 @@ class SpeedLimitFollower:
     self.stable_before = None      # the steady limit before the current one
     self.exit_fb_frames = 0        # rule 6's fallback: frames on the exit's street with no limit, trust 0, cruise on
     self.exit_fb_done = False      # ... offered once per exit
+    self.exit_name, self.exit_name_frames = None, 0   # the exit's street (its road name) and frames matched unchanged
 
   def _steps(self, v):
     return v / self.step
@@ -533,6 +541,12 @@ class SpeedLimitFollower:
       self._steady_rise(i, d)
     if self.rise_retry is not None:
       self._retry_rise(i, d)
+    if self._exit_street_now():
+      n = (i.road_name or "").strip()
+      self.exit_name_frames = self.exit_name_frames + 1 if n == self.exit_name else 0
+      self.exit_name = n
+    else:
+      self.exit_name, self.exit_name_frames = None, 0
     self._exit_fallback(i, d, reported)
     if (self.exit_start is not None and reported is not None and reported == self.stable and
         (self.turn_check or self.exit_retry == reported) and self.rise is None and
@@ -612,6 +626,11 @@ class SpeedLimitFollower:
     return (self.exit_start is not None and self.exit_kind == "exit" and self.exit_street is not None and
             self._street())
 
+  def _exit_ok(self, i):
+    """Rule 6's raises on the exit's street may go now (EXIT_MIN_SPEED, EXIT_STREET_MATCH, no stop / red light)."""
+    return (not i.stop_active and not i.red_light and i.v_ego >= EXIT_MIN_SPEED and
+            self.exit_name_frames >= _frames(EXIT_STREET_MATCH))
+
   def _exit_fallback(self, i, d, reported):
     """Rule 6 with no limit known (EXIT_STEADY_TIME): his speed, below STREET_FALLBACK and his since the exit began
     (no SET of his, cruise on since the street), raised to it once."""
@@ -619,7 +638,8 @@ class SpeedLimitFollower:
           self.cruise_off_frame < self.exit_street)
     self.exit_fb_frames = self.exit_fb_frames + 1 if ok else 0
     if (self.exit_fb_done or self.exit_fb_frames < _frames(EXIT_STEADY_TIME) or
-        self.frame - self.road_since < _frames(EXIT_STEADY_TIME) or self.rise is not None or self.offer is not None):
+        self.frame - self.road_since < _frames(EXIT_STEADY_TIME) or self.rise is not None or self.offer is not None or
+        not self._exit_ok(i)):
       return
     self.exit_fb_done = True
     if d >= self.fallback - 0.5:
@@ -1061,6 +1081,8 @@ class SpeedLimitFollower:
       return                                           # (a short flap restarts the count)
     if old == "exit" and self.road in LINK_CLASSES:
       return                                           # still on the exit (mapd's lookahead): once off it
+    if old == "exit" and self.exit_kind == "exit" and self.exit_street is not None and not self._exit_ok(i):
+      return                                           # (review: a stop / red light, a queue, the street not sure yet)
     self.rise = None
     if old == "exit":
       self._exit_raise(new, start, d, i)
@@ -1079,7 +1101,7 @@ class SpeedLimitFollower:
     if why:
       self._not_followed(old, new, i.source, why)
       if why.startswith("GPS trust"):
-        self.rise_retry = (old, new)   # (drive 69 t 875: trust 2 for 5 s as the 50 became steady; 0 from then on)
+        self.rise_retry = (old, new, self.frame)   # (drive 69 t 875: trust 2 for 5 s as the 50 became steady; 0 from then on)
     else:
       self.offer = Offer(old, new, i.source, self.frame, "raise", d, tgt=new + add)
       self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
@@ -1087,9 +1109,12 @@ class SpeedLimitFollower:
   def _retry_rise(self, i, d):
     """Rule 1 refused only for the GPS trust: the same limit still reported (and steady), it is decided again once the
     trust has been 0 for LIMIT_RAISE_STABLE_TIME with cruise on (the driver's speed then, as _steady_rise)."""
-    old, new = self.rise_retry
+    old, new, since = self.rise_retry
     if self.candidate != new or self.stable != new or self.rise is not None:
       self.rise_retry = None           # (another limit since: decided on its own)
+      return
+    if self.frame - since > _frames(LIMIT_OFFER_TIME) or self.driver_set_frame > since:
+      self.rise_retry = None           # (review: too late, or his own SET since the refusal: his)
       return
     if d is None or self.trust0_frames < _frames(LIMIT_RAISE_STABLE_TIME):
       return                           # (cruise off: wait for it; the trust not steady yet)
