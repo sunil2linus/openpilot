@@ -15,6 +15,7 @@ NO_CURVE = lambda f: None  # noqa: E731
 STABLE = int(slf.LIMIT_STABLE_TIME / slf.DT_CTRL)
 RAISE = int(slf.LIMIT_RAISE_STABLE_TIME / slf.DT_CTRL)        # a higher limit (rules 1, 2)
 QUICK = int(slf.LIMIT_RISE_QUICK_TIME / slf.DT_CTRL)          # a one-band rise with GPS trust 0 (F)
+MERGE_TGT = 70 + slf.MERGE_OVER_MPH                            # a merge onto a 70 highway (rule 5's target)
 
 
 def _li(limit_mph, driver_mph=45.0, source="Map Data", gps_trust=0, cruise=True):
@@ -836,14 +837,14 @@ def test_drive_53_ramp_1_the_highway_limit_ahead_becomes_the_drivers_speed_in_ti
   ramp = _Ramp()
   car = _car53(45, 45)
   r, c, merged = _merge_sim(ramp, car, 6000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
-  assert c.raises and abs(c.raises[0][1] - 70) < 1e-6 and c.kinds[0] == "merge", (c.raises, _reasons(c))
+  assert c.raises and abs(c.raises[0][1] - MERGE_TGT) < 1e-6 and c.kinds[0] == "merge", (c.raises, _reasons(c))
   f_raise = c.raises[0][0]
   left = ramp.length - _at(r, ramp, f_raise)
   # (owner, drive 54: "we can do it way before that") as soon as the window is ready: mapd's 70 known 36 m into the
   # link, MERGE_STABLE_TIME on (was timed to arrive 5 mph under the limit at the merge: 250-420 m before it)
   assert 560 < left < 610, left
   assert merged is not None and r["vs"][merged] / MPH >= 64, (merged, r["vs"][merged] / MPH if merged else None)
-  assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6    # the highway's limit itself, not 70 + anything
+  assert abs(r["final"] - MERGE_TGT) < 0.01 and r["max"] <= MERGE_TGT + 1e-6    # the highway's limit + MERGE_OVER (owner after drive 69)
   assert r["holds"] and [b for _, b in r["presses"] if b == cs.SET_MINUS] == []
   assert len(c.raises) == 1                                        # once per link (the 70 itself then is nothing new)
   # GPS trust 2 from 450 m before the merge (after the 5 s of trust 0 that start it, before it is due): still in time
@@ -861,10 +862,10 @@ def test_drive_53_ramp_2_the_merge_waits_for_the_loops_curve_then_goes_to_the_hi
   end = ramp.at + 3100                                               # the curve ends at the merge (31 s at 29-32 mph)
   r, c, merged = _merge_sim(ramp, car, end + 3000, anchor_mph=50, curve=T.between(0, end, 27), max_drop=15,
                             events={0: _brake_held, 400: _resume_now})
-  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] - 70) < 1e-6, (c.raises, _reasons(c))
+  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] - MERGE_TGT) < 1e-6, (c.raises, _reasons(c))
   assert c.raises[0][0] >= end                                      # (the curve's lower target wins until it ends)
   assert max(r["sets"][:end]) / MPH <= 29 + 1e-6
-  assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6
+  assert abs(r["final"] - MERGE_TGT) < 0.01 and r["max"] <= MERGE_TGT + 1e-6
 
 
 def test_drive_59_a_merge_from_27_mph_is_not_refused_for_its_jump():
@@ -874,9 +875,9 @@ def test_drive_59_a_merge_from_27_mph_is_not_refused_for_its_jump():
     ramp = _Ramp(street=street)
     r, c, _ = _merge_sim(ramp, _car53(street, street), 6000,
                          events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
-    assert c.raises and abs(c.raises[0][1] - 70) < 1e-6 and c.kinds[0] == "merge", (street, c.raises, _reasons(c))
+    assert c.raises and abs(c.raises[0][1] - MERGE_TGT) < 1e-6 and c.kinds[0] == "merge", (street, c.raises, _reasons(c))
     assert not any("jump" in x for x in _reasons(c))
-    assert abs(r["final"] - 70) < 0.01 and r["max"] <= 70 + 1e-6, (street, r["final"])
+    assert abs(r["final"] - MERGE_TGT) < 0.01 and r["max"] <= MERGE_TGT + 1e-6, (street, r["final"])
 
 
 def test_merge_negatives():
@@ -921,9 +922,9 @@ def test_merge_the_driver_touching_his_speed_during_it_is_his():
     r, c, _ = _merge_sim(ramp, _car53(45, 45), 6000, events=ev)
     after = [f for f, _ in r["presses"] if f > f0 + 150] + [f for f in r["holds"] if f > f0 + 150]
     if btn == cs.SET_MINUS:
-      assert after == [] and r["final"] < 70 - 1e-6, (btn, r["final"], after)
+      assert after == [] and r["final"] < MERGE_TGT - 1e-6, (btn, r["final"], after)
     else:
-      assert r["final"] <= 70 + 1e-6 and r["max"] <= 70 + 1e-6, (btn, r["final"])   # SET+: the rest still restored to 70
+      assert r["final"] <= MERGE_TGT + 1e-6 and r["max"] <= MERGE_TGT + 1e-6, (btn, r["final"])   # SET+: the rest still restored to 70
   # his brake (cruise off) on the ramp before the merge is taken: no raise after it
   ramp = _Ramp()
   ev = {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH), f0 - 300: _cruise_off, f0 - 200: _resume_now}
@@ -973,12 +974,12 @@ def test_merge_is_never_undone_once_on_the_highway():
     r, c, _ = _merge_sim(ramp, _car53(45, 45), 9000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
     assert c.raises and c.kinds == ["merge"] and c.undos == [], (after_s, c.undos)
     assert [p for p in r["presses"] if p[0] >= ramp.merge_f and p[1] == cs.SET_MINUS] == []
-    assert abs(r["final"] - 70) < 0.01
+    assert abs(r["final"] - MERGE_TGT) < 0.01
   # the same with trust 0 (a glitch the map is sure of): still not undone on the highway
   ramp = _GlitchAfterMerge()
   ramp.trust = lambda f: 0
   r, c, _ = _merge_sim(ramp, _car53(45, 45), 9000, events={ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)})
-  assert c.raises and c.undos == [] and abs(r["final"] - 70) < 0.01
+  assert c.raises and c.undos == [] and abs(r["final"] - MERGE_TGT) < 0.01
 
 
 def test_merge_refused_after_his_set_or_cruise_off_any_time_on_the_link():
@@ -1010,7 +1011,7 @@ def test_merge_refused_after_his_set_or_cruise_off_any_time_on_the_link():
   ev = dict(ev0(ramp))
   ev.update({ramp.at - 300: _cruise_off, ramp.at + 30: _resume_now})
   r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
-  assert c.kinds == ["merge"] and abs(r["final"] - 70) < 0.01, (c.raises, _reasons(c))
+  assert c.kinds == ["merge"] and abs(r["final"] - MERGE_TGT) < 0.01, (c.raises, _reasons(c))
 
 
 def test_a_planned_stop_ahead_holds_the_merge_raise_and_the_fast_restore():
@@ -1044,7 +1045,7 @@ def test_a_planned_stop_ahead_holds_the_merge_raise_and_the_fast_restore():
 
 
 def test_merge_metric():
-  # a 60 km/h street, a ramp to a 100 km/h highway: 100
+  # a 60 km/h street, a ramp to a 100 km/h highway: 100 + MERGE_OVER_KPH
   kph = 1 / 3.6
   ramp = _Ramp(next_mph=100 * kph / MPH, street=60 * kph / MPH)
   car = T.Car(60, dash_offset_mph=0.0, step=kph, accel_fn=_accel53, cruise_gain=0.19)
@@ -1053,8 +1054,8 @@ def test_merge_metric():
   ev = c.events({ramp.at: lambda s, cr: setattr(cr, "v_ego", 30 * kph)})
   r = T.run(car, NO_CURVE, 7000, events=ev, limit=c.limit, cap=c.cap, undo=c.undo, ceiling=c.ceiling, metric=True,
             setup=lambda lg: c.setup(lg))
-  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] * MPH / kph - 100) < 1e-6, c.raises
-  assert abs(r["final"] * MPH / kph - 100) < 1.0          # (the simulated car's long press steps in mph)
+  assert c.raises and c.kinds == ["merge"] and abs(c.raises[0][1] * MPH / kph - 100 - slf.MERGE_OVER_KPH) < 1e-6, c.raises
+  assert abs(r["final"] * MPH / kph - 100 - slf.MERGE_OVER_KPH) < 1.0          # (the simulated car's long press steps in mph)
 
 
 def test_merge_need_follows_the_cruise_table():

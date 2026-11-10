@@ -402,43 +402,113 @@ def _merge_run(frames, boost_mph, set_mph=35, v_mph=35, lose=None, radar_lead=Fa
 
 
 def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before_the_car_gets_there():
-  # owner, drives 61 / 64: set 70 on the ramp and the car eased off from ~55 mph, still 66 where the ramp met the
-  # highway. A merge raise goes MERGE_BOOST above (one SET+ hold) and comes back to 70 once the car is within 5 mph
-  car, logic, top, log = _merge_run(9000, 15)
-  assert 80 - 1e-6 <= top / MPH <= 85 + 1e-6, top / MPH
-  assert any(h["direction"] == cs.SET_PLUS for h in logic.hold_log), "the raise is a hold, not taps"
-  up = next(f for f, s, v in log if s >= 75)
-  assert up - 400 <= 500, up                               # at 75+ within 5 s of the raise (the car's own hold rate)
-  t63 = next(f for f, s, v in log if v >= 63)
-  back = next(f for f, s, v in log if f > t63 and s <= 70 + 1e-6)
-  assert back - t63 <= 500, (t63, back)                    # back at 70 within 5 s of the car reaching 63
-  assert max(v for f, s, v in log) <= 72, max(v for f, s, v in log)
-  assert abs(car.set_speed / MPH - 70) < 1e-6 and logic.boost is None and not logic.boost_stuck
-  # without the boost: the same raise by a hold, never above 70; the car gets to 65 later
-  car0, logic0, top0, log0 = _merge_run(9000, 0)
-  assert top0 / MPH <= 70 + 1e-6 and any(h["direction"] == cs.SET_PLUS for h in logic0.hold_log)
-  # (the last 15 mph are where the set speed at 70 lets the cruise ease off)
-  assert next(f for f, s, v in log0 if v >= 68) > next(f for f, s, v in log if v >= 68) + 300
+  # owner, drives 61 / 64 / 69: the merge target is the highway's limit + 5 (75 on a 70 road: limit_raise 75 here), the
+  # boost 20 above it by one SET+ hold, kept until the car is 2 mph under the target, then ONE SET- hold down that never
+  # lands below the target, taps for the rest
+  car, logic, top, log = _merge_run(9000, 20, limit=75)
+  assert 95 - 1e-6 <= top / MPH <= 95 + 1e-6, top / MPH
+  ups = [h for h in logic.hold_log if h["direction"] == cs.SET_PLUS]
+  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  # (35 -> 90 is longer than one hold may run, HOLD_MAX_SECONDS: a second one goes on)
+  assert 1 <= len(ups) <= 2 and len(downs) == 1, logic.hold_log
+  assert abs(downs[0]["bound_mph"] - 75) < 1e-6
+  up = next(f for f, s, v in log if s >= 90 - 0.01)
+  assert up - 400 <= 700, up                               # 35 -> 90 by one hold in ~6.6 s (the car's own hold rate)
+  t73 = next(f for f, s, v in log if v >= 73)
+  assert all(s >= 75 - 1e-6 for f, s, v in log if f >= t73), "never below the target"
+  back = next(f for f, s, v in log if f > t73 and s <= 75 + 1e-6)
+  assert back - t73 <= 600, (t73, back)                    # back at 75 within 6 s of the car reaching 73 (was 15 taps)
+  peak = max(v for f, s, v in log)
+  assert peak <= 75 + 4, peak                              # owner: at most ~4 above the target
+  t35_75 = next(f for f, s, v in log if v >= 75 - 0.5) - 400
+  assert t35_75 <= 1900, t35_75                            # 35 -> 75 in ~18 s on the measured cruise
+  assert abs(car.set_speed / MPH - 75) < 1e-6 and logic.boost is None and not logic.boost_stuck
+  # without the boost: the same raise by a hold, never above 75; the car gets to 72 later
+  car0, logic0, top0, log0 = _merge_run(9000, 0, limit=75)
+  assert top0 / MPH <= 75 + 1e-6 and any(h["direction"] == cs.SET_PLUS for h in logic0.hold_log)
+  assert next(f for f, s, v in log0 if v >= 72) > next(f for f, s, v in log if v >= 72) + 300
   # a car followed by the radar: no boost
-  car1, logic1, top1, _ = _merge_run(3000, 15, radar_lead=True)
-  assert top1 / MPH <= 70 + 1e-6
-  # the car answers no SET- after the boost: the driver is told (boost_stuck)
+  car1, logic1, top1, _ = _merge_run(3000, 20, radar_lead=True, limit=75)
+  assert top1 / MPH <= 75 + 1e-6
+  # half the presses ignored: the hold down still lands at or above the target, taps finish it, no alert
+  car2, logic2, top2, log2 = _merge_run(9000, 20, limit=75, lose=lambda n: n % 2 == 0)
+  t73 = next(f for f, s, v in log2 if v >= 73)
+  assert all(s >= 75 - 1e-6 for f, s, v in log2 if f >= t73) and abs(car2.set_speed / MPH - 75) < 1e-6
+  assert not logic2.boost_stuck and max(v for f, s, v in log2) <= 75 + 4
+  # the car answers no SET- after the boost: the driver is told, within MERGE_BOOST_QUIET of the last press going
+  # unanswered (here ~2.5 s after the boost ended), and never later than MERGE_BOOST_STUCK
   car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
   car.v_ego = 35 * MPH
   logic = cs.CurveSlowdownLogic(False, 10)
-  stuck = False
+  stuck, ended = None, None
   for f in range(9000):
     inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
                             brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
-                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=70 * MPH if f >= 400 else 0.0,
-                            limit_boost=15 * MPH)
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=75 * MPH if f >= 400 else 0.0,
+                            limit_boost=20 * MPH)
     btn, _ = logic.update(inp)
     if btn == cs.SET_PLUS:
       car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
     car.tick()                                             # (SET- presses never reach the car)
-    stuck = stuck or logic.boost_stuck
-  assert stuck and car.set_speed / MPH >= 80
+    if ended is None and logic.boost is not None and "ended" in logic.boost:
+      ended = f
+    if stuck is None and logic.boost_stuck:
+      stuck = f
+  assert stuck is not None and car.set_speed / MPH >= 90
+  assert stuck - ended <= cs.MERGE_BOOST_STUCK * 100, (ended, stuck)
 
+
+def test_drive_69_the_boost_alert_waits_for_taps_that_are_still_landing():
+  # drive 69 t 572-578.6: 15 SET- taps 85 -> 70 took 6.7 s and 'Set speed is high' fired at 71 with the last tap landing
+  # (MERGE_BOOST_STUCK 6 s from the boost's end). Taps only (no hold down): no alert while they land
+  old = cs.MERGE_DOWN_HOLD
+  try:
+    cs.MERGE_DOWN_HOLD = False
+    seen = []
+    car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+    car.v_ego = 35 * MPH
+    logic = cs.CurveSlowdownLogic(False, 10)
+    for f in range(9000):
+      inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego,
+                              gas_pressed=False, brake_pressed=False, standstill=False, plan_alive=True,
+                              other_button_active=False, driver_button=None, csc_active=False, csc_speed=0.0,
+                              limit_raise=75 * MPH if f >= 400 else 0.0, limit_boost=20 * MPH)
+      btn, _ = logic.update(inp)
+      if btn is not None:
+        car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+      car.tick()
+      seen.append(logic.boost_stuck)
+    assert not any(seen) and abs(car.set_speed / MPH - 75) < 1e-6
+    assert not [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  finally:
+    cs.MERGE_DOWN_HOLD = old
+
+
+def test_drive_69_a_merge_raise_holds_from_the_start_even_with_a_restore_tapping():
+  # drive 69 merge 1 (t 284-289): a restore to his street speed (38 -> 48) by 1 mph taps kept presses in flight, the
+  # merge offer came at 287.6 and its hold started only at 289.1 (47). The merge raise waits only for what is in flight
+  car = T.Car(38, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = 30 * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  logic.anchor, logic.last_set_speed = 48 * MPH, 38 * MPH
+  taps_after = 0
+  hold_at = None
+  for f in range(3000):
+    raise_ = 75 * MPH if f >= 150 else 0.0
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=raise_,
+                            limit_boost=20 * MPH if raise_ else 0.0, fast_restore=True)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      if logic.last_action == "hold":
+        hold_at = f if hold_at is None else hold_at
+      elif f >= 150 and hold_at is None:
+        taps_after += 1
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    car.tick()
+  assert hold_at is not None and hold_at - 150 <= 150, hold_at      # the hold within 1.5 s of the offer
+  assert taps_after == 0, taps_after
 
 def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
   def fn(f, c):
@@ -2604,3 +2674,28 @@ def test_a_ramp_curves_hold_ends_when_the_curve_ends_or_off_the_link():
     assert n < 1000
   assert not c.onramp_now
   assert abs(n - CTL.RAMP_STATUS_HOLD / CTL.DT_CTRL) <= 2, n
+
+
+def test_the_boosts_way_down_waits_for_his_gas_then_holds():
+  # on his gas no SET- of ours (as for any tap) and no alert; once he lifts: the one SET- hold, never below the target
+  car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = 35 * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  gas_until, ended, minus_on_gas, stuck = None, None, 0, False
+  for f in range(9000):
+    gas = gas_until is not None and f < gas_until
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=gas,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=75 * MPH if f >= 400 else 0.0,
+                            limit_boost=20 * MPH)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      minus_on_gas += gas and btn == cs.SET_MINUS
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    car.tick()
+    if ended is None and logic.boost is not None and "ended" in logic.boost:
+      ended, gas_until = f, f + 1200                       # on the gas 12 s from the boost's end
+    stuck = stuck or logic.boost_stuck
+  assert minus_on_gas == 0 and not stuck
+  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  assert len(downs) == 1 and downs[0]["frame"] >= gas_until and abs(car.set_speed / MPH - 75) < 1e-6

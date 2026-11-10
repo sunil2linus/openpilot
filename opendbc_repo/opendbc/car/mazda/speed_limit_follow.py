@@ -27,8 +27,8 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    time; never for a merge (rule 5) once the highway is matched.
 5. Merge onto a highway: on a link that leads to a highway (starpilotPlan.mapRampToHighway) from a street, the next
    posted limit ahead (mapdOut.nextSpeedLimit: the highway's) becomes the driver's speed when it is above his speed and
-   his speed is a street's (at most MERGE_SURFACE_MAX_MPH, km/h: _KPH). Always the limit itself (drive 53: he chose 70
-   on the 70 road, 75 later himself). Only a highway limit (a whole multiple, MERGE_LIMIT_MIN_MPH .. LIMIT_MAX_MPH, at
+   his speed is a street's (at most MERGE_SURFACE_MAX_MPH, km/h: _KPH). The limit plus MERGE_OVER (owner after drive
+   69; drive 53: he chose 70 on the 70 road, 75 later himself). Only a highway limit (a whole multiple, MERGE_LIMIT_MIN_MPH .. LIMIT_MAX_MPH, at
    most LIMIT_MAX_JUMP_MPH above his speed), the next limit and his speed unchanged for MERGE_STABLE_TIME with GPS
    trust 0 and cruise on throughout (a lower trust after that is fine: near the merge the highway runs next to the
    ramp), once per link. Timed for the merge: offered when the distance left to where the
@@ -203,6 +203,10 @@ MERGE_SURFACE_MAX_KPH = 90
 # (owner, drive 54: the raise came 382 m before the merge, he was on the gas from 456; now as soon as the window is ready,
 # 2 s: drive 54's would have come at 448.3 at 30 mph, 554 m before the highway's limit)
 MERGE_STABLE_TIME = 2.0      # s
+# Owner after drive 69: the merge raise goes to the highway's limit plus this (only rule 5's target; the limit itself is
+# what rules 4 / 5 compare with: the undo, the watch, the offer's end once his speed is there)
+MERGE_OVER_MPH = 5
+MERGE_OVER_KPH = 8
 # When: the stock cruise's speed-up with the set speed above the speed (drives 4c-53, median m/s^2 by the gap in mph:
 # up to 5 below, 5-10, ..., 20 and more), so the cruise is MERGE_NEAR_MPH below the highway's limit where it starts
 # (mapdOut.nextSpeedLimitDistance). 45 -> 65 mph: 11.9 s, 300 m; with MERGE_LEAD_TIME for our presses (a SET+ hold to 5
@@ -400,6 +404,7 @@ class SpeedLimitFollower:
     is_metric = self.step < MS_PER_MPH
     self.merge_min = MERGE_LIMIT_MIN_KPH if is_metric else MERGE_LIMIT_MIN_MPH
     self.surface_max = MERGE_SURFACE_MAX_KPH if is_metric else MERGE_SURFACE_MAX_MPH
+    self.merge_over = MERGE_OVER_KPH if is_metric else MERGE_OVER_MPH
     self.road = 0                  # the last known road class (mapRoadClass; 0 frames are skipped) ...
     self.road_since = 0            # ... since this frame
     self.link_start = None         # the frame the link the car is on began (None: not on a link)
@@ -911,7 +916,9 @@ class SpeedLimitFollower:
     self.merge_done = True
     self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
     old = self.stable if (self.stable is not None and self.frame - self.stable_last_seen <= _frames(LIMIT_OLD_MAX_AGE)) else None
-    self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d)
+    top = int(LIMIT_MAX_MPH / unit_mph + 1e-6)          # (never above LIMIT_MAX_MPH)
+    self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d,
+                       tgt=min(n + self.merge_over, max(top, n)))
 
   def _new_limit(self, i, d):
     new, start = self.candidate, self.frame - self.candidate_frames    # start: the new limit's first frame
