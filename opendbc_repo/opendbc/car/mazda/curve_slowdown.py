@@ -983,6 +983,7 @@ class CurveSlowdownLogic:
       self.hold = None     # a hold is not continued across a cruise cancel
     elif self.set_while_off:
       self.set_while_off = False
+      self.boost = None               # (second review) cruise engaged by his SET: the speed is his, no merge boost to take back
       if self.anchor is not None:
         self._forget()
         self.blocked = True
@@ -1009,6 +1010,11 @@ class CurveSlowdownLogic:
     self.driver_taps = [(d, f) for d, f in self.driver_taps if self.frame - f <= self._in_flight_window()]
     self._watch_driver_hold(i.driver_button if cruise_ok else None)
 
+    if (cruise_ok and self.cruise_gap and self.boost is not None and self.last_set_speed is not None and
+        abs(i.set_speed - self.last_set_speed) > self.half_step):
+      # (second review) back on after a gap at a set speed other than the one we left (his own choice): his speed. His
+      # RES bringing back the boosted set speed we put there is still ours to take down to the target
+      self.boost = None
     if cruise_ok:
       self._observe_set_speed(i)
     self._forget_hold_misses()
@@ -1874,7 +1880,8 @@ class CurveSlowdown:
     # dropped) on a link, or while the map control keeps a ramp curve's command, a signal does not turn it off; a lane
     # change on the highway or a turn on a street as before
     mc = self.map_control
-    ramp_ctx = mc is not None and (mc.link_now or mc.ramp_last_cmd is not None)
+    # (second review: only a held / governing ramp curve, not every link: the merge's lane change at the ramp's end)
+    ramp_ctx = mc is not None and mc.ramp_last_cmd is not None
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
                                                          blinker and not ramp_ctx)
     curve_active = curve_active and self.curve_enabled
@@ -1903,8 +1910,10 @@ class CurveSlowdown:
                                                   limit_lower_gas=bool(self.limit_follow is not None and
                                                                        self.limit_follow.lower is not None and
                                                                        self.limit_follow.lower.kind == "lower"),
-                                                  cam_speed=(self.curve_target.speed if (plan_alive and self.curve_enabled)
-                                                             else None))
+                                                  cam_speed=(self.curve_target.raw if (plan_alive and self.curve_enabled)
+                                                             else None),
+                                                  cam_low=(self.curve_target.low if (plan_alive and self.curve_enabled)
+                                                           else None))
       if self.map_control.lower_event is not None:
         # the street speed (speed_limit_follow rules 8 / 9) carried out or ended by him: the follower knows
         if self.limit_follow is not None:

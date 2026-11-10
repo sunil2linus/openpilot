@@ -519,7 +519,11 @@ def test_on_a_link_his_signal_does_not_turn_the_camera_curve_off(tmp_path, monke
   for _ in range(5):
     c.update(W.CC, state, None, None, False)
   assert got[-1] is True
-  plan.mapRoadClass = 2                                         # on a link: the signal does not switch it off
+  plan.mapRoadClass = 2                                         # on a link (the merge's lane change): as before
   for _ in range(100):
+    c.update(W.CC, state, None, None, False)
+  assert got[-1] is True
+  for _ in range(5):                                            # a held / governing ramp curve: not switched off
+    c.map_control.ramp_last_cmd = 14.0
     c.update(W.CC, state, None, None, False)
   assert got[-1] is False

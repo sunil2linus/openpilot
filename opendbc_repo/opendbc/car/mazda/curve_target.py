@@ -111,6 +111,11 @@ class CurveTarget:
       self.active = self.speed < driver_speed - END_GAP
     return self.active, self.speed
 
+  @property
+  def low(self):
+    """The most demanding target of the last CONFIRM_TIME (m/s): a single straight frame does not hide a curve."""
+    return min(self.window) if self.window else NO_CURVE
+
 
 # ---------------- map curves (from starpilotPlan, see starpilot/controls/lib/map_curves.py) ----------------
 

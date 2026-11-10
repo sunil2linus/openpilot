@@ -135,11 +135,15 @@ RAMP_STATUS_HOLD_MAX = 15.0      # s
 # Owner (after the review): with the GPS weak we know we are in the loop, so the camera decides. While the held command
 # stands, a camera curve whose speed is at most RAMP_CAM_LOOP above it is the loop still (held, also past the
 # distance / time rule and off the link), and the camera path straight (its speed more than RAMP_CAM_OPEN above it) for
-# RAMP_CAM_OPEN_TIME lets go (as the loop opens up, earlier than the distance rule). Without the camera (the model not
+# RAMP_CAM_OPEN_TIME lets go (as the loop opens up, earlier than the distance rule). Second review: one straight camera
+# frame (glare, a lead in the way) filled the window's least demanding value for a whole second and let go in the
+# loop; "open" now needs every frame's own value straight for RAMP_CAM_OPEN_TIME (the path straight that long, so the
+# car's own lateral acceleration is low by then), and "the loop still" counts the window's most demanding value (a
+# dropout frame does not end it). Without the camera (the model not
 # alive): the distance / time rule.
 RAMP_CAM_LOOP = 8 * MPH          # m/s
 RAMP_CAM_OPEN = 10 * MPH         # m/s
-RAMP_CAM_OPEN_TIME = 1.0         # s
+RAMP_CAM_OPEN_TIME = 1.5         # s
 RAMP_EXIT = 1
 HIGHWAY_CLASSES = (1, 3)        # motorway, trunk
 LINK_CLASSES = (2, 4, 6, 8, 10)  # motorway / trunk / primary / secondary / tertiary links (map_curves.LINK_CLASSES)
@@ -1034,7 +1038,7 @@ class MapCurveControl:
     return cmd, sp, v_c, "nav exit", self.nav_follower, self.nav_follower.firm
 
   def update(self, f: MapFields, driver_speed, signal, v_ego=0.0, max_drop=0.0, gas=False, a_ego=None,
-             set_speed=None, driver_set=False, limit_lower=0.0, limit_lower_gas=True, cam_speed=None):
+             set_speed=None, driver_set=False, limit_lower=0.0, limit_lower_gas=True, cam_speed=None, cam_low=None):
     """signal: turn signal side, -1 left, 1 right, 0 none. v_ego: the true speed (m/s) for the followers (0: plan
     only). max_drop: the driver's Curve Max Drop in m/s (0: unknown, no floor in the plan). gas: the driver is on the
     gas (his decision near an exit). a_ego: the car's acceleration (m/s^2; None: the road follower runs open loop).
@@ -1140,7 +1144,8 @@ class MapCurveControl:
       held = self.ramp_last_cmd
       if cam_speed is not None:
         # (RAMP_CAM_*) the camera decides: the loop still, or straight for RAMP_CAM_OPEN_TIME
-        in_loop = cam_speed <= held + RAMP_CAM_LOOP
+        # cam_speed: this frame's camera curve speed; cam_low: the most demanding of its last second (None: this one)
+        in_loop = (cam_speed if cam_low is None else min(cam_low, cam_speed)) <= held + RAMP_CAM_LOOP
         self.cam_open_frames = self.cam_open_frames + 1 if cam_speed > held + RAMP_CAM_OPEN else 0
         hwy_end = self.cam_open_frames >= int(RAMP_CAM_OPEN_TIME / DT_CTRL)
       else:

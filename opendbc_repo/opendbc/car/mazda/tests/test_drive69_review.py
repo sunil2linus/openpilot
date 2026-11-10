@@ -323,3 +323,78 @@ def test_the_exits_street_raises_wait_for_no_stop_no_red_a_moving_car_and_a_sure
   assert got and got[0] >= 4500, got
   got = run(name=lambda k: "Cross Road" if k < 3300 else "Dobry")  # the cross street snapped to first
   assert got and got[0] >= 3300 + slf.EXIT_STREET_MATCH * 100, got
+
+
+# ---- second review ----
+
+def test_one_straight_camera_frame_never_ends_the_held_ramp_command():
+  # review69/cam_glitch.py: CurveTarget.speed is the least demanding of its 1 s window, so one straight frame (glare, a
+  # lead in the way) read straight for a whole second and let go of the hold in the loop. "Open" needs every frame's own
+  # value straight for RAMP_CAM_OPEN_TIME; "the loop still" counts the window's most demanding value
+  CT = _load("curve_target_r69", os.path.join(HERE, "..", "curve_target.py"))
+  k_loop = 2.2 / (30 * MPH) ** 2
+
+  def run(straight):
+    t = CT.CurveTarget(2.2)
+    c = CTL.MapCurveControl(3.0)
+    ramp = dict(on_ramp=True, ramp_type=2, ramp_to_highway=True, road_class=2, ramp_end_distance=900.0)
+    released = None
+    for f in range(1200):
+      t.update(0.0 if straight(f) else k_loop, 45 * MPH)
+      if f < 200:
+        c.update(F(status=2, radius=84.0, distance=0.0, **ramp), 50 * MPH, 0, v_ego=13.4, cam_speed=t.raw, cam_low=t.low)
+        continue
+      out = c.update(F(status=5, radius=212.0, distance=10.0, road_class=2), 50 * MPH, 1, v_ego=13.4,
+                     cam_speed=t.raw, cam_low=t.low)
+      if released is None and out.why != "ramp hold":
+        released = f
+    return released
+  assert run(lambda f: f in (350, 351, 600)) is None             # single straight frames: held
+  assert run(lambda f: 500 <= f < 600) is None                   # straight for 1 s only: held
+  rel = run(lambda f: f >= 500)                                  # the loop opens at 500
+  assert rel is not None and abs(rel - 500 - CTL.RAMP_CAM_OPEN_TIME / DT) <= 2, rel
+
+
+def _boost_engage(ev):
+  return _boost_run(6000, ev)
+
+
+def test_his_set_at_engage_after_a_boost_is_his_but_res_of_our_boosted_set_comes_down():
+  # his brake during the boost, then SET at 85: his choice (not pressed down to the target)
+  def ev(f, st, car, lg):
+    if f == 1300:
+      st["cruise"], st["brake"] = False, True
+    if f == 1320:
+      st["brake"] = False
+    if f == 1500:
+      car.set_speed = 85 * MPH                                    # SET engages at his speed
+      st["btn"] = cs.SET_MINUS
+    if f == 1510:
+      st["btn"] = None
+      st["cruise"] = True
+  car, lg, log, _ = _boost_engage(ev)
+  assert abs(car.set_speed / MPH - 85) < 1e-6 and lg.boost is None, car.set_speed / MPH
+  # RES: the set speed comes back at the boosted value we put there: ours, down to the target
+
+  def ev2(f, st, car, lg):
+    if f == 1300:
+      st["cruise"], st["brake"] = False, True
+    if f == 1320:
+      st["brake"] = False
+    if f == 1600:
+      st["cruise"] = True
+  car, lg, log, _ = _boost_engage(ev2)
+  assert abs(car.set_speed / MPH - 75) < 1e-6, car.set_speed / MPH
+  # RES at another set speed than we left (his own stored choice): his
+
+  def ev3(f, st, car, lg):
+    if f == 1300:
+      st["cruise"], st["brake"] = False, True
+    if f == 1320:
+      st["brake"] = False
+    if f == 1590:
+      car.set_speed = 82 * MPH
+    if f == 1600:
+      st["cruise"] = True
+  car, lg, log, _ = _boost_engage(ev3)
+  assert abs(car.set_speed / MPH - 82) < 1e-6 and lg.boost is None, car.set_speed / MPH
