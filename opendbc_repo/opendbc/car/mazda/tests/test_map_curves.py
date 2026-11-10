@@ -1354,6 +1354,59 @@ def test_drive_56_an_on_ramps_loop_is_planned_before_the_turn_by_signal_or_navig
   assert not out.active
 
 
+def _junction_scene():
+  """Drive 69 t 686-698: a street north (cls 5) to a junction with a crossing road (y = 290); an on-ramp leaves the
+  crossing road 40 m west of the junction, loops left (70 m) and joins a motorway heading east."""
+  st = G.way(40, G.straight(0, -500, 0, 1000), name="East South Boulevard", cls=5, speed_mph=45)
+  cr = G.way(41, G.straight(500, 290, 270, 1000), name="Dequindre Road", cls=5, speed_mph=45)
+  pts = G.straight(-40, 290, 270, 40) + G.arc(-80, 220, 70, 90, 270)[1:]
+  ramp = G.way(42, pts, name="", cls=2, speed_mph=45, oneway=True)
+  ex, ey = pts[-1]
+  mw = G.way(43, G.straight(ex - 200, ey, 90, 1200), name="", cls=1, speed_mph=70)
+  ramp.lat[-1], ramp.lon[-1] = mw.lat[10], mw.lon[10]
+  ramp.end = B.key(mw.lat[10], mw.lon[10])
+  k = 27                                                   # the crossing road's node at x = -40
+  ramp.lat[0], ramp.lon[0] = cr.lat[k], cr.lon[k]
+  ramp.start = B.key(cr.lat[k], cr.lon[k])
+  return {w.id: w for w in (st, cr, ramp, mw)}
+
+
+def test_drive_69_an_ordinary_turn_near_an_on_ramp_is_no_on_ramp_ahead():
+  # navigation's "turn left" 130 m ahead and his left signal for it found an M-59 on-ramp starting on the crossing road
+  # past the junction: its 57 m loop held the set speed at 27 on the street for 11 s
+  root, curves, ramps = write_files(_junction_scene())
+  assert ramps and any(r["type"] == "entrance" for r in ramps)
+  la, lo = pos(0, 160)
+  street = {"dt": 0.05, "v_ego": 12.0, "street": True}
+  m = planner(root)
+  m.update(la, lo, 0.0, 40, True, nav=("turn", "left", 130.0), gps=dict(street, signal=0))
+  assert not m.onramp_ahead and m.status != MC.STATUS_RAMP_CURVE
+  m = planner(root)
+  m.update(la, lo, 0.0, 40, True, gps=dict(street, signal=-1))      # his signal for the turn: the ramp is not on our road
+  assert not m.onramp_ahead
+  for t in ("merge", "fork", "turn"):
+    assert t not in MC.ONRAMP_NAV_TYPES
+  m = planner(root)                                                  # navigation naming the ramp itself still counts
+  m.update(la, lo, 0.0, 40, True, nav=("on ramp", "left", 136.0), gps=dict(street, signal=0))
+  assert m.onramp_ahead
+
+
+def test_an_on_ramp_ahead_is_kept_two_seconds_not_flickered():
+  root, curves, ramps = write_files(_onramp_scene())
+  street = {"dt": 0.05, "v_ego": 10.0, "street": True}
+  m = planner(root)
+  y, seen = -120.0, []
+  for i in range(80):
+    la, lo = pos(0, y)
+    m.update(la, lo, 0.0, 30, True, gps=dict(street, signal=1 if i == 0 else 0))
+    seen.append((m.onramp_ahead, m.distance))
+    y += 0.5
+  kept = [d for on, d in seen if on]
+  assert abs(len(kept) - MC.ONRAMP_KEEP / 0.05) <= 2, len(kept)
+  assert all(a > b for a, b in zip(kept, kept[1:], strict=False)), "its distance counts down from the ramp's start"
+  assert not seen[-1][0]
+
+
 def test_on_a_ramp_onto_a_highway_the_loop_stops_governing_before_its_end():
   # drive 59, the Rochester Rd loop: held at 27 until the loop's very end, then a short merge. On a ramp to a highway
   # the ramp curve stops governing RAMP_HWY_RELEASE before its end (the restore / merge starts while the loop ends)
