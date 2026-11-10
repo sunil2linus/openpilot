@@ -558,3 +558,14 @@ def test_drive_56_rule_8_goes_up_when_the_set_speed_is_already_under_the_streets
   f.lower = slf.Offer(50, 45, "Map Data", 0, "lower", 55, tgt=50)
   f.lower_finished("his speed under it", 43)
   assert f.offer is None
+
+
+def test_drive_66_a_lower_limit_is_counted_with_cruise_on_and_longer_after_a_turn():
+  # drive 66 t 366-384: cruise turned on just after a turn, the map said 25 for a few seconds on a 35 / 45 road and he
+  # was slowed 33 -> 29. A lower limit is counted with cruise on only (5 s), and 10 s after a turn onto the road
+  f = slf.SpeedLimitFollower(False, street_mode=0)
+  assert f.cruise_frames == 0
+  f.update(slf.LimitInputs(25 * MPH, "Map Data", 0, 33 * MPH, True, road_class=7, road_name="A"))
+  f.update(slf.LimitInputs(25 * MPH, "Map Data", 0, 0.0, False, road_class=7, road_name="A"))
+  assert f.cruise_frames == 0
+  assert slf.LOWER_NEW_ROAD_STEADY >= 2 * slf.LOWER_STEADY

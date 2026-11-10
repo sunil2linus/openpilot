@@ -124,6 +124,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaStopSlowdownActive @34 :Bool; # Mazda stopped car / stop ahead slowdown (On) is lowering the set speed
   mazdaExitCurveBrake @35 :Bool;     # Mazda navigation exit: the cruise cannot slow enough for the exit's curve, brake (On)
   mazdaLimitSlowLimit @36 :Float32;  # Mazda: slowing for a lower posted limit (speed_limit_follow rule 9), the limit m/s; 0 none
+  mazdaSetSpeedHigh @37 :Bool;       # Mazda: after a merge boost the set speed did not come back down to the highway speed
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -213,6 +214,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mapCurvesPaused @47;
     mapExitCurveBrake @48;
     mazdaLimitSlowing @49;
+    mazdaSetSpeedHigh @50;
   }
 }
 

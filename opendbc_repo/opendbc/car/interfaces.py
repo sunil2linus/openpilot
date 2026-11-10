@@ -467,6 +467,7 @@ class CarInterfaceBase(ABC):
                                             getattr(slowdown, "stop_mode", 0) == 2)
       fp_ret.mazdaExitCurveBrake = bool(getattr(slowdown, "exit_brake_alert", False))
       fp_ret.mazdaLimitSlowLimit = float(getattr(slowdown, "limit_slow_limit", 0.0) or 0.0)
+      fp_ret.mazdaSetSpeedHigh = bool(getattr(slowdown, "set_speed_high", False))
     fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
 
     return ret, fp_ret

@@ -38,6 +38,19 @@ EARTH_R = 6371008.8
 
 LOOKAHEAD = 1000.0        # m along the road
 PLAN_LAT = 2.2            # m/s^2: as the car side (curve_target.MAP_LATERAL_ACCEL)
+# Ramp curves (ramps and exits) are taken faster (owner, drives 61 / 64: "we are the bottleneck"; the same ramps by hand:
+# the 68 m loop at 34-35 mph, exit curves entered at 45-47; with our 2.2 m/s^2: 27 and 32-33). The car's steering has
+# measured ~2.7 m/s^2 as what it holds (curve learning, Torque Interceptor), so ramp curves are planned at RAMP_LAT: the
+# radius the planner gives for a ramp curve is scaled so that the car side's PLAN_LAT speed is the RAMP_LAT speed
+# (ramp_radius; the notices, which show the speed at PLAN_LAT for the published radius, agree). Road curves keep
+# PLAN_LAT and the curve memory.
+RAMP_LAT = 2.6            # m/s^2
+
+
+def ramp_radius(c):
+  """The radius to plan curve record `c` with: a ramp curve's is scaled for RAMP_LAT (see above)."""
+  r = float(c["r"])
+  return r * RAMP_LAT / PLAN_LAT if c.get("ramp") else r
 # PLAN_DECEL: as the car side for road curves (curve_target.MAP_DECEL, the drive evidence is there): the slowdown is
 # planned firm and the car side commands the set speed below the plan so the stock cruise really slows that hard
 # (drive 50: the old gentle 0.25 plan started 380-395 m before West Utica's 30 mph curve). The car profile's learned
@@ -64,7 +77,7 @@ NEAR = 15.0               # m
 # are almost at the end of the curve we should start increasing the speed"; the Rochester Rd loop held 27 mph until the
 # loop's very end, then the merge was short): the cruise takes ~1-2 s to answer, the camera curve slowdown still has
 # what is left of the curve
-RAMP_HWY_RELEASE = 60.0   # m
+RAMP_HWY_RELEASE = 120.0  # m (drives 61 / 64: 60 was late, by hand he speeds up with ~180 m of the loop ramp left)
 # On-ramps from a street (owner, drive 56: the Crooks Rd loop onto M-59, a ~27 mph curve 40 m into the ramp, entered from
 # 46 mph with a hard brake; the Mound Rd ramp, navigation announced "on ramp" 400 m out, entered at 40 for a 29 mph
 # curve): before the turn onto a ramp that leads to a highway, its first curve is planned like a ramp curve, when
@@ -1513,7 +1526,7 @@ class MapCurves:
     """The curve's radius: what the car measured on clean passes (curve memory) if known, else the map's; made
     tighter when the memory caps the curve's speed (steering maxed out there), so that the curve's speed at PLAN_LAT
     is the cap. The car side plans at PLAN_LAT or less, so it never goes faster than the cap."""
-    r = c["r"]
+    r = ramp_radius(c)
     if self.memory is not None and not c.get("ramp"):
       d = self.direction(c)
       learned = self.memory.radius(c, d)
@@ -1637,7 +1650,7 @@ class MapCurves:
       for s_c, c in firsts:
         if s_c < 0 or s_c > ONRAMP_NAV_RANGE:
           continue
-        v = plan_speed(c["r"], d + s_c, c.get("adv", 0.0), decel=self.decel, floor=0.0, lead_time=PLAN_LEAD_TIME)
+        v = plan_speed(ramp_radius(c), d + s_c, c.get("adv", 0.0), decel=self.decel, floor=0.0, lead_time=PLAN_LEAD_TIME)
         if best is None or v < best[0]:
           best = (v, c, d + s_c)
     if best is None:
@@ -1649,7 +1662,7 @@ class MapCurves:
                        lead_time=PLAN_LEAD_TIME if self.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME)
       if cur <= v:
         return
-    self.curve, self.distance, self.radius = c, dd, c["r"]
+    self.curve, self.distance, self.radius = c, dd, ramp_radius(c)
     self.advisory = float(c.get("adv", 0.0) or 0.0)
     self.status, self.source, self.onramp_ahead = STATUS_RAMP_CURVE, 0, True
 
@@ -1698,7 +1711,7 @@ class MapCurves:
     for f in (w["forks"] if w["chain"] == best["chain"] else []):
       curves += [(c, f["from_start"] + s) for c, s in self._branch_curves(f)]
     if curves:
-      c, s = min(curves, key=lambda cs: plan_speed(cs[0]["r"], distance + cs[1], cs[0].get("adv", 0.0), decel=self.decel))
+      c, s = min(curves, key=lambda cs: plan_speed(ramp_radius(cs[0]), distance + cs[1], cs[0].get("adv", 0.0), decel=self.decel))
       self.nav_curve, self.nav_curve_dist = c, distance + s
       self.nav_exit = NAV_EXIT_CURVES
     else:
@@ -1847,7 +1860,7 @@ class MapCurves:
           d_e = 0.0
         if d_e <= NEAR and self.odo_ok:
           w["entered"][key] = self.odo + d_e
-      sp = plan_speed(c["r"], d_e, c.get("adv", 0.0), decel=self.decel)
+      sp = plan_speed(ramp_radius(c), d_e, c.get("adv", 0.0), decel=self.decel)
       if sp < best_speed:
         best, best_d, best_speed = c, d_e, sp
     if best is not None:
@@ -2241,7 +2254,7 @@ class MapCurvesPlanner:
     plan.mapNavExitDistance = float(mc.nav_exit_dist)
     plan.mapNavExitSide = int(mc.nav_side)
     if mc.nav_curve is not None:
-      plan.mapNavCurveRadius = float(mc.nav_curve["r"])
+      plan.mapNavCurveRadius = ramp_radius(mc.nav_curve)
       plan.mapNavCurveDistance = float(mc.nav_curve_dist)
       plan.mapNavCurveAdvisory = float(mc.nav_curve.get("adv", 0.0) or 0.0)
     plan.mapExitShape = int(mc.exit_shape)
@@ -2254,6 +2267,6 @@ class MapCurvesPlanner:
     if plan.mapExitBendValid:
       plan.mapExitHighwayBend, plan.mapExitLinkBend = float(hb), float(lb)
     if mc.exit_curve is not None:
-      plan.mapExitCurveRadius = float(mc.exit_curve["r"])
+      plan.mapExitCurveRadius = ramp_radius(mc.exit_curve)
       plan.mapExitCurveDistance = float(mc.exit_curve_dist)
       plan.mapExitCurveAdvisory = float(mc.exit_curve.get("adv", 0.0) or 0.0)

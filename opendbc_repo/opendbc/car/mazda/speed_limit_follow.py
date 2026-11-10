@@ -249,6 +249,11 @@ LOWER_BIG_DROP = (20, 32)    # mph / km/h
 LOWER_BIG_STEADY = 8.0       # s
 LOWER_NAV_STEADY = 2.5       # s with navigation's limit agreeing
 LOWER_NAV_BIG_STEADY = 5.0   # s
+# ... and the limit is counted with cruise on only, and for LOWER_NEW_ROAD_STEADY after a turn onto a road (rule 7's turn)
+# unless navigation agrees (drive 66 t 366-384: cruise turned on just after a turn, the map said 25 for a few seconds on a
+# 35 / 45 road, he was slowed 33 -> 29 until he pressed SET)
+LOWER_NEW_ROAD_STEADY = 10.0  # s
+LOWER_NEW_ROAD_TIME = 20.0    # s after the turn
 LOWER_UNDO_TIME = 30.0       # s: the limit back up this soon after it slowed him: his speed before comes back
 NAV_LIMIT_MIN = (15, 24)     # mph / km/h: navigation's limit below this is no limit (drive 55: 9 messages of 5 mph)
 NAV_AGREE = (1, 2)           # mph / km/h
@@ -421,6 +426,7 @@ class SpeedLimitFollower:
     self.cand_name = ""            # the road name when the candidate limit first appeared ...
     self.cand_turn = False         # ... and navigation's turn was within NAV_TURN_NEAR then
     self.turn_frame = -1_000_000   # rule 7's last turn (the name changed)
+    self.cruise_frames = 0         # frames cruise has been on (rule 9 counts a lower limit with cruise on)
     self.turned_frame = -1_000_000  # the last frame the heading watch said "turned"
     self.nav = None                # navigation's limit (steps, None: none usable) this frame
     self.stable_before = None      # the steady limit before the current one
@@ -461,6 +467,7 @@ class SpeedLimitFollower:
   def update(self, i: LimitInputs):
     """m/s to raise the driver's speed to this frame, else 0.0. A lower limit's cap (rule 3) is in `cap`."""
     self.frame += 1
+    self.cruise_frames = self.cruise_frames + 1 if i.cruise_enabled else 0
     reported = None
     if i.limit >= 1.0 and i.source in LIMIT_SOURCES:
       x = self._steps(i.limit)
@@ -733,7 +740,9 @@ class SpeedLimitFollower:
     agree = nav is not None and abs(nav - c) <= self.nav_agree
     big = old - c > self.big_drop
     need = (LOWER_NAV_BIG_STEADY if big else LOWER_NAV_STEADY) if agree else (LOWER_BIG_STEADY if big else LOWER_STEADY)
-    if self.candidate_frames < _frames(need):
+    if not agree and self.frame - self.turn_frame < _frames(LOWER_NEW_ROAD_TIME):
+      need = max(need, LOWER_NEW_ROAD_STEADY)
+    if min(self.candidate_frames, self.cruise_frames) < _frames(need):
       return
     limit, sources = c, ("map+nav" if agree else "map")
     if nav is not None and not agree:

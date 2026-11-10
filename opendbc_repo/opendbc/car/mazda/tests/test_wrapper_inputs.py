@@ -196,7 +196,9 @@ def test_wrapper_merge_on_and_test(tmp_path, monkeypatch):
     adopt = [d for k, d in records if k == "speedLimitAdopt"]
     assert len(adopt) == 1 and adopt[0]["kind"] == "merge" and abs(adopt[0]["new_mph"] - 70) < 1e-6, (mode, records)
     if mode == 2:
-      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 70) < 1e-6 and any(s for s in sent)
+      # (the merge boost: the set speed may go 15 above the highway speed meanwhile)
+      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 85) < 1e-6 and any(s for s in sent)
+      assert abs(c.logic.boost["target"] / MPH - 70) < 1e-6
     else:
       assert adopt[0]["mode"] == "test" and c.logic.anchor is None and not any(sent)
 
@@ -419,3 +421,19 @@ def test_the_wheels_cancel_or_resume_stops_our_frames(tmp_path, monkeypatch):
   # carstate reads them from CRZ_BTNS
   src = open(os.path.join(os.path.dirname(cs.__file__), "carstate.py")).read()
   assert 'cp.vl["CRZ_BTNS"]["CAN_OFF"]' in src and 'cp.vl["CRZ_BTNS"]["RES"]' in src
+
+
+def test_no_red_light_on_a_ramp_onto_a_highway(tmp_path, monkeypatch):
+  # drive 61, the Crooks Rd loop onto M-59: a "red light" twice inside the loop took the set speed 27 -> 22 for 20 s
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0)
+  plan = sm.msgs["starpilotPlan"]
+  plan.redLight = True
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass, plan.mapOnRamp, plan.mapRampToHighway = 2, True, True
+  _drive(c, 2, set_mph=30, v_mph=28)
+  assert not seen[-1].red_light and not seen[-1].plan_stop
+  plan.mapRampToHighway = False                      # an exit ramp to a street (a light at its end): as before
+  _drive(c, 2, set_mph=30, v_mph=28)
+  assert seen[-1].red_light

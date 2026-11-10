@@ -104,6 +104,12 @@ class StarPilotEvents:
       self.events.add(StarPilotEventName.mazdaLimitSlowing)
     self.prev_limit_slow = limit_slow
 
+    # Mazda: the set speed stayed above the highway speed after a merge boost: once
+    set_high = bool(getattr(sm["starpilotCarState"], "mazdaSetSpeedHigh", False))
+    if set_high and not getattr(self, "prev_set_high", False):
+      self.events.add(StarPilotEventName.mazdaSetSpeedHigh)
+    self.prev_set_high = set_high
+
     if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
       self.mazda_lkas_off_shown = True
       self.events.add(StarPilotEventName.mazdaStockLkasOff)

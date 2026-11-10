@@ -1325,6 +1325,14 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: limit_slowing_alert,
   },
 
+  StarPilotEventName.mazdaSetSpeedHigh: {
+    ET.PERMANENT: Alert(
+      "Set speed is high",
+      "Lower the cruise set speed",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 4.),
+  },
+
   StarPilotEventName.mazdaStockLkasOff: {
     ET.PERMANENT: Alert(
       "Car's Lane Keep Assist is off",

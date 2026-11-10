@@ -372,6 +372,74 @@ def test_drive_56_an_exit_from_80_with_half_the_taps_ignored_still_reaches_the_r
   assert logic.lower_presses <= cs.CURVE_BUDGET_SENT_FACTOR * 60
 
 
+def _MEASURED_ACCEL(gap_mph):
+  # drives 4c-66 (cruise on, no lead): the stock cruise speeds up harder the further the set speed is above the car
+  return 0.33 if gap_mph < 5 else (0.51 if gap_mph < 10 else (0.75 if gap_mph < 15 else (0.91 if gap_mph < 20 else 1.06)))
+
+
+def _merge_run(frames, boost_mph, set_mph=35, v_mph=35, lose=None, radar_lead=False, limit=70):
+  """A merge raise to `limit` (+ boost) on the measured cruise: the car accelerates harder the further the set speed is
+  above it (_MEASURED_ACCEL)."""
+  car = T.Car(set_mph, dash_offset_mph=0.0, lag=10, lose=lose, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = v_mph * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  top, log = car.set_speed, []
+  for f in range(frames):
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=limit * MPH if f >= 400 else 0.0,
+                            limit_boost=boost_mph * MPH, radar_lead=radar_lead)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      if logic.last_action == "hold":
+        car.hold_frame(btn)
+      else:
+        car.press(btn)
+    car.tick()
+    top = max(top, car.set_speed)
+    log.append((f, car.set_speed / MPH, car.v_ego / MPH))
+  return car, logic, top, log
+
+
+def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before_the_car_gets_there():
+  # owner, drives 61 / 64: set 70 on the ramp and the car eased off from ~55 mph, still 66 where the ramp met the
+  # highway. A merge raise goes MERGE_BOOST above (one SET+ hold) and comes back to 70 once the car is within 5 mph
+  car, logic, top, log = _merge_run(9000, 15)
+  assert 80 - 1e-6 <= top / MPH <= 85 + 1e-6, top / MPH
+  assert any(h["direction"] == cs.SET_PLUS for h in logic.hold_log), "the raise is a hold, not taps"
+  up = next(f for f, s, v in log if s >= 75)
+  assert up - 400 <= 500, up                               # at 75+ within 5 s of the raise (the car's own hold rate)
+  t63 = next(f for f, s, v in log if v >= 63)
+  back = next(f for f, s, v in log if f > t63 and s <= 70 + 1e-6)
+  assert back - t63 <= 500, (t63, back)                    # back at 70 within 5 s of the car reaching 63
+  assert max(v for f, s, v in log) <= 72, max(v for f, s, v in log)
+  assert abs(car.set_speed / MPH - 70) < 1e-6 and logic.boost is None and not logic.boost_stuck
+  # without the boost: the same raise by a hold, never above 70; the car gets to 65 later
+  car0, logic0, top0, log0 = _merge_run(9000, 0)
+  assert top0 / MPH <= 70 + 1e-6 and any(h["direction"] == cs.SET_PLUS for h in logic0.hold_log)
+  # (the last 15 mph are where the set speed at 70 lets the cruise ease off)
+  assert next(f for f, s, v in log0 if v >= 68) > next(f for f, s, v in log if v >= 68) + 300
+  # a car followed by the radar: no boost
+  car1, logic1, top1, _ = _merge_run(3000, 15, radar_lead=True)
+  assert top1 / MPH <= 70 + 1e-6
+  # the car answers no SET- after the boost: the driver is told (boost_stuck)
+  car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = 35 * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  stuck = False
+  for f in range(9000):
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=70 * MPH if f >= 400 else 0.0,
+                            limit_boost=15 * MPH)
+    btn, _ = logic.update(inp)
+    if btn == cs.SET_PLUS:
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    car.tick()                                             # (SET- presses never reach the car)
+    stuck = stuck or logic.boost_stuck
+  assert stuck and car.set_speed / MPH >= 80
+
+
 def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
   def fn(f, c):
     if f < 2500:
@@ -1254,7 +1322,7 @@ def test_drive_56_an_on_ramps_loop_is_planned_before_the_turn_by_signal_or_navig
   m = planner(root)
   m.update(la, lo, 0.0, 30, True, gps=dict(street, signal=1))
   assert m.status == MC.STATUS_RAMP_CURVE and m.onramp_ahead, (m.status, m.onramp_ahead)
-  assert 150 <= m.distance <= 185 and abs(m.radius - 70) < 5, (m.distance, m.radius)
+  assert 150 <= m.distance <= 185 and abs(m.radius - 70 * MC.RAMP_LAT / MC.PLAN_LAT) < 6, (m.distance, m.radius)
   m = planner(root)
   m.update(la, lo, 0.0, 30, True, gps=dict(street, signal=-1))             # the other side: nothing
   assert not m.onramp_ahead and m.status != MC.STATUS_RAMP_CURVE
@@ -2405,3 +2473,14 @@ def test_the_curve_notice_shows_the_speed_the_car_takes_the_curve_to():
   mc.status, mc.floor = MC.STATUS_RAMP_CURVE, 35 * MPH            # a ramp curve: never the road's floor
   mp.publish(plan)
   assert abs(plan.mapCurveTarget - math.sqrt(2.2 * 93.08)) < 1e-6
+
+
+def test_ramp_curves_are_planned_at_the_ramp_lateral_limit():
+  # owner, drives 61 / 64: the 68 m loop at 27 mph and exit curves at 32-33 held traffic up (by hand: 34-35 and 45-47).
+  # Ramp curves are planned at RAMP_LAT (2.6, the steering holds ~2.7): the radius given is scaled for the car side
+  loop = {"r": 68.0, "ramp": {"type": "ramp"}}
+  road = {"r": 68.0}
+  v = lambda r: math.sqrt(MC.PLAN_LAT * r) / MPH  # noqa: E731
+  assert abs(v(MC.ramp_radius(loop)) - math.sqrt(MC.RAMP_LAT * 68.0) / MPH) < 1e-6
+  assert 29.5 <= v(MC.ramp_radius(loop)) <= 30.5 and abs(v(MC.ramp_radius(road)) - 27.4) < 0.1
+  assert MC.RAMP_LAT <= 2.7
