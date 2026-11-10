@@ -3076,3 +3076,22 @@ def test_a_floor_stop_from_55_mph_with_a_lost_tap_holds():
       assert holds and holds[0] - start <= int(0.6 / T.DT), (lost, lag, start, holds[:1])
       at_floor = next(k for k, s in enumerate(r["sets"]) if s / MPH <= 20.5)
       assert (at_floor - start) * T.DT <= 5.0, (lost, lag, start, at_floor)
+
+
+def test_drive_69_t760_no_red_light_head_start_in_a_curve():
+  # t 760: in a followed 38 mph map curve the stop-light detector came on (the tail lights ahead): the head start took
+  # the set speed 38 -> 35 for 30 s. No head start while a curve target is on; after the curve it starts as before
+  def go(curve_until):
+    return run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1500, lead=_NoCar(200), max_drop=10, red=lambda f: 100 <= f < 1200,
+               map_curve=lambda f: (f < curve_until, 40 * MPH), curve_to_trigger=True)
+  r = go(1500)
+  assert scs.RED_LIGHT not in r["kinds"]
+  assert r["min"] >= 40 - 1e-6                         # only the curve's own target
+  r2 = go(600)
+  first = next((k for k, kind in enumerate(r2["kinds"]) if kind == scs.RED_LIGHT), None)
+  assert first is not None and first >= 600, first
+  # a stop ahead (the planned stop) in a curve still starts on the warning
+  r3 = run(Car(45, dash_offset_mph=0.0), NO_CURVE, 1000, lead=_NoCar(200), max_drop=10, red=lambda f: f >= 100,
+           plan=lambda f: f >= 300, model=lambda f: -0.6 if f >= 300 else -0.2,
+           map_curve=lambda f: (True, 40 * MPH), curve_to_trigger=True)
+  assert scs.STOP_AHEAD in r3["kinds"] and scs.RED_LIGHT not in r3["kinds"]

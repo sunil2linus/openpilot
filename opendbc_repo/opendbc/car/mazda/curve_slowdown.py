@@ -1556,6 +1556,7 @@ class CurveSlowdown:
     self.trigger = StoppedCarTrigger()
     self.frame = 0
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
+    self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
     self.recorder = None
     self.curve_event = None
     self.stop_event = None
@@ -1728,7 +1729,8 @@ class CurveSlowdown:
       model_length=model_length, lane_change=lane_change, gas_pressed=bool(CS.out.gasPressed),
       set_speed=float(CS.out.cruiseState.speed) if cruise_enabled else 0.0,
       # the stop-light detector (the red light head start / the false stop guard); False while the plan is not alive
-      red_light=bool(getattr(plan, "redLight", False)) and red_ok if self._alive('starpilotPlan') else False)
+      red_light=bool(getattr(plan, "redLight", False)) and red_ok if self._alive('starpilotPlan') else False,
+      curve_active=self.curve_on)
     stop_active = self.trigger.update(stop_inputs) if self.stop_mode in (TEST, ON) else False
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
@@ -1878,6 +1880,7 @@ class CurveSlowdown:
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
+    self.curve_on = bool(curve_active)
     if self.exit_brake_frames > 0:
       self.exit_brake_frames -= 1
     if self.limit_follow is not None:

@@ -437,3 +437,17 @@ def test_no_red_light_on_a_ramp_onto_a_highway(tmp_path, monkeypatch):
   plan.mapRampToHighway = False                      # an exit ramp to a street (a light at its end): as before
   _drive(c, 2, set_mph=30, v_mph=28)
   assert seen[-1].red_light
+
+
+def test_the_trigger_is_told_when_a_curve_slowdown_is_on(tmp_path, monkeypatch):
+  # (no red light head start in a curve, drive 69 t 760) the curve target of the last frame goes to the stop trigger
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0)
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  _drive(c, 3)
+  assert not seen[-1].curve_active
+  c.curve_enabled = True
+  monkeypatch.setattr(c.curve_target, "update", lambda *a, **k: (True, 35 * MPH))
+  _drive(c, 2)
+  assert seen[-1].curve_active

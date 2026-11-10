@@ -199,14 +199,16 @@ class CSC:
 def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=5, lead=None, stop_mode=2,
         model=lambda f: None, setup=None, plan=lambda f: False, wheel_phase=0, wheel_alive=lambda f: True,
         limit=lambda f: 0.0, lane_change=lambda f: False, model_length=lambda f: 0.0, red=lambda f: False,
-        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0, other=lambda f: False, map_curve=None):
+        cap=lambda f: 0.0, undo=lambda f: 0.0, ceiling=lambda f: 0.0, other=lambda f: False, map_curve=None,
+        curve_to_trigger=False):
   """model(f): the driving model's desired acceleration at frame f (m/s^2), None = no modelV2.
   plan(f): True while the model plans a stop ahead (the red light check).
   red(f): starpilotPlan.redLight (the stop-light detector) at frame f.
   limit(f) / cap(f) / undo(f) / ceiling(f): the speed limit follower's raise / lower limit cap / undo / provisional
   ceiling (m/s, 0 none), called in that order.
   map_curve(f): a followed map curve instead of the camera mimic: (active, target m/s[, floor m/s]) or None (curve_track
-  on while active; the floor is MapOutput.floor, 0 / none: the controller's own Max Drop floor)."""
+  on while active; the floor is MapOutput.floor, 0 / none: the controller's own Max Drop floor).
+  curve_to_trigger: the stop trigger is told when the curve target was on last frame (as the wrapper does)."""
   logic = cs.CurveSlowdownLogic(metric, max_drop)
   if setup is not None:
     setup(logic)
@@ -219,6 +221,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
   start = car.set_speed
   min_set = max_set = car.set_speed
   a_ego, vs, follow, radar_hold, clear, kinds = 0.0, [], [], [], [], []
+  curve_on = False
   for f in range(frames):
     if events and f in events:
       events[f](st, car)
@@ -243,7 +246,8 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                                 model_alive=model(f) is not None, model_accel=model(f) or 0.0, plan_stop=plan(f),
                                 a_ego=a_ego, lead_y_path=lead.y_path(f, car) if (status and hasattr(lead, "y_path")) else None,
                                 model_length=model_length(f), lane_change=lane_change(f), gas_pressed=st["gas"],
-                                set_speed=car.set_speed if st["cruise"] else 0.0, red_light=red(f))
+                                set_speed=car.set_speed if st["cruise"] else 0.0, red_light=red(f),
+                                curve_active=curve_to_trigger and curve_on)
       active = trigger.update(li)
       ever_active = ever_active or active
       stop_active, stop_target, stop_urgent = active and stop_mode == 2, trigger.target, trigger.urgent
@@ -268,6 +272,7 @@ def run(car, curve_fn, frames, events=None, plan_lag=10, metric=False, max_drop=
                             curve_track=bool(map_curve is not None and pa),
                             curve_floor=mc[2] if (mc is not None and pa and len(mc) > 2) else 0.0)
     btn, off = logic.update(inp)
+    curve_on = pa
     if btn is not None:
       assert 0 <= off < 16
       if logic.last_action == "hold":

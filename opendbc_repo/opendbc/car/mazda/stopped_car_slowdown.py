@@ -316,6 +316,9 @@ RED_MIN_SPEED = 15 * MS_PER_MPH
 RED_LOW_SPEED = WARN_MIN_SPEED
 RED_AFTER_STOP = 12.0        # s
 RED_LIGHT = "red light (head start)"
+# No head start while a curve slowdown is on (drive 69 t 760, a 38 mph map curve: the detector took the tail lights ahead
+# for a red light, 38 -> 35 for 30 s); the stop ahead warning start itself is unchanged
+RED_IN_CURVE_OFF = True
 RED_GONE = "red light gone"
 # When the light goes (drive 52: it went at 187.8 s, the queue car was in our lane at 188.0, 55-76 % a car), a slower
 # car in our lane of any confidence the unsure car would take counts as "slower car ahead": no restore at once, and while
@@ -412,6 +415,7 @@ class StoppedCarInputs:
   gas_pressed: bool = False
   set_speed: float = 0.0            # m/s: the cruise set speed (0 unknown), the unsure car's cap is below it
   red_light: bool = False           # starpilotPlan.redLight (the stop-light detector), False when the plan is not alive
+  curve_active: bool = False        # a curve slowdown target (camera or a followed map curve) is on: no red light head start
 
 
 def _interp(x, xp, fp):
@@ -618,7 +622,8 @@ class StoppedCarTrigger:
     return (RED_START_ENABLED and not self.red_latched and self.red_frames >= _frames(RED_ON_TIME) and start_gates and
             i.v_ego >= RED_MIN_SPEED and (i.v_ego >= RED_LOW_SPEED or self.red_onset_rolling >= _frames(RED_AFTER_STOP)) and
             self.since_lane_change >= _frames(WARN_LANE_CHANGE_HOLD) and
-            self.a_f is not None and self.a_f > WARN_NOT_SLOWING_ACCEL)   # (not when the car is already slowing)
+            self.a_f is not None and self.a_f > WARN_NOT_SLOWING_ACCEL and   # (not when the car is already slowing)
+            not (RED_IN_CURVE_OFF and i.curve_active))
 
   def _filter_lead_v(self, i):
     if i.lead_alive and i.lead_status:
