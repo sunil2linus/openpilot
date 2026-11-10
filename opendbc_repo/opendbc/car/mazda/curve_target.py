@@ -177,6 +177,15 @@ MAP_ROAD_ACCEL_TAU = 0.5      # s
 # speed FIRM_SETTLE_TIME of the current slowdown early (the taps up take ~1-2 s and the cruise answers a second later).
 FIRM_MAX_DECEL = 1.0          # m/s^2
 FIRM_UNDERSHOOT = 8 * MS_PER_MPH  # m/s
+# ... for a curve taken under FIRM_LOW_CURVE only FIRM_UNDERSHOOT_LOW (drive 69: the dash showed 26 for a 33 mph exit
+# curve the car took at 33; at that gap the cruise already slows ~0.9 m/s^2 of its ~1.0)
+FIRM_UNDERSHOOT_LOW = 6 * MS_PER_MPH  # m/s
+FIRM_LOW_CURVE = 40 * MS_PER_MPH      # m/s
+
+
+def firm_undershoot(v_curve):
+  """The firm follow's undershoot (m/s) for a curve taken at v_curve (m/s)."""
+  return FIRM_UNDERSHOOT_LOW if (v_curve or 0.0) < FIRM_LOW_CURVE else FIRM_UNDERSHOOT
 FIRM_SETTLE_TIME = 1.6        # s
 
 
@@ -265,7 +274,7 @@ class MapCurveFollower:
   @property
   def low(self):
     """The lowest the command may go (m/s): the curve's speed less the undershoot in use."""
-    return (self.v_curve or 0.0) - (FIRM_UNDERSHOOT if self.firm else self.undershoot)
+    return (self.v_curve or 0.0) - (firm_undershoot(self.v_curve) if self.firm else self.undershoot)
 
   def update(self, v_ego, v_curve, distance, plan_speed, a_ego=None):
     """a_ego: the car's filtered acceleration (m/s^2) for closed_loop (None: not used)."""
@@ -288,7 +297,7 @@ class MapCurveFollower:
       self.firm, self.cmd = True, None
     if self.firm:
       want = map_follow_speed(v_ego, v_curve, distance, lead_time=self.lead_time, max_decel=FIRM_MAX_DECEL,
-                              undershoot=FIRM_UNDERSHOOT, settle=0.0)
+                              undershoot=firm_undershoot(v_curve), settle=0.0)
     else:
       want = map_follow_speed(v_ego, v_curve, distance, lead_time=self.lead_time, max_decel=self.max_decel,
                               undershoot=self.undershoot)

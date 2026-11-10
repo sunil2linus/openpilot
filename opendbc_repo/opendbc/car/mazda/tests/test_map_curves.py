@@ -2725,3 +2725,24 @@ def test_the_boosts_way_down_waits_for_his_gas_then_holds():
   assert minus_on_gas == 0 and not stuck
   downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
   assert len(downs) == 1 and downs[0]["frame"] >= gas_until and abs(car.set_speed / MPH - 75) < 1e-6
+
+
+def test_drive_69_a_firm_exit_curve_under_40_mph_keeps_the_set_speed_6_under_it():
+  # drive 69 t 385-400: the 33 mph exit curve from 57 mph; the firm follow took the set to 26 (8 under), the car took the
+  # curve at 33. Under 40 mph the undershoot is 6: the set no lower than 27, the car still at the curve's speed at entry
+  CT = _load("curve_target_t", os.path.join(HERE, "..", "curve_target.py"))
+  v_curve = 33.3 * MPH
+  for v0_mph, d0 in ((57.0, 300.0), (50.0, 220.0)):
+    fol = CT.MapCurveFollower(firm=True)
+    v, d, low_cmd, dt = v0_mph * MPH, d0, 1e9, 0.01
+    pend = []
+    while d > 0:
+      cmd = fol.update(v, v_curve, d, 100.0)
+      low_cmd = min(low_cmd, cmd)
+      pend.append(cmd)
+      seen = pend[-100] if len(pend) >= 100 else v                 # the cruise answers ~1 s late
+      v = max(v - CT.cruise_decel(v - seen) * dt, 0.0)
+      d -= v * dt
+    assert fol.firm and low_cmd >= v_curve - 6 * MPH - 1e-6, (v0_mph, low_cmd / MPH)
+    assert abs(v - v_curve) / MPH <= 2.0, (v0_mph, v / MPH)
+  assert CT.firm_undershoot(45 * MPH) == CT.FIRM_UNDERSHOOT                         # 40 mph and up: 8 as before
