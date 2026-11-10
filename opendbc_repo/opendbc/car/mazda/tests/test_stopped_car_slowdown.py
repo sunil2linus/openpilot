@@ -2860,3 +2860,62 @@ def test_a_pending_lower_limit_cap_applies_in_a_curve_once_it_cannot_cause_a_set
            map_curve=lambda f: (True, 40 * MPH, 37 * MPH), cap=lambda f: 50 * MPH, setup=lambda lg: setattr(lg, "anchor", 70 * MPH))
   assert r1["logic"].limit_cap is not None and near(r1["logic"].anchor / MPH, 70)
   assert near(r1["final"], 40)
+
+
+# ---------------- drive 69: holds lost for the rest of the drive ----------------
+
+def _hold_landings(r):
+  h = r["holds"]
+  return [f for f in range(h[0] + 1, h[-1] + 30) if abs(r["sets"][f] - r["sets"][f - 1]) > 0.1 * MPH]
+
+
+def test_drive_69_a_driver_set_edge_on_a_hold_landing_does_not_switch_holds_off():
+  # drive 69 t 879.18: the floor hold 41 -> 20 had its last quantum (25 -> 20) land on the frame the wheel reported SET+;
+  # the edge cut the hold first, so that quantum read as "the car kept stepping after the release": holds off for the rest
+  # of the drive (every 55 mph red light after it only tapped). Now the quantum the car was stepping stays the hold's.
+  r0 = approach(45, 60, frames=1500)
+  landings = _hold_landings(r0)
+  assert len(landings) >= 4, landings
+  for land in landings[1:5]:
+    def phantom(s, c):
+      c.driver_button, c.driver_button_until = cs.SET_PLUS, c.frame + 100   # (no set speed change of his)
+    r = approach(45, 60, frames=1500, events={land + 1: phantom})
+    lg = r["logic"]
+    assert lg.hold_misses == 0 and lg.holds_allowed, (land, lg.hold_misses, lg.holds_off_why)
+    assert not lg.disabled and r["min"] >= FLOOR_MPH - 1e-6
+
+
+def test_hold_misses_are_forgotten_after_hold_miss_forget():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  idle = _si(45)
+  for _ in range(10):
+    lg.update(idle)
+  lg._hold_miss("the car kept stepping after a release", True)       # the genuine protection: off at once
+  assert not lg.holds_allowed and lg.hold_misses == cs.HOLD_MISS_LIMIT
+  for _ in range(cs._frames(cs.HOLD_MISS_FORGET) - 1):
+    lg.update(idle)
+  assert not lg.holds_allowed
+  lg.update(idle)
+  assert lg.holds_allowed and lg.hold_misses == 0 and lg.holds_off_why.startswith("forgotten")
+
+
+def test_holds_come_back_for_a_stop_after_the_decay():
+  # holds switched off early in the drive (two misses); a stopped car 125 s later gets its floor hold again
+  frames = cs._frames(cs.HOLD_MISS_FORGET) + 1500
+  start = cs._frames(cs.HOLD_MISS_FORGET) + 500
+
+  def setup(lg):
+    lg.hold_misses, lg.holds_ok, lg.hold_miss_frame, lg.holds_off_why = cs.HOLD_MISS_LIMIT, False, 0, "a hold with no effect"
+  lead = StoppedLead(60 + 20.1168 * start * T.DT, present=lambda f: f >= start)
+  r = run(Car(45, dash_offset_mph=0.0), NO_CURVE, frames, lead=lead, max_drop=10, setup=setup)
+  assert r["holds"] and min(r["holds"]) >= start, r["holds"][:3]
+  assert r["min"] >= FLOOR_MPH - 1e-6 and r["min"] <= 21
+  # control: with no decay the same stop only taps
+  old = cs.HOLD_MISS_FORGET
+  cs.HOLD_MISS_FORGET = 1e9
+  try:
+    lead2 = StoppedLead(60 + 20.1168 * start * T.DT, present=lambda f: f >= start)
+    r2 = run(Car(45, dash_offset_mph=0.0), NO_CURVE, frames, lead=lead2, max_drop=10, setup=setup)
+  finally:
+    cs.HOLD_MISS_FORGET = old
+  assert not r2["holds"]

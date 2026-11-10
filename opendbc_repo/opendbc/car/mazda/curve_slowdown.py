@@ -138,6 +138,10 @@ HOLD_OVERRUN_DEFAULT = 1                 # quanta that may still land after a SE
 # the last 19 mph (drive 3c).
 HOLD_UP_OVERRUN_DEFAULT = 2              # assumed for SET+ holds until a hold has measured the car (then worst seen + 1)
 HOLD_MISS_LIMIT = 2                      # holds with no effect before holds are off for the drive
+# ... but not for the whole drive: drive 69 lost every hold from t 879 to the end (the 55 mph red lights only tapped, the
+# driver braked at each). The misses are forgotten HOLD_MISS_FORGET after the last one (a hold that keeps stepping after
+# its release still switches holds off at once, until then).
+HOLD_MISS_FORGET = 120.0                 # s
 HOLD_GOALS_MPH = (15, 10)                # stopped car, car not measured yet: first hold 15 mph down, the second 10 more
 # SET- holds per stopped car; once the car's holds are measured, a hold aims straight at the floor (the release rule
 # keeps the overrun margin), then taps
@@ -384,6 +388,8 @@ class CurveSlowdownLogic:
     self.phase_lock = False
     self.holds_ok = True             # allowed in the current episode
     self.hold_misses = 0
+    self.hold_miss_frame = None      # frame of the last hold miss (HOLD_MISS_FORGET)
+    self.holds_off_why = ""          # what switched holds off last (logs)
     self.hold_overrun = HOLD_OVERRUN_DEFAULT   # quanta seen to land after a release (max), starts conservative
     self.hold_measured = False
     self.hold_log = []               # [dict] one per hold, for the per-event log
@@ -626,8 +632,7 @@ class CurveSlowdownLogic:
       self.holds_learned += 1
       self.last_hold_learned = (quanta_after, "ours")
     elif p.landed == 0:
-      self.hold_misses += 1
-      self.holds_ok = False
+      self._hold_miss("a hold with no effect")
     for entry in self.hold_log:
       if entry["frame"] == p.frame:
         entry.update(pattern="quantum" if any(n >= 2 for _, n in p.landings) else ("taps" if p.landed else "none"))
@@ -637,6 +642,23 @@ class CurveSlowdownLogic:
       self.inflight.remove(p)
     if p in self.expired:
       self.expired.remove(p)
+
+  def _hold_miss(self, why, at_once=False):
+    """A hold missed (or overran): holds off for this episode; HOLD_MISS_LIMIT misses (or `at_once`) switch them off
+    until HOLD_MISS_FORGET has passed without another one."""
+    self.hold_misses = HOLD_MISS_LIMIT if at_once else self.hold_misses + 1
+    self.holds_ok = False
+    self.hold_miss_frame = self.frame
+    self.holds_off_why = why
+
+  def _forget_hold_misses(self):
+    """HOLD_MISS_FORGET after the last miss, with no hold of ours in flight: holds are allowed again."""
+    if (self.hold_misses > 0 and self.hold_miss_frame is not None and
+        self.frame - self.hold_miss_frame >= _frames(HOLD_MISS_FORGET) and
+        self.hold is None and not any(p.hold for p in self.inflight + self.expired)):
+      self.hold_misses = 0
+      self.holds_ok = True
+      self.holds_off_why = "forgotten: " + self.holds_off_why
 
   # ---- the driver's own holds: the car's landing after a release is the same whoever held the button ----
   def _watch_driver_hold_landing(self, direction, steps):
@@ -752,8 +774,7 @@ class CurveSlowdownLogic:
         if self.phase_lock:
           self.lock_overrun[SET_MINUS] = max(self.lock_overrun[SET_MINUS], 1)
         else:
-          self.hold_misses = HOLD_MISS_LIMIT
-          self.holds_ok = False
+          self._hold_miss("a hold ran onto the car's minimum", True)
         self._consume_ours(direction, int(math.ceil(steps)))
         return
       if (ours_k is not None and not hold_open and direction == SET_MINUS and steps < 1.75 and
@@ -800,9 +821,8 @@ class CurveSlowdownLogic:
           self.hold.reserve += n - n_ours
         else:
           # More than the hold had reserved: the car kept stepping after release. Still ours (the
-          # driver's speed reference must not move), but no more holds this drive.
-          self.hold_misses = HOLD_MISS_LIMIT
-          self.holds_ok = False
+          # driver's speed reference must not move), but no more holds (HOLD_MISS_FORGET).
+          self._hold_miss("the car kept stepping after a release", True)
       self._consume_ours(direction, n)
     elif one_step and expired_k is not None and not driver_recent and not after_gap:
       # A press we had given up on landed late. Counting it as ours keeps the driver's speed
@@ -908,6 +928,14 @@ class CurveSlowdownLogic:
       if i.driver_button != self.prev_driver_button:
         self.driver_taps.append((i.driver_button, self.frame))
         self.blocked = True
+        if self.hold is not None and self.hold.frames_sent:
+          # (drive 69 t 879.18: his SET edge came on the frame our floor hold's quantum 25 -> 20 landed; with the hold
+          # cut first, that quantum read as "the car kept stepping after the release" and holds were off for the rest of
+          # the drive) the quantum the car was stepping is still this hold's, as for any hold stopped between landings
+          self.hold.remaining += self._quantum_steps()
+          self.hold.reserve += self._quantum_steps()
+          if self.hold_log:
+            self.hold_log[-1]["aborted"] = True
         self.hold = None   # the driver is on the buttons: do not keep holding
       self.last_driver_edge[i.driver_button] = self.frame     # kept fresh while held
     self.prev_driver_button = i.driver_button
@@ -918,6 +946,7 @@ class CurveSlowdownLogic:
 
     if cruise_ok:
       self._observe_set_speed(i)
+    self._forget_hold_misses()
     # (every driver change of the set speed and every driver SET edge sets `blocked`, which our raise needed clear)
     if self.limit_raised is not None and (self.blocked or i.brake_pressed or not cruise_ok):
       self.limit_raised["touched"] = True
@@ -2477,7 +2506,9 @@ class CurveSlowdown:
         self.curve_presses += 1
       if lg.offset == 0 and not lg.inflight and not i.csc_active and not stop_active:
         self.recorder.close(self.curve_event, t, {"presses": self.curve_presses, "set_mph_after": i.set_speed / MS_PER_MPH,
-                                                   "disabled": lg.disabled, "no_effect_trips": lg.no_effect_trips})
+                                                   "disabled": lg.disabled, "no_effect_trips": lg.no_effect_trips,
+                                                   "holds_allowed": lg.holds_allowed, "hold_misses": lg.hold_misses,
+                                                   "holds_off_why": lg.holds_off_why})
         self.curve_event = None
     # stopped car event: from the trigger going active until the reason has cleared and the restore is done
     if self.stop_event is None and stop_active:
@@ -2510,7 +2541,8 @@ class CurveSlowdown:
           "set_mph_after": i.set_speed / MS_PER_MPH, "holds": len(holds),
           "holds_detail": "; ".join(self._hold_text(h) for h in holds),
           "hold_overrun_learned": lg.hold_overrun, "hold_measured": lg.hold_measured, "holds_learned_all_drives": self.profile.holds if self.profile else 0,
-          "holds_allowed": lg.holds_allowed, "disabled": lg.disabled,
+          "holds_allowed": lg.holds_allowed, "hold_misses": lg.hold_misses, "holds_off_why": lg.holds_off_why,
+          "disabled": lg.disabled,
           "radar_lead_rises_s": [round((f - self.trigger.start_frame) * DT_CTRL, 2) for f in self.trigger.radar_rises
                                  if f >= self.trigger.start_frame - 1500],
           "driver_braked": self.stop_brake, "early": self.trigger.early, "floor_mode": self.trigger.floor_mode,
