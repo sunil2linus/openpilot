@@ -371,6 +371,13 @@ STOP_AHEAD_RED_HOLD = 6.0    # s
 # After such a release the stop starts again at once (no WARN_REARM wait) while the light is (back) on and the planned
 # stop latched again, for REARM_ON_RED_TIME after the release.
 REARM_ON_RED_TIME = 10.0     # s
+# Limits (review of the merged fix): the light on alone holds a stop ahead at most STOP_AHEAD_RED_HOLD_MAX from the first
+# planned-stop dropout under it (a red arrow while going straight, the cross street's red: the plan blinking at least
+# every 6 s would otherwise hold the set speed down until his gas / brake), and never once the model says go (GO_TIME).
+# The restart at once happens once per release chain: not again until he braked / we stopped / the gas, or
+# REARM_CHAIN_TIME after it (a gappy detector would cycle down / up / down).
+STOP_AHEAD_RED_HOLD_MAX = 8.0   # s
+REARM_CHAIN_TIME = 30.0      # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
 WARN_GUARD_PLAN_HOLD = 4.0   # s
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
@@ -585,6 +592,8 @@ class StoppedCarTrigger:
     self.red_latched = False         # an episode was released while the light was on: it must go off before a head start
     self.rearm_on_red = False        # released as a stop ahead cleared / gone: a red light and the planned stop restart it
     self.release_frame = -10_000     # (REARM_ON_RED_TIME)
+    self.rearm_used_frame = None     # the restart at once was used (once per release chain, REARM_CHAIN_TIME)
+    self.red_hold_since = None       # first planned-stop dropout under the light this episode (STOP_AHEAD_RED_HOLD_MAX)
     self.rolling_frames = 0          # frames since we were last stopped (RED_AFTER_STOP) ...
     self.red_onset_rolling = 0       # ... when the light last came on
     self.red_base = 0.0              # the head start's reference speed (max(ours, set), or ours: CATCH_UP_*) and its cap
@@ -885,6 +894,7 @@ class StoppedCarTrigger:
                    i.v_ego >= WARN_MIN_SPEED)
       if red_rearm:
         warn_start = True
+        self.rearm_used_frame = self.frame
       if self.hold_frames >= _frames(HOLD_TIME) or early_start or warn_start:
         self._start(i, lead_ok, early_start, warn_start)
       elif unsure_on:
@@ -904,8 +914,14 @@ class StoppedCarTrigger:
       going = i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop
       self.go_frames = self.go_frames + 1 if going else 0
       # the light still on (STOP_AHEAD_RED_HOLD): no release as cleared / gone before the warning
-      red_holds = (self.red_gap < _frames(RED_DROPOUT) and
-                   self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD))
+      red_on = self.red_gap < _frames(RED_DROPOUT)
+      if not red_on:
+        self.red_hold_since = None
+      elif not i.plan_stop and self.red_hold_since is None:
+        self.red_hold_since = self.frame
+      red_holds = (red_on and self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD) and
+                   (self.red_hold_since is None or self.frame - self.red_hold_since < _frames(STOP_AHEAD_RED_HOLD_MAX)) and
+                   self.go_frames < _frames(GO_TIME))
       still_planned = self._warn_still_planned(i) if self.warn_pending else True
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
@@ -1069,6 +1085,7 @@ class StoppedCarTrigger:
     took_over = self.active and self.kind in TAP_KINDS
     from_red = took_over and self.kind == RED_LIGHT
     self.rearm_on_red = False
+    self.red_hold_since = None
     self.catch_up = False                      # (a tap episode's first drop: the new kind's own target from here)
     self.caught_up = self.caught_up and took_over
     self.active = True
@@ -1275,7 +1292,10 @@ class StoppedCarTrigger:
     self.catch_up = False
     self.red_latched = self.red_gap <= _frames(RED_DROPOUT)   # the light must go off before a red light head start
     self.release_frame = self.frame
-    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED)
+    if reason in ("cruise off / brake", "openpilot disengaged", "ego stopped behind the lead", "driver on the gas") or (
+        self.rearm_used_frame is not None and self.frame - self.rearm_used_frame > _frames(REARM_CHAIN_TIME)):
+      self.rearm_used_frame = None     # a new chain: the restart at once is available again
+    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.rearm_used_frame is None
     if restore_now and self.frame - self.last_plan_stop > _frames(LATCH_DROPOUT):
       # a release that restores at once with no stop planned now: the latch goes with it, so the restore is not held
       # back as "a stop planned ahead" (hold_restore, which the controller's restore_now respects); a plan that comes

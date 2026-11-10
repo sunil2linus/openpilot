@@ -3095,3 +3095,85 @@ def test_drive_69_t760_no_red_light_head_start_in_a_curve():
            plan=lambda f: f >= 300, model=lambda f: -0.6 if f >= 300 else -0.2,
            map_curve=lambda f: (True, 40 * MPH), curve_to_trigger=True)
   assert scs.STOP_AHEAD in r3["kinds"] and scs.RED_LIGHT not in r3["kinds"]
+
+
+# ---------------- review of the merged fix: limits of the hold under a red light and of the restart ----------------
+
+def _starts(r):
+  return [k for k, kind in enumerate(r["kinds"]) if kind == scs.STOP_AHEAD and (k == 0 or r["kinds"][k - 1] != scs.STOP_AHEAD)]
+
+
+def test_a_red_light_for_another_lane_holds_a_stop_ahead_at_most_stop_ahead_red_hold_max():
+  # a red arrow while going straight / the cross street's red: the light stays on, the plan blinks (1.5 s on, 1.5 s off):
+  # released STOP_AHEAD_RED_HOLD_MAX after the first dropout under the light (once the plan is then gone for
+  # STOP_AHEAD_GONE_TIME), and every later episode the same; the restart at once is used once per REARM_CHAIN_TIME
+  plan = lambda f: f >= 140 and (f - 140) % 300 < 150       # noqa: E731
+  rearms = []
+  orig = scs.StoppedCarTrigger.update
+
+  def watch(self, i):
+    before = self.rearm_used_frame
+    out = orig(self, i)
+    if self.rearm_used_frame is not None and self.rearm_used_frame != before:
+      rearms.append(self.frame)
+    return out
+  scs.StoppedCarTrigger.update = watch
+  try:
+    r, rel = _drive69_red(plan=plan, frames=6000)
+  finally:
+    scs.StoppedCarTrigger.update = orig
+  cleared = [x for x in rel if x[1] == scs.STOP_AHEAD_CLEARED]
+  assert cleared, rel
+  first_drop = 290
+  assert first_drop + scs.STOP_AHEAD_RED_HOLD_MAX / scs.DT_CTRL <= cleared[0][0] <= \
+    first_drop + (scs.STOP_AHEAD_RED_HOLD_MAX + 3.0) / scs.DT_CTRL + 3, cleared
+  starts = _starts(r)
+  for s0 in starts:                               # (before: one episode held to the floor for the whole minute)
+    end = next((x[0] for x in rel if x[0] > s0), len(r["kinds"]))
+    assert (end - s0) * T.DT <= 1.5 + scs.STOP_AHEAD_RED_HOLD_MAX + 3.0 or end == len(r["kinds"]), (s0, end, rel)
+  assert all(b - a > scs.REARM_CHAIN_TIME / scs.DT_CTRL for a, b in zip(rearms, rearms[1:], strict=False)), rearms
+
+
+def test_the_model_saying_go_releases_a_stop_ahead_under_a_red_light():
+  car = Car(45, dash_offset_mph=0.0, accel=0.6, cruise_gain=0.19, cruise_dead=1.0, cruise_max=1.0, min_set_mph=CAR_MIN_MPH,
+            lag=12)
+  r, rel = _releases(lambda: run(car, NO_CURVE, 2000, lead=_NoCar(200), max_drop=10, red=lambda f: True,
+                                 plan=lambda f: 140 <= f < 500, model=lambda f: -0.6 if 140 <= f < 500 else 0.5))
+  assert rel and rel[0][1] in (scs.STOP_AHEAD_CLEARED, scs.STOP_AHEAD_UNCONFIRMED), rel
+  assert rel[0][0] - 500 <= scs.GO_TIME / scs.DT_CTRL + 3, rel
+
+
+def test_the_restart_at_once_happens_once_per_release_chain():
+  def release(tr):
+    n = 0
+    while tr.update(_latched_inputs(lead_status=False, plan_stop=False, red_light=False, model_accel=-0.2)):
+      n += 1
+      assert n < 1000
+    assert tr.release_reason in (scs.STOP_AHEAD_CLEARED, scs.STOP_AHEAD_UNCONFIRMED), tr.release_reason
+
+  def back(tr, frames=250):
+    for k in range(frames):
+      if tr.update(_latched_inputs(lead_status=False)):
+        return k
+    return None
+  tr = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr)
+  release(tr)
+  assert back(tr) is not None                     # the first time: at once
+  release(tr)
+  assert not tr.rearm_on_red and back(tr) is None   # not again in the same chain (the WARN_REARM wait)
+  # a new chain after the driver braked: available again
+  tr2 = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr2)
+  release(tr2)
+  assert back(tr2) is not None
+  tr2.update(_latched_inputs(lead_status=False, brake_pressed=True))
+  assert not tr2.active and tr2.rearm_used_frame is None
+  # ... or REARM_CHAIN_TIME after it was used
+  tr3 = scs.StoppedCarTrigger()
+  _started_past_the_warning(tr3)
+  release(tr3)
+  assert back(tr3) is not None
+  tr3.rearm_used_frame -= int(scs.REARM_CHAIN_TIME / scs.DT_CTRL) + 1
+  release(tr3)
+  assert tr3.rearm_on_red and back(tr3) is not None
