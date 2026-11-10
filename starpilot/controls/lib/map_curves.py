@@ -935,6 +935,13 @@ CAP_FLOOR = 25 * MPH       # never below this (the stock cruise's lowest set spe
 CAP_RISE = 0.5 * MPH       # a clean pass at (or within CAP_NEAR of) the cap raises it this much ...
 CAP_NEAR = 2.5 * MPH       # (true speed: the dash reads ~2 mph above it, and the car side keeps a margin above the cap)
 CAP_JUMP = 5 * MPH         # ... a clean pass well above the cap raises it to that pass's speed, at most this much
+# A cap holds the car at the cap, so its passes are never "well above" it and it rose CAP_RISE a drive (drive 69: West
+# Utica's second curve capped at 37 mph, driven at 38 with 1.1-1.3 m/s^2 on a ~250 m radius, 48 needed no slowdown):
+# a full clean pass at or near the cap that measured a radius whose PLAN_LAT speed is CAP_LIFT_MARGIN or more above the
+# cap raises it CAP_JUMP; after CAP_LIFT_PASSES such passes the cap goes. A pass with the steering maxed out caps the
+# curve again whatever was lifted (add_saturated_pass).
+CAP_LIFT_MARGIN = 5 * MPH
+CAP_LIFT_PASSES = 2
 # One trusted gentle pass: a map curve much sharper than the road really is (a kink where two map ways join) is
 # corrected after a single clean pass, when that pass was full, fast enough and right through the curve's apex.
 MEMORY_ONE_PASS = 1.6      # the newest pass measured at least this many times the map's radius ...
@@ -1158,6 +1165,7 @@ class CurveMemory:
     e["cap"] = round(max(floor, min(old, SAT_FACTOR * v)), 2)
     e["cap_t"] = round(t, 1)
     e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
+    e.pop("cap_lift", None)                   # (CAP_LIFT_PASSES counts again from here)
     self.save()
 
   def add_pass(self, c, r, t=None, v=None, flags=None, direction=None):
@@ -1169,8 +1177,16 @@ class CurveMemory:
        abs(t - float(e.get("cap_t", -1e12))) >= MEMORY_SAME_PASS:
       # it took the curve cleanly near the cap (try a bit faster), or well above it (up to that speed)
       cap = float(e["cap"])
-      e["cap"] = round(max(cap + CAP_RISE, min(v, cap + CAP_JUMP)), 2)
+      new_cap = max(cap + CAP_RISE, min(v, cap + CAP_JUMP))
+      if "full" in (flags or []) and math.sqrt(PLAN_LAT * max(float(r), 0.0)) >= cap + CAP_LIFT_MARGIN:
+        # (CAP_LIFT_*) the curve measured much gentler than the cap: up CAP_JUMP, gone after CAP_LIFT_PASSES of these
+        e["cap_lift"] = int(e.get("cap_lift", 0)) + 1
+        new_cap = cap + CAP_JUMP
+      e["cap"] = round(new_cap, 2)
       e["cap_t"] = round(t, 1)
+      if int(e.get("cap_lift", 0)) >= CAP_LIFT_PASSES:
+        e.pop("cap", None)
+        e.pop("cap_lift", None)
     passes = [p for p in e["passes"] if isinstance(p, list) and len(p) >= 2]
     if passes and abs(t - passes[-1][1]) < MEMORY_SAME_PASS:
       passes = passes[:-1]                    # the same pass again (the other carriageway's record): keep the newest

@@ -1591,6 +1591,32 @@ def test_a_pass_with_the_steering_maxed_out_caps_the_curve_speed(tmp_path):
   assert abs(mem.speed_cap(unsigned) - 25 * MC.MPH) < 0.01                              # floor: 25 mph
 
 
+def test_drive_69_a_cap_lifts_when_full_clean_passes_measure_a_much_gentler_curve(tmp_path):
+  # West Utica's second curve: capped at 37 mph, driven at the cap (38 on the dash) with 1.1-1.3 m/s^2 on a ~250 m
+  # radius; the cap only rose 0.5 mph a pass (the cap holds the car at it, so no pass is "well above" it)
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = {"apex": (42.6, -83.1), "r": 116.6}
+  mem.add_saturated_pass(c, 41.1 * MC.MPH, t=1000.0)
+  cap0 = mem.speed_cap(c)
+  assert abs(cap0 - 37.0 * MC.MPH) < 0.02
+  mem.add_pass(c, 250.0, t=5000.0, v=37.5 * MC.MPH, flags=["full"])
+  assert abs(mem.speed_cap(c) - (cap0 + MC.CAP_JUMP)) < 0.02                          # up 5 mph (was 0.5)
+  mem.add_pass(c, 250.0, t=9000.0, v=41.0 * MC.MPH, flags=["full"])
+  assert mem.speed_cap(c) is None                                                      # gone after two such passes
+  # the steering maxed out on a later pass: capped again (saturation stays authoritative), the count starts over
+  mem.add_saturated_pass(c, 41.1 * MC.MPH, t=13000.0)
+  assert abs(mem.speed_cap(c) - 37.0 * MC.MPH) < 0.02
+  mem.add_pass(c, 250.0, t=17000.0, v=37.5 * MC.MPH, flags=["full"])
+  assert mem.speed_cap(c) is not None
+  # a pass that was not full, or measured a radius near the cap's own: the old CAP_RISE only
+  mem2 = MC.CurveMemory(str(tmp_path / "mem2.json"))
+  mem2.add_saturated_pass(c, 41.1 * MC.MPH, t=1000.0)
+  mem2.add_pass(c, 250.0, t=5000.0, v=37.5 * MC.MPH, flags=[])
+  assert abs(mem2.speed_cap(c) - (cap0 + MC.CAP_RISE)) < 0.02
+  mem2.add_pass(c, 140.0, t=9000.0, v=37.5 * MC.MPH, flags=["full"])                  # sqrt(2.2 x 140) = 39 mph < cap + 5
+  assert abs(mem2.speed_cap(c) - (cap0 + 2 * MC.CAP_RISE)) < 0.02
+
+
 def test_the_planner_slows_more_for_a_capped_curve(tmp_path):
   root, curves, _ = write_files(G.curve_road(r=115, turn=40, split=True))
   mem = MC.CurveMemory(str(tmp_path / "mem.json"))
