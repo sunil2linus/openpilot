@@ -402,43 +402,113 @@ def _merge_run(frames, boost_mph, set_mph=35, v_mph=35, lose=None, radar_lead=Fa
 
 
 def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before_the_car_gets_there():
-  # owner, drives 61 / 64: set 70 on the ramp and the car eased off from ~55 mph, still 66 where the ramp met the
-  # highway. A merge raise goes MERGE_BOOST above (one SET+ hold) and comes back to 70 once the car is within 5 mph
-  car, logic, top, log = _merge_run(9000, 15)
-  assert 80 - 1e-6 <= top / MPH <= 85 + 1e-6, top / MPH
-  assert any(h["direction"] == cs.SET_PLUS for h in logic.hold_log), "the raise is a hold, not taps"
-  up = next(f for f, s, v in log if s >= 75)
-  assert up - 400 <= 500, up                               # at 75+ within 5 s of the raise (the car's own hold rate)
-  t63 = next(f for f, s, v in log if v >= 63)
-  back = next(f for f, s, v in log if f > t63 and s <= 70 + 1e-6)
-  assert back - t63 <= 500, (t63, back)                    # back at 70 within 5 s of the car reaching 63
-  assert max(v for f, s, v in log) <= 72, max(v for f, s, v in log)
-  assert abs(car.set_speed / MPH - 70) < 1e-6 and logic.boost is None and not logic.boost_stuck
-  # without the boost: the same raise by a hold, never above 70; the car gets to 65 later
-  car0, logic0, top0, log0 = _merge_run(9000, 0)
-  assert top0 / MPH <= 70 + 1e-6 and any(h["direction"] == cs.SET_PLUS for h in logic0.hold_log)
-  # (the last 15 mph are where the set speed at 70 lets the cruise ease off)
-  assert next(f for f, s, v in log0 if v >= 68) > next(f for f, s, v in log if v >= 68) + 300
+  # owner, drives 61 / 64 / 69: the merge target is the highway's limit + 5 (75 on a 70 road: limit_raise 75 here), the
+  # boost 20 above it by one SET+ hold, kept until the car is 2 mph under the target, then ONE SET- hold down that never
+  # lands below the target, taps for the rest
+  car, logic, top, log = _merge_run(9000, 20, limit=75)
+  assert 95 - 1e-6 <= top / MPH <= 95 + 1e-6, top / MPH
+  ups = [h for h in logic.hold_log if h["direction"] == cs.SET_PLUS]
+  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  # (35 -> 90 is longer than one hold may run, HOLD_MAX_SECONDS: a second one goes on)
+  assert 1 <= len(ups) <= 2 and len(downs) == 1, logic.hold_log
+  assert abs(downs[0]["bound_mph"] - 75) < 1e-6
+  up = next(f for f, s, v in log if s >= 90 - 0.01)
+  assert up - 400 <= 700, up                               # 35 -> 90 by one hold in ~6.6 s (the car's own hold rate)
+  t73 = next(f for f, s, v in log if v >= 73)
+  assert all(s >= 75 - 1e-6 for f, s, v in log if f >= t73), "never below the target"
+  back = next(f for f, s, v in log if f > t73 and s <= 75 + 1e-6)
+  assert back - t73 <= 600, (t73, back)                    # back at 75 within 6 s of the car reaching 73 (was 15 taps)
+  peak = max(v for f, s, v in log)
+  assert peak <= 75 + 4, peak                              # owner: at most ~4 above the target
+  t35_75 = next(f for f, s, v in log if v >= 75 - 0.5) - 400
+  assert t35_75 <= 1900, t35_75                            # 35 -> 75 in ~18 s on the measured cruise
+  assert abs(car.set_speed / MPH - 75) < 1e-6 and logic.boost is None and not logic.boost_stuck
+  # without the boost: the same raise by a hold, never above 75; the car gets to 72 later
+  car0, logic0, top0, log0 = _merge_run(9000, 0, limit=75)
+  assert top0 / MPH <= 75 + 1e-6 and any(h["direction"] == cs.SET_PLUS for h in logic0.hold_log)
+  assert next(f for f, s, v in log0 if v >= 72) > next(f for f, s, v in log if v >= 72) + 300
   # a car followed by the radar: no boost
-  car1, logic1, top1, _ = _merge_run(3000, 15, radar_lead=True)
-  assert top1 / MPH <= 70 + 1e-6
-  # the car answers no SET- after the boost: the driver is told (boost_stuck)
+  car1, logic1, top1, _ = _merge_run(3000, 20, radar_lead=True, limit=75)
+  assert top1 / MPH <= 75 + 1e-6
+  # half the presses ignored: the hold down still lands at or above the target, taps finish it, no alert
+  car2, logic2, top2, log2 = _merge_run(9000, 20, limit=75, lose=lambda n: n % 2 == 0)
+  t73 = next(f for f, s, v in log2 if v >= 73)
+  assert all(s >= 75 - 1e-6 for f, s, v in log2 if f >= t73) and abs(car2.set_speed / MPH - 75) < 1e-6
+  assert not logic2.boost_stuck and max(v for f, s, v in log2) <= 75 + 4
+  # the car answers no SET- after the boost: the driver is told, within MERGE_BOOST_QUIET of the last press going
+  # unanswered (here ~2.5 s after the boost ended), and never later than MERGE_BOOST_STUCK
   car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
   car.v_ego = 35 * MPH
   logic = cs.CurveSlowdownLogic(False, 10)
-  stuck = False
+  stuck, ended = None, None
   for f in range(9000):
     inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
                             brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
-                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=70 * MPH if f >= 400 else 0.0,
-                            limit_boost=15 * MPH)
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=75 * MPH if f >= 400 else 0.0,
+                            limit_boost=20 * MPH)
     btn, _ = logic.update(inp)
     if btn == cs.SET_PLUS:
       car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
     car.tick()                                             # (SET- presses never reach the car)
-    stuck = stuck or logic.boost_stuck
-  assert stuck and car.set_speed / MPH >= 80
+    if ended is None and logic.boost is not None and "ended" in logic.boost:
+      ended = f
+    if stuck is None and logic.boost_stuck:
+      stuck = f
+  assert stuck is not None and car.set_speed / MPH >= 90
+  assert stuck - ended <= cs.MERGE_BOOST_STUCK * 100, (ended, stuck)
 
+
+def test_drive_69_the_boost_alert_waits_for_taps_that_are_still_landing():
+  # drive 69 t 572-578.6: 15 SET- taps 85 -> 70 took 6.7 s and 'Set speed is high' fired at 71 with the last tap landing
+  # (MERGE_BOOST_STUCK 6 s from the boost's end). Taps only (no hold down): no alert while they land
+  old = cs.MERGE_DOWN_HOLD
+  try:
+    cs.MERGE_DOWN_HOLD = False
+    seen = []
+    car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+    car.v_ego = 35 * MPH
+    logic = cs.CurveSlowdownLogic(False, 10)
+    for f in range(9000):
+      inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego,
+                              gas_pressed=False, brake_pressed=False, standstill=False, plan_alive=True,
+                              other_button_active=False, driver_button=None, csc_active=False, csc_speed=0.0,
+                              limit_raise=75 * MPH if f >= 400 else 0.0, limit_boost=20 * MPH)
+      btn, _ = logic.update(inp)
+      if btn is not None:
+        car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+      car.tick()
+      seen.append(logic.boost_stuck)
+    assert not any(seen) and abs(car.set_speed / MPH - 75) < 1e-6
+    assert not [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  finally:
+    cs.MERGE_DOWN_HOLD = old
+
+
+def test_drive_69_a_merge_raise_holds_from_the_start_even_with_a_restore_tapping():
+  # drive 69 merge 1 (t 284-289): a restore to his street speed (38 -> 48) by 1 mph taps kept presses in flight, the
+  # merge offer came at 287.6 and its hold started only at 289.1 (47). The merge raise waits only for what is in flight
+  car = T.Car(38, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = 30 * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  logic.anchor, logic.last_set_speed = 48 * MPH, 38 * MPH
+  taps_after = 0
+  hold_at = None
+  for f in range(3000):
+    raise_ = 75 * MPH if f >= 150 else 0.0
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=False,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=raise_,
+                            limit_boost=20 * MPH if raise_ else 0.0, fast_restore=True)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      if logic.last_action == "hold":
+        hold_at = f if hold_at is None else hold_at
+      elif f >= 150 and hold_at is None:
+        taps_after += 1
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    car.tick()
+  assert hold_at is not None and hold_at - 150 <= 150, hold_at      # the hold within 1.5 s of the offer
+  assert taps_after == 0, taps_after
 
 def test_fast_restore_raises_with_holds_and_never_above_the_driver_speed():
   def fn(f, c):
@@ -1354,6 +1424,59 @@ def test_drive_56_an_on_ramps_loop_is_planned_before_the_turn_by_signal_or_navig
   assert not out.active
 
 
+def _junction_scene():
+  """Drive 69 t 686-698: a street north (cls 5) to a junction with a crossing road (y = 290); an on-ramp leaves the
+  crossing road 40 m west of the junction, loops left (70 m) and joins a motorway heading east."""
+  st = G.way(40, G.straight(0, -500, 0, 1000), name="East South Boulevard", cls=5, speed_mph=45)
+  cr = G.way(41, G.straight(500, 290, 270, 1000), name="Dequindre Road", cls=5, speed_mph=45)
+  pts = G.straight(-40, 290, 270, 40) + G.arc(-80, 220, 70, 90, 270)[1:]
+  ramp = G.way(42, pts, name="", cls=2, speed_mph=45, oneway=True)
+  ex, ey = pts[-1]
+  mw = G.way(43, G.straight(ex - 200, ey, 90, 1200), name="", cls=1, speed_mph=70)
+  ramp.lat[-1], ramp.lon[-1] = mw.lat[10], mw.lon[10]
+  ramp.end = B.key(mw.lat[10], mw.lon[10])
+  k = 27                                                   # the crossing road's node at x = -40
+  ramp.lat[0], ramp.lon[0] = cr.lat[k], cr.lon[k]
+  ramp.start = B.key(cr.lat[k], cr.lon[k])
+  return {w.id: w for w in (st, cr, ramp, mw)}
+
+
+def test_drive_69_an_ordinary_turn_near_an_on_ramp_is_no_on_ramp_ahead():
+  # navigation's "turn left" 130 m ahead and his left signal for it found an M-59 on-ramp starting on the crossing road
+  # past the junction: its 57 m loop held the set speed at 27 on the street for 11 s
+  root, curves, ramps = write_files(_junction_scene())
+  assert ramps and any(r["type"] == "entrance" for r in ramps)
+  la, lo = pos(0, 160)
+  street = {"dt": 0.05, "v_ego": 12.0, "street": True}
+  m = planner(root)
+  m.update(la, lo, 0.0, 40, True, nav=("turn", "left", 130.0), gps=dict(street, signal=0))
+  assert not m.onramp_ahead and m.status != MC.STATUS_RAMP_CURVE
+  m = planner(root)
+  m.update(la, lo, 0.0, 40, True, gps=dict(street, signal=-1))      # his signal for the turn: the ramp is not on our road
+  assert not m.onramp_ahead
+  for t in ("merge", "fork", "turn"):
+    assert t not in MC.ONRAMP_NAV_TYPES
+  m = planner(root)                                                  # navigation naming the ramp itself still counts
+  m.update(la, lo, 0.0, 40, True, nav=("on ramp", "left", 136.0), gps=dict(street, signal=0))
+  assert m.onramp_ahead
+
+
+def test_an_on_ramp_ahead_is_kept_two_seconds_not_flickered():
+  root, curves, ramps = write_files(_onramp_scene())
+  street = {"dt": 0.05, "v_ego": 10.0, "street": True}
+  m = planner(root)
+  y, seen = -120.0, []
+  for i in range(80):
+    la, lo = pos(0, y)
+    m.update(la, lo, 0.0, 30, True, gps=dict(street, signal=1 if i == 0 else 0))
+    seen.append((m.onramp_ahead, m.distance))
+    y += 0.5
+  kept = [d for on, d in seen if on]
+  assert abs(len(kept) - MC.ONRAMP_KEEP / 0.05) <= 2, len(kept)
+  assert all(a > b for a, b in zip(kept, kept[1:], strict=False)), "its distance counts down from the ramp's start"
+  assert not seen[-1][0]
+
+
 def test_on_a_ramp_onto_a_highway_the_loop_stops_governing_before_its_end():
   # drive 59, the Rochester Rd loop: held at 27 until the loop's very end, then a short merge. On a ramp to a highway
   # the ramp curve stops governing RAMP_HWY_RELEASE before its end (the restore / merge starts while the loop ends)
@@ -1466,6 +1589,32 @@ def test_a_pass_with_the_steering_maxed_out_caps_the_curve_speed(tmp_path):
   unsigned = {"apex": (42.7, -83.2), "r": 60.0}
   mem.add_saturated_pass(unsigned, 26.0 * MC.MPH, t=1.0)
   assert abs(mem.speed_cap(unsigned) - 25 * MC.MPH) < 0.01                              # floor: 25 mph
+
+
+def test_drive_69_a_cap_lifts_when_full_clean_passes_measure_a_much_gentler_curve(tmp_path):
+  # West Utica's second curve: capped at 37 mph, driven at the cap (38 on the dash) with 1.1-1.3 m/s^2 on a ~250 m
+  # radius; the cap only rose 0.5 mph a pass (the cap holds the car at it, so no pass is "well above" it)
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = {"apex": (42.6, -83.1), "r": 116.6}
+  mem.add_saturated_pass(c, 41.1 * MC.MPH, t=1000.0)
+  cap0 = mem.speed_cap(c)
+  assert abs(cap0 - 37.0 * MC.MPH) < 0.02
+  mem.add_pass(c, 250.0, t=5000.0, v=37.5 * MC.MPH, flags=["full"])
+  assert abs(mem.speed_cap(c) - (cap0 + MC.CAP_JUMP)) < 0.02                          # up 5 mph (was 0.5)
+  mem.add_pass(c, 250.0, t=9000.0, v=41.0 * MC.MPH, flags=["full"])
+  assert mem.speed_cap(c) is None                                                      # gone after two such passes
+  # the steering maxed out on a later pass: capped again (saturation stays authoritative), the count starts over
+  mem.add_saturated_pass(c, 41.1 * MC.MPH, t=13000.0)
+  assert abs(mem.speed_cap(c) - 37.0 * MC.MPH) < 0.02
+  mem.add_pass(c, 250.0, t=17000.0, v=37.5 * MC.MPH, flags=["full"])
+  assert mem.speed_cap(c) is not None
+  # a pass that was not full, or measured a radius near the cap's own: the old CAP_RISE only
+  mem2 = MC.CurveMemory(str(tmp_path / "mem2.json"))
+  mem2.add_saturated_pass(c, 41.1 * MC.MPH, t=1000.0)
+  mem2.add_pass(c, 250.0, t=5000.0, v=37.5 * MC.MPH, flags=[])
+  assert abs(mem2.speed_cap(c) - (cap0 + MC.CAP_RISE)) < 0.02
+  mem2.add_pass(c, 140.0, t=9000.0, v=37.5 * MC.MPH, flags=["full"])                  # sqrt(2.2 x 140) = 39 mph < cap + 5
+  assert abs(mem2.speed_cap(c) - (cap0 + 2 * MC.CAP_RISE)) < 0.02
 
 
 def test_the_planner_slows_more_for_a_capped_curve(tmp_path):
@@ -2484,3 +2633,116 @@ def test_ramp_curves_are_planned_at_the_ramp_lateral_limit():
   assert abs(v(MC.ramp_radius(loop)) - math.sqrt(MC.RAMP_LAT * 68.0) / MPH) < 1e-6
   assert 29.5 <= v(MC.ramp_radius(loop)) <= 30.5 and abs(v(MC.ramp_radius(road)) - 27.4) < 0.1
   assert MC.RAMP_LAT <= 2.7
+
+
+def _loop_69(hold_s=None):
+  """Drive 69, t 510-560: the on-ramp loop (map 71 m, published 84 m at the ramp lateral limit) entered from a primary
+  road (class 5) with his right signal on (no camera curve). At the loop's entry GPS trust fell to 2 and the planner held
+  another curve (status 5, 212 m) for ~2 s, then matched the loop again with the ramp flag."""
+  entry = 200.0
+
+  def fields(x):
+    if x < entry - 10:
+      return F(status=2, radius=84.0, distance=entry - x, road_class=5, onramp_ahead=True)
+    if x < entry + 15:
+      return F(status=5, radius=212.0, distance=max(entry + 15 - x, 0.0), road_class=5, gps_trust=2)
+    return F(status=2, radius=84.0, distance=0.0, road_class=2, on_ramp=True, ramp_type=2, ramp_to_highway=True,
+             ramp_end_distance=max(entry + 400 - x, 1.0))
+  old = CTL.RAMP_STATUS_HOLD
+  try:
+    if hold_s is not None:
+      CTL.RAMP_STATUS_HOLD = hold_s
+    return drive_53(fields, 2500, 50, v_mph=40), entry
+  finally:
+    CTL.RAMP_STATUS_HOLD = old
+
+
+def test_drive_69_a_ramp_curve_lost_to_a_held_status_at_the_loop_entry_never_raises_the_set_speed():
+  # drive 69 t 529: GPS trust 2 at the loop's entry, the loop's curve became a held one (status 5) and the restore held
+  # SET+ 31 -> 35 where the car was at ~3.4 m/s^2. The ramp curve's last command is kept (RAMP_STATUS_HOLD)
+  r, entry = _loop_69()
+  assert not _plus_between(r, entry - 10, entry + 40), _plus_between(r, entry - 10, entry + 40)
+  held = [s for s, xx in zip(r["sets"], r["xs"], strict=True) if entry - 10 <= xx < entry + 15]
+  assert max(held) <= min(held) + 1.5, (min(held), max(held))     # neither up nor further down
+  assert max(held) <= math.sqrt(2.2 * 84.0) / MPH + 1.5
+  # without the hold (the old behaviour) the same scene restores inside the loop's entry
+  r0, _ = _loop_69(hold_s=0.0)
+  assert _plus_between(r0, entry - 10, entry + 40), "the scene exercises the restore"
+
+
+def test_a_ramp_curves_hold_ends_when_the_curve_ends_or_off_the_link():
+  c = CTL.MapCurveControl(3.0)
+  ramp = dict(on_ramp=True, ramp_type=2, ramp_to_highway=True, ramp_end_distance=400.0, road_class=2)
+  for _ in range(HOLD + 50):
+    out = c.update(F(status=2, radius=84.0, distance=0.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert out.active and out.track
+  out = c.update(F(status=5, radius=212.0, distance=10.0, **ramp), 50 * MPH, 0, v_ego=14.0, set_speed=31 * MPH)
+  assert out.active and out.why == "ramp hold" and not out.settled and abs(out.speed - 31 * MPH) < 1e-6
+  # a real end of the curve (status 0) lets go at once
+  out = c.update(F(**ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active
+  out = c.update(F(status=4, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active                                              # (forgotten)
+  # near the end of a ramp onto a highway (RAMP_STATUS_HWY_RELEASE) status 4 / 5 does not hold it
+  for _ in range(5):
+    c.update(F(status=2, radius=84.0, distance=0.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  ramp["ramp_end_distance"] = 100.0
+  out = c.update(F(status=5, radius=212.0, distance=10.0, **ramp), 50 * MPH, 0, v_ego=14.0)
+  assert not out.active
+  # off a link the hold lasts RAMP_STATUS_HOLD after the ramp curve last governed
+  c = CTL.MapCurveControl(3.0)
+  for _ in range(HOLD + 50):
+    c.update(F(status=2, radius=84.0, distance=50.0, road_class=5, onramp_ahead=True), 50 * MPH, 0, v_ego=14.0)
+  n = 0
+  while c.update(F(status=5, radius=212.0, distance=10.0, road_class=5), 50 * MPH, 0, v_ego=14.0).active:
+    assert c.onramp_now                                            # (an on-ramp's curve: no camera-only stops)
+    n += 1
+    assert n < 1000
+  assert not c.onramp_now
+  assert abs(n - CTL.RAMP_STATUS_HOLD / CTL.DT_CTRL) <= 2, n
+
+
+def test_the_boosts_way_down_waits_for_his_gas_then_holds():
+  # on his gas no SET- of ours (as for any tap) and no alert; once he lifts: the one SET- hold, never below the target
+  car = T.Car(35, dash_offset_mph=0.0, lag=10, accel_fn=_MEASURED_ACCEL)
+  car.v_ego = 35 * MPH
+  logic = cs.CurveSlowdownLogic(False, 10)
+  gas_until, ended, minus_on_gas, stuck = None, None, 0, False
+  for f in range(9000):
+    gas = gas_until is not None and f < gas_until
+    inp = cs.SlowdownInputs(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=gas,
+                            brake_pressed=False, standstill=False, plan_alive=True, other_button_active=False,
+                            driver_button=None, csc_active=False, csc_speed=0.0, limit_raise=75 * MPH if f >= 400 else 0.0,
+                            limit_boost=20 * MPH)
+    btn, _ = logic.update(inp)
+    if btn is not None:
+      minus_on_gas += gas and btn == cs.SET_MINUS
+      car.hold_frame(btn) if logic.last_action == "hold" else car.press(btn)
+    car.tick()
+    if ended is None and logic.boost is not None and "ended" in logic.boost:
+      ended, gas_until = f, f + 1200                       # on the gas 12 s from the boost's end
+    stuck = stuck or logic.boost_stuck
+  assert minus_on_gas == 0 and not stuck
+  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
+  assert len(downs) == 1 and downs[0]["frame"] >= gas_until and abs(car.set_speed / MPH - 75) < 1e-6
+
+
+def test_drive_69_a_firm_exit_curve_under_40_mph_keeps_the_set_speed_6_under_it():
+  # drive 69 t 385-400: the 33 mph exit curve from 57 mph; the firm follow took the set to 26 (8 under), the car took the
+  # curve at 33. Under 40 mph the undershoot is 6: the set no lower than 27, the car still at the curve's speed at entry
+  CT = _load("curve_target_t", os.path.join(HERE, "..", "curve_target.py"))
+  v_curve = 33.3 * MPH
+  for v0_mph, d0 in ((57.0, 300.0), (50.0, 220.0)):
+    fol = CT.MapCurveFollower(firm=True)
+    v, d, low_cmd, dt = v0_mph * MPH, d0, 1e9, 0.01
+    pend = []
+    while d > 0:
+      cmd = fol.update(v, v_curve, d, 100.0)
+      low_cmd = min(low_cmd, cmd)
+      pend.append(cmd)
+      seen = pend[-100] if len(pend) >= 100 else v                 # the cruise answers ~1 s late
+      v = max(v - CT.cruise_decel(v - seen) * dt, 0.0)
+      d -= v * dt
+    assert fol.firm and low_cmd >= v_curve - 6 * MPH - 1e-6, (v0_mph, low_cmd / MPH)
+    assert abs(v - v_curve) / MPH <= 2.0, (v0_mph, v / MPH)
+  assert CT.firm_undershoot(45 * MPH) == CT.FIRM_UNDERSHOOT                         # 40 mph and up: 8 as before

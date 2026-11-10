@@ -194,11 +194,12 @@ def test_wrapper_merge_on_and_test(tmp_path, monkeypatch):
     _mapd(sm, 70, 250.0)                                          # (already less than the cruise needs: at once)
     sent = _drive(c, 600)
     adopt = [d for k, d in records if k == "speedLimitAdopt"]
-    assert len(adopt) == 1 and adopt[0]["kind"] == "merge" and abs(adopt[0]["new_mph"] - 70) < 1e-6, (mode, records)
+    # (owner after drive 69: the highway's limit + 5, MERGE_OVER)
+    assert len(adopt) == 1 and adopt[0]["kind"] == "merge" and abs(adopt[0]["new_mph"] - 75) < 1e-6, (mode, records)
     if mode == 2:
-      # (the merge boost: the set speed may go 15 above the highway speed meanwhile)
-      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 85) < 1e-6 and any(s for s in sent)
-      assert abs(c.logic.boost["target"] / MPH - 70) < 1e-6
+      # (the merge boost: the set speed may go 20 above the merge target meanwhile)
+      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 95) < 1e-6 and any(s for s in sent)
+      assert abs(c.logic.boost["target"] / MPH - 75) < 1e-6
     else:
       assert adopt[0]["mode"] == "test" and c.logic.anchor is None and not any(sent)
 
@@ -451,3 +452,33 @@ def test_the_trigger_is_told_when_a_curve_slowdown_is_on(tmp_path, monkeypatch):
   monkeypatch.setattr(c.curve_target, "update", lambda *a, **k: (True, 35 * MPH))
   _drive(c, 2)
   assert seen[-1].curve_active
+
+
+def test_no_red_light_on_a_highways_link_entered_from_a_street_but_kept_on_an_exit(tmp_path, monkeypatch):
+  # drive 69 t 530: a "red light" in the on-ramp loop's entry before the ramp flag (MapCurveControl.onramp_now). An
+  # exit's link (entered from a highway) keeps them: it may end at a street's light, which he stops at
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 5                              # a street
+  _drive(c, 20, set_mph=30, v_mph=28)
+  plan.redLight = True
+  plan.mapRoadClass = 2                              # its motorway link (the ramp flag not on yet)
+  _drive(c, 3, set_mph=30, v_mph=28)
+  assert c.map_control.onramp_now and not seen[-1].red_light and not seen[-1].plan_stop
+  # an exit: from the highway onto its link, a light at the link's end
+  c, sm, records = _make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode = 2
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  plan.mapRoadClass = 1
+  _drive(c, 20, set_mph=40, v_mph=38)
+  plan.redLight = True
+  plan.mapRoadClass, plan.mapOnRamp, plan.mapRampType = 2, True, 1
+  _drive(c, 3, set_mph=40, v_mph=38)
+  assert not c.map_control.onramp_now and seen[-1].red_light

@@ -83,10 +83,19 @@ RAMP_HWY_RELEASE = 120.0  # m (drives 61 / 64: 60 was late, by hand he speeds up
 # curve): before the turn onto a ramp that leads to a highway, its first curve is planned like a ramp curve, when
 #   * navigation's next maneuver is that ramp (type in ONRAMP_NAV_TYPES, matched at its start within NAV_MATCH_*), or
 #   * his turn signal is on toward it and its start is at most ONRAMP_SIGNAL_RANGE ahead (no navigation needed).
-ONRAMP_NAV_TYPES = ("on ramp", "turn", "ramp", "merge")
+# (drive 69 t 686-698: navigation's "turn left" onto Dequindre Rd 130 m ahead matched an M-59 on-ramp starting on that
+# road past the junction, and its 57 m loop held the set speed at 27 on the street for 11 s: a turn, a merge or a fork
+# is no ramp; only a maneuver that is the ramp itself counts)
+ONRAMP_NAV_TYPES = ("on ramp", "ramp")
 ONRAMP_NAV_RANGE = 600.0      # m
 ONRAMP_SIGNAL_RANGE = 150.0   # m
 ONRAMP_SIDE_SIN = 0.34        # the ramp leaves at least ~20 deg toward a side (its first curve's entry from its start): that side
+# By his signal the ramp must leave the road we are on: its start at most this far sideways of our line of travel (an
+# ordinary turn's signal at a junction found a ramp starting on the crossing road, past the junction)
+ONRAMP_SIGNAL_LATERAL = 25.0  # m
+# The decision is kept this long after it was last made (drive 69: the planner's answer went on and off every 0.5 s,
+# the set speed's raise was blocked and let go with it); while kept, its distance is counted from the ramp's start
+ONRAMP_KEEP = 2.0             # s
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 # Ramp loops (drive 53, the on-ramp loop onto M-59: 71 m, 243 deg, 386 m long): "ahead" is a straight-line bearing test,
@@ -926,6 +935,13 @@ CAP_FLOOR = 25 * MPH       # never below this (the stock cruise's lowest set spe
 CAP_RISE = 0.5 * MPH       # a clean pass at (or within CAP_NEAR of) the cap raises it this much ...
 CAP_NEAR = 2.5 * MPH       # (true speed: the dash reads ~2 mph above it, and the car side keeps a margin above the cap)
 CAP_JUMP = 5 * MPH         # ... a clean pass well above the cap raises it to that pass's speed, at most this much
+# A cap holds the car at the cap, so its passes are never "well above" it and it rose CAP_RISE a drive (drive 69: West
+# Utica's second curve capped at 37 mph, driven at 38 with 1.1-1.3 m/s^2 on a ~250 m radius, 48 needed no slowdown):
+# a full clean pass at or near the cap that measured a radius whose PLAN_LAT speed is CAP_LIFT_MARGIN or more above the
+# cap raises it CAP_JUMP; after CAP_LIFT_PASSES such passes the cap goes. A pass with the steering maxed out caps the
+# curve again whatever was lifted (add_saturated_pass).
+CAP_LIFT_MARGIN = 5 * MPH
+CAP_LIFT_PASSES = 2
 # One trusted gentle pass: a map curve much sharper than the road really is (a kink where two map ways join) is
 # corrected after a single clean pass, when that pass was full, fast enough and right through the curve's apex.
 MEMORY_ONE_PASS = 1.6      # the newest pass measured at least this many times the map's radius ...
@@ -1149,6 +1165,7 @@ class CurveMemory:
     e["cap"] = round(max(floor, min(old, SAT_FACTOR * v)), 2)
     e["cap_t"] = round(t, 1)
     e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
+    e.pop("cap_lift", None)                   # (CAP_LIFT_PASSES counts again from here)
     self.save()
 
   def add_pass(self, c, r, t=None, v=None, flags=None, direction=None):
@@ -1160,8 +1177,16 @@ class CurveMemory:
        abs(t - float(e.get("cap_t", -1e12))) >= MEMORY_SAME_PASS:
       # it took the curve cleanly near the cap (try a bit faster), or well above it (up to that speed)
       cap = float(e["cap"])
-      e["cap"] = round(max(cap + CAP_RISE, min(v, cap + CAP_JUMP)), 2)
+      new_cap = max(cap + CAP_RISE, min(v, cap + CAP_JUMP))
+      if "full" in (flags or []) and math.sqrt(PLAN_LAT * max(float(r), 0.0)) >= cap + CAP_LIFT_MARGIN:
+        # (CAP_LIFT_*) the curve measured much gentler than the cap: up CAP_JUMP, gone after CAP_LIFT_PASSES of these
+        e["cap_lift"] = int(e.get("cap_lift", 0)) + 1
+        new_cap = cap + CAP_JUMP
+      e["cap"] = round(new_cap, 2)
       e["cap_t"] = round(t, 1)
+      if int(e.get("cap_lift", 0)) >= CAP_LIFT_PASSES:
+        e.pop("cap", None)
+        e.pop("cap_lift", None)
     passes = [p for p in e["passes"] if isinstance(p, list) and len(p) >= 2]
     if passes and abs(t - passes[-1][1]) < MEMORY_SAME_PASS:
       passes = passes[:-1]                    # the same pass again (the other carriageway's record): keep the newest
@@ -1414,6 +1439,7 @@ class MapCurves:
     self.entered = {}            # ramp curve s_a -> odo at its entry, on the ramp chain `entered_chain`
     self.entered_chain = 0
     self.watches = []            # navigation exits watched past the split (_watch_add), newest last
+    self.onramp_keep = None      # [s left, curve, ramp start (lat, lon), m from the start to the curve] (ONRAMP_KEEP)
     self.reset()
 
   def reset(self):
@@ -1612,19 +1638,50 @@ class MapCurves:
         self.ramp_end_dist = dist_m(lat, lon, *end)
     # (also when the street itself has no curve record: a straight street is no chain)
     if not self.on_ramp and (gps or {}).get("street") and not (trust is not None and trust.low) and self.data_here:
-      self._onramp_ahead(lat, lon, bearing, nav, int((gps or {}).get("signal", 0)))
+      self._onramp_ahead(lat, lon, bearing, nav, int((gps or {}).get("signal", 0)),
+                         max(float((gps or {}).get("dt", 0.05)), 0.0))
+    else:
+      self.onramp_keep = None
     if nav is not None and not (trust is not None and trust.low):
       self._nav_exit(lat, lon, bearing, *nav)
     if nav is not None and self.on_ramp:
       self._nav_fork(lat, lon, bearing, *nav)
 
-  def _onramp_ahead(self, lat, lon, bearing, nav, signal):
+  def _onramp_ahead(self, lat, lon, bearing, nav, signal, dt=0.05):
     """On a street: the first curve of an on-ramp (to a highway) we are about to turn onto, by navigation or by the turn
     signal (ONRAMP_*), governs when it needs a lower speed than the curve found so far (status STATUS_RAMP_CURVE,
-    onramp_ahead: the car side plans it as a ramp curve before the ramp is matched)."""
+    onramp_ahead: the car side plans it as a ramp curve before the ramp is matched). A decision is kept ONRAMP_KEEP."""
+    best = self._onramp_find(lat, lon, bearing, nav, signal)
+    if best is not None:
+      self.onramp_keep = [ONRAMP_KEEP, best[1], best[3], best[4]]
+    elif self.onramp_keep is not None:
+      keep = self.onramp_keep
+      keep[0] -= dt
+      ok, d = ahead(lat, lon, bearing, *keep[2])
+      if keep[0] <= 0.0 or not ok:
+        self.onramp_keep = None
+        return
+      c, s_c = keep[1], keep[3]
+      best = (plan_speed(ramp_radius(c), d + s_c, c.get("adv", 0.0), decel=self.decel, floor=0.0,
+                         lead_time=PLAN_LEAD_TIME), c, d + s_c)
+    else:
+      return
+    v, c, dd = best[:3]
+    if self.curve is not None:
+      cur = plan_speed(self.radius, self.distance, self.advisory, decel=self.decel,
+                       floor=0.0 if self.status == STATUS_RAMP_CURVE else self.floor,
+                       lead_time=PLAN_LEAD_TIME if self.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME)
+      if cur <= v:
+        return
+    self.curve, self.distance, self.radius = c, dd, ramp_radius(c)
+    self.advisory = float(c.get("adv", 0.0) or 0.0)
+    self.status, self.source, self.onramp_ahead = STATUS_RAMP_CURVE, 0, True
+
+  def _onramp_find(self, lat, lon, bearing, nav, signal):
+    """_onramp_ahead's search: (plan speed, curve, m to it, the ramp's start, m from the start to the curve) or None."""
     nav_ok = nav is not None and nav[0] in ONRAMP_NAV_TYPES and 0 < nav[2] <= ONRAMP_NAV_RANGE
     if not nav_ok and not signal:
-      return
+      return None
     best = None
     for r in self.store.ramps_all:
       if r["type"] == "exit" or r["travel"] == "both" or (r.get("to") or {}).get("cls") not in HIGHWAY_CLASSES:
@@ -1644,7 +1701,8 @@ class MapCurves:
       side = 1 if lean > ONRAMP_SIDE_SIN else (-1 if lean < -ONRAMP_SIDE_SIN else 0)
       by_nav = nav_ok and abs(d - nav[2]) <= max(NAV_MATCH_MIN, NAV_MATCH_TOL * nav[2]) and \
         (nav_side(nav[1]) in (0, side) or side == 0)
-      by_signal = signal != 0 and side == signal and d <= ONRAMP_SIGNAL_RANGE
+      lateral = abs(d * math.sin(math.radians(bearing_to(lat, lon, *start) - bearing)))
+      by_signal = signal != 0 and side == signal and d <= ONRAMP_SIGNAL_RANGE and lateral <= ONRAMP_SIGNAL_LATERAL
       if not (by_nav or by_signal):
         continue
       for s_c, c in firsts:
@@ -1652,19 +1710,8 @@ class MapCurves:
           continue
         v = plan_speed(ramp_radius(c), d + s_c, c.get("adv", 0.0), decel=self.decel, floor=0.0, lead_time=PLAN_LEAD_TIME)
         if best is None or v < best[0]:
-          best = (v, c, d + s_c)
-    if best is None:
-      return
-    v, c, dd = best
-    if self.curve is not None:
-      cur = plan_speed(self.radius, self.distance, self.advisory, decel=self.decel,
-                       floor=0.0 if self.status == STATUS_RAMP_CURVE else self.floor,
-                       lead_time=PLAN_LEAD_TIME if self.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME)
-      if cur <= v:
-        return
-    self.curve, self.distance, self.radius = c, dd, ramp_radius(c)
-    self.advisory = float(c.get("adv", 0.0) or 0.0)
-    self.status, self.source, self.onramp_ahead = STATUS_RAMP_CURVE, 0, True
+          best = (v, c, d + s_c, start, s_c)
+    return best
 
   def _nav_fork(self, lat, lon, bearing, mtype, modifier, distance):
     """On a watched exit's link: navigation's next maneuver at one of its forks says which branch it takes (logs, and
