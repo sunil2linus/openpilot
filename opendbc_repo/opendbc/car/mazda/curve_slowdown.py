@@ -98,6 +98,7 @@ UNATTRIBUTED_RECENT = 0.5             # s
 UNATTRIBUTED_HIGH_OVER = 5 * MS_PER_MPH
 UNATTRIBUTED_HIGH_OVER_KPH = 8 * MS_PER_KPH
 UNATTRIBUTED_HIGH_HOLD = 1.0          # s
+UNATTRIBUTED_HIGH_GAP = 10.0          # s: at most one such chime this often
 DRIVER_LOG_GAP = 1.0                  # s between two driverSetChange entries with nothing anchored
 EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
@@ -1918,6 +1919,7 @@ class CurveSlowdown:
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
     self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
+    self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
     self.unattributed_high_frames = 0  # an unexplained raise left the set speed high on a highway / link (UNATTRIBUTED_HIGH_*)
     self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
     self.recorder = None
@@ -2659,7 +2661,9 @@ class CurveSlowdown:
     over = UNATTRIBUTED_HIGH_OVER_KPH if self.logic.step < MS_PER_MPH else UNATTRIBUTED_HIGH_OVER
     high = (after > before and limit > 0 and road_class in HIGHWAY_CLASSES + LINK_CLASSES and
             after > limit + over + self.logic.half_step)
-    if high:
+    lg = self.logic
+    if high and lg.frame - self.unattributed_high_last >= _frames(UNATTRIBUTED_HIGH_GAP):
+      self.unattributed_high_last = lg.frame       # (review of round k, M4) at most one chime per UNATTRIBUTED_HIGH_GAP
       self.unattributed_high_frames = _frames(UNATTRIBUTED_HIGH_HOLD)
     if self.recorder is not None:
       import time

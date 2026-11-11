@@ -542,6 +542,7 @@ def _wrapper(limit=70, road_class=1):
   w.limit_follow.stable = limit
   w.recorder = _Rec()
   w.unattributed_high_frames = 0
+  w.unattributed_high_last = -1_000_000
   w.limit_mode, w.limit_want = 2, 0.0
   w.limit_cap_logged = w.limit_ceiling_logged = None
   return w, N(mapRoadClass=road_class, slcSpeedLimit=limit * MPH)
@@ -740,3 +741,19 @@ def test_review_m3_a_reopened_merge_refused_again_is_logged_once_per_link():
     step(f, on, 80)
   why = [e for e in fol.events if "not below the merge" in e[1]["reason"]]
   assert len(why) == 1, fol.events
+
+
+def test_review_m4_the_unexplained_raise_chime_at_most_once_per_10_s():
+  w, plan = _wrapper(limit=70, road_class=1)
+  lg = w.logic
+  set_mph, rises, prev = 72.0, 0, False
+  lg.update(_inp(set_speed=set_mph * MPH, v_ego=70 * MPH))
+  for f in range(1500):
+    if f % 200 == 100:
+      set_mph += 2.0 if set_mph < 90 else -2.0          # an unexplained step every 2 s, all of them high
+    i = _inp(set_speed=set_mph * MPH, v_ego=70 * MPH)
+    lg.update(i)
+    w._unattributed_change(i, plan)
+    rises += w.set_speed_high and not prev
+    prev = w.set_speed_high
+  assert rises == 2, rises                             # 15 s: at f 100 and once 10 s later
