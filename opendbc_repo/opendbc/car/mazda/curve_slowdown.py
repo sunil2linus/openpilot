@@ -275,6 +275,12 @@ MERGE_BOOST_STREET = 1.0      # s
 # tuning from drives 56-6d: lat = v^2 rad(angle) / (ratio L (1 + K v^2)) with the owner's learned steer ratio
 # MERGE_TURN_RATIO (~18.9; CP.steerRatio 15.5 without the slip term reads ~1.34x high) and K = MERGE_TURN_SLIP.
 RAMP_START_SET_REF = True
+# ... and it pauses the same way while the stop-light detector is on (review of round k, S1: a ramp meter, a light on the
+# ramp), unless the flag has been on continuously MERGE_RED_STUCK with the car moving faster than MERGE_RED_STUCK_SPEED
+# and no stop planned (a stuck flag)
+MERGE_RED_PAUSE = True
+MERGE_RED_STUCK = 20.0        # s
+MERGE_RED_STUCK_SPEED = 10.0  # m/s
 # RES after our own lowering (round k, streets): his brake (cruise off) at the floor one of our stop slowdowns left, then
 # RES (any time later: the anchor survives cruise off) brings his speed back with the fast restore (restore_pending: a
 # SET+ hold, then taps) once no stop is on or planned, no red light, no slower car in our lane (stop_clear_ahead /
@@ -459,6 +465,7 @@ class CurveSlowdownLogic:
     self.last_ours_frame = -10_000   # frame one of our presses last landed (UNATTRIBUTED_RECENT)
     self.last_other_frame = -10_000  # frame a RES / CANCEL (his or openpilot's) was last active
     self.unattributed = None         # (set before, set after) on the frame an unexplained change was seen
+    self.red_on_frames = 0           # frames the stop-light detector has been on without a break (MERGE_RED_STUCK)
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
     self.inflight = []               # [Press] not yet (fully) seen on the set speed, oldest first
@@ -669,6 +676,14 @@ class CurveSlowdownLogic:
       k = (self.frame - b["stuck_at"]) % _frames(MERGE_HIGH_REPEAT)
       if self.frame - b["stuck_at"] >= _frames(MERGE_HIGH_REPEAT) and k < _frames(MERGE_HIGH_GAP):
         self.boost_stuck = False
+
+  def _merge_paused(self, i):
+    """The merge's way up pauses (the hold released, the set speed kept, never a SET-): the car turning (MergeTurnGate)
+    or the stop-light detector on (a ramp meter, a light on the ramp: review of round k, S1), unless that flag looks
+    stuck (MERGE_RED_STUCK: on continuously that long while moving faster than MERGE_RED_STUCK_SPEED, no stop planned)."""
+    red_stuck = (self.red_on_frames > _frames(MERGE_RED_STUCK) and i.v_ego > MERGE_RED_STUCK_SPEED and
+                 not i.hold_restore and not i.stop_active)
+    return i.merge_turn_pause or (MERGE_RED_PAUSE and i.red_light and not red_stuck)
 
   def _forget(self):
     """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
@@ -1111,6 +1126,7 @@ class CurveSlowdownLogic:
     self.limit_capped = None
     self.limit_undone = None
     self.unattributed = None
+    self.red_on_frames = self.red_on_frames + 1 if i.red_light else 0
     if i.other_button_active:
       self.last_other_frame = self.frame
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
@@ -1414,7 +1430,7 @@ class CurveSlowdownLogic:
                      (i.stop_slower_ahead and self.stop_episode))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       hold_max = MERGE_UP_HOLD_MAX if self.hold_kind == "boost_up" else HOLD_MAX_SECONDS
-      turn_pause = d == SET_PLUS and i.merge_turn_pause and self.boost is not None and "ended" not in self.boost
+      turn_pause = d == SET_PLUS and self._merge_paused(i) and self.boost is not None and "ended" not in self.boost
       if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or turn_pause or
           self.frame - self.hold.frame >= _frames(hold_max) or crosses):
         if target_rose and kind == "stop":
@@ -1490,9 +1506,9 @@ class CurveSlowdownLogic:
       # kept presses in flight for 4 s and the merge's hold started at 47), or the turn gate / a red light / the
       # post-stop wait: nothing more meanwhile (no restore to an old anchor either), then its hold
       return None, None
-    if (self.boost is not None and "ended" not in self.boost and i.merge_turn_pause and
+    if (self.boost is not None and "ended" not in self.boost and self._merge_paused(i) and
         self.anchor is not None and self.offset > 0):
-      return None, None                # (MERGE_TURN_PAUSE) the merge's way up waits while the car turns
+      return None, None                # (MERGE_TURN_PAUSE, MERGE_RED_PAUSE) the merge's way up waits
 
     want_lower = False
     room = 0

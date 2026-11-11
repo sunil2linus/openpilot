@@ -612,3 +612,13 @@ def test_8d_6a_329_a_follower_event_with_no_new_limit_no_longer_blocks_the_speed
   w._limit_bookkeeping(i)
   assert lf.events == [] and w.recorder.events[-1][0] == "speedLimitNotFollowed"
   assert w.recorder.events[-1][1]["new_mph"] is None
+
+
+def test_review_s1_a_red_light_on_the_ramp_pauses_the_merge_a_stuck_flag_does_not():
+  # (rk/ramp_red.py) a ramp meter's light comes on mid-merge and stays: the way up pauses (the set kept, no SET-);
+  # on continuously MERGE_RED_STUCK at speed with no stop planned: a stuck flag, the merge goes on
+  car, lg, log, offers = _ramp_run(3200, red=lambda f: f >= 500)
+  sets = {f: s for f, s, *_ in log}
+  assert not [b for f, _, _, b, _, _, _ in log if b == cs.SET_MINUS]
+  assert abs(sets[2400] - sets[620]) < 1e-6, (sets[620], sets[2400])
+  assert sets[3100] > sets[2400] + 10, sets[3100]
