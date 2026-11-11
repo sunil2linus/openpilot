@@ -380,6 +380,9 @@ class SlowdownInputs:
   # on a link to a highway (speed_limit_follow ramp_start): cruise back on there, our old anchor from before is not
   # restored (the ramp start: the merge decides the speed)
   ramp_start: bool = False
+  # the road changed since our stop episode began (mapdOut's road name, or speed_limit_follow's heading watch saw a
+  # turn): his RES gets the gentle restore, not the fast one (RESUME_RESTORE; review of round k, S4)
+  road_changed: bool = False
   # the posted limit fell to this (m/s) with the driver's speed at the old one (speed_limit_follow.py rule 3): a pending
   # restore stops here, or at the set speed if that is higher (never a SET- for it)
   limit_cap: float = 0.0
@@ -1209,7 +1212,7 @@ class CurveSlowdownLogic:
          self.frame - self.resume_restore_frame > _frames(RESUME_RESTORE_MAX):
         self.resume_restore_frame = None
       elif (not i.stop_active and not i.hold_restore and not red_block and not i.stop_slower_ahead and
-            (i.stop_clear_ahead or i.stop_pulling_away) and
+            (i.stop_clear_ahead or i.stop_pulling_away) and not i.road_changed and
             self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP)):
         self.restore_pending = True
         self.resume_restore_frame = None
@@ -1894,6 +1897,7 @@ class CurveSlowdown:
     self.frame = 0
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
+    self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
     self.unattributed_high_frames = 0  # an unexplained raise left the set speed high on a highway / link (UNATTRIBUTED_HIGH_*)
     self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
     self.recorder = None
@@ -1916,6 +1920,19 @@ class CurveSlowdown:
 
   def _alive(self, service):
     return bool(self.sm.alive[service] and self.sm.recv_frame[service] > 0)
+
+  def _road_changed(self):
+    """RESUME_RESTORE: another road (name) or a turn (the heading watch) since the controller's stop episode began."""
+    lg, lf = self.logic, self.limit_follow
+    if not lg.stop_episode:
+      self.stop_road = None
+      return False
+    name = self._road_name()
+    if self.stop_road is None:
+      self.stop_road = (name, lf.frame if lf is not None else 0)
+      return False
+    turned = lf is not None and lf.turned_frame > self.stop_road[1]
+    return bool(name != self.stop_road[0] or turned)
 
   def _road_name(self):
     """mapdOut's road name ('' unknown): speed_limit_follow rule 7, a turn onto another road."""
@@ -2243,6 +2260,7 @@ class CurveSlowdown:
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
       red_light=bool(self._alive('starpilotPlan') and getattr(plan, "redLight", False)),
       red_stop=bool(stop_inputs.red_light),
+      road_changed=self._road_changed(),
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,

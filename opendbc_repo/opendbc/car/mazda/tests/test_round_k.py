@@ -476,7 +476,7 @@ def test_his_set_minus_on_the_link_ends_the_merge_and_a_red_light_holds_it():
 
 # ---- 7: RES after our own stop lowering brings his speed back with the fast restore ----
 
-def _resume_run(frames=4000, off_for=3000, red=lambda f: False, stop_off_ago=10.0, clear=True):
+def _resume_run(frames=4000, off_for=3000, red=lambda f: False, stop_off_ago=10.0, clear=True, changed=False):
   T = _tmc().T
   car = T.Car(19, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
   car.v_ego = 15 * MPH
@@ -489,7 +489,7 @@ def _resume_run(frames=4000, off_for=3000, red=lambda f: False, stop_off_ago=10.
   for f in range(frames):
     on = f >= off_for
     b, _ = lg.update(_inp(cruise_enabled=on, set_speed=car.set_speed if on else 0.0, v_ego=car.v_ego, red_light=red(f),
-                          red_stop=red(f),
+                          red_stop=red(f), road_changed=changed,
                           enabled=on, stop_clear_ahead=clear))
     if b is not None and on:
       car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
@@ -672,3 +672,26 @@ def test_review_s3_a_red_light_flag_stuck_on_blocks_the_restore_at_most_20_s():
   ups = [f for f, _, b, _ in log if b == cs.SET_PLUS]
   assert ups and ups[0] >= 2900 + int(cs.RED_STOP_BLOCK_MAX * 100) - 2, ups[:3]
   assert abs(car.set_speed / MPH - 45) < 1e-6
+
+
+def test_review_s4_res_after_a_turn_onto_another_road_gets_the_gentle_restore():
+  car, lg, log = _resume_run(changed=True)
+  assert lg.pending_from is None                      # no fast restore of ours (the baseline restore rules only)
+  car2, lg2, log2 = _resume_run(changed=True, clear=False)
+  assert lg2.pending_from is None and not any(a == "hold" for *_, a in log2)
+  # the wrapper: another road name, or the heading watch's turn, since the stop episode began
+  w, _ = _wrapper()
+  name = {"n": "West Utica Road"}
+  w._road_name = lambda: name["n"]
+  w.stop_road = None
+  w.logic.stop_episode = True
+  assert not w._road_changed()
+  assert not w._road_changed()
+  name["n"] = "Dequindre Road"
+  assert w._road_changed()
+  name["n"] = "West Utica Road"
+  w.limit_follow.frame += 10
+  w.limit_follow.turned_frame = w.limit_follow.frame
+  assert w._road_changed()
+  w.logic.stop_episode = False
+  assert not w._road_changed() and w.stop_road is None
