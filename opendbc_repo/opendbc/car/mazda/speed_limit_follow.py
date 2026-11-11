@@ -35,9 +35,11 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    limit starts (mapdOut.nextSpeedLimitDistance, counted down with the speed between its updates) is what the stock
    cruise needs to get within MERGE_NEAR_MPH of it (MERGE_ACCEL) plus MERGE_LEAD_TIME, or at once when less (unknown
    too). The controller takes it once no curve or stopped car needs a lower speed (the lowest target wins) and stays
-   open while on the link and LIMIT_OFFER_TIME after it. His SET press, cancel or brake on the link ends it (after it
-   was taken his buttons work as on any restore); so does any SET press of his, cancel or brake since the link began,
-   or a planned stop ahead (the controller waits). Rule 4 takes it back if the next limit is his old one or lower
+   open while on the link and LIMIT_OFFER_TIME after it. The ramp start (RAMP_START, owner, round k: most on-ramps are
+   entered from a stop or a slow turn with cruise off): his brake / cancel on the link and a later RES, an engagement
+   (SET with cruise off), or his SET+ do not end it: it is decided again with his speed then (below the merge's target:
+   offered again; at or above it: his). Only his SET- with cruise on ends it for the link (after it was taken his
+   buttons work as on any restore); a planned stop ahead makes the controller wait. Rule 4 takes it back if the next limit is his old one or lower
    within LIMIT_UNDO_TIME before the highway is matched, or if the car gets onto a road that is not a highway for
    LIMIT_STABLE_TIME (another link matched).
 6. After an exit: the first limit after a link from a highway (until EXIT_TIME after the car got onto the street) is

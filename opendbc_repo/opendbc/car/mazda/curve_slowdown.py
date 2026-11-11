@@ -279,6 +279,10 @@ RAMP_START_SET_REF = True
 # ramp), unless the flag has been on continuously MERGE_RED_STUCK with the car moving faster than MERGE_RED_STUCK_SPEED
 # and no stop planned (a stuck flag)
 MERGE_RED_PAUSE = True
+# His brake / cancel during the boost and RES later (a queue on the ramp): the set speed comes back at the boosted speed;
+# it is taken down to the merge's target at once (the boost's way-down SET- hold, then taps) from MERGE_RES_DOWN_SPEED on
+MERGE_RES_DOWN = True
+MERGE_RES_DOWN_SPEED = 1.0    # m/s
 MERGE_RED_STUCK = 20.0        # s
 MERGE_RED_STUCK_SPEED = 10.0  # m/s
 # RES after our own lowering (round k, streets): his brake (cruise off) at the floor one of our stop slowdowns left, then
@@ -1203,6 +1207,11 @@ class CurveSlowdownLogic:
       # (second review) back on after a gap at a set speed other than the one we left (his own choice): his speed. His
       # RES bringing back the boosted set speed we put there is still ours to take down to the target
       self.boost = None
+    elif (MERGE_RES_DOWN and cruise_ok and self.cruise_gap and self.boost is not None and "ended" in self.boost and
+          i.set_speed > self.boost["target"] + self.half_step):
+      # (review of round k, M2) his RES bringing back the boosted set speed: one more way-down hold, at once
+      self.boost.pop("held", None)
+      self.boost["ended"] = self.frame
     # (review of round k, S3) the stop-light detector as the trigger sees it, for at most RED_STOP_BLOCK_MAX from its onset
     if i.red_stop and not self.prev_red_stop:
       self.red_stop_onset = self.frame
@@ -1380,7 +1389,11 @@ class CurveSlowdownLogic:
       i.street_lower and i.csc_active and i.curve_track and not i.stop_active and not i.hold_restore and
       i.v_ego >= KEEP_SPEED) or (
       # (the ramp start) a merge raise offered from a stop or a slow turn onto the ramp: from rolling speed on
-      i.limit_raise > 0 and i.limit_boost > 0 and i.v_ego > RESTORE_MOVING_SPEED)
+      i.limit_raise > 0 and i.limit_boost > 0 and i.v_ego > RESTORE_MOVING_SPEED) or (
+      # (review of round k, M2: a queue on the ramp after the boost, his brake, RES at 5 mph brings back the boosted 95)
+      # the boost's set speed comes down to its target at once, at any rolling speed, before the cruise speeds up for it
+      MERGE_RES_DOWN and self.boost is not None and "ended" in self.boost and self.offset < 0 and
+      i.v_ego >= MERGE_RES_DOWN_SPEED)
     self.standstill_frames = self.standstill_frames + 1 if i.standstill else 0
     # At a standstill only the restore after stopping behind the car is sent (SET+ there only raises the set
     # speed; the MRCC keeps holding behind the car ahead), once we have been stopped STANDSTILL_RESTORE_DELAY.

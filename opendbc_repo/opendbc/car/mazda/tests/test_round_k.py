@@ -706,3 +706,23 @@ def test_review_m1_a_hold_that_never_sent_a_frame_does_not_use_up_the_episodes_h
     lg._start_hold(cs.SET_MINUS)
     lg._stop_hold(cut=True)
     assert getattr(lg, attr) == 0, kind
+
+
+def test_review_m2_a_queue_on_the_ramp_mid_boost_then_res_at_5_mph_takes_the_boost_down_at_once():
+  # (rk/ramp_sc.py E / F) the boost at 95, his brake for a queue (5 mph), RES 10 s later: the stored 95 comes back;
+  # one SET- hold at once, then taps, to the merge's 75 (it waited for 12 mph and took ~7 s)
+  def ev(f, st, car):
+    if f == 2500:
+      st["cruise"], st["brake"] = False, True
+    if 2500 <= f < 3500:
+      car.v_ego = max(car.v_ego - 0.05, 5 * MPH)
+    if f == 3400:
+      st["brake"] = False
+    if f == 3500:
+      st["cruise"] = True
+  car, lg, log, offers = _ramp_run(5000, ev=ev)
+  assert max(s for f, s, *_ in log if f < 2500) >= 90
+  downs = [f for f, _, _, b, act, _, _ in log if b == cs.SET_MINUS and act == "hold" and f >= 3500]
+  assert downs and downs[0] - 3500 <= 60, downs[:2]
+  back = next(f for f, s, *_ in log if f > 3500 and abs(s - 75) < 1e-6)
+  assert back - 3500 <= 550, back
