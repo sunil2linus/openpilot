@@ -170,7 +170,7 @@ PASS_MAX_DT = 0.2          # s: a longer pause between planner cycles starts the
 # 7 m/s with a 12 m/s approach left only the straight road around it, "2000 m")
 PASS_FAST_SHARE = 0.9
 # A pass that ends in a stop after the curve (drive 6a: West Utica's second curve, capped at 37 and driven at 1-2 m/s^2,
-# with a red light after it): the braking / slow / driver samples past the curve's end are cut off and the pass ends
+# with a red light after it): the braking / slow samples past the curve's end are cut off and the pass ends
 # there, so it still counts (clean, its speed the curve's), as any pass through the curve's end would
 PASS_STOP_CUT = True
 PASS_BUFFER = 2400         # planner cycles of driving kept for the pass window (120 s)
@@ -2153,9 +2153,9 @@ class MapCurvesPlanner:
       v = max(float(cs.vEgo), 0.0)
       self.pass_x += v * dt
       x = self.pass_x
-      # (PASS_STOP_CUT) a sample that would spoil the pass: braking, slow, openpilot not steering or the driver steering
-      stopping = (bool(getattr(cs, "brakePressed", False)) or v < PASS_MIN_SPEED or not bool(cc.latActive) or
-                  bool(cs.steeringPressed))
+      # (PASS_STOP_CUT) a stop beginning: braking or slow (review of round k, S2: not openpilot off or his steering, which
+      # in the curve's tail still spoil the pass as before)
+      stopping = bool(getattr(cs, "brakePressed", False)) or v < PASS_MIN_SPEED
       self.pass_buf.append((x, (v, float(sm["controlsState"].curvature), bool(cc.latActive), bool(cs.steeringPressed),
                                 abs(float(cc.actuators.torque))), bool(cs.leftBlinker or cs.rightBlinker), stopping))
       if len(self.pass_buf) > PASS_BUFFER + 200:

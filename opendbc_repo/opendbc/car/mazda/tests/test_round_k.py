@@ -622,3 +622,43 @@ def test_review_s1_a_red_light_on_the_ramp_pauses_the_merge_a_stuck_flag_does_no
   assert not [b for f, _, _, b, _, _, _ in log if b == cs.SET_MINUS]
   assert abs(sets[2400] - sets[620]) < 1e-6, (sets[620], sets[2400])
   assert sets[3100] > sets[2400] + 10, sets[3100]
+
+
+def test_review_s2_his_steering_in_the_curves_tail_still_spoils_the_pass(tmp_path):
+  # (rk/pass_cut.py) the map curve's end, then 30 m tighter where he grabs the wheel: as before, no pass (the stop cut
+  # is for braking / slowing only)
+  from types import SimpleNamespace as N
+  TMC = _tmc()
+  MC = TMC.MC
+
+  class P:
+    def get(self, k, encoding=None):
+      return None
+  arc = math.radians(40) * 250
+  c = TMC._curve(0, 150, arc, 40, 116.6)
+  end = 150 + arc
+  mp = MC.MapCurvesPlanner(P(), P())
+  mp.mc = TMC._FakeMC(MC.CurveMemory(str(tmp_path / "m.json")))
+  mp.trust = N(shaky=False)
+  mp.pass_curve, mp.pass_samples = None, []
+  v, x, frame, gx = 17.0, 0.0, 0, -1e9
+  segs, s0 = [], 0.0
+  for length, k in ((150, 0.0), (arc, 1 / 250), (30, 1 / 80), (120, 0.0)):
+    segs.append((s0, s0 + length, k))
+    s0 += length
+  while x < s0:
+    k = next(kk for a, b, kk in segs if a <= x < b)
+    if frame % 20 == 0:
+      gx = x - v * MC.PASS_GPS_LAG
+    inside = c if c["x0"] + MC.NEAR < gx < c["x1"] - MC.NEAR else None
+    mp.mc.inside, mp.mc.inside_exit = inside, (c["x1"] - gx) if inside is not None else float("inf")
+    mp.counter = frame
+    lat = c["apex"][0] + (gx - (c["x0"] + c["x1"]) / 2) / 111320.0
+    sm = {"carState": N(vEgo=v, steeringPressed=end + 3 <= x < end + 33, leftBlinker=False, rightBlinker=False,
+                        brakePressed=False),
+          "carControl": N(latActive=True, actuators=N(torque=0.4)), "controlsState": N(curvature=k)}
+    mp._measure_pass(sm, inside, lat, c["apex"][1], dt=MC.PASS_DT)
+    x += v * MC.PASS_DT
+    frame += 1
+  e = mp.mc.memory._find(*c["apex"])
+  assert not (e and e.get("passes")), e
