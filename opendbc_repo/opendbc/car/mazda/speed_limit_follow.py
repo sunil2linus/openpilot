@@ -438,6 +438,7 @@ class SpeedLimitFollower:
     self.merge_frame = -10_000     # the frame rule 5 last decided on this link (RAMP_START: a later engagement reopens it)
     self.cruise_on_frame = -10_000  # the frame cruise last came on
     self.ramp_next = None          # the next limit ahead on this link (steps; RAMP_START: a highway's is known)
+    self.merge_logged = None       # (link start frame, reason) of the last merge refusal logged (M3)
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
     self.rise_retry = None         # rule 1: (old, new, frame) refused only for the GPS trust: tried again once trust is 0
@@ -971,7 +972,10 @@ class SpeedLimitFollower:
     if why:
       self.merge_done = True
       self.merge_frame = self.frame
-      self._not_followed(None, n, "Map Data", "merge: " + why)
+      # (review of round k, M3) a reopened decision refused again for the same reason on this link: logged once
+      if (self.link_start, why) != self.merge_logged:
+        self.merge_logged = (self.link_start, why)
+        self._not_followed(None, n, "Map Data", "merge: " + why)
       return
     # (owner, drive 54: timed for the merge with _merge_need it came 382 m before it, "we can do it way before that"):
     # offered as soon as the window is ready

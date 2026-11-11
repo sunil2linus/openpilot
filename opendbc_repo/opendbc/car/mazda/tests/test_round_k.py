@@ -726,3 +726,17 @@ def test_review_m2_a_queue_on_the_ramp_mid_boost_then_res_at_5_mph_takes_the_boo
   assert downs and downs[0] - 3500 <= 60, downs[:2]
   back = next(f for f, s, *_ in log if f > 3500 and abs(s - 75) < 1e-6)
   assert back - 3500 <= 550, back
+
+
+def test_review_m3_a_reopened_merge_refused_again_is_logged_once_per_link():
+  fol = slf.SpeedLimitFollower(False)
+  def step(f, on, d_mph, btn=None):
+    road = dict(road_class=7) if f < 100 else dict(road_class=2, ramp_to_highway=True, next_limit=70 * MPH,
+                                                    next_distance=900.0)
+    fol.update(slf.LimitInputs(0.0, "Map Data", 0, d_mph * MPH if on else 0.0, on, v_ego=30 * MPH,
+                               driver_set=btn is not None, **road))
+  for f in range(2000):
+    on = not (600 <= f < 700 or 1100 <= f < 1200)     # two brakes / RES at his 80 (above the merge's 75): his, each time
+    step(f, on, 80)
+  why = [e for e in fol.events if "not below the merge" in e[1]["reason"]]
+  assert len(why) == 1, fol.events
