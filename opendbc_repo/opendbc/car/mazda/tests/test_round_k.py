@@ -771,3 +771,12 @@ def test_review_m4_the_unexplained_raise_chime_at_most_once_per_10_s():
     rises += w.set_speed_high and not prev
     prev = w.set_speed_high
   assert rises == 2, rises                             # 15 s: at f 100 and once 10 s later
+
+
+def test_second_review_a_red_light_he_waited_at_with_cruise_off_still_blocks_at_his_res():
+  # (rk/red_stuck2.py) the light on for 30 s while stopped with cruise off, then his RES under it: the 20 s count
+  # starts at the RES
+  car, lg, log = _resume_run(frames=3000 + 3000, off_for=3000, red=lambda f: True)
+  ups = [f for f, _, b, _ in log if b == cs.SET_PLUS]
+  assert ups and ups[0] >= 3000 + int(cs.RED_STOP_BLOCK_MAX * 100) - 2, ups[:3]
+  assert abs(car.set_speed / MPH - 45) < 1e-6

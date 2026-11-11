@@ -294,7 +294,7 @@ MERGE_RED_STUCK_SPEED = 10.0  # m/s
 # cap / ceiling and the curve's target still bound it; his own SET is his speed (set_while_off). On a link to a highway
 # the ramp start wins (RAMP_START_FORGET).
 RESUME_RESTORE = True
-RED_STOP_BLOCK_MAX = 20.0     # s (stopped_car_slowdown.RED_RELEASE_HOLD_MAX): a stuck flag blocks no longer; his gas overrides
+RED_STOP_BLOCK_MAX = 20.0     # s with cruise on (stopped_car_slowdown.RED_RELEASE_HOLD_MAX): a stuck flag blocks no longer; gas overrides
 RESUME_RESTORE_MAX = 60.0     # s
 RAMP_START_FORGET = True
 MERGE_TURN_LAT = 1.0          # m/s^2 (the architect will tune it from logs; 1.5+ fires mid-loop)
@@ -478,8 +478,7 @@ class CurveSlowdownLogic:
     self.last_other_frame = -10_000  # frame a RES / CANCEL (his or openpilot's) was last active
     self.unattributed = None         # (set before, set after) on the frame an unexplained change was seen
     self.red_on_frames = 0           # frames the stop-light detector has been on without a break (MERGE_RED_STUCK)
-    self.prev_red_stop = False
-    self.red_stop_onset = -10_000    # frame red_stop last came on (RED_STOP_BLOCK_MAX)
+    self.red_stop_frames = 0         # frames with red_stop on and cruise on since it came on (RED_STOP_BLOCK_MAX)
     self.red_block = False           # no SET+ back up from our stop slowdown now (red_stop, RESUME_RESTORE)
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
@@ -1213,11 +1212,11 @@ class CurveSlowdownLogic:
       # (review of round k, M2) his RES bringing back the boosted set speed: one more way-down hold, at once
       self.boost.pop("held", None)
       self.boost["ended"] = self.frame
-    # (review of round k, S3) the stop-light detector as the trigger sees it, for at most RED_STOP_BLOCK_MAX from its onset
-    if i.red_stop and not self.prev_red_stop:
-      self.red_stop_onset = self.frame
-    self.prev_red_stop = i.red_stop
-    red_block = i.red_stop and self.frame - self.red_stop_onset <= _frames(RED_STOP_BLOCK_MAX) and not i.gas_pressed
+    # (review of round k, S3) the stop-light detector as the trigger sees it, for at most RED_STOP_BLOCK_MAX of it with
+    # cruise on (second review: from his RES, not the light's onset: a red light he waited at with cruise off still
+    # blocks the fast restore at his RES)
+    self.red_stop_frames = (self.red_stop_frames + (1 if cruise_ok else 0)) if i.red_stop else 0
+    red_block = i.red_stop and self.red_stop_frames <= _frames(RED_STOP_BLOCK_MAX) and not i.gas_pressed
     self.red_block = red_block
     if (RESUME_RESTORE and cruise_ok and self.cruise_gap and self.stop_episode and self.anchor is not None and
         self.last_set_speed is not None and abs(i.set_speed - self.last_set_speed) < self.half_step and
