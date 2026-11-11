@@ -164,6 +164,22 @@ STOP_CAR_RATIO = 0.5        # ... or at most this fraction of our speed
 GO_ACCEL = 0.0              # m/s^2: the model no longer slows down (traffic moving / green)
 GO_SLOWER = 2.0             # m/s: the car ahead is no longer much slower than us
 GO_TIME = 1.0               # s both must hold before the stop with a car is released
+# ... or, without the model's go (drive 6c t 762-784: the light green, the floor 19 held 11.5 s while the car went 46 ->
+# 22.5 mph behind a car at 25-34 mph 65-125 m ahead; the model's desired acceleration stayed <= 0 as we slowed; drive 6d t
+# 222-231): with the floor committed (the moving car's release, MOVING_MATCH_*, is off then) no planned stop and the
+# stop-light detector off for GO_MOVING_CLEAR, the car ahead moving (filtered, at least GO_MOVING_LEAD, not braking:
+# MOVING_MATCH_DECEL) and at most GO_MOVING_CLOSING slower than us, for GO_TIME
+GO_MOVING_ENABLED = True
+GO_MOVING_CLEAR = 1.0       # s
+GO_MOVING_LEAD = 5.0        # m/s
+GO_MOVING_CLOSING = 2.5     # m/s
+TRAFFIC_MOVING = "traffic moving again (model no longer slowing, car ahead not much slower)"
+CAR_AHEAD_MOVING = "car ahead moving again (no stop planned, no red light)"
+# The stop with car gets the stop ahead's red light protection (drive 6a t 584.9: released "traffic moving again" with
+# the light on, the plan blinking off under it): while the light is on (STOP_AHEAD_RED_HOLD / STOP_AHEAD_RED_HOLD_MAX)
+# no go / moving car / pulling away release, and such a release with the light on keeps the lowered set speed until it
+# has gone (RED_RELEASE_HOLD_MAX, as a stop ahead's)
+STOP_CAR_RED_HOLD = True
 STOPPED_CAR, STOP_WITH_CAR = "stopped car", "stop with car"
 
 # Red light first (drive 2026-11-03 21:12): the stop-ahead warning fired 5 s before a hard brake, but the queue car
@@ -523,6 +539,7 @@ class StoppedCarTrigger:
                                      # use the normal restore instead, since the car may still be ahead.
     self.moving_frames = 0
     self.go_frames = 0
+    self.moving_on_frames = 0        # the car ahead moving again, no stop planned, no red light (GO_MOVING_*)
     self.kind = None                 # STOPPED_CAR or STOP_WITH_CAR while active (or last active)
     self.prev_radar_has_lead = False
     self.radar_rises = []            # frames at which the stock radar picked up a lead (for the logs)
@@ -946,7 +963,7 @@ class StoppedCarTrigger:
     elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
       if self.kind == STOP_AHEAD:
         # the car for the planned stop appeared: from here on a stop with a car (confirmed / floor mode stay)
-        self.lost_frames = self.go_frames = 0
+        self.lost_frames = self.go_frames = self.moving_on_frames = 0
       # a stop with a much slower car (or a "stopped" car that is rolling slowly towards the stop): the car ahead
       # may be moving, so "moved away" is not a release; traffic moving again is
       self.kind = STOP_WITH_CAR
@@ -959,7 +976,20 @@ class StoppedCarTrigger:
       # then the hard stop 15 s later)
       going = (i.model_alive and i.model_accel > GO_ACCEL and not i.plan_stop and
                (not still_there or i.v_ego - i.lead_v < GO_SLOWER))
+      # (once the floor is committed: before that the moving car's own release, MOVING_MATCH_*, is the one)
+      moving_on = (GO_MOVING_ENABLED and self.floor_committed and still_there and self.lead_v_f >= GO_MOVING_LEAD and
+                   self.lead_a_f >= MOVING_MATCH_DECEL and i.v_ego - self.lead_v_f <= GO_MOVING_CLOSING and
+                   self.frame - self.last_plan_stop >= _frames(GO_MOVING_CLEAR) and self.red_gap >= _frames(GO_MOVING_CLEAR))
       self.go_frames = self.go_frames + 1 if going else 0
+      self.moving_on_frames = self.moving_on_frames + 1 if moving_on else 0
+      # the light on: no go / moving car / pulling away release (STOP_CAR_RED_HOLD, the stop ahead's red_holds)
+      red_on = self.red_gap < _frames(RED_DROPOUT)
+      if not red_on:
+        self.red_absent_frames = 0
+      elif not i.plan_stop:
+        self.red_absent_frames += 1
+      red_holds = (STOP_CAR_RED_HOLD and red_on and self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD) and
+                   self.red_absent_frames < _frames(STOP_AHEAD_RED_HOLD_MAX))
       matched = (MOVING_LEAD_GUARD and still_there and not self.floor_committed and not i.plan_stop and
                  self.lead_v_f >= MOVING_LEAD_SPEED and self.lead_a_f >= MOVING_MATCH_DECEL and
                  i.v_ego - self.lead_v_f <= MOVING_MATCH_CLOSING)
@@ -970,16 +1000,18 @@ class StoppedCarTrigger:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
       elif i.v_ego < EGO_STOPPED_SPEED:
         self._release("ego stopped behind the lead")
-      elif self.pull_accel_frames >= _frames(PULL_AWAY_ACCEL_TIME):
+      elif self.pull_accel_frames >= _frames(PULL_AWAY_ACCEL_TIME) and not red_holds:
         self._release(PULLING_AWAY)
       elif self.radar_match_frames >= _frames(RADAR_RESTORE_TIME):
         self._release("radar following the car ahead at our speed")
       elif self.leave_frames >= _frames(LEAVE_TIME):
         self._release("lead leaving the lane", False)
-      elif self.moving_match_frames >= _frames(MOVING_MATCH_TIME):
+      elif self.moving_match_frames >= _frames(MOVING_MATCH_TIME) and not red_holds:
         self._release("at the moving car's speed")
-      elif self.go_frames >= _frames(GO_TIME):
-        self._release("traffic moving again (model no longer slowing, car ahead not much slower)")
+      elif self.go_frames >= _frames(GO_TIME) and not red_holds:
+        self._release(TRAFFIC_MOVING)
+      elif self.moving_on_frames >= _frames(GO_TIME):
+        self._release(CAR_AHEAD_MOVING)
       elif self.lost_frames >= _frames(lost_time):
         self._release("lead lost (vision)", False)
     else:
@@ -1145,7 +1177,7 @@ class StoppedCarTrigger:
     if not took_over:
       self.start_frame = self.frame            # (an unsure car start: the episode began with its taps)
     self.unsure_from = took_over
-    self.lost_frames = self.out_of_lane_frames = self.go_frames = 0
+    self.lost_frames = self.out_of_lane_frames = self.go_frames = self.moving_on_frames = 0
     self.early_frames = self.early_gap = 0
     self.unsure_frames = self.unsure_gap = 0
     self.pull_accel_frames = 0
@@ -1300,13 +1332,15 @@ class StoppedCarTrigger:
     return self.warn_plan_gap <= _frames(WARN_DROPOUT)
 
   def _release(self, reason, restore_now=True):
-    if reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.red_gap < _frames(RED_DROPOUT):
+    go_kind = STOP_CAR_RED_HOLD and self.kind == STOP_WITH_CAR and reason in (TRAFFIC_MOVING, "at the moving car's speed",
+                                                                            PULLING_AWAY, CAR_AHEAD_MOVING)
+    if (reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) or go_kind) and self.red_gap < _frames(RED_DROPOUT):
       restore_now = False              # (RED_RELEASE_HOLD_MAX) the light still on: the lowered set speed stays for now
       self.red_release_frame = self.frame
     self.active = False
     self.hold_frames = 0
     self.moving_frames = 0
-    self.go_frames = 0
+    self.go_frames = self.moving_on_frames = 0
     self.release_reason = reason
     self.restore_now = restore_now
     self.clear_release = reason in CLEAR_RELEASE_REASONS

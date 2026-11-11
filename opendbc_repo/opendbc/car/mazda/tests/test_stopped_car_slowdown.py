@@ -788,8 +788,8 @@ def _while_a_stop_is_planned():
     pass
   for _ in range(300):
     assert tr.update(_latched_inputs(lead_prob=0.6, model_accel=0.3, lead_v=44 * MPH))
-  for _ in range(101):
-    tr.update(_latched_inputs(lead_prob=0.6, model_accel=0.3, lead_v=44 * MPH, plan_stop=False))
+  for _ in range(101):                         # (and the light gone: round k, no go release under a red light)
+    tr.update(_latched_inputs(lead_prob=0.6, model_accel=0.3, lead_v=44 * MPH, plan_stop=False, red_light=False))
   assert not tr.active and tr.release_reason.startswith("traffic moving")
 
 

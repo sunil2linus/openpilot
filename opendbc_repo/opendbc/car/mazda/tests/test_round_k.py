@@ -62,3 +62,68 @@ def test_a_jump_that_cannot_be_ours_is_his_never_a_disable():
   lg.inflight.append(cs.Press(cs.SET_PLUS, lg.frame))
   lg.update(_inp(set_speed=28.993 * MPH, v_ego=29.5 * MPH))
   assert not lg.disabled and lg.anchor is None and not lg.inflight
+
+
+# ---- 2: stop with car: released once the car ahead moves on (no stop planned, no red light); red light protection ----
+
+from opendbc.car.mazda import stopped_car_slowdown as scs  # noqa: E402
+
+
+def _sw(**kw):
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=45 * MPH, lead_alive=True, lead_status=True,
+              lead_prob=0.9, lead_d=110.0, lead_v=12 * MPH, lead_y=0.1, model_alive=True, model_accel=-0.6)
+  base.update(kw)
+  return scs.StoppedCarInputs(**base)
+
+
+def _started():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_sw(lead_status=False, plan_stop=True, red_light=True))
+  n = 0
+  while not tr.update(_sw(plan_stop=True, red_light=True)):
+    n += 1
+    assert n < 200
+  assert tr.kind == scs.STOP_WITH_CAR
+  return tr
+
+
+def test_6c_the_car_ahead_moving_on_after_a_green_releases_the_floor():
+  # drive 6c t 772-784: the light off at 772.3, the plan off from 775, the model's desired acceleration still < 0 as we
+  # slow at the floor; the car ahead 70-95 m away speeds up to 27-35 mph; we come down 46 -> 22.5 mph (driver's gas)
+  tr = _started()
+  v, lead, rel = 46.0, 12.0, None
+  for f in range(1500):
+    v = max(v - 0.024, 22.5)                        # ~1.07 m/s^2 at the floor
+    lead = min(lead + 0.03, 34.0)
+    if not tr.update(_sw(v_ego=v * MPH, lead_v=lead * MPH, lead_d=80.0, model_accel=-0.3, plan_stop=f < 300,
+                         red_light=False)):
+      rel = (f, v)
+      break
+  assert rel is not None and tr.release_reason == scs.CAR_AHEAD_MOVING and tr.restore_now, rel
+  assert rel[1] > 28, rel                           # well before the 22.5 mph of the drive
+
+
+def test_the_car_ahead_moving_does_not_release_while_a_stop_is_planned_the_light_is_on_or_it_is_much_slower():
+  for kw in (dict(plan_stop=True), dict(red_light=True), dict(lead_v=20 * MPH), dict(lead_v=9 * MPH, v_ego=10 * MPH)):
+    tr = _started()
+    for _ in range(400):
+      assert tr.update(_sw(**{**dict(v_ego=30 * MPH, lead_v=29 * MPH, model_accel=-0.3), **kw})), (kw, tr.release_reason)
+
+
+def test_6a_584_no_traffic_moving_release_under_a_red_light_and_no_restore_until_it_has_gone():
+  # drive 6a t 580-585: the plan blinking off under the light, the model's go: released "traffic moving again" with the
+  # light on (and the set speed went back up toward the red light)
+  tr = _started()
+  for _ in range(500):                              # 5 s of the model's go, the light on, no plan: held
+    assert tr.update(_sw(v_ego=30 * MPH, lead_v=29 * MPH, model_accel=0.4, red_light=True))
+  for _ in range(200):                              # the plan gone STOP_AHEAD_RED_HOLD with the light on: released ...
+    if not tr.update(_sw(v_ego=30 * MPH, lead_v=29 * MPH, model_accel=0.4, red_light=True)):
+      break
+  assert not tr.active and tr.release_reason == scs.TRAFFIC_MOVING
+  assert not tr.restore_now and tr.hold_restore      # ... but the set speed stays down while the light is on
+  restored = False
+  for _ in range(150):                              # the light goes: the restore at once
+    tr.update(_sw(v_ego=30 * MPH, lead_v=29 * MPH, model_accel=0.4, red_light=False))
+    restored = restored or tr.restore_now
+  assert restored and not tr.hold_restore
