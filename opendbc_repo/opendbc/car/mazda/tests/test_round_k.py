@@ -489,6 +489,7 @@ def _resume_run(frames=4000, off_for=3000, red=lambda f: False, stop_off_ago=10.
   for f in range(frames):
     on = f >= off_for
     b, _ = lg.update(_inp(cruise_enabled=on, set_speed=car.set_speed if on else 0.0, v_ego=car.v_ego, red_light=red(f),
+                          red_stop=red(f),
                           enabled=on, stop_clear_ahead=clear))
     if b is not None and on:
       car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
@@ -513,12 +514,12 @@ def test_res_long_after_our_stop_lowering_restores_his_speed_with_a_hold():
 
 
 def test_res_under_a_red_light_or_right_after_the_stop_waits():
-  car, lg, log = _resume_run(red=lambda f: f < 3500)
+  car, lg, log = _resume_run(red=lambda f: 2950 <= f < 3500)
   assert next(f for f, _, b, _ in log if b == cs.SET_PLUS) >= 3500
   car, lg, log = _resume_run(off_for=200, stop_off_ago=1.0)    # RES 3 s after the stop's release: the post-stop wait
   assert lg.pending_from is not None and lg.pending_from >= 400 - 2, lg.pending_from
   assert abs(car.set_speed / MPH - 45) < 1e-6
-  car, lg, log = _resume_run(red=lambda f: f < 3500)
+  car, lg, log = _resume_run(red=lambda f: 2950 <= f < 3500)
   assert lg.pending_from is not None and lg.pending_from >= 3500, lg.pending_from
 
 
@@ -662,3 +663,12 @@ def test_review_s2_his_steering_in_the_curves_tail_still_spoils_the_pass(tmp_pat
     frame += 1
   e = mp.mc.memory._find(*c["apex"])
   assert not (e and e.get("passes")), e
+
+
+def test_review_s3_a_red_light_flag_stuck_on_blocks_the_restore_at_most_20_s():
+  # (rk/red_stuck.py) the flag on from just before his RES and never off: no SET+ for RED_STOP_BLOCK_MAX from its onset,
+  # then the restore (to his 45) goes on
+  car, lg, log = _resume_run(frames=3000 + 4000, off_for=3000, red=lambda f: f >= 2900)
+  ups = [f for f, _, b, _ in log if b == cs.SET_PLUS]
+  assert ups and ups[0] >= 2900 + int(cs.RED_STOP_BLOCK_MAX * 100) - 2, ups[:3]
+  assert abs(car.set_speed / MPH - 45) < 1e-6

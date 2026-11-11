@@ -289,6 +289,7 @@ MERGE_RED_STUCK_SPEED = 10.0  # m/s
 # cap / ceiling and the curve's target still bound it; his own SET is his speed (set_while_off). On a link to a highway
 # the ramp start wins (RAMP_START_FORGET).
 RESUME_RESTORE = True
+RED_STOP_BLOCK_MAX = 20.0     # s (stopped_car_slowdown.RED_RELEASE_HOLD_MAX): a stuck flag blocks no longer; his gas overrides
 RESUME_RESTORE_MAX = 60.0     # s
 RAMP_START_FORGET = True
 MERGE_TURN_LAT = 1.0          # m/s^2 (the architect will tune it from logs; 1.5+ fires mid-loop)
@@ -372,7 +373,10 @@ class SlowdownInputs:
   # tight ramp curve just ahead); merge_turn_pause: a merge going up pauses its SET+ (a loop / turn begins)
   merge_turn_ok: bool = True
   merge_turn_pause: bool = False
-  red_light: bool = False         # starpilotPlan.redLight: no merge start under it
+  red_light: bool = False         # starpilotPlan.redLight (raw): no merge start under it, its way up pauses
+  # ... as the stop trigger sees it (its red_ok: not at highway speed on a highway, not on a ramp onto one): no SET+ back
+  # up from one of our stop slowdowns under it (RESUME_RESTORE, at most RED_STOP_BLOCK_MAX from its onset)
+  red_stop: bool = False
   # on a link to a highway (speed_limit_follow ramp_start): cruise back on there, our old anchor from before is not
   # restored (the ramp start: the merge decides the speed)
   ramp_start: bool = False
@@ -466,6 +470,9 @@ class CurveSlowdownLogic:
     self.last_other_frame = -10_000  # frame a RES / CANCEL (his or openpilot's) was last active
     self.unattributed = None         # (set before, set after) on the frame an unexplained change was seen
     self.red_on_frames = 0           # frames the stop-light detector has been on without a break (MERGE_RED_STUCK)
+    self.prev_red_stop = False
+    self.red_stop_onset = -10_000    # frame red_stop last came on (RED_STOP_BLOCK_MAX)
+    self.red_block = False           # no SET+ back up from our stop slowdown now (red_stop, RESUME_RESTORE)
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
     self.inflight = []               # [Press] not yet (fully) seen on the set speed, oldest first
@@ -681,9 +688,13 @@ class CurveSlowdownLogic:
     """The merge's way up pauses (the hold released, the set speed kept, never a SET-): the car turning (MergeTurnGate)
     or the stop-light detector on (a ramp meter, a light on the ramp: review of round k, S1), unless that flag looks
     stuck (MERGE_RED_STUCK: on continuously that long while moving faster than MERGE_RED_STUCK_SPEED, no stop planned)."""
+    return i.merge_turn_pause or (MERGE_RED_PAUSE and self._merge_red(i))
+
+  def _merge_red(self, i):
+    """The stop-light detector holds a merge back (start and way up), unless the flag looks stuck (MERGE_RED_STUCK)."""
     red_stuck = (self.red_on_frames > _frames(MERGE_RED_STUCK) and i.v_ego > MERGE_RED_STUCK_SPEED and
                  not i.hold_restore and not i.stop_active)
-    return i.merge_turn_pause or (MERGE_RED_PAUSE and i.red_light and not red_stuck)
+    return i.red_light and not red_stuck
 
   def _forget(self):
     """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
@@ -1182,6 +1193,12 @@ class CurveSlowdownLogic:
       # (second review) back on after a gap at a set speed other than the one we left (his own choice): his speed. His
       # RES bringing back the boosted set speed we put there is still ours to take down to the target
       self.boost = None
+    # (review of round k, S3) the stop-light detector as the trigger sees it, for at most RED_STOP_BLOCK_MAX from its onset
+    if i.red_stop and not self.prev_red_stop:
+      self.red_stop_onset = self.frame
+    self.prev_red_stop = i.red_stop
+    red_block = i.red_stop and self.frame - self.red_stop_onset <= _frames(RED_STOP_BLOCK_MAX) and not i.gas_pressed
+    self.red_block = red_block
     if (RESUME_RESTORE and cruise_ok and self.cruise_gap and self.stop_episode and self.anchor is not None and
         self.last_set_speed is not None and abs(i.set_speed - self.last_set_speed) < self.half_step and
         self.offset > 0 and not i.ramp_start):
@@ -1191,7 +1208,7 @@ class CurveSlowdownLogic:
       if not cruise_ok or self.blocked or self.offset <= 0 or self.anchor is None or \
          self.frame - self.resume_restore_frame > _frames(RESUME_RESTORE_MAX):
         self.resume_restore_frame = None
-      elif (not i.stop_active and not i.hold_restore and not i.red_light and not i.stop_slower_ahead and
+      elif (not i.stop_active and not i.hold_restore and not red_block and not i.stop_slower_ahead and
             (i.stop_clear_ahead or i.stop_pulling_away) and
             self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP)):
         self.restore_pending = True
@@ -1479,7 +1496,7 @@ class CurveSlowdownLogic:
     # ramp), and only with the steering calm, no red light and not in the post-stop wait (RAISE_FAST_AFTER_STOP)
     merge = i.limit_boost > 0
     raise_ref = set_speed if (merge and RAMP_START_SET_REF) else driver_speed
-    merge_wait = merge and (not i.merge_turn_ok or i.red_light or
+    merge_wait = merge and (not i.merge_turn_ok or self._merge_red(i) or
                             self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP))
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
         not i.hold_restore and self.last_set_speed is not None and i.limit_raise > raise_ref + self.half_step and
@@ -1555,7 +1572,7 @@ class CurveSlowdownLogic:
     if i.stop_slower_ahead and self.stop_episode:
       up_ok = False
     # (round k, RESUME_RESTORE) no SET+ back up from one of our stop slowdowns while the stop-light detector is on
-    if RESUME_RESTORE and i.red_light and self.stop_episode:
+    if RESUME_RESTORE and self.red_block and self.stop_episode:
       up_ok = False
     if want_lower:
       self.restoring = False
@@ -2225,6 +2242,7 @@ class CurveSlowdown:
       merge_turn_ok=turn_ok, merge_turn_pause=turn_pause,
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
       red_light=bool(self._alive('starpilotPlan') and getattr(plan, "redLight", False)),
+      red_stop=bool(stop_inputs.red_light),
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
