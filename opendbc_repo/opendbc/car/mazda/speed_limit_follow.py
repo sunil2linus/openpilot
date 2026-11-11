@@ -206,6 +206,11 @@ MERGE_STABLE_TIME = 2.0      # s
 # Owner after drive 69: the merge raise goes to the highway's limit plus this (only rule 5's target; the limit itself is
 # what rules 4 / 5 compare with: the undo, the watch, the offer's end once his speed is there)
 MERGE_OVER_MPH = 5
+# The ramp start (owner, round k; replaces "any SET of his on the link ends rule 5"): on a link to a highway his SET+,
+# RES or SET (and cruise coming back on) leave rule 5 on, decided again with his speed then: below the merge's target
+# (the limit + MERGE_OVER) it is offered (the boost as before), at it or above it is his. Only his SET- on the link ends
+# it. His speed's street check (MERGE_SURFACE_MAX) is off: on the ramp the set speed means nothing.
+RAMP_START = True
 MERGE_OVER_KPH = 8
 # When: the stock cruise's speed-up with the set speed above the speed (drives 4c-53, median m/s^2 by the gap in mph:
 # up to 5 below, 5-10, ..., 20 and more), so the cruise is MERGE_NEAR_MPH below the highway's limit where it starts
@@ -338,6 +343,7 @@ class LimitInputs:
   next_distance: float = -1.0  # m to it (mapdOut.nextSpeedLimitDistance; < 0 unknown)
   v_ego: float = 0.0        # m/s, the true speed
   driver_set: bool = False  # the driver is on the SET-/SET+ switch this frame (cruise on or off)
+  driver_minus: bool = False  # ... on SET- (rule 5's ramp start: his SET- ends the merge, his SET+ / RES / SET do not)
   road_name: str = ""       # mapdOut.roadName (rule 7: a turn onto another road)
   nav_limit: float = 0.0    # m/s, navigation's posted limit (starpilotPlan.mapNavSpeedLimit: fresh, 0 none)
   nav_dist: float = 0.0     # m to navigation's next maneuver (0 none)
@@ -426,6 +432,10 @@ class SpeedLimitFollower:
     self.exit_start = None         # rule 6: the frame a link from a highway began (None: no exit open)
     self.exit_street = None        # the frame the car first got onto a street after it
     self.driver_set_frame = -10_000  # the last frame the driver was on SET-/SET+
+    self.driver_minus_frame = -10_000  # ... on SET- (RAMP_START)
+    self.merge_frame = -10_000     # the frame rule 5 last decided on this link (RAMP_START: a later engagement reopens it)
+    self.cruise_on_frame = -10_000  # the frame cruise last came on
+    self.ramp_next = None          # the next limit ahead on this link (steps; RAMP_START: a highway's is known)
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
     self.rise_retry = None         # rule 1: (old, new, frame) refused only for the GPS trust: tried again once trust is 0
@@ -503,6 +513,10 @@ class SpeedLimitFollower:
       self.driver, self.driver_since = d, self.frame
     if i.driver_set:
       self.driver_set_frame = self.frame
+    if i.driver_minus and self.cruise_frames > _frames(ENGAGE_SET_QUIET):
+      self.driver_minus_frame = self.frame     # (with cruise off SET- engages the cruise: that is not a SET- of his)
+    if d is not None and self.cruise_off_frame == self.frame - 1:
+      self.cruise_on_frame = self.frame
     self._road(i)
     if i.turned:
       self.turned_frame = self.frame
@@ -886,21 +900,36 @@ class SpeedLimitFollower:
 
   def _merge(self, i, d):
     """Rule 5: on a link to a highway, the highway's limit ahead becomes the driver's speed, timed for the merge."""
+    n = None
+    if i.next_limit >= 1.0:
+      x = self._steps(i.next_limit)
+      if abs(x - round(x)) <= LIMIT_WHOLE_TOL:
+        n = int(round(x))
+    self.ramp_next = n if self.link_start is not None else None
     o = self.offer
     if o is not None and o.kind == "merge":
       if self.road not in LINK_CLASSES + HIGHWAY_CLASSES and self.frame - self.road_since >= _frames(LIMIT_STABLE_TIME):
         self.offer = None
         self._not_followed(o.old, o.new, o.source, "merge: off the link onto a road that is not a highway")
       return
+    if (RAMP_START and self.merge_done and self.link_start is not None and self.offer is None and d is not None and
+        self.driver_minus_frame < self.link_start and not i.driver_set and
+        max(self.cruise_on_frame, self.driver_set_frame) > self.merge_frame):
+      # (RAMP_START) cruise back on, or his SET+ / SET, after rule 5 decided on this link: decided again (his speed then)
+      self.merge_done, self.merge_window = False, None
     if self.link_start is None or self.merge_done or not self.link_to_hwy or self.link_from in HIGHWAY_CLASSES:
       self.merge_window = None
       return
-    n = None
-    if i.next_limit >= 1.0:
-      x = self._steps(i.next_limit)
-      if abs(x - round(x)) <= LIMIT_WHOLE_TOL:
-        n = int(round(x))
-    if self.driver_set_frame >= self.link_start or self.cruise_drop_frame >= self.link_start:
+    if RAMP_START:
+      # the ramp start (owner, round k: 95 % of on-ramps are entered from a stop or a slow 90 degree turn, cruise off or
+      # the set speed meaningless): only his SET- on the link is his speed; cruise off, RES, SET and SET+ are not
+      if self.driver_minus_frame >= self.link_start:
+        self.merge_done = True
+        self.merge_frame = self.frame
+        self._not_followed(None, self.merge_window[0] if self.merge_window is not None else n, "Map Data",
+                           "merge: the driver set his speed lower on the link")
+        return
+    elif self.driver_set_frame >= self.link_start or self.cruise_drop_frame >= self.link_start:
       # the driver sets his own speed, cancels or brakes at any time since the link began (as rules 2 and 6): his
       # (review: only once the window was open; engaged by SET at 40 on the link, or a brake and RES there, -> 70).
       # Cruise already off when the link began and resumed (RES) on it is not his choice of speed: drive 53, ramp 1
@@ -924,27 +953,31 @@ class SpeedLimitFollower:
     if not ready:
       return
     unit_mph = self.step / MS_PER_MPH
+    top = int(LIMIT_MAX_MPH / unit_mph + 1e-6)          # (never above LIMIT_MAX_MPH)
+    tgt = min(n + self.merge_over, max(top, n))
     why = ""
-    if d >= n - 0.5:
+    if RAMP_START and d >= tgt - 0.5:
+      why = f"driver's speed {round(d)} is not below the merge's {tgt}"   # (his SET+ to it or above: his)
+    elif not RAMP_START and d >= n - 0.5:
       why = f"driver's speed {round(d)} is not below the highway's {n}"
     elif n % self.multiple or n * unit_mph > LIMIT_MAX_MPH + 1e-6 or n < self.merge_min:
       why = f"next limit {n} is not a highway limit"
-    elif d > self.surface_max + 0.5:
+    elif not RAMP_START and d > self.surface_max + 0.5:
       why = f"driver's speed {round(d)} is not a street's (more than {self.surface_max})"
     # (no jump limit: drive 59, both merges refused, "jump 43 > 30" and "jump 35 > 30": from a light or a loop at 25-35
     # mph onto a 70 highway is the normal merge; the link to a highway, its highway limit and GPS trust 0 are the checks)
     if why:
       self.merge_done = True
+      self.merge_frame = self.frame
       self._not_followed(None, n, "Map Data", "merge: " + why)
       return
     # (owner, drive 54: timed for the merge with _merge_need it came 382 m before it, "we can do it way before that"):
     # offered as soon as the window is ready
     self.merge_done = True
+    self.merge_frame = self.frame
     self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
     old = self.stable if (self.stable is not None and self.frame - self.stable_last_seen <= _frames(LIMIT_OLD_MAX_AGE)) else None
-    top = int(LIMIT_MAX_MPH / unit_mph + 1e-6)          # (never above LIMIT_MAX_MPH)
-    self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d,
-                       tgt=min(n + self.merge_over, max(top, n)))
+    self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d, tgt=tgt)
 
   def _new_limit(self, i, d):
     new, start = self.candidate, self.frame - self.candidate_frames    # start: the new limit's first frame
@@ -1209,6 +1242,13 @@ class SpeedLimitFollower:
   @property
   def stable_speed(self):
     return (self.stable or 0) * self.step
+
+  @property
+  def ramp_start(self):
+    """(RAMP_START) on a link to a highway from a street, his SET- not on it: the merge decides his speed here (the
+    controller's old anchor from before the link is not restored)."""
+    return bool(RAMP_START and self.link_start is not None and self.link_to_hwy and self.link_from not in HIGHWAY_CLASSES and
+                self.driver_minus_frame < self.link_start and self.ramp_next is not None and self.ramp_next >= self.merge_min)
 
   @property
   def offer_speed(self):

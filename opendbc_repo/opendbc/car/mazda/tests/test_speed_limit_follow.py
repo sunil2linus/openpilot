@@ -463,7 +463,8 @@ class Coupled:
     if self.road is not None:
       kw = dict(self.road(f, self.x))
       kw["next_limit"] = kw.get("next_limit", 0.0) * MPH
-    kw.update(v_ego=self.car.v_ego, driver_set=self.car.driver_button_now() is not None)
+    kw.update(v_ego=self.car.v_ego, driver_set=self.car.driver_button_now() is not None,
+              driver_minus=self.car.driver_button_now() == cs.SET_MINUS)
     self.raise_ = self.f.update(slf.LimitInputs(self.slc(f) * MPH, "Map Data", self.trust(f), drv, cruise, **kw))
     self.cap_ = self.f.cap_speed
     self.undo_ = self.f.undo_speed
@@ -902,13 +903,18 @@ def test_merge_negatives():
   ramp.road = (lambda orig: lambda f, x: dict(orig(f, x), road_class=1) if f < ramp.at else orig(f, x))(ramp.road)
   r, c, _ = _merge_sim(ramp, _car53(55, 55), 6000)
   assert c.raises == []
-  # his SET+ on the link before it starts: his (he chose 50; no raise to 70 on top)
+  # (round k, the ramp start: his SET+ on the link below the merge's target keeps the merge; only his SET- is his)
   ramp = _Ramp()
   e = dict(ev(ramp))
   e[ramp.at + 300] = lambda s, cr: cr.press(cs.SET_PLUS, who="driver")
   r, c, _ = _merge_sim(ramp, car(), 6000, events=e)
-  assert c.raises == [] and abs(r["final"] - 46) < 0.01, (c.raises, r["final"])
-  assert any("the driver set his speed on the link" in x for x in _reasons(c))
+  assert c.raises and abs(c.raises[0][1] - MERGE_TGT) < 1e-6 and abs(r["final"] - MERGE_TGT) < 0.01, (c.raises, r["final"])
+  ramp = _Ramp()
+  e = dict(ev(ramp))
+  e[ramp.at + 300] = lambda s, cr: cr.press(cs.SET_MINUS, who="driver")
+  r, c, _ = _merge_sim(ramp, car(), 6000, events=e)
+  assert c.raises == [] and abs(r["final"] - 44) < 0.01, (c.raises, r["final"])
+  assert any("the driver set his speed lower on the link" in x for x in _reasons(c))
 
 
 def test_merge_the_driver_touching_his_speed_during_it_is_his():
@@ -925,11 +931,11 @@ def test_merge_the_driver_touching_his_speed_during_it_is_his():
       assert after == [] and r["final"] < MERGE_TGT - 1e-6, (btn, r["final"], after)
     else:
       assert r["final"] <= MERGE_TGT + 1e-6 and r["max"] <= MERGE_TGT + 1e-6, (btn, r["final"])   # SET+: the rest still restored to 70
-  # his brake (cruise off) on the ramp before the merge is taken: no raise after it
+  # his brake (cruise off) on the ramp before the merge is taken, then RES: the merge (round k, the ramp start)
   ramp = _Ramp()
   ev = {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH), f0 - 300: _cruise_off, f0 - 200: _resume_now}
   r, c, _ = _merge_sim(ramp, _car53(45, 45), 6000, events=ev)
-  assert c.raises == [] and r["max"] <= 45 + 1e-6, (c.raises, _reasons(c))
+  assert c.kinds == ["merge"] and r["max"] <= MERGE_TGT + 1e-6, (c.raises, _reasons(c))
 
 
 def test_merge_taken_back_when_the_link_ends_on_a_street():
@@ -982,8 +988,9 @@ def test_merge_is_never_undone_once_on_the_highway():
   assert c.raises and c.undos == [] and abs(r["final"] - MERGE_TGT) < 0.01
 
 
-def test_merge_refused_after_his_set_or_cruise_off_any_time_on_the_link():
-  # review (merge1.py): his SET, cancel or brake on the link only ended the merge once its window was open
+def test_merge_after_his_set_or_cruise_off_on_the_link_the_ramp_start():
+  # review (merge1.py): his SET, cancel or brake on the link only ended the merge once its window was open; round k (the
+  # ramp start, owner): an engagement / RES / SET+ below the merge's target starts it again, only his SET- ends it
   ev0 = lambda ramp: {ramp.at: lambda s, cr: setattr(cr, "v_ego", 18 * MPH)}  # noqa: E731
 
   def engage_set40(s, c):     # SET with cruise off: engages at the current speed, 40
@@ -997,14 +1004,14 @@ def test_merge_refused_after_his_set_or_cruise_off_any_time_on_the_link():
     ev = dict(ev0(ramp))
     ev.update({ramp.at - 200: _cruise_off, ramp.at + 300: engage_set40, ramp.at + 310: on})
     r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
-    assert c.raises == [] and r["max"] <= 45 + 1e-6 and abs(r["final"] - 40) < 0.01, (known, c.raises, r["final"])
-  # his brake on the link before mapd's next limit is known, then RES at the stored 45
+    # (round k, the ramp start: an engagement on the link below the merge's target starts the merge)
+    assert c.kinds == ["merge"] and abs(r["final"] - MERGE_TGT) < 0.01, (known, c.raises, r["final"])
+  # his brake on the link before mapd's next limit is known, then RES at the stored 45: the merge (round k)
   ramp = _Ramp(known=200.0)
   ev = dict(ev0(ramp))
   ev.update({ramp.at + 50: _cruise_off, ramp.at + 400: _resume_now})
   r, c, _ = _merge_sim(ramp, _car53(45, 45), 7000, events=ev)
-  assert c.raises == [] and r["max"] <= 45 + 1e-6, (c.raises, _reasons(c))
-  assert any("cruise off on the link" in x for x in _reasons(c)), _reasons(c)
+  assert c.kinds == ["merge"] and abs(r["final"] - MERGE_TGT) < 0.01, (c.raises, _reasons(c))
   # cruise already off when the link began, RES on it (drive 53, ramp 1: off from t 290.0, RES at 298.5, 0.3 s after the
   # link was matched): not his choice of speed, the merge goes on
   ramp = _Ramp()
