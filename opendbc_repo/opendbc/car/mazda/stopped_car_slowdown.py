@@ -405,6 +405,24 @@ RED_RELEASE_HOLD_MAX = 20.0  # s
 REARM_CHAIN_TIME = 30.0      # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
 WARN_GUARD_PLAN_HOLD = 4.0   # s
+# A far stop ahead (drive 6a t 580: the plan's stop 116 m ahead at 50.5 mph, the real light > 250 m away and green; set
+# 50 -> 20 at once, the car down to 22 mph). The plan's stop distance is the distance to its slowest point in the 8 s
+# horizon (its needed deceleration is always >= 1.4), so a camera-only stop ahead (no slower car) is staged on the
+# extrapolated stop distance d_stop = v^2 / (2 plan decel) + 2: below FAR_STOP_DISTANCE the floor at once (as before);
+# otherwise for FAR_STOP_STAGE the set speed target is the speed from which FAR_STOP_DECEL stops in d_stop (whole mph
+# up, never below the floor), and at its end the floor only when the plan showed the stop on FAR_STOP_PLAN_SHARE of the
+# frames from FAR_STOP_WINDOW_START on; otherwise the episode ends (restore). Starting at FAR_STOP_RED_SPEED or more the
+# stop-light detector alone does not keep it (6a: the plan on 3 % of the frames, the light on for 4 s more); below it the
+# red light rules are as before. Real reds: the floor 1.3-1.9 s later (architect's replay), 0-3 mph more at his brake.
+FAR_STOP_ENABLED = True
+FAR_STOP_DISTANCE = 80.0     # m
+FAR_STOP_DECEL = 0.8         # m/s^2 (never more: the cruise's own slowdown at a low set speed)
+FAR_STOP_MIN_PLAN_DECEL = 0.1  # m/s^2: guard
+FAR_STOP_STAGE = 2.5         # s
+FAR_STOP_WINDOW_START = 0.5  # s
+FAR_STOP_PLAN_SHARE = 0.5
+FAR_STOP_RED_SPEED = 45 * MS_PER_MPH
+FAR_STOP_UNCONFIRMED = "far stop ahead not confirmed by the plan"
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
 # FrogPilot's lead relevance (stop_warning.lead_is_relevant), duplicated so this module stays dependency free
 REL_STOP_DISTANCE, REL_LEAD_STOP_MARGIN, REL_MAX_T_FOLLOW, REL_PLANNER_TIME, REL_CRUISING_SPEED = 6.0, 4.0, 3.0, 10.0, 5.0
@@ -636,6 +654,13 @@ class StoppedCarTrigger:
     # the false stop ahead guard (WARN_GUARD_*)
     self.warn_unsure = False         # this stop ahead episode is not confirmed yet: taps only (the unsure cap)
     self.warn_guarded = False        # ... it started that way (logs)
+    # the far stop ahead's stage (FAR_STOP_*)
+    self.far_stage = False           # this stop ahead is in its first FAR_STOP_STAGE on the distance target
+    self.far_frame = -1
+    self.far_fast = False            # ... it started at FAR_STOP_RED_SPEED or more
+    self.far_target = 0.0
+    self.far_plan = self.far_window = 0
+    self.far_staged = False          # this episode began staged (logs)
 
   def _update_red_light(self, i):
     self.rolling_frames = 0 if i.v_ego < EGO_STOPPED_SPEED else self.rolling_frames + 1
@@ -948,7 +973,8 @@ class StoppedCarTrigger:
       elif not i.plan_stop:
         self.red_absent_frames += 1
       red_holds = (red_on and self.frame - self.last_plan_stop < _frames(STOP_AHEAD_RED_HOLD) and
-                   self.red_absent_frames < _frames(STOP_AHEAD_RED_HOLD_MAX) and self.go_frames < _frames(GO_TIME))
+                   self.red_absent_frames < _frames(STOP_AHEAD_RED_HOLD_MAX) and self.go_frames < _frames(GO_TIME) and
+                   not (self.far_stage and self.far_fast))
       still_planned = self._warn_still_planned(i) if self.warn_pending else True
       if not gates:
         self._release("cruise off / brake" if not (i.cruise_enabled and not i.brake_pressed) else "openpilot disengaged", False)
@@ -960,10 +986,13 @@ class StoppedCarTrigger:
                               (STOP_AHEAD_GONE_ENABLED and self.frame - self.last_plan_stop >= _frames(STOP_AHEAD_GONE_TIME) and
                                not self._slower_in_lane(i))):
         self._release(STOP_AHEAD_CLEARED)
+      elif self.far_stage:
+        self._update_far_stage(i)
     elif self.kind in (STOP_WITH_CAR, STOP_AHEAD) or (stop_with_car and i.lead_v > RELEASE_LEAD_SPEED):
       if self.kind == STOP_AHEAD:
         # the car for the planned stop appeared: from here on a stop with a car (confirmed / floor mode stay)
         self.lost_frames = self.go_frames = self.moving_on_frames = 0
+        self.far_stage = False
       # a stop with a much slower car (or a "stopped" car that is rolling slowly towards the stop): the car ahead
       # may be moving, so "moved away" is not a release; traffic moving again is
       self.kind = STOP_WITH_CAR
@@ -1082,6 +1111,8 @@ class StoppedCarTrigger:
         self.target = self.unsure_target     # the guarded stop ahead: 1 mph taps, the unsure car's cap
       else:
         self.target = FLOOR_SPEED if WARN_FLOOR else stopped_car_target(max(i.plan_stop_d, 0.0))
+        if self.far_stage:
+          self.target = self.far_target  # (FAR_STOP_*) the distance target first
     if self.active and self.kind == STOP_WITH_CAR and self.warn_unsure:
       self.target = max(self.target, self.unsure_target)   # ... its car, until it confirms the stop: the same cap
     if self.active and self.early and not self.confirmed and self.lost_frames > _frames(EARLY_DROPOUT):
@@ -1161,6 +1192,14 @@ class StoppedCarTrigger:
     self.confirm_frames = 0
     self.confirm_frame = self.frame if self.confirmed else -1
     self.floor_mode = self.warn_start and WARN_FLOOR and not self.warn_unsure
+    # a far camera-only stop ahead: the distance target first (FAR_STOP_*)
+    d_stop = self._d_stop(i)
+    self.far_stage = self.far_staged = bool(FAR_STOP_ENABLED and self.floor_mode and self.kind == STOP_AHEAD and
+                                            d_stop >= FAR_STOP_DISTANCE)
+    self.far_frame = self.frame
+    self.far_fast = i.v_ego >= FAR_STOP_RED_SPEED
+    self.far_target = self._far_target(d_stop) if self.far_stage else 0.0
+    self.far_plan = self.far_window = 0
     if self.warn_start:
       self.warn_latched = True
       self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
@@ -1182,6 +1221,41 @@ class StoppedCarTrigger:
     self.unsure_frames = self.unsure_gap = 0
     self.pull_accel_frames = 0
     self.release_reason = None
+
+  @staticmethod
+  def _d_stop(i):
+    """The planned stop's distance extrapolated from the plan's deceleration to its slowest point (FAR_STOP_*): v^2 / (2
+    decel) + 2; 0 (near) when unknown."""
+    v, d = i.v_ego, i.plan_stop_d
+    if d <= 0 or v <= 0.5:
+      return 0.0
+    v_min = max(i.plan_ratio, 0.0) * v
+    decel = max((v * v - v_min * v_min) / (2 * max(d - PLAN_STOP_BUFFER, 1.0)), FAR_STOP_MIN_PLAN_DECEL)
+    return v * v / (2 * decel) + PLAN_STOP_BUFFER
+
+  @staticmethod
+  def _far_target(d_stop):
+    v = math.sqrt(2 * FAR_STOP_DECEL * max(d_stop, 0.0))
+    return max(FLOOR_SPEED, math.ceil(v / MS_PER_MPH - 1e-6) * MS_PER_MPH)
+
+  def _update_far_stage(self, i):
+    """The far stop ahead's stage (FAR_STOP_*): its distance target, then the floor or the end at FAR_STOP_STAGE."""
+    age = self.frame - self.far_frame
+    if i.plan_stop:
+      d_stop = self._d_stop(i)
+      if d_stop < FAR_STOP_DISTANCE:
+        self.far_stage = False         # close now: the floor at once
+        return
+      self.far_target = min(self.far_target, self._far_target(d_stop))
+    if age >= _frames(FAR_STOP_WINDOW_START):
+      self.far_window += 1
+      self.far_plan += bool(i.plan_stop)
+    if age >= _frames(FAR_STOP_STAGE):
+      unconfirmed = self.far_plan < FAR_STOP_PLAN_SHARE * max(self.far_window, 1)
+      # (below FAR_STOP_RED_SPEED with the light on: the floor, the red light rules as before)
+      if unconfirmed and (self.far_fast or self.red_gap >= _frames(RED_DROPOUT)):
+        self._release(FAR_STOP_UNCONFIRMED)
+      self.far_stage = False
 
   def _unsure_car(self, i, any_prob=False):
     """The triangle: a car the camera shows (any confidence) in our path, much slower than us (UNSURE_*). any_prob: a
@@ -1334,10 +1408,14 @@ class StoppedCarTrigger:
   def _release(self, reason, restore_now=True):
     go_kind = STOP_CAR_RED_HOLD and self.kind == STOP_WITH_CAR and reason in (TRAFFIC_MOVING, "at the moving car's speed",
                                                                             PULLING_AWAY, CAR_AHEAD_MOVING)
-    if (reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) or go_kind) and self.red_gap < _frames(RED_DROPOUT):
+    far_slow = reason == FAR_STOP_UNCONFIRMED and not self.far_fast   # (below FAR_STOP_RED_SPEED: the red rules as before)
+    far_free = self.far_stage and self.far_fast    # a fast far stop in its stage: the light alone does not keep it
+    if ((reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and not far_free) or go_kind or far_slow) and \
+       self.red_gap < _frames(RED_DROPOUT):
       restore_now = False              # (RED_RELEASE_HOLD_MAX) the light still on: the lowered set speed stays for now
       self.red_release_frame = self.frame
     self.active = False
+    self.far_stage = False
     self.hold_frames = 0
     self.moving_frames = 0
     self.go_frames = self.moving_on_frames = 0
@@ -1354,7 +1432,7 @@ class StoppedCarTrigger:
     if reason in ("cruise off / brake", "openpilot disengaged", "ego stopped behind the lead", "driver on the gas") or (
         self.rearm_used_frame is not None and self.frame - self.rearm_used_frame > _frames(REARM_CHAIN_TIME)):
       self.rearm_used_frame = None     # a new chain: the restart at once is available again
-    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.rearm_used_frame is None
+    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.rearm_used_frame is None and not far_free
     if restore_now and self.frame - self.last_plan_stop > _frames(LATCH_DROPOUT):
       # a release that restores at once with no stop planned now: the latch goes with it, so the restore is not held
       # back as "a stop planned ahead" (hold_restore, which the controller's restore_now respects); a plan that comes
