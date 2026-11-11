@@ -424,6 +424,11 @@ FAR_STOP_MIN_PLAN_DECEL = 0.1  # m/s^2: guard
 FAR_STOP_STAGE = 2.5         # s
 FAR_STOP_WINDOW_START = 0.5  # s
 FAR_STOP_PLAN_SHARE = 0.5
+# (second review, V2: the stage's cost on real reds) while the light is on and the stage began at FAR_STOP_RED_SPEED or
+# more: its target from the plan's own stop distance (plan_stop_d, nearer than d_stop), the floor at its end from
+# FAR_STOP_RED_PLAN_SHARE of the plan; without the light as above
+FAR_STOP_RED_PLAN_D = True
+FAR_STOP_RED_PLAN_SHARE = 0.25
 FAR_STOP_RED_SPEED = 45 * MS_PER_MPH
 FAR_STOP_UNCONFIRMED = "far stop ahead not confirmed by the plan"
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
@@ -1201,7 +1206,9 @@ class StoppedCarTrigger:
                                             d_stop >= FAR_STOP_DISTANCE)
     self.far_frame = self.frame
     self.far_fast = i.v_ego >= FAR_STOP_RED_SPEED
-    self.far_target = self._far_target(d_stop) if self.far_stage else 0.0
+    # (second review, V2) under the light at FAR_STOP_RED_SPEED or more: the plan's own stop distance, not the extrapolated
+    red_d = i.plan_stop_d if (FAR_STOP_RED_PLAN_D and i.red_light and self.far_fast and i.plan_stop_d > 0) else d_stop
+    self.far_target = self._far_target(red_d) if self.far_stage else 0.0
     self.far_plan = self.far_window = 0
     if self.warn_start:
       self.warn_latched = True
@@ -1249,12 +1256,16 @@ class StoppedCarTrigger:
       if d_stop < FAR_STOP_DISTANCE:
         self.far_stage = False         # close now: the floor at once
         return
-      self.far_target = min(self.far_target, self._far_target(d_stop))
+      red_on = self.red_gap < _frames(RED_DROPOUT)
+      red_d = i.plan_stop_d if (FAR_STOP_RED_PLAN_D and red_on and self.far_fast and i.plan_stop_d > 0) else d_stop
+      self.far_target = min(self.far_target, self._far_target(red_d))
     if age >= _frames(FAR_STOP_WINDOW_START):
       self.far_window += 1
       self.far_plan += bool(i.plan_stop)
     if age >= _frames(FAR_STOP_STAGE):
-      unconfirmed = self.far_plan < FAR_STOP_PLAN_SHARE * max(self.far_window, 1)
+      red_on = self.red_gap < _frames(RED_DROPOUT)
+      share = FAR_STOP_RED_PLAN_SHARE if (self.far_fast and red_on) else FAR_STOP_PLAN_SHARE
+      unconfirmed = self.far_plan < share * max(self.far_window, 1)
       # (below FAR_STOP_RED_SPEED with the light on: the floor, the red light rules as before)
       if unconfirmed and (self.far_fast or self.red_gap >= _frames(RED_DROPOUT)):
         self._release(FAR_STOP_UNCONFIRMED)

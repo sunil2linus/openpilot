@@ -194,12 +194,25 @@ def test_review_6a_580_a_vanishing_plan_under_a_red_light_never_restores_while_i
   assert any(r for f, _, _, r, _, _, _ in out if 1500 <= f < 1700)       # the light gone: back at once
 
 
-def test_review_6c_768_a_third_of_the_plan_under_a_red_light_ends_the_stage_without_a_restore():
+def test_review_6c_768_a_third_of_the_plan_under_a_red_light_goes_to_the_floor_at_the_stage_end():
+  # (second review, V2) the light on, started at 45 mph or more: a quarter of the plan confirms it (FAR_STOP_RED_PLAN_SHARE)
   tr, out = _red_trace(52, _share("100"), lambda f: True, 600)
-  rel = [(f, why) for f, act, _, _, _, why, _ in out if not act and why]
-  assert rel and rel[0][1] in (scs.FAR_STOP_UNCONFIRMED, scs.STOP_AHEAD_UNCONFIRMED, scs.STOP_AHEAD_CLEARED), rel[:2]
-  assert not any(r for _, _, _, r, _, _, _ in out)                      # 35 kept: no restore toward the light
-  assert out[-1][4]                                                     # held (hold_restore) while the light is on
+  stage_end = next(f for f, act, _, _, _, _, far in out if act and not far and f > 100)
+  assert all(act for f, act, *_ in out if 60 <= f < 600)
+  assert abs(out[stage_end][2] - scs.FLOOR_SPEED / MPH) < 0.01, out[stage_end]
+  assert 250 <= stage_end <= 320, stage_end                    # (the start ~0.5 s in, + FAR_STOP_STAGE)
+  assert not any(r for _, _, _, r, _, _, _ in out)
+
+
+def test_review_v2_the_stage_target_under_a_red_light_is_from_the_plans_own_distance():
+  tr = scs.StoppedCarTrigger()
+  for _ in range(100):
+    tr.update(_sa(50, plan_stop=False, red_light=False))
+  for _ in range(60):
+    tr.update(_sa(50, red_light=True, plan_stop_d=100.0))
+  assert tr.far_staged
+  assert abs(tr.target - tr._far_target(100.0)) < 1e-6           # not d_stop's (farther, higher)
+  assert tr._far_target(tr._d_stop(_sa(50, plan_stop_d=100.0))) > tr.target
 
 
 def test_review_69_1193_a_blinking_plan_under_a_red_light_re_arms_and_holds():
