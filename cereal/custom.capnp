@@ -125,6 +125,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaExitCurveBrake @35 :Bool;     # Mazda navigation exit: the cruise cannot slow enough for the exit's curve, brake (On)
   mazdaLimitSlowLimit @36 :Float32;  # Mazda: slowing for a lower posted limit (speed_limit_follow rule 9), the limit m/s; 0 none
   mazdaSetSpeedHigh @37 :Bool;       # Mazda: after a merge boost the set speed did not come back down to the highway speed
+  mazdaWheelButton @38 :UInt8;       # Mazda: the car's own cruise switch (CRZ_BTNS, not our presses): 0 none, 1 SET+, 2 SET-, 3 RES, 4 CANCEL
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {

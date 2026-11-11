@@ -90,6 +90,15 @@ PAUSE_ABANDON = 30.0                  # s paused before we forget the driver's s
 # before a 30 mph curve the map had already announced) only stands us down this long, not for the whole curve.
 DRIVER_REARM = 8.0                    # s without a driver SET button, nothing of ours lowered or in flight
 DRIVER_QUIET = 1.0                    # s: none of our frames while the driver is on a SET button, nor this soon after
+# A set speed change with cruise on that nothing explains (round k, drive 6a): none of our presses in flight, sent or
+# landed within UNATTRIBUTED_RECENT, no wheel button (SET, or RES / CANCEL: other_button_active) within it either
+UNATTRIBUTED_RECENT = 0.5             # s
+# ... a raise like that leaving the set speed more than this above the posted limit on a highway / link: the
+# mazdaSetSpeedHigh alert (chime only; never a SET- for it), its flag up this long
+UNATTRIBUTED_HIGH_OVER = 5 * MS_PER_MPH
+UNATTRIBUTED_HIGH_OVER_KPH = 8 * MS_PER_KPH
+UNATTRIBUTED_HIGH_HOLD = 1.0          # s
+DRIVER_LOG_GAP = 1.0                  # s between two driverSetChange entries with nothing anchored
 EXTRA_LOWER_PRESSES = 6               # SET- budget per curve = max drop steps + this (covers ignored presses)
 
 # Stopped car ahead (shares this controller with the curve slowdown)
@@ -257,6 +266,33 @@ RAISE_FAST_AFTER_STOP = 5.0   # s
 # the merge boost only on the link, or for MERGE_BOOST_HWY onto its highway; a street matched MERGE_BOOST_STREET ends it
 MERGE_BOOST_HWY = 20.0        # s
 MERGE_BOOST_STREET = 1.0      # s
+# The ramp start (owner, round k; speed_limit_follow.RAMP_START): the merge raise is compared with the set speed itself,
+# not the old anchor; it waits for a calm wheel (MergeTurnGate: the lateral acceleration from the steering angle and the
+# speed under MERGE_TURN_LAT for MERGE_TURN_CALM, the wheel not winding up, no ramp curve tighter than
+# MERGE_TURN_CURVE_R within MERGE_TURN_CURVE_D ahead), no red light and the post-stop wait (RAISE_FAST_AFTER_STOP); no
+# speed threshold. Continuous: while the merge goes up, its SET+ pauses (the hold released, the set speed kept, never a
+# SET-) at MERGE_TURN_PAUSE_LAT or the wheel winding up faster than MERGE_TURN_RATE, until calm again. Architect's
+# tuning from drives 56-6d: lat = v^2 rad(angle) / (ratio L (1 + K v^2)) with the owner's learned steer ratio
+# MERGE_TURN_RATIO (~18.9; CP.steerRatio 15.5 without the slip term reads ~1.34x high) and K = MERGE_TURN_SLIP.
+RAMP_START_SET_REF = True
+# RES after our own lowering (round k, streets): his brake (cruise off) at the floor one of our stop slowdowns left, then
+# RES (any time later: the anchor survives cruise off) brings his speed back with the fast restore (restore_pending: a
+# SET+ hold, then taps) once no stop is on or planned, no red light, no slower car in our lane (stop_clear_ahead /
+# stop_pulling_away; else the gentle taps as before), and the post-stop
+# wait (RAISE_FAST_AFTER_STOP) is over; within RESUME_RESTORE_MAX of the RES, else the normal restore. The posted limit's
+# cap / ceiling and the curve's target still bound it; his own SET is his speed (set_while_off). On a link to a highway
+# the ramp start wins (RAMP_START_FORGET).
+RESUME_RESTORE = True
+RESUME_RESTORE_MAX = 60.0     # s
+RAMP_START_FORGET = True
+MERGE_TURN_LAT = 1.0          # m/s^2 (the architect will tune it from logs; 1.5+ fires mid-loop)
+MERGE_TURN_CALM = 1.0         # s
+MERGE_TURN_PAUSE_LAT = 1.5    # m/s^2
+MERGE_TURN_RATE = 15.0        # deg/s with |angle| growing
+MERGE_TURN_RATIO = 18.9
+MERGE_TURN_SLIP = 0.001       # s^2/m^2
+MERGE_TURN_CURVE_R = 90.0     # m
+MERGE_TURN_CURVE_D = 60.0     # m
 # No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
 HWY_ROAD_CLASSES = (1, 3)
 CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
@@ -326,6 +362,14 @@ class SlowdownInputs:
   limit_raise: float = 0.0
   limit_boost: float = 0.0        # a merge raise: the set speed may go this far (m/s) above limit_raise meanwhile (MERGE_BOOST)
   boost_road_ok: bool = True      # the merge boost may go on: on the link, or just onto its highway (a street ends it)
+  # the ramp start's turn gate (MergeTurnGate, MERGE_TURN_*): a merge may start (calm steering for MERGE_TURN_CALM, no
+  # tight ramp curve just ahead); merge_turn_pause: a merge going up pauses its SET+ (a loop / turn begins)
+  merge_turn_ok: bool = True
+  merge_turn_pause: bool = False
+  red_light: bool = False         # starpilotPlan.redLight: no merge start under it
+  # on a link to a highway (speed_limit_follow ramp_start): cruise back on there, our old anchor from before is not
+  # restored (the ramp start: the merge decides the speed)
+  ramp_start: bool = False
   # the posted limit fell to this (m/s) with the driver's speed at the old one (speed_limit_follow.py rule 3): a pending
   # restore stops here, or at the set speed if that is higher (never a SET- for it)
   limit_cap: float = 0.0
@@ -343,6 +387,33 @@ class SlowdownInputs:
   # stopped car trigger: after a red light gone release a slower car (any confidence) is in our lane: no SET+ hold, no
   # SET+ at all until it is gone or the stop slowdown takes it on (stopped_car_slowdown RED_GONE, slower_after_red)
   stop_slower_ahead: bool = False
+
+
+def steer_lateral_accel(v, angle_deg, wheelbase, ratio=MERGE_TURN_RATIO, slip=MERGE_TURN_SLIP):
+  """m/s^2 from the speed and the steering wheel angle (a bicycle model with an understeer term)."""
+  return v * v * math.radians(angle_deg) / (ratio * wheelbase * (1.0 + slip * v * v))
+
+
+class MergeTurnGate:
+  """The ramp start's turn gate (MERGE_TURN_*): ok once the steering has been calm MERGE_TURN_CALM with no tight ramp
+  curve just ahead; pause (latched until ok again) when the car turns harder (MERGE_TURN_PAUSE_LAT) or the wheel winds
+  up."""
+  def __init__(self):
+    self.calm_frames = 0
+    self.paused = False
+    self.lat = 0.0
+
+  def update(self, v, angle_deg, rate_deg, wheelbase, ramp_curve_near=False):
+    self.lat = steer_lateral_accel(max(v, 0.0), angle_deg, wheelbase)
+    winding = abs(rate_deg) > MERGE_TURN_RATE and angle_deg * rate_deg > 0
+    calm = abs(self.lat) < MERGE_TURN_LAT and not winding and not ramp_curve_near
+    self.calm_frames = self.calm_frames + 1 if calm else 0
+    ok = self.calm_frames >= _frames(MERGE_TURN_CALM)
+    if abs(self.lat) >= MERGE_TURN_PAUSE_LAT or winding:
+      self.paused = True
+    elif ok:
+      self.paused = False
+    return ok, self.paused
 
 
 @dataclass
@@ -384,6 +455,10 @@ class CurveSlowdownLogic:
     self.anchor = None
     self.prev_set_speed = None       # the set speed before the last observed change
     self.driver_events = []          # driver set speed changes while we managed it (for the per-event log)
+    self.driver_log_frame = -10_000  # frame of the last one (DRIVER_LOG_GAP)
+    self.last_ours_frame = -10_000   # frame one of our presses last landed (UNATTRIBUTED_RECENT)
+    self.last_other_frame = -10_000  # frame a RES / CANCEL (his or openpilot's) was last active
+    self.unattributed = None         # (set before, set after) on the frame an unexplained change was seen
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
     self.inflight = []               # [Press] not yet (fully) seen on the set speed, oldest first
@@ -437,6 +512,7 @@ class CurveSlowdownLogic:
     self.restore_pending = False     # the stopped car reason cleared for good: restore at once, even at standstill
     self.raise_fast = False          # a posted limit raise of ours is going up: at once, with a hold when far
     self.raise_fast_at = None        # frame from which a raise right after a stop episode's release may go fast
+    self.resume_restore_frame = None # his RES at our lowered set speed, its fast restore not started yet (RESUME_RESTORE)
     self.stop_off_frame = -1_000_000 # the last frame a stop reason went off
     self.prev_stop_active = False
     self.restore_in_curve = False    # restore_pending came while a curve target was on (capped by it, see update)
@@ -620,6 +696,7 @@ class CurveSlowdownLogic:
     before it, so it is put right."""
     if self.anchor is None and self.prev_set_speed is not None:
       self.anchor = self.prev_set_speed
+    self.last_ours_frame = self.frame
     self.no_effect = 0
     self.no_effect_trips = 0
 
@@ -649,10 +726,19 @@ class CurveSlowdownLogic:
       action = "reached_anchor"
     else:
       action = "kept" if self.anchor is not None else "none"
-    if before is not None and len(self.driver_events) < 20:     # drained by the per-event log every frame
-      self.driver_events.append({"dir": direction, "steps": steps, "set_before": self.prev_set_speed,
-                                 "set_after": self.last_set_speed, "anchor_before": before, "anchor_after": self.anchor,
-                                 "inflight": len(self.inflight), "action": action})
+    self._log_driver(direction, steps, before, action)
+
+  def _log_driver(self, direction, steps, before, action):
+    """A driver change of the set speed for the per-event log (driverSetChange): always while we manage it, and with
+    nothing anchored at most every DRIVER_LOG_GAP (round k: his SET / RES with no anchor left no trace)."""
+    if len(self.driver_events) >= 20:      # drained by the per-event log every frame
+      return
+    if before is None and self.frame - self.driver_log_frame < _frames(DRIVER_LOG_GAP):
+      return
+    self.driver_log_frame = self.frame
+    self.driver_events.append({"dir": direction, "steps": steps, "set_before": self.prev_set_speed,
+                               "set_after": self.last_set_speed, "anchor_before": before, "anchor_after": self.anchor,
+                               "inflight": len(self.inflight), "action": action})
 
   def _quantum_steps(self):
     return int(round(HOLD_QUANTUM_MPH * 1.609344)) if self.step < MS_PER_MPH else HOLD_QUANTUM_MPH
@@ -836,6 +922,11 @@ class CurveSlowdownLogic:
     self.prev_set_speed = self.last_set_speed
     self.last_set_speed = i.set_speed
     direction = SET_PLUS if delta > 0 else SET_MINUS
+    recent = _frames(UNATTRIBUTED_RECENT)
+    if (not after_gap and not self.inflight and not self.expired and self.pending is None and self.hold is None and
+        self.frame - max(self.last_send_frame, self.last_ours_frame) > recent and self.prev_driver_button is None and
+        self.frame - max(self.last_driver_edge.values()) > recent and self.frame - self.last_other_frame > recent):
+      self.unattributed = (self.prev_set_speed, i.set_speed)
     steps = abs(delta) / self.step
     self._watch_driver_hold_landing(direction, steps)
     match = self._matching_press(direction)
@@ -945,8 +1036,10 @@ class CurveSlowdownLogic:
       self._apply_ours(direction)
     elif after_gap:
       # Cruise was re-engaged at a different speed: the driver chose a new speed.
+      before = self.anchor
       self._forget()
       self.blocked = True
+      self._log_driver(direction, n, before, "after_gap")
     elif one_step:
       # A single unexplained step is a driver tap (or the driver's tap matched our pending
       # press first and this is our own press landing). No more lowering for this curve.
@@ -970,8 +1063,10 @@ class CurveSlowdownLogic:
       self._disable()
     else:
       # Several steps at once (e.g. holding the button): the driver set a new speed.
+      before = self.anchor
       self._forget()
       self.blocked = True
+      self._log_driver(direction, n, before, "several_steps")
 
   def _start_hold(self, button):
     """The hold's bookkeeping, before (phase lock: possibly a few frames before) its first frame goes out."""
@@ -1015,6 +1110,9 @@ class CurveSlowdownLogic:
     self.limit_adopted = None
     self.limit_capped = None
     self.limit_undone = None
+    self.unattributed = None
+    if i.other_button_active:
+      self.last_other_frame = self.frame
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
     if self.new_wheel:
       self.wheel_frame = self.frame
@@ -1068,6 +1166,23 @@ class CurveSlowdownLogic:
       # (second review) back on after a gap at a set speed other than the one we left (his own choice): his speed. His
       # RES bringing back the boosted set speed we put there is still ours to take down to the target
       self.boost = None
+    if (RESUME_RESTORE and cruise_ok and self.cruise_gap and self.stop_episode and self.anchor is not None and
+        self.last_set_speed is not None and abs(i.set_speed - self.last_set_speed) < self.half_step and
+        self.offset > 0 and not i.ramp_start):
+      # (RESUME_RESTORE) his RES at the set speed one of our stop slowdowns left: his speed back with the fast restore
+      self.resume_restore_frame = self.frame
+    if self.resume_restore_frame is not None:
+      if not cruise_ok or self.blocked or self.offset <= 0 or self.anchor is None or \
+         self.frame - self.resume_restore_frame > _frames(RESUME_RESTORE_MAX):
+        self.resume_restore_frame = None
+      elif (not i.stop_active and not i.hold_restore and not i.red_light and not i.stop_slower_ahead and
+            (i.stop_clear_ahead or i.stop_pulling_away) and
+            self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP)):
+        self.restore_pending = True
+        self.resume_restore_frame = None
+    if (RAMP_START_FORGET and i.ramp_start and cruise_ok and self.cruise_gap and self.boost is None and
+        self.anchor is not None and not self.inflight):
+      self._forget()                   # (the ramp start) back on on the ramp: our old anchor is not his speed here
     if cruise_ok:
       self._observe_set_speed(i)
     self._forget_hold_misses()
@@ -1220,7 +1335,9 @@ class CurveSlowdownLogic:
       self.restore_in_curve = False
     speed_ok = i.v_ego >= (KEEP_SPEED if self.managing else START_SPEED) or (i.stop_active and i.v_ego >= KEEP_SPEED) or (
       i.street_lower and i.csc_active and i.curve_track and not i.stop_active and not i.hold_restore and
-      i.v_ego >= KEEP_SPEED)
+      i.v_ego >= KEEP_SPEED) or (
+      # (the ramp start) a merge raise offered from a stop or a slow turn onto the ramp: from rolling speed on
+      i.limit_raise > 0 and i.limit_boost > 0 and i.v_ego > RESTORE_MOVING_SPEED)
     self.standstill_frames = self.standstill_frames + 1 if i.standstill else 0
     # At a standstill only the restore after stopping behind the car is sent (SET+ there only raises the set
     # speed; the MRCC keeps holding behind the car ahead), once we have been stopped STANDSTILL_RESTORE_DELAY.
@@ -1297,7 +1414,8 @@ class CurveSlowdownLogic:
                      (i.stop_slower_ahead and self.stop_episode))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       hold_max = MERGE_UP_HOLD_MAX if self.hold_kind == "boost_up" else HOLD_MAX_SECONDS
-      if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or
+      turn_pause = d == SET_PLUS and i.merge_turn_pause and self.boost is not None and "ended" not in self.boost
+      if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or turn_pause or
           self.frame - self.hold.frame >= _frames(hold_max) or crosses):
         if target_rose and kind == "stop":
           self.holds_this_episode = max(0, self.holds_this_episode - 1)   # the floor hold stays available
@@ -1341,9 +1459,15 @@ class CurveSlowdownLogic:
     # A higher posted limit (the driver's speed was the old one): it becomes the driver's speed, never more; the
     # restore below brings the set speed up. Not while a reason is active, a planned stop holds the speed
     # (hold_restore), the driver stands us down or is adjusting.
+    # (the ramp start, RAMP_START_*) a merge raise: against the set speed itself (the old anchor means nothing on the
+    # ramp), and only with the steering calm, no red light and not in the post-stop wait (RAISE_FAST_AFTER_STOP)
+    merge = i.limit_boost > 0
+    raise_ref = set_speed if (merge and RAMP_START_SET_REF) else driver_speed
+    merge_wait = merge and (not i.merge_turn_ok or i.red_light or
+                            self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP))
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
-        not i.hold_restore and self.last_set_speed is not None and i.limit_raise > driver_speed + self.half_step and
-        self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
+        not i.hold_restore and self.last_set_speed is not None and i.limit_raise > raise_ref + self.half_step and
+        not merge_wait and self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
       self.anchor = i.limit_raise
@@ -1361,10 +1485,14 @@ class CurveSlowdownLogic:
       offset = self.offset
       driver_speed = set_speed + offset * self.step
     elif (i.limit_raise > 0 and i.limit_boost > 0 and reason is None and not self.blocked and not i.hold_restore and
-          i.limit_raise > driver_speed + self.half_step):
+          i.limit_raise > raise_ref + self.half_step):
       # a merge raise waits only for our presses still in flight (drive 69, merge 1: the restore's 1 mph taps 38 -> 47
-      # kept presses in flight for 4 s and the merge's hold started at 47): nothing more meanwhile, then its hold
+      # kept presses in flight for 4 s and the merge's hold started at 47), or the turn gate / a red light / the
+      # post-stop wait: nothing more meanwhile (no restore to an old anchor either), then its hold
       return None, None
+    if (self.boost is not None and "ended" not in self.boost and i.merge_turn_pause and
+        self.anchor is not None and self.offset > 0):
+      return None, None                # (MERGE_TURN_PAUSE) the merge's way up waits while the car turns
 
     want_lower = False
     room = 0
@@ -1409,6 +1537,9 @@ class CurveSlowdownLogic:
     # stop slowdown takes it on 0.5 s later, and a SET+ still in flight then holds its first SET- back (drive 52 closed
     # loop: a tap 25 -> 26 at 188.36, at our speed, put the first SET- 0.5 s later)
     if i.stop_slower_ahead and self.stop_episode:
+      up_ok = False
+    # (round k, RESUME_RESTORE) no SET+ back up from one of our stop slowdowns while the stop-light detector is on
+    if RESUME_RESTORE and i.red_light and self.stop_episode:
       up_ok = False
     if want_lower:
       self.restoring = False
@@ -1729,6 +1860,8 @@ class CurveSlowdown:
     self.trigger = StoppedCarTrigger()
     self.frame = 0
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
+    self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
+    self.unattributed_high_frames = 0  # an unexplained raise left the set speed high on a highway / link (UNATTRIBUTED_HIGH_*)
     self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
     self.recorder = None
     self.curve_event = None
@@ -2019,7 +2152,8 @@ class CurveSlowdown:
                        ramp_to_highway=bool(plan_alive and getattr(plan, "mapOnRamp", False) and
                                             getattr(plan, "mapRampToHighway", False)),
                        next_limit=next_limit, next_distance=next_dist, v_ego=v_ego,
-                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus), road_name=self._road_name(),
+                       driver_set=bool(CS.crz_set_minus or CS.crz_set_plus), driver_minus=bool(CS.crz_set_minus),
+                       road_name=self._road_name(),
                        nav_limit=float(getattr(plan, "mapNavSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
                        nav_dist=float(getattr(plan, "mapNavManeuverDistance", 0.0) or 0.0) if plan_alive else 0.0,
                        nav_turn=bool(plan_alive and getattr(plan, "mapNavManeuverTurn", False)),
@@ -2031,6 +2165,7 @@ class CurveSlowdown:
       # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
       self.limit_follow.street_active = self._street_active(plan)
       self.limit_want = self.limit_follow.update(li)
+    turn_ok, turn_pause = self._merge_turn(CS, CP, v_ego, plan if self._alive('starpilotPlan') else None)
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
     limit_ceiling = self.limit_follow.ceiling_speed if self.limit_follow is not None else 0.0
@@ -2071,12 +2206,19 @@ class CurveSlowdown:
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
       limit_boost=self._merge_boost(),
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
+      merge_turn_ok=turn_ok, merge_turn_pause=turn_pause,
+      ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
+      red_light=bool(self._alive('starpilotPlan') and getattr(plan, "redLight", False)),
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
     self.curve_on = bool(curve_active)
+    try:
+      self._unattributed_change(inputs, plan if self._alive('starpilotPlan') else None)
+    except Exception:
+      pass
     if self.exit_brake_frames > 0:
       self.exit_brake_frames -= 1
     if self.limit_follow is not None:
@@ -2373,6 +2515,16 @@ class CurveSlowdown:
     self.heading.update(DT_CTRL, math.degrees(rate), v_ego)
     return self.heading.turned()
 
+  def _merge_turn(self, CS, CP, v_ego, plan):
+    """The ramp start's turn gate (MergeTurnGate): (a merge may start, a merge going up pauses)."""
+    from opendbc.car.mazda.map_curve_control import STATUS_RAMP_CURVE
+    ramp_near = bool(plan is not None and int(getattr(plan, "mapCurveStatus", 0) or 0) == STATUS_RAMP_CURVE and
+                     0 < float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) < MERGE_TURN_CURVE_R and
+                     float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) < MERGE_TURN_CURVE_D)
+    return self.turn_gate.update(v_ego, float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0),
+                                 float(getattr(CS.out, "steeringRateDeg", 0.0) or 0.0),
+                                 float(getattr(CP, "wheelbase", 0.0) or 2.7), ramp_near)
+
   def _street_active(self, plan):
     """speed_limit_follow rules 8 / 9 act (Speed Limit Follow and Map Curves On, the planner's map curves On)."""
     from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
@@ -2413,8 +2565,36 @@ class CurveSlowdown:
 
   @property
   def set_speed_high(self):
-    """starpilotCarState.mazdaSetSpeedHigh: the set speed is still above the highway speed after a merge boost."""
-    return bool(self.logic.boost_stuck)
+    """starpilotCarState.mazdaSetSpeedHigh: the set speed is still above the highway speed after a merge boost, or an
+    unexplained raise left it high on a highway / link (UNATTRIBUTED_HIGH_*)."""
+    return bool(self.logic.boost_stuck) or self.unattributed_high_frames > 0
+
+  def _unattributed_change(self, i, plan):
+    """The controller saw a set speed change nobody explains (CurveSlowdownLogic.unattributed): an
+    'unattributedSetChange' event, and the mazdaSetSpeedHigh alert (chime only, nothing pressed) when it was a raise
+    that left the set speed more than UNATTRIBUTED_HIGH_OVER above the posted limit on a highway or a link."""
+    from opendbc.car.mazda.speed_limit_follow import HIGHWAY_CLASSES, LINK_CLASSES
+    if self.unattributed_high_frames > 0:
+      self.unattributed_high_frames -= 1
+    un = self.logic.unattributed
+    if un is None:
+      return
+    before, after = un
+    road_class = int(getattr(plan, "mapRoadClass", 0) or 0) if plan is not None else 0
+    limit = self.limit_follow.stable_speed if self.limit_follow is not None else 0.0
+    if limit <= 0 and plan is not None:
+      limit = float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0)
+    over = UNATTRIBUTED_HIGH_OVER_KPH if self.logic.step < MS_PER_MPH else UNATTRIBUTED_HIGH_OVER
+    high = (after > before and limit > 0 and road_class in HIGHWAY_CLASSES + LINK_CLASSES and
+            after > limit + over + self.logic.half_step)
+    if high:
+      self.unattributed_high_frames = _frames(UNATTRIBUTED_HIGH_HOLD)
+    if self.recorder is not None:
+      import time
+      self.recorder.record("unattributedSetChange", time.monotonic(), {
+        "set_mph_before": before / MS_PER_MPH, "set_mph_after": after / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
+        "anchor_mph": (self.logic.anchor or 0.0) / MS_PER_MPH, "limit_mph": limit / MS_PER_MPH, "road_class": road_class,
+        "gas": i.gas_pressed, "high_alert": high}, min_gap=1.0, signals=False)
 
   @property
   def limit_slow_limit(self):
@@ -2659,19 +2839,28 @@ class CurveSlowdown:
           "in_flight": len(lg.inflight), "stop_episode": lg.stop_episode}, min_gap=0.0, signals=False)
       lf.mark_undone()
     if lf.events:
+      # (round k, drive 6a t 329.6: rule 5's "the driver set his speed on the link" before the next limit was known has
+      # new None; "None * unit" raised here on every frame, the exception was swallowed and lf.events never drained, so
+      # no speedLimit* event was written until three newer ones pushed it out at t 962) each event on its own, None kept
+      events, lf.events = lf.events[-3:], []
       if self.recorder is not None:
-        import time
-        for kind, data in lf.events[-3:]:
-          own = kind in ("speedLimitMatch", "speedLimitSlow")      # (rules 8 / 9: start, done, cancel, undo each)
-          self.recorder.record(kind, time.monotonic(), {"old_mph": data["old"] * unit if data["old"] is not None else None,
-                                                        "new_mph": data["new"] * unit, "source": data["source"],
-                                                        "reason": data["reason"],
-                                                        "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH,
-                                                        **({"mode": "on" if self.limit_mode == 2 else "test",
-                                                            "vEgo_mph": i.v_ego / MS_PER_MPH, **data.get("log", {})}
-                                                           if own else {})},
-                               min_gap=0.0 if own else 10.0, signals=False)
-      lf.events = []
+        for kind, data in events:
+          try:
+            self._record_limit_event(kind, data, unit, i, lg)
+          except Exception:
+            pass
+
+  def _record_limit_event(self, kind, data, unit, i, lg):
+    """One of the follower's events (kind, data) for the per-event log; old / new None stay None."""
+    import time
+    own = kind in ("speedLimitMatch", "speedLimitSlow")      # (rules 8 / 9: start, done, cancel, undo each)
+    extra = {"mode": "on" if self.limit_mode == 2 else "test", "vEgo_mph": i.v_ego / MS_PER_MPH,
+             **data.get("log", {})} if own else {}
+    self.recorder.record(kind, time.monotonic(), {
+      "old_mph": data["old"] * unit if data["old"] is not None else None,
+      "new_mph": data["new"] * unit if data["new"] is not None else None, "source": data["source"],
+      "reason": data["reason"], "driver_mph": (i.set_speed + lg.offset * lg.step) / MS_PER_MPH, **extra},
+      min_gap=0.0 if own else 10.0, signals=False)
 
   def _log(self, i, si, stop_active, button, a_ego, plan=None):
     if self.recorder is None:

@@ -469,8 +469,18 @@ class CarInterfaceBase(ABC):
       fp_ret.mazdaLimitSlowLimit = float(getattr(slowdown, "limit_slow_limit", 0.0) or 0.0)
       fp_ret.mazdaSetSpeedHigh = bool(getattr(slowdown, "set_speed_high", False))
     fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
+    fp_ret.mazdaWheelButton = mazda_wheel_button(self.CS)
 
     return ret, fp_ret
+
+
+def mazda_wheel_button(CS) -> int:
+  """starpilotCarState.mazdaWheelButton: the stock cruise switch as the car reads it (CS.crz_*, CRZ_BTNS on bus 0: our
+  own frames are never read back there): 0 none, 1 SET+, 2 SET-, 3 RES, 4 CANCEL (the highest wins)."""
+  for attr, code in (("crz_cancel", 4), ("crz_resume", 3), ("crz_set_minus", 2), ("crz_set_plus", 1)):
+    if getattr(CS, attr, False) is True:
+      return code
+  return 0
 
 
 class CarStateBase(ABC):

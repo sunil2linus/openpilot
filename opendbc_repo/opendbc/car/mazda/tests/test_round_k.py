@@ -2,6 +2,8 @@
 import math
 
 from opendbc.car.mazda import curve_slowdown as cs
+from opendbc.car.mazda import speed_limit_follow as slf
+from opendbc.car.mazda import stopped_car_slowdown as scs
 
 MPH = cs.MS_PER_MPH
 
@@ -65,8 +67,6 @@ def test_a_jump_that_cannot_be_ours_is_his_never_a_disable():
 
 
 # ---- 2: stop with car: released once the car ahead moves on (no stop planned, no red light); red light protection ----
-
-from opendbc.car.mazda import stopped_car_slowdown as scs  # noqa: E402
 
 
 def _sw(**kw):
@@ -276,3 +276,293 @@ def test_6a_1031_the_hold_being_sent_takes_its_own_landings():
   lg.hold = b
   lg.update(_inp(set_speed=38 * MPH, v_ego=40 * MPH, stop_active=True, stop_target=scs.FLOOR_SPEED, stop_urgent=True))
   assert b.landed == 5 and a.landed == 1 and not lg.disabled
+
+
+# ---- 6: the ramp start (rule 5: any engagement / SET+ / RES on the link below the merge's target; the turn gate) ----
+
+
+WB = 2.7
+
+
+def _angle_for(lat, v):
+  """Steering wheel angle (deg) that reads `lat` m/s^2 at v m/s (cs.steer_lateral_accel inverted)."""
+  return math.degrees(lat * cs.MERGE_TURN_RATIO * WB * (1 + cs.MERGE_TURN_SLIP * v * v) / max(v * v, 0.1))
+
+
+def _acc(g):
+  return 0.33 if g < 5 else (0.51 if g < 10 else (0.75 if g < 15 else (0.91 if g < 20 else 1.06)))
+
+
+def _ramp_run(frames, lat_fn=lambda f, v: 0.0, ev=None, anchor=45, resume_at=150, red=lambda f: False):
+  """A street, then from frame 100 a link to a 70 highway (next limit 70 known on it). Cruise off at set 19 with our old
+  anchor 45 (a stop lowering it), RES at resume_at on the link; lat_fn(f, v): the car's lateral acceleration (the
+  steering). ev(f, st, car): the driver. The follower, the controller and the turn gate as the wrapper couples them."""
+  T = _tmc().T
+  car = T.Car(19, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = 21 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=19 * MPH, v_ego=car.v_ego))
+  lg.anchor = anchor * MPH
+  fol = slf.SpeedLimitFollower(False)
+  gate = cs.MergeTurnGate()
+  st = dict(cruise=False, btn=None, brake=False)
+  log, offers, prev_angle = [], [], 0.0
+  for f in range(frames):
+    if f == resume_at:
+      st["cruise"] = True
+    if ev:
+      ev(f, st, car)
+    btn_now = st["btn"] or car.driver_button_now()
+    lat = lat_fn(f, car.v_ego)
+    angle = _angle_for(lat, car.v_ego)
+    ok, pause = gate.update(car.v_ego, angle, (angle - prev_angle) / 0.01, WB)
+    prev_angle = angle
+    if lg.limit_adopted is not None:
+      fol.mark_adopted()
+    on = st["cruise"]
+    d = (lg.anchor if lg.anchor is not None else car.set_speed) if on else 0.0
+    road = dict(road_class=7) if f < 100 else dict(road_class=2, ramp_to_highway=True, next_limit=70 * MPH,
+                                                    next_distance=max(900.0 - (f - 100) * car.v_ego * 0.01, 0.0))
+    want = fol.update(slf.LimitInputs(0.0, "Map Data", 0, d, on, v_ego=car.v_ego, driver_set=btn_now is not None,
+                                      driver_minus=btn_now == cs.SET_MINUS, **road))
+    o = fol.offer
+    if o is not None and (not offers or offers[-1] is not o):
+      offers.append(o)
+    boost = cs.MERGE_BOOST if (o is not None and o.kind == "merge") else 0.0
+    b, _ = lg.update(_inp(cruise_enabled=on, set_speed=car.set_speed if on else 0.0, v_ego=car.v_ego,
+                          brake_pressed=st["brake"], driver_button=btn_now, limit_raise=want, limit_boost=boost,
+                          merge_turn_ok=ok, merge_turn_pause=pause, red_light=red(f), ramp_start=fol.ramp_start))
+    if b is not None and on:
+      car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
+    if on:
+      car.tick()
+    else:
+      car.frame += 1
+    log.append((f, car.set_speed / MPH, car.v_ego / MPH, b, lg.last_action, ok, pause))
+  return car, lg, log, offers
+
+
+def _driver_hold_to(top_mph, start):
+  """His SET+ held from `start` until the set speed reaches top_mph (the car's long press: 5 mph every 0.6 s)."""
+  def ev(f, st, car):
+    if f >= start and car.set_speed < (top_mph - 0.5) * MPH and not st.get("held"):
+      st["btn"] = cs.SET_PLUS
+      if (f - start) % 10 == 0:
+        car.hold_frame(cs.SET_PLUS)
+    elif f >= start and st["btn"] is not None:
+      st["btn"], st["held"] = None, True
+  return ev
+
+
+def test_6a_329_resume_at_19_on_the_link_then_his_set_plus_hold_to_55_gives_the_merge():
+  car, lg, log, offers = _ramp_run(7000, ev=_driver_hold_to(55, 200))
+  merges = [o for o in offers if o.kind == "merge"]
+  assert merges and merges[0].target == 75, [(o.kind, o.target) for o in offers]
+  sets = [s for _, s, _, _, _, _, _ in log]
+  assert max(sets) >= 90 - 1e-6 and max(sets) <= 95 + 1e-6, max(sets)     # the boost (75 + 20)
+  assert abs(sets[-1] - 75) < 1e-6, sets[-1]                               # back to the merge's target
+  assert not lg.disabled
+
+
+def test_engaged_mid_turn_at_22_mph_the_merge_waits_for_a_calm_wheel():
+  # a 90 degree turn onto the ramp, 3 m/s^2 until frame 400, then straight: nothing of the merge before the wheel has
+  # been calm (< MERGE_TURN_LAT) for MERGE_TURN_CALM
+  car, lg, log, offers = _ramp_run(3000, lat_fn=lambda f, v: 3.0 if f < 400 else 0.0, resume_at=150)
+  first = next((f for f, _, _, b, _, _, _ in log if b == cs.SET_PLUS), None)
+  assert first is not None and first >= 400 + 99, first
+  assert first <= 400 + 100 + 60, first                                    # ... and then at once
+
+
+def test_a_90_degree_turn_peaking_at_3_4_then_straight_starts_about_a_second_after_the_wheel_is_straight():
+  gate = cs.MergeTurnGate()
+  v, prev, ok_at = 23 * MPH, 0.0, None
+  for f in range(600):
+    t = f * 0.01
+    lat = 3.4 * math.sin(math.pi * t / 3.0) if t < 3.0 else 0.0           # 3 s turn, then straight
+    a = _angle_for(lat, v)
+    ok, _ = gate.update(v, a, (a - prev) / 0.01, WB)
+    prev = a
+    if ok and ok_at is None:
+      ok_at = t
+  straight = next(f * 0.01 for f in range(300) if 3.4 * math.sin(math.pi * f * 0.01 / 3.0) < 1.0 and f > 150)
+  assert ok_at is not None and 3.0 + 0.0 <= ok_at <= 3.0 + 1.0 and ok_at >= straight + 1.0 - 0.02, (ok_at, straight)
+
+
+def test_turn_then_2_s_straight_then_a_loop_the_merge_pauses_at_the_loop_and_goes_on_after_it():
+  def lat(f, v):
+    t = f * 0.01
+    if t < 3.0:
+      return 3.0                                     # the turn onto the ramp
+    if t < 5.0:
+      return 0.0                                     # 2 s straight: the merge starts
+    if t < 15.0:
+      return min(3.5, (t - 5.0) * 3.0)               # the loop
+    return 0.0
+  car, lg, log, offers = _ramp_run(4000, lat_fn=lat, resume_at=100)
+  ups = [f for f, _, _, b, _, _, _ in log if b == cs.SET_PLUS]
+  assert any(f < 500 for f in ups), ups[:5]                                # started on the straight
+  loop = [f for f in ups if 560 <= f < 1500]                               # from the loop's onset to its end
+  assert loop == [], loop[:5]
+  assert any(f >= 1500 for f in ups)                                       # goes on after it
+  sets = [s for _, s, _, _, _, _, _ in log]
+  assert all(sets[k] >= sets[k - 1] - 1e-6 for k in range(560, 1500))      # paused, never lowered
+
+
+def test_a_long_loop_ramp_no_merge_until_it_ends():
+  car, lg, log, offers = _ramp_run(5000, lat_fn=lambda f, v: 2.0 + 0.9 * math.sin(f * 0.01) if f < 150 + 2800 else 0.0,
+                                   ev=_driver_hold_to(30, 160))
+  ups = [f for f, _, _, b, act, _, _ in log if b == cs.SET_PLUS and f > 400]
+  assert ups and ups[0] >= 150 + 2800 + 99, ups[:3]
+
+
+def test_his_set_minus_on_the_link_ends_the_merge_and_a_red_light_holds_it():
+  def ev(f, st, car):
+    if f == 600:
+      car.press(cs.SET_MINUS, who="driver")
+  car, lg, log, offers = _ramp_run(3000, ev=ev)
+  assert not any(o.kind == "merge" and offers.index(o) >= 0 and o.frame > 600 for o in offers)
+  assert max(s for f, s, *_ in log if f > 700) <= 45 + 1e-6
+  # the light on: no merge start; it goes once the light is off
+  car, lg, log, offers = _ramp_run(3000, red=lambda f: f < 1500)
+  ups = [f for f, _, _, b, _, _, _ in log if b == cs.SET_PLUS]
+  assert ups and ups[0] >= 1500, ups[:3]
+
+
+# ---- 7: RES after our own stop lowering brings his speed back with the fast restore ----
+
+def _resume_run(frames=4000, off_for=3000, red=lambda f: False, stop_off_ago=10.0, clear=True):
+  T = _tmc().T
+  car = T.Car(19, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = 15 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=19 * MPH, v_ego=car.v_ego))
+  lg.anchor, lg.stop_episode = 45 * MPH, True                 # our stop slowdown left 19 (his 45)
+  lg.stop_off_frame = lg.frame - int(stop_off_ago * 100)
+  lg.pending_from = None
+  log = []
+  for f in range(frames):
+    on = f >= off_for
+    b, _ = lg.update(_inp(cruise_enabled=on, set_speed=car.set_speed if on else 0.0, v_ego=car.v_ego, red_light=red(f),
+                          enabled=on, stop_clear_ahead=clear))
+    if b is not None and on:
+      car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
+    if on:
+      car.tick()
+    else:
+      car.frame += 1
+    log.append((f, car.set_speed / MPH, b, lg.last_action))
+    if lg.restore_pending and lg.pending_from is None:
+      lg.pending_from = f
+  return car, lg, log
+
+
+def test_res_long_after_our_stop_lowering_restores_his_speed_with_a_hold():
+  car, lg, log = _resume_run()                                # 30 s cruise off (his brake), then RES at 19
+  first = next(f for f, _, b, _ in log if b == cs.SET_PLUS)
+  assert first - 3000 <= 60, first                             # at once (cruise settle)
+  assert any(act == "hold" for _, _, b, act in log if b == cs.SET_PLUS)
+  assert abs(car.set_speed / MPH - 45) < 1e-6 and max(s for _, s, _, _ in log) <= 45 + 1e-6
+  car, lg, log = _resume_run(clear=False)                     # a slower car in our lane: the gentle taps, no hold
+  assert not any(act == "hold" for _, _, b, act in log if b == cs.SET_PLUS)
+
+
+def test_res_under_a_red_light_or_right_after_the_stop_waits():
+  car, lg, log = _resume_run(red=lambda f: f < 3500)
+  assert next(f for f, _, b, _ in log if b == cs.SET_PLUS) >= 3500
+  car, lg, log = _resume_run(off_for=200, stop_off_ago=1.0)    # RES 3 s after the stop's release: the post-stop wait
+  assert lg.pending_from is not None and lg.pending_from >= 400 - 2, lg.pending_from
+  assert abs(car.set_speed / MPH - 45) < 1e-6
+  car, lg, log = _resume_run(red=lambda f: f < 3500)
+  assert lg.pending_from is not None and lg.pending_from >= 3500, lg.pending_from
+
+
+# ---- 8 / 9: logging (wheel button, driverSetChange with no anchor, unattributed changes, the speed limit events) ----
+
+class _Rec:
+  def __init__(self):
+    self.events = []
+
+  def record(self, kind, t, summary, min_gap=None, signals=True):
+    self.events.append((kind, summary))
+    return True
+
+
+def _wrapper(limit=70, road_class=1):
+  from types import SimpleNamespace as N
+  w = cs.CurveSlowdown.__new__(cs.CurveSlowdown)
+  w.logic = cs.CurveSlowdownLogic(False, 10)
+  w.limit_follow = slf.SpeedLimitFollower(False)
+  w.limit_follow.stable = limit
+  w.recorder = _Rec()
+  w.unattributed_high_frames = 0
+  w.limit_mode, w.limit_want = 2, 0.0
+  w.limit_cap_logged = w.limit_ceiling_logged = None
+  return w, N(mapRoadClass=road_class, slcSpeedLimit=limit * MPH)
+
+
+def test_8a_the_wheel_button_state_is_the_cars_own_switch():
+  from types import SimpleNamespace as N
+  from opendbc.car.interfaces import mazda_wheel_button
+  assert mazda_wheel_button(N(crz_set_plus=False, crz_set_minus=False, crz_resume=False, crz_cancel=False)) == 0
+  assert mazda_wheel_button(N(crz_set_plus=True, crz_set_minus=False, crz_resume=False, crz_cancel=False)) == 1
+  assert mazda_wheel_button(N(crz_set_plus=False, crz_set_minus=True, crz_resume=False, crz_cancel=False)) == 2
+  assert mazda_wheel_button(N(crz_set_plus=False, crz_set_minus=False, crz_resume=True, crz_cancel=False)) == 3
+  assert mazda_wheel_button(N(crz_set_plus=True, crz_set_minus=False, crz_resume=True, crz_cancel=True)) == 4
+  assert mazda_wheel_button(N()) == 0                              # (not a Mazda)
+
+
+def test_8b_driver_set_changes_are_logged_with_no_anchor_at_most_every_second():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=40 * MPH, v_ego=40 * MPH))
+  n = 0
+  for f in range(300):
+    btn = cs.SET_PLUS if f % 20 < 2 else None
+    s = 40 + (f // 20) + (1 if f % 20 >= 1 else 0)
+    lg.update(_inp(set_speed=s * MPH, v_ego=40 * MPH, driver_button=btn))
+    n += len(lg.driver_events)
+    lg.driver_events = []
+  assert 2 <= n <= 4, n                                            # 15 taps in 3 s: one a second
+
+
+def test_8c_9_an_unexplained_raise_is_logged_and_chimes_when_high_on_a_highway():
+  w, plan = _wrapper(limit=70, road_class=1)
+  lg = w.logic
+  lg.update(_inp(set_speed=72 * MPH, v_ego=70 * MPH))
+  for _ in range(100):
+    lg.update(_inp(set_speed=72 * MPH, v_ego=70 * MPH))
+  i = _inp(set_speed=80 * MPH, v_ego=70 * MPH)
+  lg.update(i)                                                     # 72 -> 80: nothing of ours, no button
+  assert lg.unattributed == (72 * MPH, 80 * MPH)
+  w._unattributed_change(i, plan)
+  assert w.recorder.events and w.recorder.events[-1][0] == "unattributedSetChange"
+  assert w.recorder.events[-1][1]["high_alert"] and w.set_speed_high
+  for _ in range(150):
+    lg.update(i)
+    w._unattributed_change(i, plan)
+  assert not w.set_speed_high                                      # the flag drops (chime once), nothing pressed
+  # his own SET+ tap, or our press: not unexplained; on a street: no chime
+  w, plan = _wrapper(limit=45, road_class=5)
+  lg = w.logic
+  lg.update(_inp(set_speed=45 * MPH, v_ego=45 * MPH))
+  for _ in range(100):
+    lg.update(_inp(set_speed=45 * MPH, v_ego=45 * MPH))
+  lg.update(_inp(set_speed=45 * MPH, v_ego=45 * MPH, driver_button=cs.SET_PLUS))
+  lg.update(_inp(set_speed=46 * MPH, v_ego=45 * MPH))
+  assert lg.unattributed is None
+  for _ in range(100):
+    lg.update(_inp(set_speed=46 * MPH, v_ego=45 * MPH))
+  i = _inp(set_speed=60 * MPH, v_ego=45 * MPH)
+  lg.update(i)
+  w._unattributed_change(i, plan)
+  assert lg.unattributed is not None and not w.set_speed_high
+
+
+def test_8d_6a_329_a_follower_event_with_no_new_limit_no_longer_blocks_the_speed_limit_log():
+  w, _ = _wrapper()
+  lf = w.limit_follow
+  lf.events = [("speedLimitNotFollowed", {"old": None, "new": None, "source": "Map Data",
+                                          "reason": "merge: the driver set his speed on the link"})]
+  i = _inp(set_speed=45 * MPH, v_ego=20 * MPH)
+  w._limit_bookkeeping(i)
+  assert lf.events == [] and w.recorder.events[-1][0] == "speedLimitNotFollowed"
+  assert w.recorder.events[-1][1]["new_mph"] is None
