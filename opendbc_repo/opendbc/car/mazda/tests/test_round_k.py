@@ -695,3 +695,14 @@ def test_review_s4_res_after_a_turn_onto_another_road_gets_the_gentle_restore():
   assert w._road_changed()
   w.logic.stop_episode = False
   assert not w._road_changed() and w.stop_road is None
+
+
+def test_review_m1_a_hold_that_never_sent_a_frame_does_not_use_up_the_episodes_holds():
+  for kind, attr in (("stop", "holds_this_episode"), ("curve", "curve_holds")):
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=45 * MPH, v_ego=45 * MPH))
+    setattr(lg, attr, 1)
+    lg.hold_kind = kind
+    lg._start_hold(cs.SET_MINUS)
+    lg._stop_hold(cut=True)
+    assert getattr(lg, attr) == 0, kind

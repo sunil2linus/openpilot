@@ -854,6 +854,13 @@ class CurveSlowdownLogic:
       for e in self.hold_log:
         if e["frame"] == p.frame and e["frames_sent"] == 0:
           e.update(never_sent=True, done=True)
+      # (review of round k, M1) nothing was held: the episode's / curve's hold (and the boost's way-down hold) stay available
+      if self.hold_kind == "stop":
+        self.holds_this_episode = max(0, self.holds_this_episode - 1)
+      elif self.hold_kind == "curve":
+        self.curve_holds = max(0, self.curve_holds - 1)
+      elif self.hold_kind == "boost" and self.boost is not None:
+        self.boost.pop("held", None)
       # no new hold for a moment (taps meanwhile): a hold the release rules stop before its first frame (a restore hold
       # started on the gas, which the hold's own rules then release) must not start again every other frame
       self.hold_block_until = self.frame + _frames(HOLD_NO_EFFECT_SECONDS)
