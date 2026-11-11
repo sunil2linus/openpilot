@@ -286,6 +286,7 @@ MERGE_RES_DOWN = True
 MERGE_RES_DOWN_SPEED = 1.0    # m/s
 MERGE_RED_STUCK = 20.0        # s
 MERGE_RED_STUCK_SPEED = 10.0  # m/s
+MERGE_RED_STUCK_PLAN_GONE = 2.0  # s without a stop planned by the model
 # RES after our own lowering (round k, streets): his brake (cruise off) at the floor one of our stop slowdowns left, then
 # RES (any time later: the anchor survives cruise off) brings his speed back with the fast restore (restore_pending: a
 # SET+ hold, then taps) once no stop is on or planned, no red light, no slower car in our lane (stop_clear_ahead /
@@ -388,6 +389,9 @@ class SlowdownInputs:
   # the road changed since our stop episode began (mapdOut's road name, or speed_limit_follow's heading watch saw a
   # turn): his RES gets the gentle restore, not the fast one (RESUME_RESTORE; review of round k, S4)
   road_changed: bool = False
+  # the model plans a stop ahead (stopped_car_slowdown.plan_stop, before any road gating): a red light with it is never
+  # taken for a stuck flag (MERGE_RED_STUCK)
+  model_plan_stop: bool = False
   # the posted limit fell to this (m/s) with the driver's speed at the old one (speed_limit_follow.py rule 3): a pending
   # restore stops here, or at the set speed if that is higher (never a SET- for it)
   limit_cap: float = 0.0
@@ -478,6 +482,7 @@ class CurveSlowdownLogic:
     self.last_other_frame = -10_000  # frame a RES / CANCEL (his or openpilot's) was last active
     self.unattributed = None         # (set before, set after) on the frame an unexplained change was seen
     self.red_on_frames = 0           # frames the stop-light detector has been on without a break (MERGE_RED_STUCK)
+    self.plan_free_frames = 0        # frames since the model last planned a stop (MERGE_RED_STUCK_PLAN_GONE)
     self.red_stop_frames = 0         # frames with red_stop on and cruise on since it came on (RED_STOP_BLOCK_MAX)
     self.red_block = False           # no SET+ back up from our stop slowdown now (red_stop, RESUME_RESTORE)
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
@@ -643,6 +648,8 @@ class CurveSlowdownLogic:
       self.boost_stuck = False
       return
     tgt = b["target"]
+    if "ended" not in b and self._merge_paused(i):
+      b["frame"] += 1                  # (second review) MERGE_BOOST_TIME does not run out while the way up is paused
     # (review) only his SET+ makes the speed his; his SET- above the target lowers it, our restore takes it on down
     his = self.blocked and self.last_driver_edge[SET_PLUS] >= self.last_driver_edge[SET_MINUS]
     if "ended" not in b:
@@ -699,8 +706,10 @@ class CurveSlowdownLogic:
 
   def _merge_red(self, i):
     """The stop-light detector holds a merge back (start and way up), unless the flag looks stuck (MERGE_RED_STUCK)."""
+    # (second review M-b: hold_restore / stop_active are always off on a ramp) no stop planned by the model itself for
+    # MERGE_RED_STUCK_PLAN_GONE
     red_stuck = (self.red_on_frames > _frames(MERGE_RED_STUCK) and i.v_ego > MERGE_RED_STUCK_SPEED and
-                 not i.hold_restore and not i.stop_active)
+                 self.plan_free_frames >= _frames(MERGE_RED_STUCK_PLAN_GONE) and not i.hold_restore and not i.stop_active)
     return i.red_light and not red_stuck
 
   def _forget(self):
@@ -1152,6 +1161,7 @@ class CurveSlowdownLogic:
     self.limit_undone = None
     self.unattributed = None
     self.red_on_frames = self.red_on_frames + 1 if i.red_light else 0
+    self.plan_free_frames = 0 if i.model_plan_stop else self.plan_free_frames + 1
     if i.other_button_active:
       self.last_other_frame = self.frame
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_btn_counter
@@ -1918,6 +1928,7 @@ class CurveSlowdown:
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
     self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
+    self.plan_stop_raw = False         # the model's planned stop this frame, before the road gating (M-b)
     self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
     self.unattributed_high_frames = 0  # an unexplained raise left the set speed high on a highway / link (UNATTRIBUTED_HIGH_*)
     self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
@@ -2100,6 +2111,7 @@ class CurveSlowdown:
     # speed went up toward the light) a stop episode already running keeps seeing them, until its own release rules
     if not red_ok and self.trigger.active:
       red_ok = True
+    self.plan_stop_raw = bool(p_stop)  # (the merge's stuck red light check: on a ramp p_stop is off below)
     if not red_ok:
       p_stop = False
     from opendbc.car.mazda.stopped_car_slowdown import lead_path_offset
@@ -2282,6 +2294,7 @@ class CurveSlowdown:
       red_light=bool(self._alive('starpilotPlan') and getattr(plan, "redLight", False)),
       red_stop=bool(stop_inputs.red_light),
       road_changed=self._road_changed(),
+      model_plan_stop=self.plan_stop_raw,
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,

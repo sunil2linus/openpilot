@@ -352,7 +352,7 @@ def _acc(g):
   return 0.33 if g < 5 else (0.51 if g < 10 else (0.75 if g < 15 else (0.91 if g < 20 else 1.06)))
 
 
-def _ramp_run(frames, lat_fn=lambda f, v: 0.0, ev=None, anchor=45, resume_at=150, red=lambda f: False):
+def _ramp_run(frames, lat_fn=lambda f, v: 0.0, ev=None, anchor=45, resume_at=150, red=lambda f: False, plan=lambda f: False):
   """A street, then from frame 100 a link to a 70 highway (next limit 70 known on it). Cruise off at set 19 with our old
   anchor 45 (a stop lowering it), RES at resume_at on the link; lat_fn(f, v): the car's lateral acceleration (the
   steering). ev(f, st, car): the driver. The follower, the controller and the turn gate as the wrapper couples them."""
@@ -390,7 +390,8 @@ def _ramp_run(frames, lat_fn=lambda f, v: 0.0, ev=None, anchor=45, resume_at=150
     boost = cs.MERGE_BOOST if (o is not None and o.kind == "merge") else 0.0
     b, _ = lg.update(_inp(cruise_enabled=on, set_speed=car.set_speed if on else 0.0, v_ego=car.v_ego,
                           brake_pressed=st["brake"], driver_button=btn_now, limit_raise=want, limit_boost=boost,
-                          merge_turn_ok=ok, merge_turn_pause=pause, red_light=red(f), ramp_start=fol.ramp_start))
+                          merge_turn_ok=ok, merge_turn_pause=pause, red_light=red(f), ramp_start=fol.ramp_start,
+                          model_plan_stop=plan(f)))
     if b is not None and on:
       car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
     if on:
@@ -780,3 +781,11 @@ def test_second_review_a_red_light_he_waited_at_with_cruise_off_still_blocks_at_
   ups = [f for f, _, b, _ in log if b == cs.SET_PLUS]
   assert ups and ups[0] >= 3000 + int(cs.RED_STOP_BLOCK_MAX * 100) - 2, ups[:3]
   assert abs(car.set_speed / MPH - 45) < 1e-6
+
+
+def test_second_review_a_red_light_on_the_ramp_with_a_planned_stop_never_counts_as_stuck():
+  # (M-b) the light on and the model planning a stop (a ramp meter's queue): the pause never expires
+  # (MERGE_BOOST_TIME does not run out meanwhile)
+  car, lg, log, offers = _ramp_run(4500, red=lambda f: f >= 500, plan=lambda f: f >= 500 and f % 300 < 250)
+  sets = {f: s for f, s, *_ in log}
+  assert abs(sets[4499] - sets[620]) < 1e-6, (sets[620], sets[4499])
