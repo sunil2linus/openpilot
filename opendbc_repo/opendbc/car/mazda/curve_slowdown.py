@@ -273,6 +273,7 @@ RESTORE_IN_CURVE_HOLD = True
 # a 70 from the highway capped at 45 on the street never applied through a followed map curve, and the pending cap kept
 # the in-curve restore hold (RESTORE_IN_CURVE_HOLD) out.
 CAP_CURVE_MARGIN = 3 * MS_PER_MPH        # m/s (curve_target.MAP_ROAD_UNDERSHOOT)
+UP_STEP_TOL = 0.05                       # steps (see up_ok)
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -357,6 +358,8 @@ class Press:
   release_frame: int = -1  # hold: frame of the last SET- frame sent
   landings: list = field(default_factory=list)   # hold: [(frame, steps)]
   jump: bool = False       # a SET+ on the gas: the set speed jumps to the current speed (up to `reserve` steps, once)
+  stop_frame: int = -1     # hold: frame it was stopped (HOLD_MISS_*: how long it ran)
+  cut: bool = False        # hold: cut by the brake, cruise off, openpilot off, the gas or the driver's buttons
 
 
 class CurveSlowdownLogic:
@@ -419,6 +422,7 @@ class CurveSlowdownLogic:
     self.holds_ok = True             # allowed in the current episode
     self.hold_misses = 0
     self.hold_miss_frame = None      # frame of the last hold miss (HOLD_MISS_FORGET)
+    self.hold_block_until = 0        # a hold stopped before its first frame: none again before this frame
     self.holds_off_why = ""          # what switched holds off last (logs)
     self.hold_overrun = HOLD_OVERRUN_DEFAULT   # quanta seen to land after a release (max), starts conservative
     self.hold_measured = False
@@ -474,7 +478,8 @@ class CurveSlowdownLogic:
 
   @property
   def holds_allowed(self):
-    return LONG_PRESS_ENABLED and self.holds_ok and self.hold_misses < HOLD_MISS_LIMIT
+    return (LONG_PRESS_ENABLED and self.holds_ok and self.hold_misses < HOLD_MISS_LIMIT and
+            self.frame >= self.hold_block_until)
 
   def _matching_press(self, direction):
     """Which press a one-step change in `direction` most likely is: ("driver", k) for driver_taps[k]
@@ -698,7 +703,7 @@ class CurveSlowdownLogic:
       self.hold_measured = True
       self.holds_learned += 1
       self.last_hold_learned = (quanta_after, "ours")
-    elif p.landed == 0:
+    elif self._hold_counts_miss(p):
       self._hold_miss("a hold with no effect")
     for entry in self.hold_log:
       if entry["frame"] == p.frame:
@@ -709,6 +714,34 @@ class CurveSlowdownLogic:
       self.inflight.remove(p)
     if p in self.expired:
       self.expired.remove(p)
+
+  def _hold_counts_miss(self, p):
+    """A hold with nothing landed is a miss only when it ran HOLD_NO_EFFECT_SECONDS and nothing cut it (drive 6c t
+    134.84: cut by his brake 0.1 s in, counted as "a hold with no effect")."""
+    end = p.stop_frame if p.stop_frame >= 0 else max(p.release_frame, p.frame)
+    return p.landed == 0 and not p.cut and end - p.frame >= _frames(HOLD_NO_EFFECT_SECONDS) - HOLD_FRAME_GAP
+
+  def _stop_hold(self, cut=False):
+    """The hold being sent stops. One that never sent a frame (a phase-locked start waiting for the wheel's frame)
+    never existed: it leaves nothing in flight to take the next hold's landings (drive 6a t 148 / 1031.8) or count a miss."""
+    p = self.hold
+    self.hold = None
+    if p is None:
+      return
+    p.stop_frame = self.frame
+    p.cut = p.cut or cut
+    if p.frames_sent == 0 and p.landed == 0:
+      for lst in (self.inflight, self.expired):
+        if p in lst:
+          lst.remove(p)
+      if self.pending is p:
+        self.pending = None
+      for e in self.hold_log:
+        if e["frame"] == p.frame and e["frames_sent"] == 0:
+          e.update(never_sent=True, done=True)
+      # no new hold for a moment (taps meanwhile): a hold the release rules stop before its first frame (a restore hold
+      # started on the gas, which the hold's own rules then release) must not start again every other frame
+      self.hold_block_until = self.frame + _frames(HOLD_NO_EFFECT_SECONDS)
 
   def _hold_miss(self, why, at_once=False):
     """A hold missed (or overran): holds off for this episode; HOLD_MISS_LIMIT misses (or `at_once`) switch them off
@@ -773,7 +806,11 @@ class CurveSlowdownLogic:
     """Account n steps in `direction` to our presses in flight, oldest first. A hold takes
     everything that comes its way (its reserve is a bound, not a count)."""
     while n > 0:
-      p = next((pr for pr in self.inflight if pr.direction == direction and (pr.remaining > 0 or pr.hold)), None)
+      # (drive 6a t 1031.8: an aborted hold still settling took every landing of the next one, which then read as "a
+      # hold with no effect") the hold being sent takes its own landings once its frames go out
+      cur = self.hold if (self.hold is not None and self.hold.direction == direction and self.hold.frames_sent > 0 and
+                          self.hold in self.inflight) else None
+      p = cur or next((pr for pr in self.inflight if pr.direction == direction and (pr.remaining > 0 or pr.hold)), None)
       if p is None:
         break
       take = n if p.hold else min(n, p.remaining)
@@ -996,7 +1033,7 @@ class CurveSlowdownLogic:
       # recognised as ours when cruise comes back (the set speed is not observed meanwhile).
       for p in self.inflight + self.expired:
         p.frame += 1
-      self.hold = None     # a hold is not continued across a cruise cancel
+      self._stop_hold(cut=True)     # a hold is not continued across a cruise cancel
     elif self.set_while_off:
       self.set_while_off = False
       self.boost = None               # (second review) cruise engaged by his SET: the speed is his, no merge boost to take back
@@ -1018,7 +1055,7 @@ class CurveSlowdownLogic:
           self.hold.reserve += self._quantum_steps()
           if self.hold_log:
             self.hold_log[-1]["aborted"] = True
-        self.hold = None   # the driver is on the buttons: do not keep holding
+        self._stop_hold(cut=True)   # the driver is on the buttons: do not keep holding
       self.last_driver_edge[i.driver_button] = self.frame     # kept fresh while held
     self.prev_driver_button = i.driver_button
     if i.gas_pressed:
@@ -1052,7 +1089,7 @@ class CurveSlowdownLogic:
     for p in [p for p in self.inflight if p.hold and p is not self.hold]:
       last = max([p.release_frame] + [f for f, _ in p.landings])
       if self.frame - last > _frames(HOLD_SETTLE):
-        if p.landed == 0:
+        if self._hold_counts_miss(p):
           self.no_effect += 1
         self._finish_hold(p)
         if self.pending is p:
@@ -1198,7 +1235,7 @@ class CurveSlowdownLogic:
                (speed_ok or stopped_restore or (self.restore_pending and i.v_ego > RESTORE_MOVING_SPEED) or fast_any) and
                self.cruise_on_frames >= _frames(CRUISE_SETTLE))
     if not can_act:
-      self.hold = None
+      self._stop_hold(cut=i.brake_pressed or not cruise_ok or not i.enabled)
       # Time with cruise off does not count: on resume we compare the set speed instead.
       if self.offset != 0 and cruise_ok:
         self.pause_frames += 1
@@ -1272,7 +1309,7 @@ class CurveSlowdownLogic:
           self.hold.reserve += q
           if self.hold_log:
             self.hold_log[-1]["aborted"] = True
-        self.hold = None
+        self._stop_hold(cut=i.gas_pressed or i.other_button_active)
         return None, None
       if self.phase_lock:
         ref = self.last_send_frame if self.hold.frames_sent else self.hold.frame
@@ -1359,7 +1396,9 @@ class CurveSlowdownLogic:
     # While a curve target is on, a SET+ (a raise, or any restore) only goes to the highest step at or below the
     # lowest target, never above it (review sE: rounding up gave 37 for a 36.3 mph curve), whatever the SET- budget
     # left; and it waits out the curve's 1 s SET- settle like the curve's own restore does.
-    up_ok = not i.csc_active or (target is not None and set_speed + self.step <= target + 1e-3)
+    # (drive 6a t 243-251: set 35.99 under a 36.977 cap, 36.99 > 36.977 kept it a step under the cap for 8 s: the dash's
+    # set speed and the curve's target both carry rounding, so within UP_STEP_TOL of a step counts)
+    up_ok = not i.csc_active or (target is not None and set_speed + self.step <= target + UP_STEP_TOL * self.step)
     # the highest a SET+ of ours may take the set speed: the driver's speed, a lower limit's cap still pending, or a lower
     # limit reported but not steady yet (speed_limit_follow.py, drive 53 tag 1324.5)
     ceiling = self._ceiling()
@@ -2704,7 +2743,8 @@ class CurveSlowdown:
         "warn_guarded": self.trigger.warn_guarded, **self._profile_summary()})
       self.stop_presses_at_start = lg.stop_presses
       self.stop_brake = False
-      self.stop_holds_at_start = len(lg.hold_log)
+      # (drive 6a t 148: the episode's first hold starts on the frame the episode does, before this) holds from this frame
+      self.stop_holds_at_start = len([h for h in lg.hold_log if h["frame"] < lg.frame])
       self.stop_min_set = i.set_speed
       self.radar_hold_frames = 0
     if self.stop_event is not None:
@@ -2713,7 +2753,7 @@ class CurveSlowdown:
       self.stop_brake = getattr(self, "stop_brake", False) or i.brake_pressed
       done = not stop_active and lg.offset == 0 and not lg.inflight
       if done or (not stop_active and self.stop_mode == 1):
-        holds = lg.hold_log[self.stop_holds_at_start:]
+        holds = [h for h in lg.hold_log[self.stop_holds_at_start:] if not h.get("never_sent")]
         self.recorder.close(self.stop_event, t, {
           "release_reason": self.trigger.release_reason, "kind": self.trigger.kind,
           "set_mph_min": self.stop_min_set / MS_PER_MPH,
