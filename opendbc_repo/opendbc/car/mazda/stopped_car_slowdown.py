@@ -412,8 +412,11 @@ WARN_GUARD_PLAN_HOLD = 4.0   # s
 # otherwise for FAR_STOP_STAGE the set speed target is the speed from which FAR_STOP_DECEL stops in d_stop (whole mph
 # up, never below the floor), and at its end the floor only when the plan showed the stop on FAR_STOP_PLAN_SHARE of the
 # frames from FAR_STOP_WINDOW_START on; otherwise the episode ends (restore). Starting at FAR_STOP_RED_SPEED or more the
-# stop-light detector alone does not keep it (6a: the plan on 3 % of the frames, the light on for 4 s more); below it the
-# red light rules are as before. Real reds: the floor 1.3-1.9 s later (architect's replay), 0-3 mph more at his brake.
+# stop-light detector alone does not take or hold the floor (6a: the plan on 3 % of the frames, the light on for 4 s
+# more); below it the red light rules are as before. Never a restore while the light is on, at any speed (review of
+# round k: 69@1193 and 6c 768 restored toward real reds): such a release keeps the lowered set speed (RED_RELEASE_HOLD_MAX,
+# his gas) and re-arms on the light (REARM_ON_RED_TIME). Real reds: the floor 1.3-1.9 s later (architect's replay), 0-3
+# mph more at his brake.
 FAR_STOP_ENABLED = True
 FAR_STOP_DISTANCE = 80.0     # m
 FAR_STOP_DECEL = 0.8         # m/s^2 (never more: the cruise's own slowdown at a low set speed)
@@ -1408,9 +1411,9 @@ class StoppedCarTrigger:
   def _release(self, reason, restore_now=True):
     go_kind = STOP_CAR_RED_HOLD and self.kind == STOP_WITH_CAR and reason in (TRAFFIC_MOVING, "at the moving car's speed",
                                                                             PULLING_AWAY, CAR_AHEAD_MOVING)
-    far_slow = reason == FAR_STOP_UNCONFIRMED and not self.far_fast   # (below FAR_STOP_RED_SPEED: the red rules as before)
-    far_free = self.far_stage and self.far_fast    # a fast far stop in its stage: the light alone does not keep it
-    if ((reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and not far_free) or go_kind or far_slow) and \
+    # (review of round k, B1) a far stop's releases never restore while the light is on, whatever the speed: the light
+    # alone only no longer takes / holds the floor at FAR_STOP_RED_SPEED or more (red_holds, _update_far_stage)
+    if (reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED, FAR_STOP_UNCONFIRMED) or go_kind) and \
        self.red_gap < _frames(RED_DROPOUT):
       restore_now = False              # (RED_RELEASE_HOLD_MAX) the light still on: the lowered set speed stays for now
       self.red_release_frame = self.frame
@@ -1432,7 +1435,7 @@ class StoppedCarTrigger:
     if reason in ("cruise off / brake", "openpilot disengaged", "ego stopped behind the lead", "driver on the gas") or (
         self.rearm_used_frame is not None and self.frame - self.rearm_used_frame > _frames(REARM_CHAIN_TIME)):
       self.rearm_used_frame = None     # a new chain: the restart at once is available again
-    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.rearm_used_frame is None and not far_free
+    self.rearm_on_red = reason in (STOP_AHEAD_CLEARED, STOP_AHEAD_UNCONFIRMED) and self.rearm_used_frame is None
     if restore_now and self.frame - self.last_plan_stop > _frames(LATCH_DROPOUT):
       # a release that restores at once with no stop planned now: the latch goes with it, so the restore is not held
       # back as "a stop planned ahead" (hold_restore, which the controller's restore_now respects); a plan that comes

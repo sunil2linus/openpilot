@@ -164,10 +164,56 @@ def test_a_real_red_far_away_takes_the_distance_target_then_the_floor_by_2_5_s()
   assert tr.active
 
 
-def test_6a_580_a_vanishing_plan_with_the_light_on_at_50_mph_restores_after_2_5_s():
-  tr, out, f0 = _sa_run(50, lambda f: f < 55 or f == 200)
-  assert not tr.active and tr.release_reason in (scs.FAR_STOP_UNCONFIRMED, scs.STOP_AHEAD_CLEARED, scs.STOP_AHEAD_UNCONFIRMED)
-  assert tr.restore_now and not tr.hold_restore
+def _red_trace(v_mph, plan_fn, red_fn, frames, decel=0.0):
+  """Replay-shaped trace (review of round k, rk/rep_far.py): a camera-only stop ahead at v_mph, the plan's stop on
+  plan_fn(f), redLight red_fn(f); the car slowing at `decel` m/s^2 while an episode is on. Rows (f, active, target mph,
+  restore_now, hold_restore, release reason, far stage)."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(100):
+    tr.update(_sa(v_mph, plan_stop=False, red_light=False))
+  v, out = v_mph * MPH, []
+  for f in range(frames):
+    act = tr.update(_sa(v / MPH, plan_stop=plan_fn(f), red_light=red_fn(f), set_speed=v_mph * MPH))
+    out.append((f, act, tr.target / MPH, tr.restore_now, tr.hold_restore, tr.release_reason, tr.far_stage))
+    if act:
+      v = max(v - decel * 0.01, 8.0)
+  return tr, out
+
+
+def _share(pattern):
+  """plan_fn: on for the first 60 frames (the start), then `pattern` (a string of 0/1, one char per 0.1 s, repeated)."""
+  return lambda f: f < 60 or pattern[(f // 10) % len(pattern)] == "1"
+
+
+def test_review_6a_580_a_vanishing_plan_under_a_red_light_never_restores_while_it_is_on():
+  # the plan on 3 % of the frames after the start, the light on for 15 s: no restore (and never the floor) until it
+  # goes off, then the restore at once
+  tr, out = _red_trace(50, _share("0" * 33 + "1"), lambda f: f < 1500, 2500)
+  assert not any(r for f, _, _, r, _, _, _ in out if f < 1500), [f for f, _, _, r, _, _, _ in out if r][:3]
+  assert all(t > 25 for _, act, t, _, _, _, _ in out if act)            # (FAR_STOP_RED_SPEED: never the floor)
+  assert any(r for f, _, _, r, _, _, _ in out if 1500 <= f < 1700)       # the light gone: back at once
+
+
+def test_review_6c_768_a_third_of_the_plan_under_a_red_light_ends_the_stage_without_a_restore():
+  tr, out = _red_trace(52, _share("100"), lambda f: True, 600)
+  rel = [(f, why) for f, act, _, _, _, why, _ in out if not act and why]
+  assert rel and rel[0][1] in (scs.FAR_STOP_UNCONFIRMED, scs.STOP_AHEAD_UNCONFIRMED, scs.STOP_AHEAD_CLEARED), rel[:2]
+  assert not any(r for _, _, _, r, _, _, _ in out)                      # 35 kept: no restore toward the light
+  assert out[-1][4]                                                     # held (hold_restore) while the light is on
+
+
+def test_review_69_1193_a_blinking_plan_under_a_red_light_re_arms_and_holds():
+  # the plan on 58 % (short gaps): an early release "gone before the warning" must not restore; it re-arms and the stage
+  # target holds until the car ahead is found
+  tr, out = _red_trace(53, _share("1101101100110"), lambda f: True, 800, decel=0.8)
+  assert not any(r for _, _, _, r, _, _, _ in out)
+  last_on = max(f for f, act, *_ in out if act)
+  assert last_on >= 700 and out[-1][1], [(f, why) for f, act, _, _, _, why, _ in out if not act and why][:3]
+
+
+def test_review_a_vanishing_plan_with_no_red_light_at_50_mph_restores_after_the_stage():
+  tr, out, f0 = _sa_run(50, lambda f: f < 55 or f == 200, red_light=False)
+  assert not tr.active and tr.restore_now and not tr.hold_restore
   assert out[-1][0] - f0 <= int(scs.FAR_STOP_STAGE / scs.DT_CTRL) + 1
   assert min(t for _, act, t, _ in out if act) > 25    # never the floor
 
