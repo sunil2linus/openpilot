@@ -789,3 +789,55 @@ def test_second_review_a_red_light_on_the_ramp_with_a_planned_stop_never_counts_
   car, lg, log, offers = _ramp_run(4500, red=lambda f: f >= 500, plan=lambda f: f >= 500 and f % 300 < 250)
   sets = {f: s for f, s, *_ in log}
   assert abs(sets[4499] - sets[620]) < 1e-6, (sets[620], sets[4499])
+
+
+# ---- the owner's early confirm under the red light (FAR_STOP_RED_CONFIRM_*) ----
+
+def _first(out, cond):
+  return next((f for f, act, t, r, h, why, far in out if cond(act, t, far)), None)
+
+
+def _floor(act, t, far):
+  return act and abs(t * MPH - scs.FLOOR_SPEED) < 1e-6
+
+
+def test_early_confirm_a_steady_plan_under_the_red_light_goes_to_the_floor_after_0_75_s():
+  tr, out = _red_trace(50, lambda f: True, lambda f: True, 400)
+  start = _first(out, lambda act, t, far: act)
+  fl = _first(out, _floor)
+  assert tr.far_staged and fl is not None and fl - start <= int(scs.FAR_STOP_RED_CONFIRM_RUN * 100) + 1, (start, fl)
+
+
+def test_early_confirm_a_blinking_plan_at_65_percent_goes_to_the_floor_at_about_1_s():
+  pat = "11011010110110101101"                     # 13 / 20 on, no run longer than 0.2 s
+  tr, out = _red_trace(50, lambda f: f < 60 or pat[(f // 10) % len(pat)] == "1", lambda f: True, 600)
+  start = _first(out, lambda act, t, far: act)
+  fl = _first(out, _floor)
+  assert fl is not None and 95 <= fl - start <= 130, (start, fl)
+
+
+def test_early_confirm_6a_580_the_flashing_yellow_never_the_floor_no_restore_under_the_light():
+  # video (a6e): a flashing yellow; the plan's stop in 5 short runs (0.10, 0.20, 0.10, 0.45, 0.06 s) within 2.5 s
+  runs = [(55, 10), (95, 20), (145, 10), (185, 45), (260, 6)]     # (start frame, length) after the 0.55 s that starts it
+
+  def plan(f):
+    return f < 55 or any(a <= f < a + n for a, n in runs)
+  tr, out = _red_trace(50, plan, lambda f: f < 1500, 2000)
+  assert any(far for *_, far in out)                               # (the stage ran)
+  assert _first(out, _floor) is None
+  assert not any(r for f, _, _, r, _, _, _ in out if f < 1500)
+  assert any(r for f, _, _, r, _, _, _ in out if f >= 1500)
+
+
+def test_early_confirm_not_without_the_red_light_the_2_5_s_stage_as_before():
+  # the light on until 1.2 s before the start (WARN_RED_RECENT: the stop is not guarded), off from there
+  tr2 = scs.StoppedCarTrigger()
+  for k in range(100):
+    tr2.update(_sa(50, plan_stop=False, red_light=k < 30))
+  rows = []
+  for f in range(600):
+    act = tr2.update(_sa(50, plan_stop=True, red_light=False))
+    rows.append((f, act, tr2.target / MPH, tr2.restore_now, tr2.hold_restore, tr2.release_reason, tr2.far_stage))
+  start = _first(rows, lambda act, t, far: act)
+  fl = _first(rows, _floor)
+  assert tr2.far_staged and fl is not None and fl - start >= int(scs.FAR_STOP_STAGE * 100) - 1, (start, fl)

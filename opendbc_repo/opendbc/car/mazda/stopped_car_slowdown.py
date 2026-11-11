@@ -429,6 +429,13 @@ FAR_STOP_PLAN_SHARE = 0.5
 # FAR_STOP_RED_PLAN_SHARE of the plan; without the light as above
 FAR_STOP_RED_PLAN_D = True
 FAR_STOP_RED_PLAN_SHARE = 0.25
+# (owner, after V2) once the planner's stop is confirmed with the light on (stage begun at FAR_STOP_RED_SPEED or more), the
+# floor at once instead of at the stage end: the plan's stop present without a break for FAR_STOP_RED_CONFIRM_RUN, or on
+# FAR_STOP_RED_CONFIRM_SHARE of the frames of the last FAR_STOP_RED_CONFIRM_WINDOW (from that far into the stage on).
+# 0.75 s, not 0.5: 6a 580 was a flashing yellow (video, a6e) whose longest run of the plan's stop was 0.45 s.
+FAR_STOP_RED_CONFIRM_RUN = 0.75       # s
+FAR_STOP_RED_CONFIRM_SHARE = 0.6
+FAR_STOP_RED_CONFIRM_WINDOW = 1.0     # s
 FAR_STOP_RED_SPEED = 45 * MS_PER_MPH
 FAR_STOP_UNCONFIRMED = "far stop ahead not confirmed by the plan"
 TAP_KINDS = frozenset({SLOW_UNSURE, RED_LIGHT})   # our tap-only episodes (no lead target, no holds)
@@ -668,6 +675,7 @@ class StoppedCarTrigger:
     self.far_fast = False            # ... it started at FAR_STOP_RED_SPEED or more
     self.far_target = 0.0
     self.far_plan = self.far_window = 0
+    self.far_run, self.far_recent = 0, []   # FAR_STOP_RED_CONFIRM_*: the plan's current run (frames), its last window
     self.far_staged = False          # this episode began staged (logs)
 
   def _update_red_light(self, i):
@@ -1210,6 +1218,7 @@ class StoppedCarTrigger:
     red_d = i.plan_stop_d if (FAR_STOP_RED_PLAN_D and i.red_light and self.far_fast and i.plan_stop_d > 0) else d_stop
     self.far_target = self._far_target(red_d) if self.far_stage else 0.0
     self.far_plan = self.far_window = 0
+    self.far_run, self.far_recent = 0, []
     if self.warn_start:
       self.warn_latched = True
       self.warn_pending = self.warn_frames < _frames(WARN_DEBOUNCE)
@@ -1259,6 +1268,17 @@ class StoppedCarTrigger:
       red_on = self.red_gap < _frames(RED_DROPOUT)
       red_d = i.plan_stop_d if (FAR_STOP_RED_PLAN_D and red_on and self.far_fast and i.plan_stop_d > 0) else d_stop
       self.far_target = min(self.far_target, self._far_target(red_d))
+    # (owner, FAR_STOP_RED_CONFIRM_*) under the light at FAR_STOP_RED_SPEED or more, the planner's stop confirmed: the floor
+    # now (the stage-end confirm's path)
+    self.far_run = self.far_run + 1 if i.plan_stop else 0
+    self.far_recent.append(bool(i.plan_stop))
+    del self.far_recent[:-_frames(FAR_STOP_RED_CONFIRM_WINDOW)]
+    if self.far_fast and self.red_gap < _frames(RED_DROPOUT) and (
+        self.far_run >= _frames(FAR_STOP_RED_CONFIRM_RUN) or
+        (age >= _frames(FAR_STOP_RED_CONFIRM_WINDOW) and
+         sum(self.far_recent) >= FAR_STOP_RED_CONFIRM_SHARE * len(self.far_recent))):
+      self.far_stage = False
+      return
     if age >= _frames(FAR_STOP_WINDOW_START):
       self.far_window += 1
       self.far_plan += bool(i.plan_stop)
