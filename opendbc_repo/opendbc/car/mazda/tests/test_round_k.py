@@ -731,6 +731,7 @@ def test_review_m2_a_queue_on_the_ramp_mid_boost_then_res_at_5_mph_takes_the_boo
 
 def test_review_m3_a_reopened_merge_refused_again_is_logged_once_per_link():
   fol = slf.SpeedLimitFollower(False)
+
   def step(f, on, d_mph, btn=None):
     road = dict(road_class=7) if f < 100 else dict(road_class=2, ramp_to_highway=True, next_limit=70 * MPH,
                                                     next_distance=900.0)
