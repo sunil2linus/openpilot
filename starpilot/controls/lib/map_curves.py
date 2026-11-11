@@ -169,6 +169,10 @@ PASS_MAX_DT = 0.2          # s: a longer pause between planner cycles starts the
 # a pass counts for its radius only with this share of it at PASS_MIN_SPEED or more (review of the window: a 40 m bend at
 # 7 m/s with a 12 m/s approach left only the straight road around it, "2000 m")
 PASS_FAST_SHARE = 0.9
+# A pass that ends in a stop after the curve (drive 6a: West Utica's second curve, capped at 37 and driven at 1-2 m/s^2,
+# with a red light after it): the braking / slow / driver samples past the curve's end are cut off and the pass ends
+# there, so it still counts (clean, its speed the curve's), as any pass through the curve's end would
+PASS_STOP_CUT = True
 PASS_BUFFER = 2400         # planner cycles of driving kept for the pass window (120 s)
 # frogpilotPlan.mapNavExit
 NAV_NONE, NAV_EXIT_CURVES, NAV_EXIT_NO_CURVES, NAV_EXIT_NO_DATA = 0, 1, 2, 3
@@ -2149,8 +2153,11 @@ class MapCurvesPlanner:
       v = max(float(cs.vEgo), 0.0)
       self.pass_x += v * dt
       x = self.pass_x
+      # (PASS_STOP_CUT) a sample that would spoil the pass: braking, slow, openpilot not steering or the driver steering
+      stopping = (bool(getattr(cs, "brakePressed", False)) or v < PASS_MIN_SPEED or not bool(cc.latActive) or
+                  bool(cs.steeringPressed))
       self.pass_buf.append((x, (v, float(sm["controlsState"].curvature), bool(cc.latActive), bool(cs.steeringPressed),
-                                abs(float(cc.actuators.torque))), bool(cs.leftBlinker or cs.rightBlinker)))
+                                abs(float(cc.actuators.torque))), bool(cs.leftBlinker or cs.rightBlinker), stopping))
       if len(self.pass_buf) > PASS_BUFFER + 200:
         del self.pass_buf[:200]
       if inside is not None and self.pass_curve is not None and inside is not self.pass_curve and \
@@ -2187,6 +2194,14 @@ class MapCurvesPlanner:
       self.pass_shaky |= bool(self.trust.shaky)
       if not self._same(inside, c) and x >= self._pass_end():
         self._end_pass(self._pass_end())
+      elif PASS_STOP_CUT and not self._same(inside, c) and self.pass_x_exit <= x and stopping:
+        # through the curve's end, then braking / slowing for a stop (drive 6a, West Utica's second curve before a red
+        # light): the pass ends here, clean, without the stop, and counts as full (the car is through the curve's end)
+        self.pass_stop_cut = True
+        try:
+          self._end_pass(x)
+        finally:
+          self.pass_stop_cut = False
     except Exception:
       self.pass_curve, self.pass_buf = None, []
 
@@ -2209,7 +2224,9 @@ class MapCurvesPlanner:
       return
     if not self.pass_buf or self.pass_buf[0][0] > x_start + 1.0:
       return                                # the kept driving does not reach back to its start (a gap): not a pass
-    window = [(s, b) for xx, s, b in self.pass_buf if x_start <= xx <= x_end]
+    # (PASS_STOP_CUT) past the curve's end, the stop's own samples are not the curve's
+    window = [(s, b) for xx, s, b, st in self.pass_buf if x_start <= xx <= x_end and
+              not (PASS_STOP_CUT and st and xx >= self.pass_x_exit)]
     self.pass_curve, self.pass_samples = c, [s for s, _ in window]
     self.pass_blinker = any(b for _, b in window)
     try:
@@ -2238,7 +2255,8 @@ class MapCurvesPlanner:
       return
     r = curve_pass_radius(samples)
     if r is not None:
-      flags = (["full"] if self.pass_exit <= PASS_EXIT_NEAR else []) + (["vetoed"] if self.pass_vetoed else [])
+      full = self.pass_exit <= PASS_EXIT_NEAR or getattr(self, "pass_stop_cut", False)
+      flags = (["full"] if full else []) + (["vetoed"] if self.pass_vetoed else [])
       self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
 
   def _nav_street(self, ni, now):
