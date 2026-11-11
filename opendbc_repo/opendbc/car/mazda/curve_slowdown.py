@@ -186,6 +186,8 @@ GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= 
 # a normal step, holds allowed. Still never a SET+ that could land above the driver's speed if it did jump, and a
 # landing on the current speed from a SET+ of ours off the gas is still booked as ours (JUMP_OFF_GAS_CLAIM).
 GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed during which a SET+ may still jump
+JUMP_CLAIM_ABOVE = 1.25                  # steps: a SET+ landing this far above the current speed is still a jump of ours
+JUMP_CLAIM_BELOW = 2.5                   # steps: ... and this far below it (the car slowing while the tap was on its way)
 # Never speed up inside a curve (drive 53, the on-ramp loop onto M-59, t 1019-1030): behind a car the set speed sat at
 # 39-41 while the car went 27-28 mph into a 71 m loop; the cruise followed the car ahead up to 32 mph in the loop
 # ("Turn Exceeds Steering Limit" twice). While the camera's curve target governs on a link road (map curves On: the
@@ -809,8 +811,13 @@ class CurveSlowdownLogic:
     jump_ok = (not after_gap and self.anchor is not None and i.set_speed <= self.anchor + self.half_step)
     if not jump_ok:
       jp = None
+    # (drive 6a t 1084.6: a SET+ tap 1 s after the gas, set 20 -> 28.993 with the car at 29.5: |28.993 - 30| missed the old
+    # "within 1.0 of round(vEgo)" by 0.007 and switched the controller off for the drive) a landing on the current speed
+    # is up to one step above it (JUMP_CLAIM_ABOVE) or a little below (the car slowing while the tap was on its way)
+    land_rel = round(i.set_speed / self.step) - i.v_ego / self.step
+    on_speed = -JUMP_CLAIM_BELOW <= land_rel <= JUMP_CLAIM_ABOVE
     if jp is None and jump_ok and direction == SET_PLUS and driver_k is None and not driver_recent and steps > 1.25 and \
-       abs(i.set_speed / self.step - round(i.v_ego / self.step)) <= 1.0:
+       on_speed:
       # a SET+ of ours off the gas that jumped to the current speed after all (not seen on drives 4c-4f): ours, not
       # "more steps than our presses" (which switches everything off for the drive)
       jp = next((p for p in self.inflight + self.expired if p.direction == SET_PLUS and not p.hold), None)
@@ -911,6 +918,15 @@ class CurveSlowdownLogic:
       # The driver held the button: several steps of theirs.
       self.driver_taps = [(d, f) for d, f in self.driver_taps if d != direction]
       self._driver_change(direction, n)
+    elif ours_k is not None and direction == SET_PLUS and on_speed:
+      # (drive 6a t 1084.6) a SET+ of ours that jumped to the current speed but cannot be booked as ours (after a cruise
+      # gap, nothing anchored, or past the driver's speed): recoverable, the set speed is his from here
+      p = self.inflight[ours_k]
+      if not p.hold:
+        self.inflight.remove(p)        # (it landed: the jump)
+      self.pending = None
+      self._forget()
+      self.blocked = True
     elif ours_k is not None:
       # More steps than we have presses in flight, in our direction: the car may step more than
       # once per press. We can't keep the limits reliably, so switch off for this drive.
