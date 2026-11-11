@@ -1,4 +1,6 @@
 """Round k (drives 6a / 6c / 6d): the logged scenarios as tests."""
+import math
+
 from opendbc.car.mazda import curve_slowdown as cs
 
 MPH = cs.MS_PER_MPH
@@ -47,9 +49,9 @@ def test_a_jump_just_under_the_current_speed_is_booked_as_ours():
 
 
 def test_a_jump_one_step_above_the_current_speed_is_ours_more_is_not():
-  lg, set_mph, _ = _jump_run(lambda v: round(v) + 1.0)
+  lg, set_mph, _ = _jump_run(lambda v: math.floor(v) + 1.0)          # 30 at 29.55
   assert not lg.disabled and abs(set_mph - 43) < 0.5
-  lg, set_mph, _ = _jump_run(lambda v: round(v) + 3.0)    # past the current speed + a step: still a disable
+  lg, set_mph, _ = _jump_run(lambda v: math.floor(v) + 2.0)    # 31 at 29.55: past the current speed + a step: still a disable
   assert lg.disabled
 
 
