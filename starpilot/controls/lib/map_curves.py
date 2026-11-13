@@ -941,9 +941,15 @@ MEMORY_MAX_R = 2000.0      # m: a pass that never really turned counts as this
 # with a stop in the curve (PASS_MIN_SPEED with the brake) or the turn signal. Planned at max(map, RAMP_MEMORY_SHARE x the
 # tightest pass), at most RAMP_MEMORY_MAX x the map's, from RAMP_MEMORY_MIN_PASSES pass on; never below the map's radius,
 # and no speed cap from memory on a ramp this round. Still at RAMP_LAT on that radius.
+# Review of round L (rl/s5.py: one wrong 200 m pass on an 85 m curve planned it at +40 %, 3.6 m/s^2 on the true radius,
+# and a saturated or hand-steered pass afterwards changed nothing): RAMP_MEMORY_MIN_PASSES clean passes whose last two
+# agree within MEMORY_AGREE, at most RAMP_MEMORY_MAX (1.15: ~3.0 m/s^2 on the map's radius at RAMP_LAT); only passes tagged
+# "ramp" in records tagged "ramp" with a direction (a direction unknown: the map's radius); and a pass with the steering at
+# its limit (more than PASS_SAT_BLIP), his steering or his brake in the curve clears the record's ramp passes (back to the
+# map's radius).
 RAMP_MEMORY_SHARE = 0.9
-RAMP_MEMORY_MAX = 1.4
-RAMP_MEMORY_MIN_PASSES = 1
+RAMP_MEMORY_MAX = 1.15
+RAMP_MEMORY_MIN_PASSES = 2
 PASS_MIN_SPEED = 8.0       # m/s
 PASS_MIN_TIME = 2.0        # s of samples in the curve
 PASS_SATURATED = 0.98      # |steer command|: the car could not follow (it goes wide): the pass does not count ...
@@ -1139,19 +1145,51 @@ class CurveMemory:
       return None
 
   def ramp_radius(self, c, direction=None):
-    """The map radius (not scaled for RAMP_LAT) to plan ramp curve `c` with from its passes (RAMP_MEMORY_*), or None."""
+    """The map radius (not scaled for RAMP_LAT) to plan ramp curve `c` with from its passes (RAMP_MEMORY_*), or None
+    (also when the direction of travel is unknown)."""
     try:
+      if direction is None:
+        return None
       e = self._find(*c["apex"], direction)
-      if e is None:
+      if e is None or not e.get("ramp") or e.get("dir") is None:
         return None
       passes = [float(p[0]) for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 4 and
-                "full" in (p[3] or []) and 0 < float(p[0]) < MEMORY_MAX_R]
+                "full" in (p[3] or []) and "ramp" in (p[3] or []) and 0 < float(p[0]) < MEMORY_MAX_R]
       if len(passes) < RAMP_MEMORY_MIN_PASSES:
         return None
+      a, b = passes[-2], passes[-1]
+      if max(a, b) > MEMORY_AGREE * min(a, b):
+        return None
       r_map = float(c["r"])
-      return min(max(r_map, RAMP_MEMORY_SHARE * min(passes)), RAMP_MEMORY_MAX * r_map)
+      return min(max(r_map, RAMP_MEMORY_SHARE * min(a, b)), RAMP_MEMORY_MAX * r_map)
     except (KeyError, TypeError, IndexError, ValueError):
       return None
+
+  def add_ramp_pass(self, c, r, direction, t=None, v=None, flags=None):
+    """A clean pass through ramp curve `c` (tagged "ramp", the record too); nothing without a direction."""
+    if direction is None:
+      return
+    self.add_pass(c, r, t=t, v=v, flags=sorted(set(flags or []) | {"ramp"}), direction=direction)
+    e = self._find(*c["apex"], direction)
+    if e is not None and e.get("dir") is not None:
+      e["ramp"] = True
+
+  def clear_ramp(self, c, direction=None):
+    """A ramp pass that went wrong (the steering at its limit, his steering or brake): the ramp passes of the record
+    driven in `direction` are dropped (every ramp record at the curve when it is unknown): the map's radius again."""
+    try:
+      hit = False
+      for e in self.entries:
+        if not e.get("ramp") or dist_m(c["apex"][0], c["apex"][1], e["lat"], e["lon"]) > MEMORY_MATCH:
+          continue
+        if direction is not None and e.get("dir") is not None and not same_direction(e["dir"], direction):
+          continue
+        e["passes"] = [p for p in e.get("passes", []) if not (isinstance(p, list) and len(p) >= 4 and "ramp" in (p[3] or []))]
+        hit = True
+      if hit:
+        self.save()
+    except (KeyError, TypeError, ValueError, IndexError):
+      pass
 
   @staticmethod
   def one_pass_ok(c, p):
@@ -1610,7 +1648,7 @@ class MapCurves:
 
   def _ramp_r(self, c, direction=None):
     """A ramp curve's radius to plan with: the map's, or from its passes (RAMP_MEMORY_*), scaled for RAMP_LAT.
-    direction None: a curve on another road than the matched one (an on-ramp ahead): the nearest record."""
+    direction None (unknown, or a curve on another road than the matched one: an on-ramp ahead): the map's."""
     learned = self.memory.ramp_radius(c, direction) if self.memory is not None else None
     if learned is None:
       return ramp_radius(c)
@@ -2311,6 +2349,9 @@ class MapCurvesPlanner:
     # (RAMP_MEMORY_*) a stop in the curve: braking below PASS_MIN_SPEED before its end
     self.pass_stop = any(st and s[0] < PASS_MIN_SPEED for xx, s, b, st in self.pass_buf
                          if x_start <= xx <= min(x_end, self.pass_x_exit))
+    # ... and his brake (or steering) in it: the ramp memory is cleared (RAMP_MEMORY_*)
+    self.pass_brake = any(st and s[0] >= PASS_MIN_SPEED for xx, s, b, st in self.pass_buf
+                          if x_start <= xx <= min(x_end, self.pass_x_exit))
     try:
       self._finish_pass()
     finally:
@@ -2320,8 +2361,14 @@ class MapCurvesPlanner:
     c, samples = self.pass_curve, self.pass_samples
     if self.pass_blinker or self.pass_apex > PASS_APEX_NEAR:
       return
-    if c.get("ramp") and getattr(self, "pass_stop", False):
-      return
+    direction = getattr(self, "pass_dir", None)
+    if c.get("ramp"):
+      # (RAMP_MEMORY_*) the steering at its limit, his steering or his brake in the curve: back to the map's radius
+      sat = sum(1 for _, _, _, _, cmd in samples if cmd >= PASS_SATURATED) * PASS_DT > PASS_SAT_BLIP + 1e-9
+      if sat or any(drv for _, _, _, drv, _ in samples) or getattr(self, "pass_brake", False) or \
+         getattr(self, "pass_stop", False):
+        self.mc.memory.clear_ramp(c, direction)
+        return
     # the road match may have been wrong (GPS not trusted at some point in the pass), or the car did not turn
     # through this curve (a parallel road): learning from it could make a real curve look gentle
     turn_c = float(c.get("turn", 0.0) or 0.0)
@@ -2332,10 +2379,7 @@ class MapCurvesPlanner:
       self.pass_drops = getattr(self, "pass_drops", []) + [{"reason": reason, "name": c.get("name", "") or "",
                                                              "map_turn": turn_c, "driven_turn": round(driven, 1)}]
       return
-    direction = getattr(self, "pass_dir", None)
     v_sat = curve_pass_saturation(samples)
-    if v_sat is not None and c.get("ramp"):
-      return                                  # (RAMP_MEMORY_*: no speed cap from memory on a ramp this round)
     if v_sat is not None:
       self.mc.memory.add_saturated_pass(c, v_sat, direction=direction)
       return
@@ -2343,7 +2387,10 @@ class MapCurvesPlanner:
     if r is not None:
       full = self.pass_exit <= PASS_EXIT_NEAR or getattr(self, "pass_stop_cut", False)
       flags = (["full"] if full else []) + (["vetoed"] if self.pass_vetoed else [])
-      self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
+      if c.get("ramp"):
+        self.mc.memory.add_ramp_pass(c, r, direction, v=curve_pass_speed(samples), flags=flags)
+      else:
+        self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
 
   def _nav_street(self, ni, now):
     """Navigation's limit and next maneuver for the car side's street speed (mapNavSpeedLimit, mapNavManeuver*)."""

@@ -430,23 +430,65 @@ def _ramp_c(r=85.0):
   return {"apex": (42.6, -83.1), "r": r, "ramp": {"type": "exit"}, "s_a": 0.0, "name": ""}
 
 
+DIR = 90.0
+
+
 def test_ramp_memory_radius_rules(tmp_path):
+  # (review of round L, F2) two clean ramp passes agreeing, at most 1.15 x the map's, never below it, a direction known
   mem = MC.CurveMemory(str(tmp_path / "mem.json"))
   c = _ramp_c()
-  assert mem.ramp_radius(c) is None                                    # no memory: the map's (unchanged)
-  mem.add_pass(c, 115.0, t=1000.0, v=19.0, flags=["full"])
-  assert abs(mem.ramp_radius(c) - 0.9 * 115.0) < 1e-6                  # one clean pass: 0.9 x the tightest
-  mem.add_pass(c, 300.0, t=5000.0, v=19.0, flags=["full"])
-  assert abs(mem.ramp_radius(c) - 0.9 * 115.0) < 1e-6                  # the tightest pass counts
-  c2 = {**_ramp_c(), "apex": (42.7, -83.2)}
-  mem.add_pass(c2, 200.0, t=1.0, v=19.0, flags=["full"])
-  assert abs(mem.ramp_radius(c2) - 1.4 * 85.0) < 1e-6                  # at most +40 % over the map
+  assert mem.ramp_radius(c, DIR) is None                               # no memory: the map's (unchanged)
+  mem.add_ramp_pass(c, 200.0, DIR, t=1000.0, v=15.0, flags=["full"])
+  assert mem.ramp_radius(c, DIR) is None                               # one pass (rl/s5.py: a wrong 200 m one): the map's
+  mem.add_ramp_pass(c, 115.0, DIR, t=2000.0, v=19.0, flags=["full"])
+  assert mem.ramp_radius(c, DIR) is None                               # the last two disagree (200 / 115)
+  mem.add_ramp_pass(c, 115.0, DIR, t=3000.0, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c, DIR) - 97.75) < 1e-6                   # 0.9 x 115 = 103.5, capped at 1.15 x 85
+  assert mem.ramp_radius(c, None) is None and mem.ramp_radius(c, DIR + 180.0) is None   # direction unknown / the other way
   c3 = {**_ramp_c(), "apex": (42.8, -83.3)}
-  mem.add_pass(c3, 70.0, t=1.0, v=19.0, flags=["full"])
-  assert abs(mem.ramp_radius(c3) - 85.0) < 1e-6                        # never below the map's
+  for k in range(2):
+    mem.add_ramp_pass(c3, 70.0, DIR, t=1.0 + 500 * k, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c3, DIR) - 85.0) < 1e-6                   # never below the map's
   c4 = {**_ramp_c(), "apex": (42.9, -83.4)}
-  mem.add_pass(c4, 115.0, t=1.0, v=19.0, flags=[])
-  assert mem.ramp_radius(c4) is None                                   # not a full pass: nothing
+  for k in range(2):
+    mem.add_ramp_pass(c4, 115.0, DIR, t=1.0 + 500 * k, v=19.0, flags=[])
+  assert mem.ramp_radius(c4, DIR) is None                              # not full passes: nothing
+  c5 = {**_ramp_c(), "apex": (43.0, -83.5)}
+  for k in range(2):
+    mem.add_pass(c5, 115.0, t=1.0 + 500 * k, v=19.0, flags=["full"], direction=DIR)   # untagged (a road record)
+  assert mem.ramp_radius(c5, DIR) is None
+  mem.add_ramp_pass(c, 115.0, None, t=9000.0, flags=["full"])          # no direction: not stored
+  assert len(mem._find(*c["apex"], DIR)["passes"]) == 3
+
+
+def test_review_l_f2_a_saturated_or_hand_steered_ramp_pass_clears_its_memory(tmp_path):
+  # rl/s5.py: the saturated pass ("Turn Exceeds Steering Limit") and the pass with his steering / brake changed nothing
+  for kind in ("sat", "steer", "brake"):
+    mem = MC.CurveMemory(str(tmp_path / f"{kind}.json"))
+    c = _ramp_c()
+    for k in range(2):
+      mem.add_ramp_pass(c, 115.0, DIR, t=1000.0 * (k + 1), v=19.0, flags=["full"])
+    assert abs(mem.ramp_radius(c, DIR) - 97.75) < 1e-6
+    v = math.sqrt(MC.RAMP_LAT * 97.75)
+    if kind == "sat":
+      samples = [(v, 1 / 95.0, True, False, 0.99)] * 30 + [(v, 1 / 85.0, True, False, 0.6)] * 50
+    elif kind == "steer":
+      samples = [(v, 1 / 85.0, True, True, 0.6)] * 80
+    else:
+      samples = [(v, 1 / 85.0, True, False, 0.6)] * 80
+    _ramp_pass_on(tmp_path, mem, c, samples, brake=kind == "brake")
+    assert mem.ramp_radius(c, DIR) is None, kind                       # back to the map's radius
+
+
+def _ramp_pass_on(tmp_path, mem, c, samples, blinker=False, stop=False, brake=False):
+  from types import SimpleNamespace as N
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mc = MC.MapCurves(MC.MapCurveStore(str(tmp_path), background=False), memory=mem)
+  mp.trust = N(shaky=False)
+  mp.pass_curve, mp.pass_samples, mp.pass_dir = c, samples, DIR
+  mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = blinker, 5.0, 16.0, False, False
+  mp.pass_stop, mp.pass_brake = stop, brake
+  mp._finish_pass()
 
 
 def test_6f_a_remembered_ramp_curve_is_planned_faster_and_a_road_curve_is_unchanged(tmp_path):
@@ -455,15 +497,18 @@ def test_6f_a_remembered_ramp_curve_is_planned_faster_and_a_road_curve_is_unchan
   mem = MC.CurveMemory(str(tmp_path / "mem.json"))
   m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
   r_map = float(ramp_c["r"])
-  assert abs(m._radius(ramp_c) - MC.ramp_radius(ramp_c)) < 1e-6 and m._source(ramp_c) == 0
-  mem.add_pass(ramp_c, r_map * 115.0 / 85.0, t=1000.0, v=19.0, flags=["full"])
-  want = max(r_map, 0.9 * r_map * 115.0 / 85.0) * MC.RAMP_LAT / MC.PLAN_LAT
-  assert abs(m._radius(ramp_c) - want) < 0.2 and m._source(ramp_c) == 1   # (passes are kept to 0.1 m)
-  # drive 6f's numbers: map 85 m, measured 115 m: the curve's speed at RAMP_LAT on 103.5 m, >= 36 mph (was 33.3)
+  assert abs(m._ramp_r(ramp_c, DIR) - MC.ramp_radius(ramp_c)) < 1e-6
+  for k in range(2):
+    mem.add_ramp_pass(ramp_c, r_map * 1.1, DIR, t=1000.0 * (k + 1), v=19.0, flags=["full"])
+  want = max(r_map, 0.9 * r_map * 1.1) * MC.RAMP_LAT / MC.PLAN_LAT
+  assert abs(m._ramp_r(ramp_c, DIR) - want) < 0.2
+  assert abs(m._ramp_r(ramp_c, None) - MC.ramp_radius(ramp_c)) < 1e-6   # direction unknown: the map's
+  # drive 6f's numbers: map 85 m, measured 115 m twice: the curve's speed at RAMP_LAT on 97.75 m, >= 35 mph (was 33.3)
   c = _ramp_c()
-  mem.add_pass(c, 115.0, t=1000.0, v=19.0, flags=["full"])
-  v = MC.curve_speed_limit(m._ramp_r(c)) / MPH
-  assert v >= 36.0 and abs(MC.curve_speed_limit(MC.ramp_radius(c)) / MPH - 33.3) < 0.2, v
+  for k in range(2):
+    mem.add_ramp_pass(c, 115.0, DIR, t=1000.0 * (k + 1), v=19.0, flags=["full"])
+  v = MC.curve_speed_limit(m._ramp_r(c, DIR)) / MPH
+  assert v >= 35.5 and abs(MC.curve_speed_limit(MC.ramp_radius(c)) / MPH - 33.3) < 0.2, v
   # a road curve: the road memory as before (two agreeing passes)
   road = {"apex": (43.0, -83.0), "r": 100.0, "s_a": 0.0}
   mem.add_pass(road, 150.0, t=1.0, v=19.0, flags=["full"])
@@ -479,32 +524,22 @@ def test_6f_ramp_curve_from_61_mph_with_its_memory_on_the_car_side():
                   ramp_end_distance=900.0 - x)
     return TM.drive_53(fields, 3000, 61, v_mph=61)
   r0 = run(85.0 * MC.RAMP_LAT / MC.PLAN_LAT)
-  r1 = run(0.9 * 115.0 * MC.RAMP_LAT / MC.PLAN_LAT)
+  r1 = run(1.15 * 85.0 * MC.RAMP_LAT / MC.PLAN_LAT)
   v0, v1 = TM._at(r0, entry), TM._at(r1, entry)
-  assert v1 >= 36.0 and v1 >= v0 + 2.5, (v0, v1)
-  assert min(r1["sets"]) >= min(r0["sets"]) + 2.5
-
-
-def _ramp_pass(tmp_path, blinker=False, stop=False, name="p"):
-  from types import SimpleNamespace as N
-  mp = MC.MapCurvesPlanner(None, None)
-  mem = MC.CurveMemory(str(tmp_path / f"{name}.json"))
-  mp.mc = MC.MapCurves(MC.MapCurveStore(str(tmp_path), background=False), memory=mem)
-  mp.trust = N(shaky=False)
-  c = _ramp_c()
-  samples = [(19.0, 1 / 115.0, True, False, 0.4)] * 80
-  mp.pass_curve, mp.pass_samples, mp.pass_dir = c, samples, None
-  mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = blinker, 5.0, 16.0, False, False
-  mp.pass_stop = stop
-  mp._finish_pass()
-  return mem
+  assert v1 >= 35.0 and v1 >= v0 + 1.5, (v0, v1)
+  assert min(r1["sets"]) >= min(r0["sets"]) + 1.5
 
 
 def test_a_ramp_pass_with_a_lane_change_or_a_stop_is_not_stored(tmp_path):
-  mem = _ramp_pass(tmp_path, name="clean")
-  assert mem.entries and abs(mem.entries[0]["passes"][0][0] - 115.0) < 1.0 and "full" in mem.entries[0]["passes"][0][3]
-  assert not _ramp_pass(tmp_path, blinker=True, name="lc").entries
-  assert not _ramp_pass(tmp_path, stop=True, name="stop").entries
+  samples = [(19.0, 1 / 115.0, True, False, 0.4)] * 80
+  mem = MC.CurveMemory(str(tmp_path / "clean.json"))
+  _ramp_pass_on(tmp_path, mem, _ramp_c(), samples)
+  p = mem.entries[0]["passes"][0]
+  assert abs(p[0] - 115.0) < 1.0 and "full" in p[3] and "ramp" in p[3] and mem.entries[0].get("ramp")
+  for kw in (dict(blinker=True), dict(stop=True)):
+    mem = MC.CurveMemory(str(tmp_path / f"x{len(kw)}{list(kw)[0]}.json"))
+    _ramp_pass_on(tmp_path, mem, _ramp_c(), samples, **kw)
+    assert not any(e.get("passes") for e in mem.entries), kw
 
 
 def test_the_ramp_curve_we_are_in_is_measured(tmp_path):
