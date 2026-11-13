@@ -79,11 +79,11 @@ try:
   from opendbc.car.mazda.curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
                                               END_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET,
                                               MAP_START_GAP, MAP_LEAD_TIME, MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME,
-                                              MAP_ROAD_ACCEL_TAU)
+                                              MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
 except ImportError:          # offline tests load this file directly
   from curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP, END_GAP,
                             MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET, MAP_START_GAP, MAP_LEAD_TIME,
-                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU)
+                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
 
 MPH = 0.44704
 KPH = 1 / 3.6
@@ -634,7 +634,7 @@ class MapCurveControl:
     self.street_limit_max = STREET_LIMIT_MAX[m] * self.unit
     self.street_floor = RAMP_FLOOR   # (curve_slowdown.MIN_SET_SPEED: the controller never goes under it for a curve target)
     self.curve = MapCurveTarget(lat_accel, decel)
-    self.follower = MapCurveFollower(firm=True)          # (firm only for a ramp curve, see update)
+    self.follower = MapCurveFollower(firm=True, lead_time=MAP_RAMP_LEAD_TIME)   # (firm only for a ramp curve, see update)
     self.road_follower = MapCurveFollower(undershoot=MAP_ROAD_UNDERSHOOT, lead_time=MAP_ROAD_LEAD_TIME, closed_loop=True)
     self.a_f = None                 # the car's acceleration, filtered (MAP_ROAD_ACCEL_TAU), for the road follower
     self.nav = MapCurveTarget(lat_accel, decel)
@@ -1118,8 +1118,12 @@ class MapCurveControl:
     # a road curve is never planned below the driver's Curve Max Drop (the controller would not go there anyway, and
     # planning for a lower speed only starts the slowdown earlier than that speed needs)
     floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
+    # (round L) a ramp curve (status 2): MAP_RAMP_LEAD_TIME, the cruise's reaction at the car's own speed (map_curve_speed
+    # takes the curve's speed when higher), not his set speed; a road curve as before
+    ramp_st = f.status == STATUS_RAMP_CURVE
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
-                              lead_time=MAP_ROAD_LEAD_TIME if road_curve else MAP_LEAD_TIME)
+                              lead_time=MAP_ROAD_LEAD_TIME if road_curve else (MAP_RAMP_LEAD_TIME if ramp_st else MAP_LEAD_TIME),
+                              reaction_speed=v_ego if (ramp_st and v_ego > 0) else None)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and (f.on_ramp or onramp)
     speed, why = NO_CURVE, ""
     if a:

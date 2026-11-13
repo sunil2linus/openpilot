@@ -419,3 +419,105 @@ def test_no_street_raise_while_an_on_ramp_ahead_below_the_set_speed_is_pending()
   assert ups == 0 and lg.limit_adopted is None and lg.anchor is None
   ups, lg = run(False)
   assert ups > 0
+
+
+# ---- 5: ramp curve memory (drive 6f, the exit to S Rochester Rd: map 85 m, measured 113-132 m) ----
+
+MC = TM.MC
+
+
+def _ramp_c(r=85.0):
+  return {"apex": (42.6, -83.1), "r": r, "ramp": {"type": "exit"}, "s_a": 0.0, "name": ""}
+
+
+def test_ramp_memory_radius_rules(tmp_path):
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = _ramp_c()
+  assert mem.ramp_radius(c) is None                                    # no memory: the map's (unchanged)
+  mem.add_pass(c, 115.0, t=1000.0, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c) - 0.9 * 115.0) < 1e-6                  # one clean pass: 0.9 x the tightest
+  mem.add_pass(c, 300.0, t=5000.0, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c) - 0.9 * 115.0) < 1e-6                  # the tightest pass counts
+  c2 = {**_ramp_c(), "apex": (42.7, -83.2)}
+  mem.add_pass(c2, 200.0, t=1.0, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c2) - 1.4 * 85.0) < 1e-6                  # at most +40 % over the map
+  c3 = {**_ramp_c(), "apex": (42.8, -83.3)}
+  mem.add_pass(c3, 70.0, t=1.0, v=19.0, flags=["full"])
+  assert abs(mem.ramp_radius(c3) - 85.0) < 1e-6                        # never below the map's
+  c4 = {**_ramp_c(), "apex": (42.9, -83.4)}
+  mem.add_pass(c4, 115.0, t=1.0, v=19.0, flags=[])
+  assert mem.ramp_radius(c4) is None                                   # not a full pass: nothing
+
+
+def test_6f_a_remembered_ramp_curve_is_planned_faster_and_a_road_curve_is_unchanged(tmp_path):
+  root, curves, _ = TE.write_files(TM._onramp_scene())
+  ramp_c = next(c for c in curves if c.get("ramp"))
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False), memory=mem)
+  r_map = float(ramp_c["r"])
+  assert abs(m._radius(ramp_c) - MC.ramp_radius(ramp_c)) < 1e-6 and m._source(ramp_c) == 0
+  mem.add_pass(ramp_c, r_map * 115.0 / 85.0, t=1000.0, v=19.0, flags=["full"])
+  want = max(r_map, 0.9 * r_map * 115.0 / 85.0) * MC.RAMP_LAT / MC.PLAN_LAT
+  assert abs(m._radius(ramp_c) - want) < 0.2 and m._source(ramp_c) == 1   # (passes are kept to 0.1 m)
+  # drive 6f's numbers: map 85 m, measured 115 m: the curve's speed at RAMP_LAT on 103.5 m, >= 36 mph (was 33.3)
+  c = _ramp_c()
+  mem.add_pass(c, 115.0, t=1000.0, v=19.0, flags=["full"])
+  v = MC.curve_speed_limit(m._ramp_r(c)) / MPH
+  assert v >= 36.0 and abs(MC.curve_speed_limit(MC.ramp_radius(c)) / MPH - 33.3) < 0.2, v
+  # a road curve: the road memory as before (two agreeing passes)
+  road = {"apex": (43.0, -83.0), "r": 100.0, "s_a": 0.0}
+  mem.add_pass(road, 150.0, t=1.0, v=19.0, flags=["full"])
+  assert m._radius(road) == 100.0
+
+
+def test_6f_ramp_curve_from_61_mph_with_its_memory_on_the_car_side():
+  entry = 430.0
+
+  def run(r_pub):
+    def fields(x):
+      return TE.F(status=2, radius=r_pub, distance=max(entry - x, 0.0), road_class=2, on_ramp=True, ramp_type=1,
+                  ramp_end_distance=900.0 - x)
+    return TM.drive_53(fields, 3000, 61, v_mph=61)
+  r0 = run(85.0 * MC.RAMP_LAT / MC.PLAN_LAT)
+  r1 = run(0.9 * 115.0 * MC.RAMP_LAT / MC.PLAN_LAT)
+  v0, v1 = TM._at(r0, entry), TM._at(r1, entry)
+  assert v1 >= 36.0 and v1 >= v0 + 2.5, (v0, v1)
+  assert min(r1["sets"]) >= min(r0["sets"]) + 2.5
+
+
+def _ramp_pass(tmp_path, blinker=False, stop=False, name="p"):
+  from types import SimpleNamespace as N
+  mp = MC.MapCurvesPlanner(None, None)
+  mem = MC.CurveMemory(str(tmp_path / f"{name}.json"))
+  mp.mc = MC.MapCurves(MC.MapCurveStore(str(tmp_path), background=False), memory=mem)
+  mp.trust = N(shaky=False)
+  c = _ramp_c()
+  samples = [(19.0, 1 / 115.0, True, False, 0.4)] * 80
+  mp.pass_curve, mp.pass_samples, mp.pass_dir = c, samples, None
+  mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = blinker, 5.0, 16.0, False, False
+  mp.pass_stop = stop
+  mp._finish_pass()
+  return mem
+
+
+def test_a_ramp_pass_with_a_lane_change_or_a_stop_is_not_stored(tmp_path):
+  mem = _ramp_pass(tmp_path, name="clean")
+  assert mem.entries and abs(mem.entries[0]["passes"][0][0] - 115.0) < 1.0 and "full" in mem.entries[0]["passes"][0][3]
+  assert not _ramp_pass(tmp_path, blinker=True, name="lc").entries
+  assert not _ramp_pass(tmp_path, stop=True, name="stop").entries
+
+
+def test_the_ramp_curve_we_are_in_is_measured(tmp_path):
+  # the on-ramp loop of test_map_curves._onramp_scene, driven along its shape: MapCurves gives it as the curve we are in
+  root, curves, _ = TE.write_files(TM._onramp_scene())
+  ramp_c = next(c for c in curves if c.get("ramp"))
+  m = MC.MapCurves(MC.MapCurveStore(root, background=False))
+  pts = TM.G.straight(0, 0, 90, 40) + TM.G.arc(40, -70, 70, 90, -90)[1:]
+  seen = False
+  for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+    brg = math.degrees(math.atan2(x1 - x0, y1 - y0)) % 360.0
+    for k in range(5):
+      x, y = x0 + (x1 - x0) * k / 5, y0 + (y1 - y0) * k / 5
+      m.update(*TM.pos(x, y), brg, 31, True, gps={"dt": 0.1, "v_ego": 10.0})
+      seen |= m.inside is not None and m.inside.get("ramp") is not None and m.inside["s_a"] == ramp_c["s_a"]
+  assert seen
