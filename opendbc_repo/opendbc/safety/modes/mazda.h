@@ -48,6 +48,7 @@ const int FLAG_TORQUE_INTERCEPTOR = 8;
 const int FLAG_RADAR_INTERCEPTOR = 16;
 const int FLAG_NO_FSC = 32;
 const int FLAG_NO_MRCC = 64;
+const int FLAG_AUTO_RESUME = 256;   // MazdaSafetyFlags.AUTO_RESUME (setting MazdaBrakeAutoResume)
 
 bool gen1 = false;
 bool gen2 = false;
@@ -56,6 +57,71 @@ bool torque_interceptor = false;
 bool radar_interceptor = false;
 bool no_fsc = false;
 bool no_mrcc = false;
+bool auto_resume = false;
+
+// Gen1 stock MRCC, gas auto-resume (opendbc/car/mazda/auto_resume.py, setting MazdaBrakeAutoResume, default off).
+// While controls are not allowed only CANCEL may be sent, except in this narrow window: after the driver's brake
+// turned the cruise off (the cruise's falling edge with the brake pressed), with the main switch still on, the brake
+// released and the gas pressed now, RES (0x04) or SET- (0x20, it engages at the current speed) may be sent, at most
+// MAZDA_AR_MAX_FRAMES frames per brake cancel and only within MAZDA_AR_MAX_MOVING_US of moving time after it. The
+// window closes when the cruise comes on or the main switch goes off; the frame budget is refilled only by a new
+// cruise on -> brake cancel cycle (never by a new brake press). SET+ is never allowed. Without the flag nothing changes.
+#define MAZDA_AR_MAX_FRAMES 8U
+#define MAZDA_AR_MAX_MOVING_US 180000000U   // 180 s, counted only while the car moves
+#define MAZDA_BTN_RES 0x04U                 // CRZ_BTNS byte 0: RES (bit 2) alone
+#define MAZDA_BTN_SET_MINUS 0x20U           // CRZ_BTNS byte 0: SET_M (bit 5) alone
+static bool mazda_ar_window = false;        // the last cruise falling edge was a brake cancel, window still open
+static bool mazda_ar_cruise_prev = false;
+static bool mazda_ar_moving_prev = false;
+static uint32_t mazda_ar_moving_us = 0U;    // moving time since that falling edge
+static uint32_t mazda_ar_ts_last = 0U;
+static uint32_t mazda_ar_frames = 0U;       // button frames allowed in this window
+
+static void mazda_auto_resume_cruise(bool cruise_engaged) {
+  if (cruise_engaged) {
+    mazda_ar_window = false;
+  } else if (mazda_ar_cruise_prev) {
+    // falling edge: a window only for a brake cancel with the main switch on; a fresh budget and moving time
+    mazda_ar_window = auto_resume && brake_pressed && acc_main_on;
+    mazda_ar_frames = 0U;
+    mazda_ar_moving_us = 0U;
+    mazda_ar_moving_prev = vehicle_moving;
+    mazda_ar_ts_last = microsecond_timer_get();
+  } else {
+  }
+  if (!acc_main_on) {
+    mazda_ar_window = false;
+  }
+  mazda_ar_cruise_prev = cruise_engaged;
+}
+
+static void mazda_auto_resume_time(void) {
+  // count the time since the brake cancel while the car moves (standing still never counts)
+  uint32_t ts = microsecond_timer_get();
+  if (mazda_ar_window && mazda_ar_moving_prev) {
+    uint32_t elapsed = safety_get_ts_elapsed(ts, mazda_ar_ts_last);
+    if (elapsed > (MAZDA_AR_MAX_MOVING_US - mazda_ar_moving_us)) {
+      mazda_ar_moving_us = MAZDA_AR_MAX_MOVING_US + 1U;
+      mazda_ar_window = false;
+    } else {
+      mazda_ar_moving_us += elapsed;
+    }
+  }
+  mazda_ar_ts_last = ts;
+  mazda_ar_moving_prev = vehicle_moving;
+}
+
+static bool mazda_auto_resume_allowed(uint8_t button) {
+  bool allowed = false;
+  bool button_ok = (button == MAZDA_BTN_RES) || (button == MAZDA_BTN_SET_MINUS);
+  if (auto_resume && gen1 && !no_mrcc && !radar_interceptor && mazda_ar_window && button_ok && acc_main_on &&
+      !brake_pressed && gas_pressed && (mazda_ar_moving_us <= MAZDA_AR_MAX_MOVING_US) &&
+      (mazda_ar_frames < MAZDA_AR_MAX_FRAMES)) {
+    mazda_ar_frames += 1U;
+    allowed = true;
+  }
+  return allowed;
+}
 
 
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
@@ -66,6 +132,7 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
         // sample speed: scale by 0.01 to get kph
         int speed = (msg->data[2] << 8) | msg->data[3];
         vehicle_moving = speed > 10; // moving when speed > 0.1 kph
+        mazda_auto_resume_time();
       }
 
       if (msg->addr == MAZDA_STEER_TORQUE && !torque_interceptor) {
@@ -79,6 +146,7 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
         acc_main_on = GET_BIT(msg, 17U);
         bool cruise_engaged = msg->data[0] & 0x8U;
         pcm_cruise_check(cruise_engaged);
+        mazda_auto_resume_cruise(cruise_engaged);
       }
 
       if (msg->addr == MAZDA_ENGINE_DATA) {
@@ -220,9 +288,9 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     // cruise buttons check
     if (msg->addr == MAZDA_CRZ_BTNS) {
       // allow resume spamming while controls allowed, but
-      // only allow cancel while controls not allowed
+      // only allow cancel while controls not allowed (and the auto-resume window's RES / SET-, see above)
       bool cancel_cmd = (msg->data[0] == 0x1U);
-      if (!controls_allowed && !cancel_cmd) {
+      if (!controls_allowed && !cancel_cmd && !mazda_auto_resume_allowed(msg->data[0])) {
         tx = false;
       }
     }
@@ -318,6 +386,13 @@ static safety_config mazda_init(uint16_t param) {
   torque_interceptor = GET_FLAG(param, FLAG_TORQUE_INTERCEPTOR);
   no_fsc = GET_FLAG(param, FLAG_NO_FSC);
   no_mrcc = GET_FLAG(param, FLAG_NO_MRCC);
+  auto_resume = GET_FLAG(param, FLAG_AUTO_RESUME);
+  mazda_ar_window = false;
+  mazda_ar_cruise_prev = false;
+  mazda_ar_moving_prev = false;
+  mazda_ar_moving_us = 0U;
+  mazda_ar_ts_last = 0U;
+  mazda_ar_frames = 0U;
 
   safety_config ret = BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
 

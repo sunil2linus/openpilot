@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import unittest
+from types import SimpleNamespace
 
+from opendbc.can import CANPacker
 from opendbc.car.structs import CarParams
-from opendbc.car.mazda.values import MazdaSafetyFlags
+from opendbc.car.mazda import mazdacan
+from opendbc.car.mazda.values import Buttons, MazdaSafetyFlags
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety
@@ -163,6 +166,146 @@ class TestMazdaTorqueInterceptorCmdSafety(TestMazdaTorqueInterceptorSafety):
   """Runs the generic torque steering tests on the TI command (CAM_LKAS2, bus 1) instead of CAM_LKAS."""
   def _torque_cmd_msg(self, torque, steer_req=1):
     return self._ti_cmd_msg(torque)
+
+
+class AutoResumeHelpers:
+  """The gas auto-resume window (MazdaBrakeAutoResume, opendbc/car/mazda/auto_resume.py, mazda.h)."""
+  def _crz(self, active, main=True):
+    return self.packer.make_can_msg_safety("CRZ_CTRL", 0, {"CRZ_ACTIVE": active, "CRZ_AVAILABLE": 1 if main else 0})
+
+  def _engine(self, kph, gas=0):
+    return self.packer.make_can_msg_safety("ENGINE_DATA", 0, {"SPEED": kph, "PEDAL_GAS": gas})
+
+  def _btn(self, button):
+    # the very frame the car code sends (mazdacan.create_button_cmd)
+    addr, dat, bus = mazdacan.create_button_cmd(CANPacker("mazda_2017"), SimpleNamespace(flags=MazdaSafetyFlags.GEN1), 3,
+                                                button)
+    return libsafety_py.make_CANPacket(addr, bus, dat)
+
+  def _brake_cancel(self, kph=50, brake_at_fall=True, main=True, t=0):
+    """Cruise on, the driver's brake, cruise off (brake still down), brake released, gas down."""
+    self.safety.set_timer(t)
+    self._rx(self._crz(1, main))
+    self._rx(self._engine(kph))
+    self.assertTrue(self.safety.get_controls_allowed() or not main)
+    self._rx(self._user_brake_msg(1 if brake_at_fall else 0))
+    self._rx(self._crz(0, main))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._engine(kph, gas=40))
+
+
+class AutoResumeTests(AutoResumeHelpers):
+  def test_res_and_set_minus_frames_are_the_ones_the_car_code_sends(self):
+    self.assertEqual(self._btn(Buttons.RESUME).data[0], 0x04)
+    self.assertEqual(self._btn(Buttons.SET_MINUS).data[0], 0x20)
+    self.assertEqual(self._btn(Buttons.SET_PLUS).data[0], 0x10)
+    self.assertEqual(self._btn(Buttons.CANCEL).data[0], 0x01)
+
+  def test_allowed_only_in_the_window(self):
+    self.safety.set_controls_allowed(0)
+    for b in (Buttons.RESUME, Buttons.SET_MINUS, Buttons.SET_PLUS):
+      self.assertFalse(self._tx(self._btn(b)))
+    self._brake_cancel()
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self.assertTrue(self._tx(self._btn(Buttons.SET_MINUS)))
+    self.assertTrue(self._tx(self._btn(Buttons.CANCEL)))
+
+  def test_set_plus_never(self):
+    self._brake_cancel()
+    for _ in range(10):
+      self.assertFalse(self._tx(self._btn(Buttons.SET_PLUS)))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))     # (SET+ did not use the budget)
+
+  def test_needs_the_gas_and_no_brake(self):
+    self._brake_cancel()
+    self._rx(self._engine(50, gas=0))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._engine(50, gas=40))
+    self._rx(self._user_brake_msg(1))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
+    # a new brake press does not close the window (a stop sign, then the gas)
+    self._rx(self._user_brake_msg(0))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_not_after_a_cancel_without_the_brake(self):
+    self._brake_cancel(brake_at_fall=False)
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
+
+  def test_not_with_the_main_switch_off(self):
+    self._brake_cancel()
+    self._rx(self._crz(0, main=False))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._crz(0, main=True))     # main back on: the stored speed is gone, the window stays closed
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_frame_budget_not_refilled_by_a_new_brake_press(self):
+    self._brake_cancel()
+    for _ in range(8):
+      self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._user_brake_msg(0))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
+    # a new cruise on -> brake cancel cycle refills it
+    self._brake_cancel()
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_window_closes_when_the_cruise_comes_on(self):
+    self._brake_cancel()
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._crz(1))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))   # controls allowed now: as before
+    # controls lost with the cruise still on (e.g. an RX check): the closed window allows nothing
+    self.safety.set_controls_allowed(0)
+    self._rx(self._crz(1))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self.safety.set_controls_allowed(1)
+    # off again without the brake (his CANCEL): closed
+    self._rx(self._crz(0))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_180_s_of_moving_time_closes_it_standing_still_never_counts(self):
+    self._brake_cancel(kph=0)
+    # 10 minutes standing at a red light
+    for s in range(1, 601):
+      self.safety.set_timer(s * 1_000_000)
+      self._rx(self._engine(0, gas=40))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    # then 179 s moving: still open; past 180 s: closed for good
+    t0 = 600
+    for s in range(1, 180):
+      self.safety.set_timer((t0 + s) * 1_000_000)
+      self._rx(self._engine(30, gas=40))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    for s in range(180, 183):
+      self.safety.set_timer((t0 + s) * 1_000_000)
+      self._rx(self._engine(30, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._engine(0, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
+
+
+class TestMazdaAutoResumeSafety(AutoResumeTests, TestMazdaTorqueInterceptorSafety):
+  """Gen1 + TI with the flag: every test of the classes above runs with it too (nothing else changes)."""
+  SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR | MazdaSafetyFlags.AUTO_RESUME
+
+
+class TestMazdaAutoResumeNoTiSafety(AutoResumeTests, TestMazdaSafety):
+  """Gen1 without a Torque Interceptor, with the flag (the window does not depend on the TI)."""
+  SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.AUTO_RESUME
+
+
+class TestMazdaFlagOffSafety(AutoResumeHelpers, TestMazdaTorqueInterceptorSafety):
+  """Without the flag the brake cancel opens no window: only CANCEL while controls are not allowed (as before)."""
+  def test_no_window_with_the_flag_off(self):
+    self._brake_cancel()
+    for b in (Buttons.RESUME, Buttons.SET_MINUS, Buttons.SET_PLUS):
+      self.assertFalse(self._tx(self._btn(b)))
+    self.assertTrue(self._tx(self._btn(Buttons.CANCEL)))
 
 
 def _rx_checks_valid(param, include_crz_ctrl, include_ti):
