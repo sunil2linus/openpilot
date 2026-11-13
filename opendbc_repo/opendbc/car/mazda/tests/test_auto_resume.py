@@ -1,15 +1,15 @@
 """The gas brings the cruise back after a brake (auto_resume.py, MazdaBrakeAutoResume): the pure logic, driven frame by
 frame with a small model of the car (RES brings the stored speed back, SET- engages at the current speed)."""
 from opendbc.car.mazda import auto_resume as ar
-from opendbc.car.mazda.auto_resume import AutoResumeInputs, AutoResumeLogic, RES, SET_MINUS
+from opendbc.car.mazda.auto_resume import AutoResumeInputs, AutoResumeLogic, RES
 
 MPH = 0.44704
 F = 100   # frames per second
 
 
 class Sim:
-  """A drive at 100 Hz. The wheel's CRZ_BTNS counter steps every 10 frames. The car takes our frame when `accepts` (the
-  cruise on CAR_DELAY frames later)."""
+  """A drive at 100 Hz. The wheel's CRZ_BTNS counter steps every 10 frames. The car takes our RES when `accepts` (the
+  cruise on CAR_DELAY frames later at the stored set speed)."""
   CAR_DELAY = 3
 
   def __init__(self, metric=False, set_mph=45, v_mph=45, accepts=True, **kw):
@@ -32,8 +32,6 @@ class Sim:
       self.i["btn_counter"] = (self.frame // 10) % 16
       if self.engage_at is not None and self.frame >= self.engage_at[0]:
         self.i["cruise_enabled"] = True
-        if self.engage_at[1] == SET_MINUS:
-          self.i["set_speed"] = max(self.i["v_ego"], 30 / 3.6)
         self.engage_at = None
       b = self.lg.update(AutoResumeInputs(**self.i))
       self.events += self.lg.events
@@ -71,10 +69,10 @@ def test_highway_brake_then_gas_resumes():
   assert s.sent and s.sent[0][1] == RES and s.i["cruise_enabled"]
   assert s.lg.state == ar.DONE and s.kinds("autoResumeSent")[0]["ok"] and s.kinds("autoResumeSent")[0]["button"] == RES
   # the burst stopped once the cruise was on, and the frames went on the wheel's new frames, >= 0.1 s apart
-  assert 1 <= len(s.sent) <= ar.BURST_FRAMES[RES]
+  assert 1 <= len(s.sent) <= ar.BURST_FRAMES
   assert all(b - a >= ar.FRAME_GAP for (a, _), (b, _) in zip(s.sent, s.sent[1:], strict=False))
   assert all(f % 10 == 0 for f, _ in s.sent)
-  assert s.lg.busy and s.lg.own_engage
+  assert s.lg.busy
 
 
 def test_not_armed_unless_his_brake_after_two_seconds_of_cruise():
@@ -119,7 +117,7 @@ def test_stop_sign_with_a_turn_waits_for_the_wheel():
   s.step(int(0.4 * F), steering_angle=0.0, v_ego=16 * MPH)
   assert s.sent == []                          # not calm CALM_TIME yet
   s.step(int(0.3 * F))
-  assert s.sent and s.sent[0][1] == RES        # 25 stored, 16 now: within the jump
+  assert s.sent and s.sent[0][1] == RES
   assert s.lg.state == ar.DONE
 
 
@@ -146,10 +144,10 @@ def test_red_light_five_minutes_then_gas():
   assert s.lg.state == ar.ARMED and s.lg.dist == 0.0
   s.step(int(0.3 * F), gas_pressed=True, v_ego=2 * MPH)
   s.step(int(0.6 * F), v_ego=5 * MPH)
-  # 45 stored, 5 now: SET- (engages at the current speed: the car's 30 km/h minimum here), one frame
-  assert [b for _, b in s.sent] == [SET_MINUS]
-  assert s.i["cruise_enabled"] and abs(s.i["set_speed"] - 30 / 3.6) < 1e-6
-  assert s.lg.state == ar.DONE and s.kinds("autoResumeSent")[0]["button"] == SET_MINUS
+  # 45 stored, 5 now: RES all the same (the stored speed comes back; the street rules take it down from there)
+  assert [b for _, b in s.sent] == [RES]
+  assert s.i["cruise_enabled"] and abs(s.i["set_speed"] - 45 * MPH) < 1e-6
+  assert s.lg.state == ar.DONE and s.kinds("autoResumeSent")[0]["button"] == RES
 
 
 def test_parking_lot_then_a_public_road_within_the_distance():
@@ -252,21 +250,13 @@ def test_moving_time_limit_mirrors_the_panda():
   assert s.lg.state == ar.OFF and s.sent == []
 
 
-def test_big_stored_speed_sends_one_set_minus():
+def test_big_stored_speed_still_sends_res():
+  # (architect: the SET- path was dropped) 70 stored at 40 mph: RES, never a SET-
   s = Sim(set_mph=70, v_mph=70, road_class=1)
   s.brake_cancel(v_after_mph=40)
   s.step(2 * F, gas_pressed=True, v_ego=45 * MPH)
-  assert [b for _, b in s.sent] == [SET_MINUS] and abs(s.i["set_speed"] - 45 * MPH) < 1e-6
-  # km/h: the jump is 16 km/h
-  s = Sim(metric=True, set_mph=50, v_mph=50)
-  s.brake_cancel(v_after_mph=41)
-  s.step(2 * F, gas_pressed=True)
-  assert [b for _, b in s.sent] == [RES]            # 9 mph = 14.5 km/h: RES
-  # a SET- of curve_slowdown not yet seen on the set speed: ours would be taken for it, so wait
-  s = Sim(set_mph=70, v_mph=70, road_class=1)
-  s.brake_cancel(v_after_mph=40)
-  s.step(2 * F, gas_pressed=True, slowdown_minus_inflight=True)
-  assert s.sent == [] and s.lg.wait_why == "slowdown SET- in flight"
+  assert [b for _, b in s.sent] == [RES] and abs(s.i["set_speed"] - 70 * MPH) < 1e-6
+  assert not hasattr(ar, "AUTO_RESUME_MAX_JUMP") and not hasattr(ar, "SET_MINUS")
 
 
 def test_no_response_one_retry_then_give_up():
@@ -279,11 +269,6 @@ def test_no_response_one_retry_then_give_up():
   s.step(F, gas_pressed=False)
   s.step(3 * F, gas_pressed=True)
   assert len(s.sent) == 8
-  # SET- path: one frame per attempt
-  s = Sim(accepts=False, set_mph=70, v_mph=70)
-  s.brake_cancel(v_after_mph=30)
-  s.step(5 * F, gas_pressed=True)
-  assert [b for _, b in s.sent] == [SET_MINUS, SET_MINUS] and s.lg.state == ar.GAVE_UP
   # his own engagement later clears it; a new brake cancel arms again
   s.step(1, cruise_enabled=True)
   assert s.lg.state == ar.OFF
@@ -440,7 +425,7 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
   run(1, brake=False)
   assert w.state == ar.ARMED
   # curve_slowdown with a press going holds ours back
-  busy = SimpleNamespace(logic=SimpleNamespace(pending=object(), hold=None, frame=0, last_send_frame=-10_000, inflight=[]))
+  busy = SimpleNamespace(logic=SimpleNamespace(pending=None, hold=object(), frame=0, last_send_frame=-10_000, inflight=[]))
   assert run(2 * F, slowdown=busy, gas=True) == []
   # the map lost (and long enough): no frame either
   sm.msgs["starpilotPlan"].mapRoadClass = 0
@@ -458,28 +443,17 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
     assert "autoResumeArmed" in kinds and "autoResumeRefused" in kinds
 
 
-def test_our_set_minus_engagement_is_not_logged_as_his_press():
-  # curve_slowdown's controller: the cruise back on after a gap at another set speed is "the driver chose a new speed"
-  # (forget, blocked: as his own engagement) but, when the engagement was ours, no driverSetChange entry for it
-  from opendbc.car.mazda.curve_slowdown import CurveSlowdownLogic, SlowdownInputs
-
-  def run(own):
-    lg = CurveSlowdownLogic(False)
-
-    def step(n, cruise, set_mph):
-      for _ in range(n):
-        lg.update(SlowdownInputs(enabled=cruise, cruise_enabled=cruise, set_speed=set_mph * MPH, v_ego=30 * MPH,
-                                 gas_pressed=False, brake_pressed=False, standstill=False, plan_alive=True,
-                                 csc_active=False, csc_speed=0.0, other_button_active=False))
-    step(300, True, 45)
-    step(300, False, 45)
-    lg.own_engage = own
-    step(50, True, 30)
-    return lg
-  his, ours = run(False), run(True)
-  assert [e["action"] for e in his.driver_events] == ["after_gap"]
-  assert ours.driver_events == [] and ours.anchor is None and ours.unattributed is None
-  assert ours.blocked == his.blocked and ours.last_set_speed == his.last_set_speed    # otherwise the same as his
+def test_a_frozen_press_of_curve_slowdown_does_not_block_ours():
+  # a press of curve_slowdown in flight when he braked stays `pending` (its timers frozen) while the cruise is off: only a
+  # hold or a frame of its within BUSY_AFTER makes it busy
+  from types import SimpleNamespace
+  lg = SimpleNamespace(pending=object(), hold=None, frame=5000, last_send_frame=1000)
+  assert ar.AutoResume.slowdown_busy(SimpleNamespace(logic=lg)) is False
+  lg.last_send_frame = 4950
+  assert ar.AutoResume.slowdown_busy(SimpleNamespace(logic=lg)) is True
+  lg.last_send_frame, lg.hold = 1000, object()
+  assert ar.AutoResume.slowdown_busy(SimpleNamespace(logic=lg)) is True
+  assert ar.AutoResume.slowdown_busy(None) is False
 
 
 def test_carcontroller_builds_it_only_with_the_toggle_and_the_flag(monkeypatch):

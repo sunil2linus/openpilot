@@ -22,8 +22,10 @@ The owner's design (round n):
      curve_slowdown's holds), at least FRAME_GAP apart; the cruise must be on VERIFY_TIME after the last frame; one
      retry; then give up until the cruise comes on by other means. Never while curve_slowdown has a press going and the
      other way round (busy). openpilot refusing the engagement (its CANCEL): give up, no RES -> CANCEL loop.
-  F. Speed jump: a stored set speed more than AUTO_RESUME_MAX_JUMP above the current speed: one SET- frame instead (from
-     standby SET engages at the current speed), the street speed / merge / restore rules raise it from there.
+  F. Always RES (architect, round n): the SET- path (engage at the current speed when the stored speed is far above it)
+     was dropped: SET- from standby is not verified on this car, it would leave the car's 30 km/h minimum on a road with
+     no known limit, and his own habit is RES from low speed. A stored speed far above the road's is brought down by
+     the existing rules after the engagement (rule 8, the limit cap, the RES restore, the ramp start), as after his RES.
 
 Conservative: anything unknown means no frame. AutoResumeLogic is pure (no openpilot imports) and unit tested
 (tests/test_auto_resume.py); AutoResume is the card-side wrapper (carcontroller.py).
@@ -31,8 +33,8 @@ Conservative: anything unknown means no frame. AutoResumeLogic is pure (no openp
 import math
 from dataclasses import dataclass
 
-from opendbc.car.mazda.curve_slowdown import (DT_CTRL, HOLD_FALLBACK_FRAMES, MERGE_TURN_LAT, MERGE_TURN_RATE, MS_PER_KPH,
-                                              MS_PER_MPH, steer_lateral_accel)
+from opendbc.car.mazda.curve_slowdown import (DRIVER_QUIET, DT_CTRL, HOLD_FALLBACK_FRAMES, MERGE_TURN_LAT, MERGE_TURN_RATE, MS_PER_MPH,
+                                              steer_lateral_accel)
 
 ARM_CRUISE_ON = 2.0              # s the cruise was on before his brake
 # the cruise falls 20-40 ms after the brake edge, with the brake still down (16 logged brake cancels): the brake must be
@@ -47,24 +49,22 @@ AUTO_RESUME_MAX_DIST = 800.0     # m driven since the brake without the cruise b
 # the panda closes its window after 180 s of moving time (mazda.h MAZDA_AR_MAX_MOVING_US): disarm a little before, so
 # no frame of ours is dropped there (a crawl in traffic: 800 m at 10 mph is ~180 s)
 AUTO_RESUME_MAX_MOVING = 170.0   # s
-AUTO_RESUME_MAX_JUMP = 10 * MS_PER_MPH        # stored set speed this far above the current speed: SET- instead of RES
-AUTO_RESUME_MAX_JUMP_KPH = 16 * MS_PER_KPH
 PUBLIC_ROAD_CLASSES = tuple(range(1, 13))    # highwayClass 1 motorway .. 10 tertiary_link, 11 unclassified, 12 residential
 MAX_GPS_TRUST = 0                # starpilotPlan.mapGpsTrust: 0 ok (as the street speed's rule 8)
 NOT_ALLOWED_TIME = 0.5           # s of CRZ_CTRL byte 4 non-zero before it disarms
-BURST_FRAMES = {"RES": 4, "SET_MINUS": 1}    # frames per attempt (one SET- only: a second would lower the new set speed)
+BURST_FRAMES = 4                 # RES frames per attempt
 FRAME_GAP = 10                   # frames: >= 0.1 s between two of our frames
 VERIFY_TIME = 0.6                # s after the last frame for the cruise to be on
 ATTEMPTS = 2                     # the first and one retry
 MAX_FRAMES = 8                   # the panda's budget per brake cancel (mazda.h MAZDA_AR_MAX_FRAMES)
 REFUSE_WINDOW = 2.0              # s after our engagement: openpilot's cancel (or the cruise off again) means it refused
 REFUSE_CANCEL_FRAMES = 3         # frames of openpilot's cancel request in that window
-OWN_ENGAGE_TIME = 2.0            # s the controller (curve_slowdown) is told the engagement was ours
+OWN_ENGAGE_TIME = DRIVER_QUIET   # s after our engagement curve_slowdown still waits (busy): as after his RES on the wheel
 BUSY_AFTER = 1.0                 # s after our last frame curve_slowdown still waits
 MOVING_SPEED = 0.3               # m/s
 
 OFF, ARMED, SENDING, DONE, GAVE_UP = 0, 1, 2, 3, 4   # starpilotCarState.mazdaAutoResume
-RES, SET_MINUS = "RES", "SET_MINUS"
+RES = "RES"
 
 
 def _frames(seconds):
@@ -99,14 +99,12 @@ class AutoResumeInputs:
   gps_trust: int = 4              # starpilotPlan.mapGpsTrust
   engageable: bool = False        # selfdriveState.engageable (False when not received): no openpilot no-entry
   slowdown_busy: bool = False     # curve_slowdown has a press going (pending, a hold, a frame in the last BUSY_AFTER)
-  slowdown_minus_inflight: bool = False  # ... a SET- of it not yet seen on the set speed (would claim our SET- landing)
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter
   is_metric: bool = False
 
 
 class AutoResumeLogic:
   def __init__(self, is_metric: bool = False):
-    self.jump = AUTO_RESUME_MAX_JUMP_KPH if is_metric else AUTO_RESUME_MAX_JUMP
     self.frame = 0
     self.state = OFF
     self.events = []                 # (kind, data) for the event recorder, drained by the wrapper
@@ -158,12 +156,8 @@ class AutoResumeLogic:
   def busy(self):
     """curve_slowdown must not press: our frames are going or just went, or the cruise just came on by us."""
     return (self.state == SENDING or self.frame - self.last_frame < _frames(BUSY_AFTER) or
-            self.frame - self.own_engage_frame < _frames(OWN_ENGAGE_TIME))
-
-  @property
-  def own_engage(self):
-    """The cruise came on by our RES / SET- within OWN_ENGAGE_TIME (not his press, not an unexplained change)."""
-    return self.frame - self.own_engage_frame < _frames(OWN_ENGAGE_TIME)
+            self.frame - (self.own_engage_frame - 1) < _frames(OWN_ENGAGE_TIME))   # (as from his RES's last wheel frame,
+    # the one before the cruise comes on: curve_slowdown's DRIVER_QUIET then ends on the same frame)
 
   def _event(self, kind, **data):
     if len(self.events) < 20:
@@ -184,7 +178,7 @@ class AutoResumeLogic:
 
   # ---- per frame ----
   def update(self, i: AutoResumeInputs):
-    """Returns the button to send this frame (RES / SET_MINUS) or None. The frame carries CTR = wheel + 1."""
+    """Returns the button to send this frame (RES) or None. The frame carries CTR = wheel + 1."""
     self.frame += 1
     f = self.frame
     v = max(float(i.v_ego), 0.0)
@@ -297,13 +291,10 @@ class AutoResumeLogic:
         else:
           self.wait_why = self._send_blocker(i)
           if self.wait_why == "":
-            self.button = SET_MINUS if i.set_speed > v + self.jump else RES
-            if self.button == SET_MINUS and i.slowdown_minus_inflight:
-              self.wait_why = "slowdown SET- in flight"
-            else:
-              self.state = SENDING
-              self.attempt += 1
-              self.burst_sent = 0
+            self.button = RES
+            self.state = SENDING
+            self.attempt += 1
+            self.burst_sent = 0
     if self.state == SENDING:
       button = self._sending(i, f)
     return button
@@ -336,7 +327,7 @@ class AutoResumeLogic:
       if self.attempt >= ATTEMPTS:
         self._give_up("brake during the last attempt")
       return None
-    n = BURST_FRAMES[self.button]
+    n = BURST_FRAMES
     if self.burst_sent < n:
       if f - self.last_gas > _frames(GAS_RECENT):
         self.state = ARMED
@@ -355,15 +346,11 @@ class AutoResumeLogic:
       return self.button
     # the burst is out: the cruise must be on within VERIFY_TIME (the rise is handled in update)
     if f - self.last_frame > _frames(VERIFY_TIME):
-      if self.attempt < ATTEMPTS and self.total_sent + BURST_FRAMES[self.button] <= MAX_FRAMES:
+      if self.attempt < ATTEMPTS and self.total_sent + BURST_FRAMES <= MAX_FRAMES:
         self._event("autoResumeRefused", reason="no response, retry", disarmed=False, attempt=self.attempt,
                     frames=self.total_sent, dist_m=round(self.dist, 1))
         self.attempt += 1
         self.burst_sent = 0
-        # the speed may have changed: RES or SET- again from the same rule
-        self.button = SET_MINUS if i.set_speed > max(float(i.v_ego), 0.0) + self.jump else RES
-        if self.button == SET_MINUS and i.slowdown_minus_inflight:
-          self._give_up("slowdown SET- in flight")
       else:
         self._give_up("no response")
     return None
@@ -466,15 +453,14 @@ class AutoResume:
     return self.logic.busy
 
   @staticmethod
-  def slowdown_state(slowdown):
-    """(busy, a SET- in flight) of curve_slowdown's controller: a press of its going, or its frame within BUSY_AFTER."""
+  def slowdown_busy(slowdown):
+    """curve_slowdown's controller is holding a button or sent a frame within BUSY_AFTER. (Not its `pending`: a press in
+    flight when he braked stays pending, its timers frozen, the whole time the cruise is off; it sends nothing then.)"""
     lg = getattr(slowdown, "logic", None) if slowdown is not None else None
     if lg is None:
-      return False, False
-    busy = bool(getattr(lg, "pending", None) is not None or getattr(lg, "hold", None) is not None or
+      return False
+    return bool(getattr(lg, "hold", None) is not None or
                 lg.frame - getattr(lg, "last_send_frame", -10_000) < _frames(BUSY_AFTER))
-    minus = any(getattr(p, "direction", None) == "SET_MINUS" for p in list(getattr(lg, "inflight", [])))
-    return busy, minus
 
   def update(self, CC, CS, packer, CP, slowdown=None, cancel_sent=False):
     from opendbc.car import structs
@@ -489,7 +475,7 @@ class AutoResume:
     v = float(out.vEgo)
     angle = float(getattr(out, "steeringAngleDeg", 0.0) or 0.0)
     yaw_rate = math.degrees(max(v, 0.0) * math.tan(math.radians(angle) / self.ratio) / self.wheelbase)
-    busy, minus = self.slowdown_state(slowdown)
+    busy = self.slowdown_busy(slowdown)
     gear = getattr(out, "gearShifter", None)
     i = AutoResumeInputs(
       cruise_enabled=bool(out.cruiseState.enabled), cruise_available=bool(out.cruiseState.available),
@@ -503,14 +489,13 @@ class AutoResume:
       op_cancel=bool(CC.cruiseControl.cancel), cancel_sent=bool(cancel_sent), other_button_active=bool(CC.cruiseControl.resume),
       plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0,
       gps_trust=self._trust(plan) if plan_alive else 4, engageable=engageable,
-      slowdown_busy=busy, slowdown_minus_inflight=minus, btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
+      slowdown_busy=busy, btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       is_metric=self.is_metric)
     button = self.logic.update(i)
     self._record(i, button)
     if button is None:
       return []
-    btn = Buttons.RESUME if button == RES else Buttons.SET_MINUS
-    return [mazdacan.create_button_cmd(packer, CP, CS.crz_btns_counter, btn)]
+    return [mazdacan.create_button_cmd(packer, CP, CS.crz_btns_counter, Buttons.RESUME)]
 
   def _record(self, i, button):
     if self.recorder is None:
