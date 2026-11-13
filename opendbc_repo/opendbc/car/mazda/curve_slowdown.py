@@ -288,9 +288,14 @@ MERGE_BOOST_HWY = 20.0        # s
 # moves at MERGE_LEAD_MIN_SPEED or more and we are not closing on it at MERGE_LEAD_CLOSING or more (the stop trigger's
 # filtered lead speed, SlowdownInputs.lead_v); a slow / stopping / stationary lead (a queue, a ramp meter) still does (the
 # set speed then goes down to the target as before), and so does any radar lead whose speed is unknown.
+# Review of round L, F5: MERGE_LEAD_MIN_SPEED 13 m/s (a ramp queue creeping at 18-25 mph blocks); the lead's speed only from
+# radarState's own lead (no lead there: unknown, blocked); and the lead gone (the stock radar's flag drops) while the
+# boosted set speed is above the target and the car turns (|lat| >= MERGE_TURN_LAT) or a ramp curve is near: the boost ends
+# at once (its way-down SET- hold to the target) and opens again once the turn gate is ok (MERGE_LEAD_GONE_REOPEN).
 MERGE_MOVING_LEAD = True
-MERGE_LEAD_MIN_SPEED = 8.0    # m/s
+MERGE_LEAD_MIN_SPEED = 13.0   # m/s
 MERGE_LEAD_CLOSING = 3.0      # m/s
+MERGE_LEAD_GONE_REOPEN = True
 MERGE_BOOST_STREET = 1.0      # s
 # The ramp start (owner, round k; speed_limit_follow.RAMP_START): the merge raise is compared with the set speed itself,
 # not the old anchor; it waits for a calm wheel (MergeTurnGate: the lateral acceleration from the steering angle and the
@@ -437,6 +442,7 @@ class SlowdownInputs:
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
   radar_lead: bool = False        # the stock radar follows a lead (CRZ_CTRL.RADAR_HAS_LEAD, debounced: trigger.radar_stable)
   lead_v: float = -1.0            # m/s, the lead's speed (the stop trigger's filtered vLead; < 0 unknown): MERGE_MOVING_LEAD
+  merge_turning: bool = False     # |lat| >= MERGE_TURN_LAT or a ramp curve near (MergeTurnGate.turning, MERGE_LEAD_GONE_REOPEN)
   # the posted limit rose to this (m/s) with the driver's speed at the old one or up to 5 above, or a first limit
   # (speed_limit_follow.py rules 1, 2): make it the driver's speed
   limit_raise: float = 0.0
@@ -496,11 +502,13 @@ class MergeTurnGate:
     self.unwound = False             # the unwind path said ok (MERGE_TURN_UNWIND), kept while it unwinds or is calm
     self.paused = False
     self.lat = 0.0
+    self.turning = False
     self.v_prev = None
     self.a_f = 0.0                   # m/s^2, the car's acceleration filtered (MERGE_TURN_ACCEL_TAU)
 
   def update(self, v, angle_deg, rate_deg, wheelbase, ramp_curve_near=False, curve_ahead=False):
     self.lat = steer_lateral_accel(max(v, 0.0), angle_deg, wheelbase)
+    self.turning = abs(self.lat) >= MERGE_TURN_LAT or ramp_curve_near     # (MERGE_LEAD_GONE_REOPEN)
     winding = abs(rate_deg) > MERGE_TURN_RATE and angle_deg * rate_deg > 0
     calm = abs(self.lat) < MERGE_TURN_LAT and not winding and not ramp_curve_near
     self.calm_frames = self.calm_frames + 1 if calm else 0
@@ -643,6 +651,8 @@ class CurveSlowdownLogic:
     self.limit_raised = None
     self.boost = None                # the merge boost in progress: {"target", "frame"[, "ended"]} (MERGE_BOOST)
     self.boost_stuck = False         # the set speed did not come back down to the highway speed after it
+    self.prev_radar_lead = False
+    self.boost_reopen = None         # {"target", "frame"}: a boost ended for a lead gone in a turn (MERGE_LEAD_GONE_REOPEN)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -737,17 +747,39 @@ class CurveSlowdownLogic:
     if not i.radar_lead:
       return False
     if not MERGE_MOVING_LEAD or i.lead_v < 0:
-      return True
+      return True                      # (its speed unknown, or radarState has no lead of its own: they disagree)
     return i.lead_v < MERGE_LEAD_MIN_SPEED or i.v_ego - i.lead_v >= MERGE_LEAD_CLOSING
 
   def _boost_update(self, i, cruise_ok):
     """The merge boost's end (MERGE_BOOST): the driver's speed goes back to the highway speed, the restore lowers the
     set speed to it (SET- taps); boost_stuck while the set speed stays above it for MERGE_BOOST_STUCK after that."""
+    lead_gone = self.prev_radar_lead and not i.radar_lead
+    self.prev_radar_lead = i.radar_lead
+    ro = self.boost_reopen
+    if ro is not None and self.boost is None:
+      # (MERGE_LEAD_GONE_REOPEN) open again once the gate is ok, back at the target, still a merge; else forgotten
+      if (not cruise_ok or self.blocked or i.brake_pressed or i.limit_boost <= 0 or i.limit_raise <= 0 or
+          not i.boost_road_ok or self.frame - ro["frame"] > _frames(MERGE_BOOST_TIME)):
+        self.boost_reopen = None
+      elif (i.merge_turn_ok and not self._merge_paused(i) and not i.merge_turning and not self._lead_blocks_boost(i) and
+            self.last_set_speed is not None and self.last_set_speed <= ro["target"] + self.half_step):
+        top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
+        self.boost = {"target": ro["target"], "frame": ro["frame"]}
+        self.anchor = max(min(ro["target"] + i.limit_boost, top), ro["target"])
+        self.boost_reopen = None
     b = self.boost
     if b is None:
       self.boost_stuck = False
       return
     tgt = b["target"]
+    if (MERGE_LEAD_GONE_REOPEN and "ended" not in b and lead_gone and i.merge_turning and
+        self.last_set_speed is not None and self.last_set_speed > tgt + self.half_step and not self.blocked):
+      # (MERGE_LEAD_GONE_REOPEN) the lead gone in a turn with the boosted set speed above the target: down at once
+      self.boost_reopen = {"target": tgt, "frame": b["frame"]}
+      self.anchor = tgt
+      self.restore_pending = True
+      b["ended"] = self.frame
+      return
     if "ended" not in b and self._merge_paused(i):
       b["frame"] += 1                  # (second review) MERGE_BOOST_TIME does not run out while the way up is paused
     # (review) only his SET+ makes the speed his; his SET- above the target lowers it, our restore takes it on down
@@ -2438,7 +2470,7 @@ class CurveSlowdown:
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
       limit_boost=self._merge_boost(),
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
-      merge_turn_ok=turn_ok, merge_turn_pause=turn_pause,
+      merge_turn_ok=turn_ok, merge_turn_pause=turn_pause, merge_turning=bool(self.turn_gate.turning),
       onramp_pending=bool(self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
                           0 < float(getattr(plan, "mapCurveTarget", 0.0) or 0.0) < set_speed - lg.half_step),
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),

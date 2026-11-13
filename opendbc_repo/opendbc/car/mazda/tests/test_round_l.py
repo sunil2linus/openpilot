@@ -710,3 +710,70 @@ def test_review_l_f3_a_red_light_stop_started_before_the_on_ramp_keeps_running(t
   assert all(act and red for dd, act, red in log if dd <= start), [x for x in log if x[0] <= start and not (x[1] and x[2])][:3]
   # without an episode the camera stops stay off within ONRAMP_RED_OFF_DIST (test_6f_no_red_light_stop_...)
   assert cs.ONRAMP_RED_OFF_DIST == 50.0
+
+
+# ---- review of round L, F5: the boost behind a lead ----
+
+def test_review_l_f5_a_ramp_queue_creeping_at_18_to_25_mph_blocks_the_boost():
+  for lead_mph in (18.0, 22.0, 25.0):
+    lg, log = _boost_run(lambda f, lv=lead_mph: lv * MPH, v_mph=lead_mph)
+    assert all(b is None for _, _, b, _ in log) and max(s for _, _, _, s in log) <= 55 + 1e-6, lead_mph
+  assert cs.MERGE_LEAD_MIN_SPEED == 13.0
+
+
+def _gone_run(turning_fn, frames=3000):
+  """The boost open behind a moving lead (40 -> 75 up), the lead gone at frame 700 (the radar flag drops)."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  v = 45 * MPH
+  lg.update(_inp(set_speed=40 * MPH, v_ego=v))
+  set_mph, log, due = 40.0, [], []
+  for f in range(frames):
+    lead = f < 700
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v, limit_raise=55 * MPH, limit_boost=20 * MPH,
+                          radar_lead=lead, lead_v=v + 2.0 if lead else -1.0, merge_turning=turning_fn(f),
+                          merge_turn_ok=not turning_fn(f), btn_counter=(f // 10) % 16))
+    if b is not None:
+      step = 1 if b == cs.SET_PLUS else -1
+      if lg.last_action == "hold":
+        if f % 10 == 0:
+          due.append((f + 8, 5 * step))
+      else:
+        due.append((f + 8, step))
+    for d in [d for d in due if d[0] == f]:
+      due.remove(d)
+      set_mph = min(max(set_mph + d[1], 19.0), 100.0)
+    log.append((f, set_mph, None if lg.boost is None else dict(lg.boost), lg.anchor))
+  return lg, log
+
+
+def test_review_l_f5_the_lead_gone_in_a_turn_brings_the_boosted_set_down_then_the_boost_opens_again():
+  turning = lambda f: 650 <= f < 1600  # noqa: E731
+  lg, log = _gone_run(turning)
+  assert log[699][1] > 60, log[699][1]                          # boosted behind the moving lead
+  # in the turn, the lead gone: down to the target within ~2 s (one SET- hold), not left high through the curve
+  down = next(f for f, s, _, _ in log if f >= 700 and s <= 55 + 1e-6)
+  assert down - 700 <= 250, down
+  assert all(s <= 55 + 1e-6 for f, s, _, _ in log if down <= f < 1600)
+  # the gate ok again: the boost opens again
+  assert any(b is not None and "ended" not in b for f, _, b, _ in log if f >= 1600)
+  assert max(s for f, s, _, _ in log if f >= 1600) > 60
+  # not turning: the boost goes on without the lead (as before)
+  lg, log = _gone_run(lambda f: False)
+  assert all(s > 60 for f, s, _, _ in log if 900 <= f < 1500)
+
+
+def test_review_l_f5_the_lead_speed_only_from_radarstates_own_lead(tmp_path, monkeypatch):
+  c, sm, seen, WI = _wrapper(tmp_path, monkeypatch)
+  got = []
+  orig = c.logic.update
+  monkeypatch.setattr(c.logic, "update", lambda i: (got.append(i), orig(i))[1])
+  cs_ = WI.W.car_state(40, 45)
+  cs_.radar_has_lead = True                                    # the stock radar's flag, radarState without a lead
+  for _ in range(3):
+    c.update(WI.W.CC, cs_, None, None, False)
+  assert got[-1].lead_v < 0
+  lead = sm.msgs["radarState"].leadOne
+  lead.status, lead.modelProb, lead.dRel, lead.vLead = True, 0.9, 30.0, 20.0
+  for _ in range(3):
+    c.update(WI.W.CC, cs_, None, None, False)
+  assert abs(got[-1].lead_v - 20.0) < 1e-6
