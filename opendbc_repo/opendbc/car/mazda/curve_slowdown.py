@@ -2025,6 +2025,7 @@ class CurveSlowdown:
     self.map_mode = map_mode
     self.map_control = None
     self.map_out = None
+    self.map_on_used = False
     self.map_event = None
     self.exit_event = None
     self.exit_brake_frames = 0       # "Exit curve - brake": frames the flag stays up (starpilotCarState.mazdaExitCurveBrake)
@@ -2313,6 +2314,7 @@ class CurveSlowdown:
     curve_street = False                   # the street speed governs (MapOutput.street): presses from KEEP_SPEED
     curve_no_accel = False                 # only on a link, which only the map knows (CurveMix.no_accel, CURVE_NO_ACCEL)
     self.map_out = None
+    self.map_on_used = False         # the map's target is combined in this frame (CurveMix; CURVE_ON_HOLD)
     if self.map_control is not None and plan_alive:
       from opendbc.car.mazda.map_curve_control import MapFields, ON as MAP_ON
       signal = 1 if CS.out.rightBlinker else (-1 if CS.out.leftBlinker else 0)
@@ -2337,7 +2339,8 @@ class CurveSlowdown:
         self.map_control.lower_event = None
       if mo.adopt and self.map_mode == MAP_ON and adopt_forgets(lg, mo, set_speed):
         lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
-      if self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON:
+      self.map_on_used = self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON
+      if self.map_on_used:
         # a followed road curve: the camera's target counts at the lowest it has been in it, so the follower's step
         # back up never follows the camera's target up (CurveMix)
         curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise = self.curve_mix.update(
@@ -2449,7 +2452,8 @@ class CurveSlowdown:
     )
     button, offset = self.logic.update(inputs)
     # (CURVE_ON_HOLD) a map curve target that drops still counts a while (a HELD flicker before the ramp's link)
-    if self.map_out is not None and self.map_out.active:
+    # (review of round L, F4: only when the map's target is used, as CurveMix: Map Curves On here and in the planner)
+    if self.map_out is not None and self.map_out.active and self.map_on_used:
       self.map_curve_frames = int(CURVE_ON_HOLD / DT_CTRL)
     elif self.map_curve_frames > 0:
       self.map_curve_frames -= 1

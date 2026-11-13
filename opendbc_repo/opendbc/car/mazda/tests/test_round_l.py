@@ -350,6 +350,14 @@ def test_6f_a_map_curve_target_that_drops_still_counts_for_the_red_head_start(tm
   assert all(i.curve_active for i in seen[-280:])
   WI._drive(c, int(0.3 / cs.DT_CTRL), set_mph=35, v_mph=32)
   assert not seen[-1].curve_active
+  # (review of round L, F4) Map Curves in Test mode (here or in the planner): the map's target is not used, no hold
+  for wrapper_mode, plan_mode in ((1, 2), (2, 1)):
+    c.map_mode, plan.mapCurveMode = wrapper_mode, plan_mode
+    out["mo"] = MapOutput(active=True, speed=30 * MPH, why="ramp")
+    WI._drive(c, 5, set_mph=35, v_mph=32)
+    out["mo"] = MapOutput()
+    WI._drive(c, 2, set_mph=35, v_mph=32)
+    assert not seen[-1].curve_active, (wrapper_mode, plan_mode)
 
 
 # ---- 4: navigation's "on ramp" second in allManeuvers (drive 6f t 625-646) ----
