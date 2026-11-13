@@ -67,6 +67,8 @@ class MazdaSafetyFlags(IntFlag):
   NO_FSC = 32
   NO_MRCC = 64
   MANUAL_TRANSMISSION = 128
+  # panda safety (mazda.h): allow the gas auto-resume window (RES / SET- only, after a brake cancel; MazdaBrakeAutoResume)
+  AUTO_RESUME = 256
 
 
 @dataclass

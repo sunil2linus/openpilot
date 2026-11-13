@@ -529,6 +529,13 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_state": lambda: params.get_bool("MazdaSlowLowerLimit"),
       "set_state": lambda s: self._controller._on_toggle("MazdaSlowLowerLimit"),
     })
+    tiles.append({
+      "title": tr("Gas brings cruise back after a brake"),
+      "subtitle": tr("When your brake turned the cruise off, pressing the gas turns it back on (RES, or your current speed "
+                     "if the old one is much higher). Only on mapped public roads, with the wheel straight. From the next drive."),
+      "get_state": lambda: params.get_bool("MazdaBrakeAutoResume"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaBrakeAutoResume"),
+    })
     get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
     tiles.append({
       "title": tr("Model Follow (Test)"),

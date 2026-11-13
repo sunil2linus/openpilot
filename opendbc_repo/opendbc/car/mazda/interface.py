@@ -117,6 +117,11 @@ class CarInterface(CarInterfaceBase):
       if p.get_bool("NoFSC"):  # No Front Sensing Camera
         ret.flags |= MazdaSafetyFlags.NO_FSC.value
         ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.NO_FSC.value
+      # The gas brings the cruise back after a brake (auto_resume.py, default off): stock MRCC only. The panda then
+      # allows RES / SET- in a narrow window after a brake cancel (mazda.h); without the flag nothing changes there.
+      if p.get_bool("MazdaBrakeAutoResume") and not ret.flags & (MazdaSafetyFlags.RADAR_INTERCEPTOR | MazdaSafetyFlags.NO_MRCC):
+        ret.flags |= MazdaSafetyFlags.AUTO_RESUME.value
+        ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.AUTO_RESUME.value
 
     if candidate in GEN2:
       ret.steerActuatorDelay = 0.5
