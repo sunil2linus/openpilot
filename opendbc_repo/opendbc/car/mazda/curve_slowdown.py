@@ -185,7 +185,9 @@ FAST_RESTORE_ANY_SPEED = True
 #    GAS_JUMP_MARGIN on the gas: the car keeps accelerating until it lands) stays at or below the driver's speed;
 #    no holds then;
 #  * on the gas, once nothing slower is in our lane, SET+ taps (no holds, never SET-) restore too.
-# (SET- while the car is faster than the set speed lands as a normal step: every floor hold and curve tap does that.)
+# (SET- while the car is faster than the set speed lands as a normal step once the car has been off the gas a while:
+# every floor hold and curve tap does that. Right after his gas it does not: drive 6f t 535.69, gas released at 535.65
+# at 47.2 mph with the set at 39, our SET- tap set 47, the current speed. GAS_RELEASE_SETTLE / JUMP_DOWN_CLAIM below.)
 GAS_JUMP_ENABLED = True
 JUMP_STEPS = 2                           # the car this much faster than the set speed: a SET+ jumps
 JUMP_UNCERT = 0                          # steps: the jump may land this much above round(vEgo) (drive 4d: 0)
@@ -198,6 +200,14 @@ GAS_JUMP_MARGIN = 1                      # steps, on the gas: landing + this <= 
 GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed during which a SET+ may still jump
 JUMP_CLAIM_ABOVE = 1.25                  # steps: a SET+ landing this far above the current speed is still a jump of ours
 JUMP_CLAIM_BELOW = 2.5                   # steps: ... and this far below it (the car slowing while the tap was on its way)
+# Round L (drive 6f t 535.69: right after his gas a SET- of ours jumped the set speed UP 39 -> 47 to the current speed; read
+# as his "several steps", the anchor forgotten, blocked: the set stayed 47 into a 33 mph ramp curve). No tap of ours
+# (SET- or SET+) for GAS_RELEASE_SETTLE after his gas while the car is JUMP_STEPS or more faster than the set speed (on the
+# gas itself SET- never goes out, and SET+ is the gas restore's own jump); and a landing UP at about the current speed
+# (JUMP_CLAIM_*) with a SET- tap of ours in flight and no SET button edge of his is ours (JUMP_DOWN_CLAIM): the anchor and
+# the target stay, the lowering goes on.
+GAS_RELEASE_SETTLE = 0.5                 # s
+JUMP_DOWN_CLAIM = True
 # Never speed up inside a curve (drive 53, the on-ramp loop onto M-59, t 1019-1030): behind a car the set speed sat at
 # 39-41 while the car went 27-28 mph into a 71 m loop; the cruise followed the car ahead up to 32 mph in the loop
 # ("Turn Exceeds Steering Limit" twice). While the camera's curve target governs on a link road (map curves On: the
@@ -504,6 +514,7 @@ class CurveSlowdownLogic:
     self.prev_driver_button = None
     self.last_driver_edge = {SET_MINUS: -10_000, SET_PLUS: -10_000}
     self.last_gas_frame = -10_000    # last frame the gas was pressed (GAS_JUMP_RECENT)
+    self.jump_down_claims = 0        # SET- taps of ours that jumped up to the current speed, booked as ours (JUMP_DOWN_CLAIM)
     self.blocked_frame = None        # frame the current block started (DRIVER_REARM)
     self.rearms = 0                  # blocks lifted by DRIVER_REARM (logs)
     self.no_effect = 0
@@ -1020,6 +1031,22 @@ class CurveSlowdownLogic:
       if self.pending is jp:
         self.pending = None
       self._apply_ours(direction, jp.landed)
+      return
+    # (JUMP_DOWN_CLAIM) a SET- tap of ours that jumped UP to the current speed (no SET edge of his, either button)
+    jm = next((p for p in self.inflight + self.expired if p.direction == SET_MINUS and not p.hold), None)
+    his_edge = (self.prev_driver_button is not None or driver_k is not None or
+                self.frame - max(self.last_driver_edge.values()) <= _frames(DRIVER_RECENT) or
+                self.frame - self.last_other_frame <= recent)
+    if (JUMP_DOWN_CLAIM and jm is not None and direction == SET_PLUS and not his_edge and not after_gap and
+        steps > 1.25 and on_speed and self.anchor is not None):
+      for lst in (self.inflight, self.expired):
+        if jm in lst:
+          lst.remove(jm)
+      jm.landed, jm.remaining = 1, 0
+      if self.pending is jm:
+        self.pending = None
+      self._apply_ours(SET_MINUS)
+      self.jump_down_claims += 1
       return
     n_ours = sum(p.remaining for p in self.inflight if p.direction == direction)
     hold_open = any(p.hold for p in self.inflight if p.direction == direction)
@@ -1664,6 +1691,9 @@ class CurveSlowdownLogic:
     gas_ok = GAS_JUMP_ENABLED and button == SET_PLUS and gas_restore and offset > 0
     if button is None or (i.gas_pressed and not gas_ok) or i.other_button_active:
       return None, None
+    if (not i.gas_pressed and self.frame - self.last_gas_frame <= _frames(GAS_RELEASE_SETTLE) and
+        int(round(i.v_ego / self.step)) >= int(round(i.set_speed / self.step)) + JUMP_STEPS):
+      return None, None                # (GAS_RELEASE_SETTLE) just off the gas: a tap now may jump to the current speed
     if any(p.direction != button for p in self.inflight):
       # Never reverse direction while a press may still land.
       return None, None

@@ -140,3 +140,54 @@ def test_6f_a_restore_hold_already_going_stops_under_the_red_light():
   assert hold_frames and hold_frames[0] < 60 and hold_frames[-1] <= 61, hold_frames[-3:]
   assert ups and max(ups) <= 61 and set_mph <= 55, (ups[-3:], set_mph)
 
+
+# ---- 2: our SET- right after his gas jumps UP to the current speed (drive 6f t 535.69) ----
+
+def _gas_release_run(jump_window=1.0, frames=1500, driver_tap_at=None):
+  """Set 39 under his 75 (a ramp curve at 33 followed), the car at 47.2 on his gas until frame 100. The car: a SET tap
+  within jump_window s after the gas, the car 2+ mph over the set speed, sets the current speed; else 1 mph steps.
+  driver_tap_at: his own SET+ tap at that frame (a jump of his)."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=39 * MPH, v_ego=47.2 * MPH))
+  lg.anchor = 75 * MPH
+  set_mph, v, last_gas, due, log, minus = 39.0, 47.2, 0, [], [], []
+  for f in range(frames):
+    gas = f < 100
+    if gas:
+      last_gas = f
+    v = v if gas else max(v - 0.0025, 33.0)
+    drv = cs.SET_PLUS if driver_tap_at is not None and driver_tap_at <= f < driver_tap_at + 5 else None
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v * MPH, gas_pressed=gas, csc_active=True, csc_speed=33 * MPH,
+                          curve_track=True, curve_floor=25 * MPH, driver_button=drv, btn_counter=(f // 10) % 16))
+    if drv is not None and f == driver_tap_at:
+      due.append((f + 8, "jump"))
+    if b is not None:
+      if b == cs.SET_MINUS:
+        minus.append(f)
+      jump = (f - last_gas) * cs.DT_CTRL <= jump_window and v >= set_mph + 2
+      due.append((f + 8, "jump" if jump else b))
+    for d in [d for d in due if d[0] == f]:
+      due.remove(d)
+      set_mph = float(round(v)) if d[1] == "jump" else set_mph + (1 if d[1] == cs.SET_PLUS else -1)
+    log.append((f, set_mph))
+  return lg, set_mph, minus, log
+
+
+def test_6f_no_set_minus_right_after_the_gas_while_it_may_jump():
+  # (the car jumps on a tap up to 0.5 s after the gas: drives 4c-4f, every jump had the gas within 0.5 s)
+  lg, set_mph, minus, log = _gas_release_run(jump_window=0.5)
+  assert cs.GAS_RELEASE_SETTLE >= 0.5 and minus and min(minus) >= 150, minus[:3]
+  assert max(s for _, s in log) <= 39 + 1e-6            # never a jump up
+  assert abs(set_mph - 33) <= 1.0 and lg.anchor is not None and abs(lg.anchor / MPH - 75) < 0.5
+
+
+def test_6f_a_set_minus_of_ours_landing_as_a_jump_up_is_ours_and_lowering_goes_on():
+  # the car jumps on a SET tap up to 1 s after the gas: our first SET- (0.5 s after) lands 39 -> 47
+  lg, set_mph, minus, log = _gas_release_run(jump_window=1.0)
+  assert max(s for _, s in log) >= 46, "the jump happened"
+  assert lg.jump_down_claims == 1 and not lg.disabled
+  assert lg.anchor is not None and abs(lg.anchor / MPH - 75) < 0.5
+  assert abs(set_mph - 33) <= 1.0, set_mph              # lowered on to the curve's target (was: 47, blocked)
+  # his own SET+ edge then: his (the old rule)
+  lg, set_mph, _, _ = _gas_release_run(jump_window=1.0, driver_tap_at=150)
+  assert lg.jump_down_claims == 0 and lg.blocked
