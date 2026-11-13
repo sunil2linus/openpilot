@@ -201,9 +201,11 @@ GAS_JUMP_RECENT = 1.0                    # s after the gas was last pressed duri
 JUMP_CLAIM_ABOVE = 1.25                  # steps: a SET+ landing this far above the current speed is still a jump of ours
 JUMP_CLAIM_BELOW = 2.5                   # steps: ... and this far below it (the car slowing while the tap was on its way)
 # Round L (drive 6f t 535.69: right after his gas a SET- of ours jumped the set speed UP 39 -> 47 to the current speed; read
-# as his "several steps", the anchor forgotten, blocked: the set stayed 47 into a 33 mph ramp curve). No tap of ours
-# (SET- or SET+) for GAS_RELEASE_SETTLE after his gas while the car is JUMP_STEPS or more faster than the set speed (on the
-# gas itself SET- never goes out, and SET+ is the gas restore's own jump); and a landing UP at about the current speed
+# as his "several steps", the anchor forgotten, blocked: the set stayed 47 into a 33 mph ramp curve). No SET- of ours for
+# GAS_RELEASE_SETTLE after his gas while the car is JUMP_STEPS or more faster than the set speed (on the gas itself SET-
+# never goes out). A SET+ that may jump keeps its own rules (GAS_JUMP_*: booked as a jump of ours, only sent while where it
+# may land stays at or below his speed, never in a curve): there the jump is the restore we want (test_exit_plan's
+# re-review, 40 -> 79 at once after his gas; waiting 0.5 s lost it and took 1 mph taps). And a landing UP at about the current speed
 # (JUMP_CLAIM_*) with a SET- tap of ours in flight and no SET button edge of his is ours (JUMP_DOWN_CLAIM): the anchor and
 # the target stay, the lowering goes on.
 GAS_RELEASE_SETTLE = 0.5                 # s
@@ -1691,9 +1693,9 @@ class CurveSlowdownLogic:
     gas_ok = GAS_JUMP_ENABLED and button == SET_PLUS and gas_restore and offset > 0
     if button is None or (i.gas_pressed and not gas_ok) or i.other_button_active:
       return None, None
-    if (not i.gas_pressed and self.frame - self.last_gas_frame <= _frames(GAS_RELEASE_SETTLE) and
+    if (button == SET_MINUS and not i.gas_pressed and self.frame - self.last_gas_frame <= _frames(GAS_RELEASE_SETTLE) and
         int(round(i.v_ego / self.step)) >= int(round(i.set_speed / self.step)) + JUMP_STEPS):
-      return None, None                # (GAS_RELEASE_SETTLE) just off the gas: a tap now may jump to the current speed
+      return None, None                # (GAS_RELEASE_SETTLE) just off the gas: a SET- now may jump up to the current speed
     if any(p.direction != button for p in self.inflight):
       # Never reverse direction while a press may still land.
       return None, None
