@@ -235,6 +235,23 @@ def test_distance_limit():
   assert s.lg.state == ar.OFF and s.kinds("autoResumeRefused")[-1]["reason"] == "distance"
 
 
+def test_moving_time_limit_mirrors_the_panda():
+  # a crawl: 5 mph for 175 s is ~390 m (under the distance) but past the panda's 180 s window less a margin
+  s = Sim(set_mph=45, v_mph=45, road_class=0)
+  s.brake_cancel(v_after_mph=5)
+  s.step(int(ar.AUTO_RESUME_MAX_MOVING * F) - 150)    # (the 1 s with the brake down after the fall counts too)
+  assert s.lg.state == ar.ARMED
+  s.step(100)
+  assert s.lg.state == ar.OFF and s.kinds("autoResumeRefused")[-1]["reason"] == "moving time"
+  # the brake released a frame before the cruise fell: the panda opens no window, nor do we
+  s = Sim()
+  s.step(10 * F)
+  s.step(3, brake_pressed=True)
+  s.step(1, brake_pressed=False, cruise_enabled=False)
+  s.step(2 * F, gas_pressed=True)
+  assert s.lg.state == ar.OFF and s.sent == []
+
+
 def test_big_stored_speed_sends_one_set_minus():
   s = Sim(set_mph=70, v_mph=70, road_class=1)
   s.brake_cancel(v_after_mph=40)

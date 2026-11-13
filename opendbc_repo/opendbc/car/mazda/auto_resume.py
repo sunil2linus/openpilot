@@ -35,7 +35,8 @@ from opendbc.car.mazda.curve_slowdown import (DT_CTRL, HOLD_FALLBACK_FRAMES, MER
                                               MS_PER_MPH, steer_lateral_accel)
 
 ARM_CRUISE_ON = 2.0              # s the cruise was on before his brake
-BRAKE_RECENT = 0.2               # s: the cruise falls 20-40 ms after the brake (13 logged brake cancels)
+# the cruise falls 20-40 ms after the brake edge, with the brake still down (16 logged brake cancels): the brake must be
+# down on the frame it falls, as the panda requires (mazda.h: brake_pressed at the CRZ_CTRL falling edge)
 CANCEL_QUIET = 0.5               # s before the fall: no CANCEL frame of ours, no openpilot cancel without the brake, no wheel CANCEL
 GAS_HOLD = 0.3                   # s his gas held (brake released) to count as a press
 GAS_RECENT = 3.0                 # s after his gas was last down a press waiting for the wheel may still go
@@ -43,6 +44,9 @@ CALM_TIME = 0.5                  # s of calm wheel before a frame
 AUTO_RESUME_MAP_GAP = 5.0        # s of moving time the map may be lost after a good brake-time road
 MAP_GAP_TURN = 30.0              # deg: ... with the heading changed less than this since the map was last good
 AUTO_RESUME_MAX_DIST = 800.0     # m driven since the brake without the cruise back: disarm
+# the panda closes its window after 180 s of moving time (mazda.h MAZDA_AR_MAX_MOVING_US): disarm a little before, so
+# no frame of ours is dropped there (a crawl in traffic: 800 m at 10 mph is ~180 s)
+AUTO_RESUME_MAX_MOVING = 170.0   # s
 AUTO_RESUME_MAX_JUMP = 10 * MS_PER_MPH        # stored set speed this far above the current speed: SET- instead of RES
 AUTO_RESUME_MAX_JUMP_KPH = 16 * MS_PER_KPH
 PUBLIC_ROAD_CLASSES = tuple(range(1, 13))    # highwayClass 1 motorway .. 10 tertiary_link, 11 unclassified, 12 residential
@@ -107,9 +111,7 @@ class AutoResumeLogic:
     self.state = OFF
     self.events = []                 # (kind, data) for the event recorder, drained by the wrapper
     self.prev_enabled = False
-    self.prev_brake = False
     self.on_frames = 0
-    self.last_brake_edge = -10_000
     self.last_cancel_sent = -10_000
     self.last_op_cancel = -10_000
     self.last_wheel_cancel = -10_000
@@ -130,6 +132,7 @@ class AutoResumeLogic:
     self.map_gap = 0.0               # s of moving time since the map was last good
     self.map_yaw = 0.0               # heading then
     self.dist = 0.0
+    self.moving_time = 0.0
     self.press = None                # frame of a gas press waiting to go
     self.press_spent = False         # this gas press was used (sent, refused): a new one needs the gas released first
     self.attempt = 0
@@ -191,9 +194,6 @@ class AutoResumeLogic:
     if self.new_wheel:
       self.wheel_frame = f
     self.prev_counter = i.btn_counter
-    if i.brake_pressed and not self.prev_brake:
-      self.last_brake_edge = f
-    self.prev_brake = i.brake_pressed
     if i.cancel_sent:
       self.last_cancel_sent = f
     if i.op_cancel and not i.brake_pressed:
@@ -250,6 +250,8 @@ class AutoResumeLogic:
 
     # ---- armed: cruise off, waiting for his gas ----
     self.dist += v * DT_CTRL
+    if moving:
+      self.moving_time += DT_CTRL
     if self.map_ok(i):
       self.map_gap, self.map_yaw = 0.0, self.yaw
     elif moving:
@@ -270,6 +272,8 @@ class AutoResumeLogic:
       why = "no set speed"
     elif self.dist > AUTO_RESUME_MAX_DIST:
       why = "distance"
+    elif self.moving_time > AUTO_RESUME_MAX_MOVING:
+      why = "moving time"
     if why is not None:
       self._disarm(why)
       return None
@@ -374,8 +378,7 @@ class AutoResumeLogic:
     f = self.frame
     if self.state == GAVE_UP:
       return
-    by_brake = i.brake_pressed or f - self.last_brake_edge <= _frames(BRAKE_RECENT)
-    if not by_brake:
+    if not i.brake_pressed:
       self.state = OFF
       self._reset_episode()
       return
