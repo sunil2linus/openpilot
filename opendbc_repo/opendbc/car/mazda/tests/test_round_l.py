@@ -521,3 +521,47 @@ def test_the_ramp_curve_we_are_in_is_measured(tmp_path):
       m.update(*TM.pos(x, y), brg, 31, True, gps={"dt": 0.1, "v_ego": 10.0})
       seen |= m.inside is not None and m.inside.get("ramp") is not None and m.inside["s_a"] == ramp_c["s_a"]
   assert seen
+
+
+# ---- 6: the merge boost behind a moving lead (owner; drive 6f, the Dequindre ramp 419-451) ----
+
+def _boost_run(lead_fn, frames=600, v_mph=40.0):
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=40 * MPH, v_ego=v_mph * MPH))
+  set_mph, log = 40.0, []
+  for f in range(frames):
+    lv = lead_fn(f)
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v_mph * MPH, limit_raise=55 * MPH, limit_boost=20 * MPH,
+                          radar_lead=True, lead_v=lv, btn_counter=(f // 10) % 16))
+    if b == cs.SET_PLUS:
+      set_mph += 1
+    elif b == cs.SET_MINUS:
+      set_mph -= 1
+    log.append((f, lg.anchor, None if lg.boost is None else dict(lg.boost), set_mph))
+  return lg, log
+
+
+def test_merge_boost_behind_a_lead_moving_away_and_its_end_when_it_slows():
+  v = 40 * MPH
+  # the lead 2.5 m/s faster than us: the boost opens, anchor at the target + 20
+  lg, log = _boost_run(lambda f: v + 2.5)
+  assert any(a is not None and abs(a / MPH - 75) < 0.5 for _, a, _, _ in log), [a for _, a, _, _ in log][-1]
+  assert lg.boost is not None and "ended" not in lg.boost
+  # ... then it slows to 5 m/s (a queue): the boost ends, the anchor back to the target
+  lg, log = _boost_run(lambda f: v + 2.5 if f < 300 else 5.0, frames=2000)
+  ended = next(f for f, a, b, _ in log if b is not None and "ended" in b)
+  assert 300 <= ended <= 302, ended
+  assert abs(log[ended][1] / MPH - 55) < 0.5 and max(s for _, _, _, s in log[:300]) > 55
+  assert abs(log[-1][3] - 55) < 1e-6, log[-1]                  # the set speed down to the target
+  # closing at 3 m/s or more: blocked (a raise to the target only)
+  lg, log = _boost_run(lambda f: v - 3.0)
+  assert all(bb is None for _, _, bb, _ in log) and max(st for _, _, _, st in log) <= 55 + 1e-6
+  # the lead's speed unknown: blocked, as before
+  lg, log = _boost_run(lambda f: -1.0)
+  assert all(bb is None for _, _, bb, _ in log) and max(st for _, _, _, st in log) <= 55 + 1e-6
+  # (no lead at all: the boost as before)
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=40 * MPH, v_ego=v))
+  for _ in range(50):
+    lg.update(_inp(set_speed=40 * MPH, v_ego=v, limit_raise=55 * MPH, limit_boost=20 * MPH))
+  assert lg.boost is not None and abs(lg.anchor / MPH - 75) < 0.5

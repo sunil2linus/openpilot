@@ -283,6 +283,14 @@ MERGE_STOP_ROLLING_SPEED = 15 * MS_PER_MPH   # m/s (stopped_car_slowdown.RED_MIN
 STOPPED_SPEED = 1.0           # m/s: his brake below this is a brake to a stop
 # the merge boost only on the link, or for MERGE_BOOST_HWY onto its highway; a street matched MERGE_BOOST_STREET ends it
 MERGE_BOOST_HWY = 20.0        # s
+# Owner (round L, drive 6f Dequindre ramp 419-451: a car 26-32 m ahead going 40 -> 65 mph blocked the boost, the set went
+# only to 75 and the car was slow to follow when it sped away): a radar lead no longer blocks or ends the boost while it
+# moves at MERGE_LEAD_MIN_SPEED or more and we are not closing on it at MERGE_LEAD_CLOSING or more (the stop trigger's
+# filtered lead speed, SlowdownInputs.lead_v); a slow / stopping / stationary lead (a queue, a ramp meter) still does (the
+# set speed then goes down to the target as before), and so does any radar lead whose speed is unknown.
+MERGE_MOVING_LEAD = True
+MERGE_LEAD_MIN_SPEED = 8.0    # m/s
+MERGE_LEAD_CLOSING = 3.0      # m/s
 MERGE_BOOST_STREET = 1.0      # s
 # The ramp start (owner, round k; speed_limit_follow.RAMP_START): the merge raise is compared with the set speed itself,
 # not the old anchor; it waits for a calm wheel (MergeTurnGate: the lateral acceleration from the steering angle and the
@@ -428,6 +436,7 @@ class SlowdownInputs:
   hold_restore: bool = False      # a stop is planned ahead (stopped car trigger latched): keep the lowered speed for now
   btn_counter: int = -1           # the wheel's CRZ_BTNS counter (-1 unknown: holds are timed by HOLD_FRAME_GAP)
   radar_lead: bool = False        # the stock radar follows a lead (CRZ_CTRL.RADAR_HAS_LEAD, debounced: trigger.radar_stable)
+  lead_v: float = -1.0            # m/s, the lead's speed (the stop trigger's filtered vLead; < 0 unknown): MERGE_MOVING_LEAD
   # the posted limit rose to this (m/s) with the driver's speed at the old one or up to 5 above, or a first limit
   # (speed_limit_follow.py rules 1, 2): make it the driver's speed
   limit_raise: float = 0.0
@@ -722,6 +731,15 @@ class CurveSlowdownLogic:
     caps = [c for c in (self._cap(), self.limit_ceiling) if c is not None]
     return min(caps) if caps else None
 
+  @staticmethod
+  def _lead_blocks_boost(i):
+    """A radar lead holds the merge boost back / ends it, unless it is moving away with us (MERGE_MOVING_LEAD)."""
+    if not i.radar_lead:
+      return False
+    if not MERGE_MOVING_LEAD or i.lead_v < 0:
+      return True
+    return i.lead_v < MERGE_LEAD_MIN_SPEED or i.v_ego - i.lead_v >= MERGE_LEAD_CLOSING
+
   def _boost_update(self, i, cruise_ok):
     """The merge boost's end (MERGE_BOOST): the driver's speed goes back to the highway speed, the restore lowers the
     set speed to it (SET- taps); boost_stuck while the set speed stays above it for MERGE_BOOST_STUCK after that."""
@@ -736,7 +754,8 @@ class CurveSlowdownLogic:
     his = self.blocked and self.last_driver_edge[SET_PLUS] >= self.last_driver_edge[SET_MINUS]
     if "ended" not in b:
       if (i.v_ego >= tgt - MERGE_BOOST_END or not cruise_ok or self.blocked or i.stop_active or i.csc_active or
-          i.radar_lead or i.brake_pressed or not i.boost_road_ok or self.frame - b["frame"] > _frames(MERGE_BOOST_TIME)):
+          self._lead_blocks_boost(i) or i.brake_pressed or not i.boost_road_ok or
+          self.frame - b["frame"] > _frames(MERGE_BOOST_TIME)):
         if his:
           self.boost = None            # his own buttons: the speed is his
           return
@@ -1647,7 +1666,7 @@ class CurveSlowdownLogic:
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
       self.anchor = i.limit_raise
-      if i.limit_boost > 0 and not i.radar_lead and i.boost_road_ok:
+      if i.limit_boost > 0 and not self._lead_blocks_boost(i) and i.boost_road_ok:
         self.boost = {"target": i.limit_raise, "frame": self.frame}
         top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
@@ -2408,6 +2427,8 @@ class CurveSlowdown:
         self.limit_follow is not None and self.limit_follow.paused),
       btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       radar_lead=bool(self.trigger.radar_stable),
+      lead_v=((float(self.trigger.lead_v_f) if self.stop_mode in (TEST, ON) else float(stop_inputs.lead_v))
+              if (stop_inputs.lead_alive and stop_inputs.lead_status) else -1.0),
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
       stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
       stop_slower_ahead=bool(self.trigger.slower_after_red) and self.stop_mode == ON,
