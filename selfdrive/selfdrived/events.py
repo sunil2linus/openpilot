@@ -1333,6 +1333,16 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 4.),
   },
 
+  # Mazda (MazdaBrakeAutoResume): our RES / SET- brought the cruise back after his brake, when he pressed the gas. A short
+  # notice so he knows it came on by itself (openpilot's own engage sound plays as usual)
+  StarPilotEventName.mazdaCruiseResumed: {
+    ET.PERMANENT: Alert(
+      "Cruise resumed",
+      "",
+      StarPilotAlertStatus.starpilot, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 3.),
+  },
+
   StarPilotEventName.mazdaStockLkasOff: {
     ET.PERMANENT: Alert(
       "Car's Lane Keep Assist is off",

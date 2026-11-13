@@ -110,6 +110,12 @@ class StarPilotEvents:
       self.events.add(StarPilotEventName.mazdaSetSpeedHigh)
     self.prev_set_high = set_high
 
+    # Mazda: our RES / SET- brought the cruise back after his brake (auto_resume.py state 3 "done"): once per resume
+    auto_resume = int(getattr(sm["starpilotCarState"], "mazdaAutoResume", 0) or 0)
+    if auto_resume == 3 and getattr(self, "prev_auto_resume", 0) != 3:
+      self.events.add(StarPilotEventName.mazdaCruiseResumed)
+    self.prev_auto_resume = auto_resume
+
     if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
       self.mazda_lkas_off_shown = True
       self.events.add(StarPilotEventName.mazdaStockLkasOff)

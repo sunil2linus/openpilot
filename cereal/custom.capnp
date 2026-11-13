@@ -126,6 +126,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaLimitSlowLimit @36 :Float32;  # Mazda: slowing for a lower posted limit (speed_limit_follow rule 9), the limit m/s; 0 none
   mazdaSetSpeedHigh @37 :Bool;       # Mazda: after a merge boost the set speed did not come back down to the highway speed
   mazdaWheelButton @38 :UInt8;       # Mazda: the car's own cruise switch (CRZ_BTNS, not our presses): 0 none, 1 SET+, 2 SET-, 3 RES, 4 CANCEL
+  mazdaAutoResume @39 :UInt8;        # Mazda: the gas brings the cruise back after a brake (auto_resume.py): 0 off, 1 armed, 2 sending, 3 done, 4 gave up
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
@@ -216,6 +217,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mapExitCurveBrake @48;
     mazdaLimitSlowing @49;
     mazdaSetSpeedHigh @50;
+    mazdaCruiseResumed @51;
   }
 }
 
