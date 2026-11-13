@@ -565,3 +565,77 @@ def test_merge_boost_behind_a_lead_moving_away_and_its_end_when_it_slows():
   for _ in range(50):
     lg.update(_inp(set_speed=40 * MPH, v_ego=v, limit_raise=55 * MPH, limit_boost=20 * MPH))
   assert lg.boost is not None and abs(lg.anchor / MPH - 75) < 0.5
+
+
+# ---- review of round L, F1: weak GPS past the split, a short false "link" or none, his gas held (rl/s1c.py, s1b.py) ----
+
+def _false_link_weak(shape_fn, trust_fn, gas=None, frames=20000):
+  """test_exit_plan._false_link with the GPS trust given: he stays on (set 80), navigation's exit at 3000."""
+  ex = 3000.0
+  F = TE.F
+
+  def fields(x):
+    hw = dict(road_class=1, limit=70 * MPH, gps_trust=trust_fn(x))
+    if x < ex - 2500:
+      return F(**hw)
+    if x < ex - 46:
+      return F(nav_exit=1, nav_exit_distance=ex - x, nav_curve_radius=85.0, nav_curve_distance=ex + 500 - x,
+               nav_exit_side=1, exit_shape=shape_fn(x), **hw)
+    return F(exit_shape=shape_fn(x), **hw)
+  return TE.drive_exit(fields, frames, 80, lane=lambda x: 1 if ex - 300 < x < ex + 300 else None, gas=gas), ex
+
+
+WEAK = lambda x: 2 if x > 2950 else 0  # noqa: E731
+
+
+def test_review_l_f1_gas_held_overturns_a_quiet_false_link_with_weak_gps():
+  sh = lambda x: 2 if 3050 < x < 3110 else 0  # noqa: E731
+  for rel in (200, 400, 600):
+    r, ex = _false_link_weak(sh, WEAK, gas=lambda x, rel=rel: 36.0 if 3150 <= x < 3000 + rel else None)
+    p = r["ctl"].plan or r["ctl"].last_plan
+    i0 = next(i for i, xx in enumerate(r["xs"]) if xx >= ex + rel)
+    assert p.why == "overturned: gas" and min(r["vs"][i0:]) >= 77.0, (rel, p.why, min(r["vs"][i0:]))
+    assert abs(r["sets"][-1] - 80) < 1e-6
+  # (was: 81 -> 39 mph on the highway after the release at +200)
+  old = CTL.GAS_QUIET_LINK
+  try:
+    CTL.GAS_QUIET_LINK = 1e9
+    r, ex = _false_link_weak(sh, WEAK, gas=lambda x: 36.0 if 3150 <= x < 3200 else None)
+  finally:
+    CTL.GAS_QUIET_LINK = old
+  assert min(r["vs"]) < 60.0
+
+
+def test_review_l_f1_silent_shapes_and_his_gas_held_restore_his_speed_not_adopt():
+  for sh in (lambda x: 0, lambda x: 2 if 3100 < x < 3130 else 0):
+    r, ex = _false_link_weak(sh, WEAK, gas=lambda x: 36.0 if 3100 <= x < 4000 else None)
+    p = r["ctl"].plan or r["ctl"].last_plan
+    assert p.why == "not confirmed, his gas" and abs(r["sets"][-1] - 80) < 1e-6, (p.why, r["sets"][-1])
+  # no gas: as before (held, then adopted)
+  r, ex = _false_link_weak(lambda x: 0, WEAK)
+  assert (r["ctl"].plan or r["ctl"].last_plan).why == "not confirmed"
+
+
+def test_review_l_f1_the_rereview_case_with_weak_gps_too():
+  # test_exit_plan.test_rereview_his_gas_held_past_the_split_is_his_decision_even_after_a_link, trusted and weak
+  link_then_none = lambda x: 2 if 3000 < x < 3200 else 0  # noqa: E731
+  for trust in (lambda x: 0, WEAK):
+    r, ex = _false_link_weak(link_then_none, trust, gas=lambda x: 36.0 if 3300 <= x < 3360 else None, frames=17000)
+    assert r["ctl"].last_plan.why == "overturned: gas", r["ctl"].last_plan.why
+    assert TE._at(r, ex + 500, "sets") >= 79.0 and abs(r["sets"][-1] - 80) < 1e-6
+
+
+def test_review_l_f1_nav_near_clears_when_navigation_drops_or_reroutes():
+  def plan_at(rem_drop, other=False):
+    ctl = CTL.MapCurveControl(3.0)
+    base = dict(mode=CTL.ON, road_class=1, nav_exit_side=1)
+    ctl.update(CTL.MapFields(nav_exit=1, nav_exit_distance=250.0, **base), 33.0, 0, v_ego=30.0)
+    p = ctl.plan
+    assert p.nav_near
+    ctl.odo = p.exit_at - rem_drop
+    f = CTL.MapFields(nav_exit=1, nav_exit_distance=rem_drop + 1500.0, **base) if other else CTL.MapFields(**base)
+    ctl.update(f, 33.0, 0, v_ego=30.0)
+    return p
+  assert not plan_at(150.0).nav_near                  # cancelled 150 m before the exit point
+  assert not plan_at(150.0, other=True).nav_near      # rerouted to an exit farther on
+  assert plan_at(20.0).nav_near                       # the usual clearing at the split

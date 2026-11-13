@@ -284,6 +284,15 @@ GAS_OVERTURN_GAIN = 3 * MPH     # m/s
 # his gas held (GAS_OVERTURN_*) together with the road match on the highway with GPS trusted HWY_MATCH_STAY past the split
 # (the re-review's false "link" then silence on the highway).
 NAV_GAS_KEEPS = True
+# Review of round L (s1c.py: GPS weak past the split, the shapes said "link" for ~60 m then went silent: confirmed, and his
+# gas held no longer overturned it, 81 -> 39 mph on the highway): his gas held still overturns a confirmation that is not
+# settled, has no trusted link match, and whose last "link" answer is more than GAS_QUIET_LINK m behind. And (s1b.py: the
+# shapes silent past the split, his gas held: the plan ran on to EXIT_PASS_MARGIN and adopted 71 under his 80) his gas held
+# past the split with no "link" answer since is his decision at EXIT_PASS_MARGIN: his speed back, not adopted.
+GAS_QUIET_LINK = 40.0           # m
+# navigation no longer announcing the exit (a cancel, a reroute to another exit) farther than this before its exit point:
+# its route does not take it (nav_near off). Closer, it is the usual clearing at the split (drive 53: 46 m and 9 m before)
+NAV_NEAR_CLEAR = 80.0           # m
 
 # ---- the camera's view of our lane (LaneView) ----
 # modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
@@ -558,6 +567,8 @@ class ExitPlan:
     self.seen_shape = False       # the planner gives the shape check
     self.why = ""                 # how it ended (logs)
     self.nav_near = False         # navigation still announced it DECIDE_NEAR or closer: its route takes it (NAV_GAS_KEEPS)
+    self.link_odo = None          # the control's odometer at the shapes' last "link" answer (GAS_QUIET_LINK)
+    self.gas_past = False         # his gas held (GAS_OVERTURN_*) past the split with no "link" answer since
     self.update_nav(odo, f)
 
   def update_nav(self, odo, f):
@@ -726,6 +737,8 @@ class MapCurveControl:
     """Adopt / follow / drop the plan from navigation's exit."""
     p = self.plan
     announced = f.nav_exit in NAV_PLAN_EXITS and f.nav_exit_distance > 0 and not on_link
+    if p is not None and p.nav_near and p.exit_at - self.odo > NAV_NEAR_CLEAR and not (announced and p.same(self.odo, f)):
+      p.nav_near = False                            # (NAV_NEAR_CLEAR) cancelled, or another exit: not navigation's route
     if announced:
       if p is not None and p.same(self.odo, f):
         p.update_nav(self.odo, f)
@@ -786,6 +799,8 @@ class MapCurveControl:
       if rem < -QUIET_FROM:
         p.answered = True
     p.link_s = p.link_s + DT_CTRL if (f.exit_shape == 2 and rem <= EXIT_EARLY) else 0.0
+    if f.exit_shape == 2:
+      p.link_odo = self.odo
     p.hwy_s = p.hwy_s + DT_CTRL if (f.exit_shape == 1 and rem < 0) else (0.0 if f.exit_shape == 2 else p.hwy_s)
     # the model path (ModelPath): "link" / "highway" on consecutive answers
     mv = self.model_v = self.model.verdict(f)
@@ -823,7 +838,14 @@ class MapCurveControl:
     # trusted road match on the highway past the split, it still is
     nav_keep = NAV_GAS_KEEPS and p.nav_near and rem <= DECIDE_NEAR
     gas_hwy = gas_firm and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6
-    gas_decides = not nav_keep or gas_hwy
+    # (GAS_QUIET_LINK) no "link" answer for GAS_QUIET_LINK m (none at all past the split counts from the exit point)
+    link_quiet = self.odo - (p.link_odo if p.link_odo is not None else p.exit_at) > GAS_QUIET_LINK
+    gas_quiet = p.confirmed and not p.settled and not link_match and link_quiet
+    gas_decides = not nav_keep or gas_hwy or (gas_firm and gas_quiet)
+    if gas_firm and rem < 0 and not p.confirmed and link_quiet and not link_match:
+      p.gas_past = True
+    elif f.exit_shape == 2 or link_match:
+      p.gas_past = False
     stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
@@ -885,6 +907,9 @@ class MapCurveControl:
       self._end("missed", restore=True)
       return none
     if rem < -EXIT_PASS_MARGIN:
+      if p.gas_past and not p.declined:
+        self._end("not confirmed, his gas", restore=True)   # (GAS_QUIET_LINK) his speed back, not adopted
+        return none
       if rem < -EXIT_LOST_MAX or p.last_cmd is None or p.declined:
         # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS trusted): his speed back
         # (the usual taps, no fast restore); else the held set speed becomes his
