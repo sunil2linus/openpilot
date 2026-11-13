@@ -156,6 +156,7 @@ LINK_HOLD = 0.5                 # s
 # motorway / trunk link (these only join a motorway or a trunk). A street slip lane keeps the Max Drop floor.
 HIGHWAY_LINK_CLASSES = (2, 4)
 TRUST_LOW = 2                   # starpilotPlan.mapGpsTrust (map_curves.TRUST_LOW): another road close by, or worse
+TRUST_PAUSED = 3                # ... 3 / 4: GPS paused (no fixes)
 
 # ---- navigation exits (ExitPlan) ----
 NAV_PLAN_EXITS = (1, 2)         # starpilotPlan.mapNavExit: matched on the map, with or without curves (3, no data: no plan)
@@ -289,6 +290,9 @@ NAV_GAS_KEEPS = True
 # settled, has no trusted link match, and whose last "link" answer is more than GAS_QUIET_LINK m behind. And (s1b.py: the
 # shapes silent past the split, his gas held: the plan ran on to EXIT_PASS_MARGIN and adopted 71 under his 80) his gas held
 # past the split with no "link" answer since is his decision at EXIT_PASS_MARGIN: his speed back, not adopted.
+# (Re-review R1, rl/s1d.py: a real exit with GPS paused past the split and his foot lightly on the gas at +20..+120 m was
+# ended at +250 m and fast-restored on the ramp, 56-70 mph at an 85 m curve: only while fixes arrive (not GPS paused),
+# and back by the usual taps, no fast restore.)
 GAS_QUIET_LINK = 40.0           # m
 # navigation no longer announcing the exit (a cancel, a reroute to another exit) farther than this before its exit point:
 # its route does not take it (nav_near off). Closer, it is the usual clearing at the split (drive 53: 46 m and 9 m before)
@@ -569,6 +573,7 @@ class ExitPlan:
     self.nav_near = False         # navigation still announced it DECIDE_NEAR or closer: its route takes it (NAV_GAS_KEEPS)
     self.link_odo = None          # the control's odometer at the shapes' last "link" answer (GAS_QUIET_LINK)
     self.gas_past = False         # his gas held (GAS_OVERTURN_*) past the split with no "link" answer since
+    self.nav_miss_s = 0.0         # s navigation has not announced it near it (NAV_NEAR_CLEAR)
     self.update_nav(odo, f)
 
   def update_nav(self, odo, f):
@@ -738,7 +743,12 @@ class MapCurveControl:
     p = self.plan
     announced = f.nav_exit in NAV_PLAN_EXITS and f.nav_exit_distance > 0 and not on_link
     if p is not None and p.nav_near and p.exit_at - self.odo > NAV_NEAR_CLEAR and not (announced and p.same(self.odo, f)):
-      p.nav_near = False                            # (NAV_NEAR_CLEAR) cancelled, or another exit: not navigation's route
+      # (NAV_NEAR_CLEAR) cancelled, or another exit, for NAV_GRACE (a one-frame drop is not): not navigation's route
+      p.nav_miss_s += DT_CTRL
+      if p.nav_miss_s >= NAV_GRACE - 1e-6:
+        p.nav_near = False
+    elif p is not None:
+      p.nav_miss_s = 0.0
     if announced:
       if p is not None and p.same(self.odo, f):
         p.update_nav(self.odo, f)
@@ -846,6 +856,8 @@ class MapCurveControl:
       p.gas_past = True
     elif f.exit_shape == 2 or link_match:
       p.gas_past = False
+    if f.gps_trust >= TRUST_PAUSED:
+      p.gas_past = False      # (re-review R1, rl/s1d.py) a GPS pause: the "exit lost" hold governs, not his gas
     stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
@@ -908,7 +920,7 @@ class MapCurveControl:
       return none
     if rem < -EXIT_PASS_MARGIN:
       if p.gas_past and not p.declined:
-        self._end("not confirmed, his gas", restore=True)   # (GAS_QUIET_LINK) his speed back, not adopted
+        self._end("not confirmed, his gas")   # (GAS_QUIET_LINK) his speed back by the usual taps, not adopted
         return none
       if rem < -EXIT_LOST_MAX or p.last_cmd is None or p.declined:
         # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS trusted): his speed back

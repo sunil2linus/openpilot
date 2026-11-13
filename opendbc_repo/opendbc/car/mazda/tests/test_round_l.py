@@ -672,6 +672,8 @@ def test_review_l_f1_the_rereview_case_with_weak_gps_too():
 
 
 def test_review_l_f1_nav_near_clears_when_navigation_drops_or_reroutes():
+  frames = 1
+
   def plan_at(rem_drop, other=False):
     ctl = CTL.MapCurveControl(3.0)
     base = dict(mode=CTL.ON, road_class=1, nav_exit_side=1)
@@ -680,9 +682,13 @@ def test_review_l_f1_nav_near_clears_when_navigation_drops_or_reroutes():
     assert p.nav_near
     ctl.odo = p.exit_at - rem_drop
     f = CTL.MapFields(nav_exit=1, nav_exit_distance=rem_drop + 1500.0, **base) if other else CTL.MapFields(**base)
-    ctl.update(f, 33.0, 0, v_ego=30.0)
+    for _ in range(frames):
+      ctl.update(f, 33.0, 0, v_ego=0.0)           # (standing: the distance stays)
     return p
-  assert not plan_at(150.0).nav_near                  # cancelled 150 m before the exit point
+  n = int(CTL.NAV_GRACE / CTL.DT_CTRL) + 5
+  assert plan_at(150.0).nav_near                      # (re-review R1) a single-frame drop does not clear it
+  frames = n
+  assert not plan_at(150.0).nav_near                  # cancelled 150 m before the exit point, NAV_GRACE
   assert not plan_at(150.0, other=True).nav_near      # rerouted to an exit farther on
   assert plan_at(20.0).nav_near                       # the usual clearing at the split
 
@@ -777,3 +783,20 @@ def test_review_l_f5_the_lead_speed_only_from_radarstates_own_lead(tmp_path, mon
   for _ in range(3):
     c.update(WI.W.CC, cs_, None, None, False)
   assert abs(got[-1].lead_v - 20.0) < 1e-6
+
+
+def test_review_l_r1_a_gps_pause_past_the_split_with_his_light_gas_is_held_not_ended(tmp_path):
+  # rl/s1d.py: a real exit (drive 53 E2 timeline), GPS paused past the split (trust 3, no shapes, no match), his foot lightly
+  # on the gas +20..+120 m: was ended at +250 m ("his gas") and fast-restored on the ramp, 56-70 mph at the 85 m curve
+  fields0, exit_x, curve_x = TE._e2()
+  for pause, v_max in ((300.0, 48.5), (450.0, 59.1)):     # (the speeds at 4bb3412bb: 48.4 / 59.0)
+    def fields(x, pause=pause):
+      f = fields0(x)
+      if exit_x - 30 <= x < exit_x + pause:
+        return TE.F(**{**f.__dict__, "gps_trust": 3, "exit_shape": 0, "road_class": 1, "on_ramp": False, "status": 0,
+                       "radius": 0.0, "distance": 0.0})
+      return f
+    r = TE.drive_exit(fields, 9000, 75, lane=lambda x: 1 if x >= 1200 else None, signal=TE.E2_SIGNAL,
+                      gas=lambda x: 0.0 if exit_x + 20 <= x < exit_x + 120 else None)
+    p = r["ctl"].plan or r["ctl"].last_plan
+    assert p.why != "not confirmed, his gas" and TE._at(r, curve_x) <= v_max, (pause, p.why, TE._at(r, curve_x))
