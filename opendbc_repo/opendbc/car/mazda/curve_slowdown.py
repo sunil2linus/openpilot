@@ -364,6 +364,9 @@ CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
 CURVE_ON_HOLD = 3.0           # s
 ONRAMP_RED_OFF_DIST = 100.0   # m to the on-ramp's first curve
 ONRAMP_RED_OFF_HOLD = 3.0     # s
+# Round L (drive 6f t 624.7-627.3: the street's match on engage raised the set 47 -> 53 with the on-ramp's 30 mph curve
+# ~400 m ahead): no street raise while an on-ramp ahead's curve below the set speed is pending (SlowdownInputs.onramp_pending)
+ONRAMP_NO_RAISE = True
 # A restore asked for at once (restore_pending: a stop ahead that cleared, a red light gone) while a followed map curve's
 # target is on: the restore hold (RESTORE_HOLD_MIN_GAIN) runs up to the curve's target with its usual margin below it,
 # then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
@@ -464,6 +467,9 @@ class SlowdownInputs:
   # stopped car trigger: after a red light gone release a slower car (any confidence) is in our lane: no SET+ hold, no
   # SET+ at all until it is gone or the stop slowdown takes it on (stopped_car_slowdown RED_GONE, slower_after_red)
   stop_slower_ahead: bool = False
+  # the on-ramp's first curve governs before the turn onto it (mapOnRampAhead) with its speed below the set speed: no street
+  # raise (limit_raise without a merge boost: speed_limit_follow rules 1 / 2 / 6 / 7 / 8) meanwhile (ONRAMP_NO_RAISE)
+  onramp_pending: bool = False
 
 
 def steer_lateral_accel(v, angle_deg, wheelbase, ratio=MERGE_TURN_RATIO, slip=MERGE_TURN_SLIP):
@@ -1634,9 +1640,10 @@ class CurveSlowdownLogic:
     rolling = merge and self.stop_min_v >= MERGE_STOP_ROLLING_SPEED and not self.stop_braked
     stop_wait = self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP) and not rolling
     merge_wait = merge and (not i.merge_turn_ok or self._merge_red(i) or stop_wait)
+    street_wait = ONRAMP_NO_RAISE and i.onramp_pending and not merge
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
         not i.hold_restore and self.last_set_speed is not None and i.limit_raise > raise_ref + self.half_step and
-        not merge_wait and self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
+        not merge_wait and not street_wait and self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
       self.anchor = i.limit_raise
@@ -2408,6 +2415,8 @@ class CurveSlowdown:
       limit_boost=self._merge_boost(),
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
       merge_turn_ok=turn_ok, merge_turn_pause=turn_pause,
+      onramp_pending=bool(self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
+                          0 < float(getattr(plan, "mapCurveTarget", 0.0) or 0.0) < set_speed - lg.half_step),
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
       red_light=bool(self._alive('starpilotPlan') and getattr(plan, "redLight", False)),
       red_stop=bool(stop_inputs.red_light),

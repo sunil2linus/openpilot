@@ -96,6 +96,16 @@ ONRAMP_SIGNAL_LATERAL = 25.0  # m
 # The decision is kept this long after it was last made (drive 69: the planner's answer went on and off every 0.5 s,
 # the set speed's raise was blocked and let go with it); while kept, its distance is counted from the ramp's start
 ONRAMP_KEEP = 2.0             # s
+# Round L (drive 6f t 625-646, S Rochester Rd to M-59 E: navigation's primary maneuver was "turn" / slight right at 369 m,
+# its "on ramp" came second in allManeuvers at the same distance; the on-ramp ahead was found only from his signal at ~160
+# m, he braked at -3 m/s^2). Navigation names the ramp also when one of its first ONRAMP_NAV_ALL maneuvers is "on ramp" /
+# "ramp" within ONRAMP_NAV_ALL_TOL of the primary's distance (that maneuver's distance is matched at the ramp's start as
+# before), or when the primary is a ONRAMP_NAV_PRIMARY maneuver toward the ramp's side (strictly) and the ramp's start is
+# within ONRAMP_NAV_ALL_TOL of its distance and on our road (at most ONRAMP_SIGNAL_LATERAL sideways: drive 69's turn onto
+# the crossing road whose on-ramp started 40 m along it stays out)
+ONRAMP_NAV_ALL = 3
+ONRAMP_NAV_ALL_TOL = 50.0     # m
+ONRAMP_NAV_PRIMARY = ("turn", "end of road", "continue", "fork")
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 # Ramp loops (drive 53, the on-ramp loop onto M-59: 71 m, 243 deg, 386 m long): "ahead" is a straight-line bearing test,
@@ -1440,6 +1450,7 @@ class MapCurves:
     self.entered_chain = 0
     self.watches = []            # navigation exits watched past the split (_watch_add), newest last
     self.onramp_keep = None      # [s left, curve, ramp start (lat, lon), m from the start to the curve] (ONRAMP_KEEP)
+    self.nav_all = []            # navigation's first maneuvers (ONRAMP_NAV_ALL)
     self.reset()
 
   def reset(self):
@@ -1575,10 +1586,12 @@ class MapCurves:
       return 2
     return 1 if learned is not None else 0
 
-  def update(self, lat, lon, bearing, way_id, is_forward, nav=None, camera=None, trust=None, gps=None):
+  def update(self, lat, lon, bearing, way_id, is_forward, nav=None, camera=None, trust=None, gps=None, nav_all=None):
     """nav: (maneuver type, modifier, distance m) of the next maneuver, or None. camera: CameraView or None
     (no camera check). trust: GpsTrust (None: the position is trusted, as in the offline tests), fed here with
-    gps = {"dt", "v_ego", "acc", "rel", "ambiguous"}."""
+    gps = {"dt", "v_ego", "acc", "rel", "ambiguous"}. nav_all: navigation's first maneuvers [(type, modifier, m)]
+    (allManeuvers, ONRAMP_NAV_ALL; the on-ramp ahead only)."""
+    self.nav_all = list(nav_all or [])[:ONRAMP_NAV_ALL]
     self.reset()
     self.veto.tick()
     if gps is not None:
@@ -1680,7 +1693,16 @@ class MapCurves:
   def _onramp_find(self, lat, lon, bearing, nav, signal):
     """_onramp_ahead's search: (plan speed, curve, m to it, the ramp's start, m from the start to the curve) or None."""
     nav_ok = nav is not None and nav[0] in ONRAMP_NAV_TYPES and 0 < nav[2] <= ONRAMP_NAV_RANGE
-    if not nav_ok and not signal:
+    # (ONRAMP_NAV_ALL) the ramp named among navigation's first maneuvers at the primary's distance: that one is matched
+    nav_prim = None
+    if not nav_ok and nav is not None and 0 < nav[2] <= ONRAMP_NAV_RANGE + ONRAMP_NAV_ALL_TOL:
+      named = next((m for m in getattr(self, "nav_all", []) if m[0] in ONRAMP_NAV_TYPES and 0 < m[2] <= ONRAMP_NAV_RANGE and
+                    abs(m[2] - nav[2]) <= ONRAMP_NAV_ALL_TOL), None)
+      if named is not None:
+        nav, nav_ok = (named[0], named[1], named[2]), True
+      elif nav[0] in ONRAMP_NAV_PRIMARY and nav_side(nav[1]) != 0:
+        nav_prim = nav
+    if not nav_ok and nav_prim is None and not signal:
       return None
     best = None
     for r in self.store.ramps_all:
@@ -1703,7 +1725,9 @@ class MapCurves:
         (nav_side(nav[1]) in (0, side) or side == 0)
       lateral = abs(d * math.sin(math.radians(bearing_to(lat, lon, *start) - bearing)))
       by_signal = signal != 0 and side == signal and d <= ONRAMP_SIGNAL_RANGE and lateral <= ONRAMP_SIGNAL_LATERAL
-      if not (by_nav or by_signal):
+      by_prim = (nav_prim is not None and side != 0 and nav_side(nav_prim[1]) == side and
+                 abs(d - nav_prim[2]) <= ONRAMP_NAV_ALL_TOL and lateral <= ONRAMP_SIGNAL_LATERAL)
+      if not (by_nav or by_signal or by_prim):
         continue
       for s_c, c in firsts:
         if s_c < 0 or s_c > ONRAMP_NAV_RANGE:
@@ -2041,6 +2065,13 @@ class MapCurvesPlanner:
           nav = (str(ni.maneuverType), str(ni.maneuverModifier), float(ni.maneuverDistance))
     except Exception:
       nav = None
+    nav_all = []
+    try:
+      if nav is not None:
+        nav_all = [(str(m.type), str(m.modifier), float(m.distance))
+                   for m in list(sm["navInstruction"].allManeuvers)[:ONRAMP_NAV_ALL]]
+    except Exception:
+      nav_all = []
     try:
       if sm.alive["navInstruction"] and sm.valid["navInstruction"] and sm.updated["navInstruction"]:
         self._nav_street(sm["navInstruction"], now)
@@ -2054,7 +2085,8 @@ class MapCurvesPlanner:
                    camera=camera, trust=self.trust,
                    gps={"dt": dt, "v_ego": v_ego, "acc": acc, "rel": rel, "ambiguous": self.matcher.ambiguous,
                         "signal": self._signal(sm),
-                        "street": bool(self.road_class) and self.road_class not in HIGHWAY_CLASSES + LINK_CLASSES})
+                        "street": bool(self.road_class) and self.road_class not in HIGHWAY_CLASSES + LINK_CLASSES},
+                   nav_all=nav_all)
     mc = self.mc
     if self.trust.paused and not was_paused and mc.data_here and (not self.pause_announced or self.prev_slowing):
       self.pause_announced = True

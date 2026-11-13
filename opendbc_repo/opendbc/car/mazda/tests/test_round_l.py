@@ -225,7 +225,7 @@ def _loop_merge(profile, frames=4000, v_min=13.4):
 
 def _pw(points):
   def f(t):
-    for (t0, a0), (t1, a1) in zip(points, points[1:]):
+    for (t0, a0), (t1, a1) in zip(points, points[1:], strict=False):
       if t <= t1:
         return a0 + (a1 - a0) * (t - t0) / (t1 - t0)
     return points[-1][1]
@@ -348,3 +348,74 @@ def test_6f_a_map_curve_target_that_drops_still_counts_for_the_red_head_start(tm
   WI._drive(c, int(0.3 / cs.DT_CTRL), set_mph=35, v_mph=32)
   assert not seen[-1].curve_active
 
+
+# ---- 4: navigation's "on ramp" second in allManeuvers (drive 6f t 625-646) ----
+
+TM = TE.TM
+
+
+def test_6f_the_on_ramp_named_second_in_navigation_is_planned_from_far_out():
+  root, curves, ramps = TE.write_files(TM._onramp_scene())
+  la, lo = TM.pos(0, -390)
+  street = {"dt": 0.05, "v_ego": 22.0, "street": True}
+  prim = ("turn", "slight right", 380.0)
+  alls = [("end of road", "right", 380.0), ("on ramp", "slight right", 380.0), ("off ramp", "slight right", 3600.0)]
+  m = TM.planner(root)
+  m.update(la, lo, 0.0, 30, True, nav=prim, gps=dict(street, signal=0), nav_all=alls)
+  assert m.onramp_ahead and m.status == TM.MC.STATUS_RAMP_CURVE and 380 <= m.distance <= 480, (m.onramp_ahead, m.distance)
+  # (before round L the primary maneuver alone was read: nothing until his signal ~150 m out)
+  m = TM.planner(root)
+  m.update(la, lo, 0.0, 30, True, nav=("turn", "slight right", 150.0), gps=dict(street, signal=0),
+           nav_all=[("turn", "slight right", 150.0), ("on ramp", "slight right", 400.0)])
+  assert not m.onramp_ahead                         # the on ramp 250 m from the primary's distance: not this one
+  # the primary alone, a turn toward the ramp's side at its start's distance, the ramp leaving our road: also
+  m = TM.planner(root)
+  m.update(la, lo, 0.0, 30, True, nav=prim, gps=dict(street, signal=0))
+  assert m.onramp_ahead
+  # ... not toward the other side, nor 100 m off
+  for nav in (("turn", "slight left", 380.0), ("turn", "slight right", 280.0), ("merge", "slight right", 380.0)):
+    m = TM.planner(root)
+    m.update(la, lo, 0.0, 30, True, nav=nav, gps=dict(street, signal=0))
+    assert not m.onramp_ahead, nav
+
+
+def test_drive_69_turn_onto_the_crossing_road_with_its_on_ramp_still_no_on_ramp_ahead():
+  root, curves, ramps = TE.write_files(TM._junction_scene())
+  la, lo = TM.pos(0, 160)
+  street = {"dt": 0.05, "v_ego": 12.0, "street": True}
+  m = TM.planner(root)
+  m.update(la, lo, 0.0, 40, True, nav=("turn", "left", 130.0), gps=dict(street, signal=0),
+           nav_all=[("turn", "left", 130.0), ("continue", "straight", 2000.0)])
+  assert not m.onramp_ahead
+
+
+def test_6f_on_ramp_ahead_from_380_m_slows_to_its_speed_with_the_cruise_alone():
+  entry = 430.0
+  v_c = math.sqrt(2.6 * 70.0) / MPH                 # the loop at RAMP_LAT (published 84 m at PLAN_LAT)
+
+  def fields(x):
+    if x < entry:
+      return TE.F(status=2, radius=84.0, distance=entry - x, road_class=5, onramp_ahead=True)
+    return TE.F(status=2, radius=84.0, distance=0.0, road_class=2, on_ramp=True, ramp_type=2, ramp_to_highway=True,
+                ramp_end_distance=400.0)
+  r = TM.drive_53(fields, 3000, 50, v_mph=50)
+  v_in = TM._at(r, entry)
+  assert v_in <= v_c + 2.0, (v_in, v_c)
+  vs, xs = r["vs"], r["xs"]
+  n = int(1.0 / cs.DT_CTRL)
+  dec = max((vs[k - n] - vs[k]) * MPH for k in range(n, len(vs)) if xs[k] <= entry)
+  assert dec <= 0.85, dec                           # the cruise's own slowdown, no brake needed
+
+
+def test_no_street_raise_while_an_on_ramp_ahead_below_the_set_speed_is_pending():
+  def run(pending):
+    lg = cs.CurveSlowdownLogic(False, 10)
+    ups = 0
+    for _ in range(800):
+      b, _ = lg.update(_inp(set_speed=47 * MPH, v_ego=47 * MPH, limit_raise=53 * MPH, onramp_pending=pending))
+      ups += b == cs.SET_PLUS
+    return ups, lg
+  ups, lg = run(True)
+  assert ups == 0 and lg.limit_adopted is None and lg.anchor is None
+  ups, lg = run(False)
+  assert ups > 0
