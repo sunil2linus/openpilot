@@ -28,6 +28,8 @@ class CarState(CarStateBase):
     self.crz_resume = False
     self.radar_has_lead = False   # stock MRCC radar lead (CRZ_CTRL, Gen1 without Radar Interceptor)
     self.radar_lead_distance = 0  # its distance bucket (0-5)
+    self.crz_set_allowed = False  # gas auto-resume (auto_resume.py): CRZ_INFO.ACC_SET_ALLOWED, the car would take RES / SET now
+    self.crz_not_allowed = False  # ... CRZ_CTRL byte 4 non-zero: the cruise cannot be set (0x0c after P, drive 44 seg 24)
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -147,6 +149,14 @@ class CarState(CarStateBase):
       ret.cruiseState.enabled = cp.vl["CRZ_CTRL"]["CRZ_ACTIVE"] == 1
       self.radar_has_lead = cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"] == 1
       self.radar_lead_distance = int(cp.vl["CRZ_CTRL"]["RADAR_LEAD_RELATIVE_DISTANCE"])
+      if self.CP.flags & MazdaSafetyFlags.AUTO_RESUME:
+        # Only with the gas auto-resume on (MazdaBrakeAutoResume): CRZ_INFO (0x21B, the radar, bus 0, 50 Hz; checksum
+        # good on 117526 of 117543 logged frames) is parsed only then. ACC_SET_ALLOWED is 0 while the brake is down and
+        # for up to ~10 s at a standstill after it (logs): a "not now", never a disarm. CRZ_CTRL byte 4 is 0 or 0x0c in
+        # all logs; 0x0c (from P on, drive 44 seg 17-25) is the state where RES and SET did nothing (no DBC signal: the
+        # raw byte, inside NEW_SIGNAL_9).
+        self.crz_set_allowed = cp.vl["CRZ_INFO"]["ACC_SET_ALLOWED"] == 1
+        self.crz_not_allowed = cp.vl_raw["CRZ_CTRL"][4] != 0
 
     # stock lkas should be on
     # TODO: is this needed?
