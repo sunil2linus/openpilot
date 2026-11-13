@@ -48,6 +48,10 @@ GAS_HOLD = 0.3                   # s his gas held (brake released) to count as a
 GAS_RECENT = 3.0                 # s after his gas was last down a press waiting for the wheel may still go
 CALM_TIME = 0.5                  # s of calm wheel before a frame
 AUTO_RESUME_MAX_ANGLE = 45.0     # deg: |wheel angle| under this for CALM_TIME too
+# (re-review, 6c t 1698.8: a Michigan-left U-turn, ~200 deg, on the same road name and class; RES 0.5 s after the wheel
+# straightened, he braked 2.4 s later for a business) after a big turn of the wheel wait this long, armed
+AUTO_RESUME_BIG_TURN = 90.0      # deg
+AUTO_RESUME_BIG_TURN_WAIT = 3.0  # s since |wheel angle| was last above AUTO_RESUME_BIG_TURN
 MAP_STABLE_TIME = 2.0            # s the road class and name unchanged before a send
 AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
 LEAD_NEAR = 50.0                 # m
@@ -130,6 +134,7 @@ class AutoResumeLogic:
     self.wheel_frame = -10_000
     self.new_wheel = False
     self.calm_frames = 0
+    self.big_turn_frame = -10_000    # frame |wheel angle| was last above AUTO_RESUME_BIG_TURN
     self.road = None                 # (class, name) last frame
     self.road_frame = -10_000        # frame it last changed
     self.last_wheel_btn = -10_000    # frame his RES / SET was last down
@@ -228,6 +233,8 @@ class AutoResumeLogic:
     self.lat = steer_lateral_accel(v, float(i.steering_angle), float(i.wheelbase) or 2.7)
     winding = abs(i.steering_rate) > MERGE_TURN_RATE and i.steering_angle * i.steering_rate > 0
     straight = abs(float(i.steering_angle)) < AUTO_RESUME_MAX_ANGLE
+    if abs(float(i.steering_angle)) > AUTO_RESUME_BIG_TURN:
+      self.big_turn_frame = f
     self.calm_frames = self.calm_frames + 1 if (abs(self.lat) < MERGE_TURN_LAT and not winding and straight) else 0
 
     rose = i.cruise_enabled and not self.prev_enabled
@@ -327,6 +334,8 @@ class AutoResumeLogic:
     """Why no frame may go this frame ("" none)."""
     if self.calm_frames < _frames(CALM_TIME):
       return "turning"
+    if (self.frame - self.big_turn_frame) * DT_CTRL < AUTO_RESUME_BIG_TURN_WAIT:
+      return "after a big turn"
     if not i.gas_pressed:
       return "gas"
     if not self.map_ok(i):

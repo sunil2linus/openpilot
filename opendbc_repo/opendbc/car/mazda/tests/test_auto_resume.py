@@ -116,7 +116,9 @@ def test_stop_sign_with_a_turn_waits_for_the_wheel():
   # the wheel unwinds (not winding up: |angle| falling) and is straight; the gas still down
   s.step(int(0.4 * F), steering_angle=0.0, v_ego=16 * MPH)
   assert s.sent == []                          # not calm CALM_TIME yet
-  s.step(int(0.3 * F))
+  s.step(int(2.5 * F))
+  assert s.sent == [] and s.lg.wait_why == "after a big turn"   # (a 300 deg turn: AUTO_RESUME_BIG_TURN_WAIT)
+  s.step(int(0.2 * F))
   assert s.sent and s.sent[0][1] == RES
   assert s.lg.state == ar.DONE
 
@@ -130,7 +132,7 @@ def test_turn_with_the_gas_lifted_more_than_three_seconds_drops_that_press():
   assert s.sent == [] and s.lg.state == ar.ARMED and s.kinds("autoResumeRefused")[-1]["reason"] == "gas released"
   # the panda only passes a frame with the gas down: a press made in the turn, the gas lifted when the wheel is straight
   # (within GAS_RECENT): we wait for the gas, then it goes at once
-  s.step(int(0.4 * F), gas_pressed=True, steering_angle=300.0, v_ego=16 * MPH)
+  s.step(int(0.4 * F), gas_pressed=True, steering_angle=80.0, v_ego=16 * MPH)     # (under the big turn's 90 deg)
   s.step(F, gas_pressed=False, steering_angle=0.0)
   assert s.sent == [] and s.lg.press is not None and s.lg.wait_why == "gas"
   s.step(int(0.15 * F), gas_pressed=True)
@@ -215,12 +217,43 @@ def test_the_wheel_angle_must_be_small():
   # (review B2) at junction speed the lateral accel is ~0 with the wheel at 150 deg: still turning
   s = Sim(set_mph=45, v_mph=45)
   s.brake_cancel(v_after_mph=11)
-  s.step(2 * F, gas_pressed=True, steering_angle=110.0)
+  s.step(2 * F, gas_pressed=True, steering_angle=80.0)
   assert abs(s.lg.lat) < 1.0 and s.sent == [] and s.lg.wait_why == "turning"
   s.step(int(0.4 * F), steering_angle=40.0)
   assert s.sent == []                        # under 45 deg, not for CALM_TIME yet
   s.step(int(0.2 * F))
   assert s.sent
+
+
+def test_a_big_turn_of_the_wheel_waits_three_seconds():
+  # (re-review, 6c t 1698.8) a U-turn on the same road: 200 deg, then straight, the gas held throughout
+  def run(angle, turn_s=2.0):
+    s = Sim(set_mph=53, v_mph=53)
+    s.brake_cancel(v_after_mph=15)
+    s.step(F)
+    s.step(int(turn_s * F), gas_pressed=True, steering_angle=angle, v_ego=12 * MPH)
+    t_below = s.frame                              # the angle drops below 90 (and 45) here
+    s.step(5 * F, steering_angle=0.0, v_ego=18 * MPH)
+    return s, t_below
+  s, t0 = run(200.0)
+  assert s.sent and abs((s.sent[0][0] - t0) / F - ar.AUTO_RESUME_BIG_TURN_WAIT) <= 0.15, (s.sent[0][0] - t0) / F
+  # a 90+ deg junction turn: the same 3 s wait
+  s, t0 = run(100.0)
+  assert s.sent and (s.sent[0][0] - t0) / F >= ar.AUTO_RESUME_BIG_TURN_WAIT - 0.01
+  # a 30 deg lane-position correction: only the 0.5 s calm (it never was over 45 deg: no wait at all)
+  s, t0 = run(30.0)
+  assert s.sent and (s.sent[0][0] - t0) / F < 0.2
+  # the wait is time, not samples: 3 s whatever the wheel does under 90 deg meanwhile
+  s = Sim(set_mph=53, v_mph=53)
+  s.brake_cancel(v_after_mph=15)
+  s.step(F)
+  s.step(F, gas_pressed=True, steering_angle=-120.0, v_ego=12 * MPH)
+  t0 = s.frame
+  s.step(int(1.0 * F), steering_angle=60.0)
+  s.step(int(1.5 * F), steering_angle=0.0, v_ego=18 * MPH)
+  assert s.sent == [] and s.lg.wait_why == "after a big turn"
+  s.step(F)
+  assert s.sent and (s.sent[0][0] - t0) / F >= 3.0 - 0.01
 
 
 def test_creep_guard_needs_a_moving_lead_under_10_mph():
