@@ -439,3 +439,57 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
   if w.recorder is not None:
     kinds = [k for k, _ in records]
     assert "autoResumeArmed" in kinds and "autoResumeRefused" in kinds
+
+
+def test_our_set_minus_engagement_is_not_logged_as_his_press():
+  # curve_slowdown's controller: the cruise back on after a gap at another set speed is "the driver chose a new speed"
+  # (forget, blocked: as his own engagement) but, when the engagement was ours, no driverSetChange entry for it
+  from opendbc.car.mazda.curve_slowdown import CurveSlowdownLogic, SlowdownInputs
+
+  def run(own):
+    lg = CurveSlowdownLogic(False)
+
+    def step(n, cruise, set_mph):
+      for _ in range(n):
+        lg.update(SlowdownInputs(enabled=cruise, cruise_enabled=cruise, set_speed=set_mph * MPH, v_ego=30 * MPH,
+                                 gas_pressed=False, brake_pressed=False, standstill=False, plan_alive=True,
+                                 csc_active=False, csc_speed=0.0, other_button_active=False))
+    step(300, True, 45)
+    step(300, False, 45)
+    lg.own_engage = own
+    step(50, True, 30)
+    return lg
+  his, ours = run(False), run(True)
+  assert [e["action"] for e in his.driver_events] == ["after_gap"]
+  assert ours.driver_events == [] and ours.anchor is None and ours.unattributed is None
+  assert ours.blocked == his.blocked and ours.last_set_speed == his.last_set_speed    # otherwise the same as his
+
+
+def test_carcontroller_builds_it_only_with_the_toggle_and_the_flag(monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace
+  import cereal.messaging as messaging
+  from opendbc.car import Bus, structs
+  from opendbc.car.mazda import carcontroller
+  from opendbc.car.mazda.values import MazdaSafetyFlags
+
+  class Params:
+    def __init__(self, *a, **k):
+      pass
+
+    def get(self, key, encoding=None):
+      return None
+
+    def get_bool(self, key):
+      return on[0] and key == "MazdaBrakeAutoResume"
+  on = [False]
+  monkeypatch.setattr(carcontroller, "Params", Params)
+  monkeypatch.setattr(messaging, "SubMaster", lambda services: SimpleNamespace(update=lambda t: None))
+  for toggle, flag, expect in ((False, False, False), (False, True, False), (True, False, False), (True, True, True)):
+    on[0] = toggle
+    CP = structs.CarParams()
+    CP.flags = int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR | (MazdaSafetyFlags.AUTO_RESUME if flag else 0))
+    CP.openpilotLongitudinalControl = False
+    c = carcontroller.CarController({Bus.pt: "mazda_2017"}, CP)
+    assert (c.auto_resume is not None) == expect, (toggle, flag)

@@ -470,6 +470,9 @@ class CarInterfaceBase(ABC):
       fp_ret.mazdaSetSpeedHigh = bool(getattr(slowdown, "set_speed_high", False))
     fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
     fp_ret.mazdaWheelButton = mazda_wheel_button(self.CS)
+    auto_resume = getattr(self.CC, "auto_resume", None)    # Mazda: the gas brings the cruise back (auto_resume.py)
+    if auto_resume is not None:
+      fp_ret.mazdaAutoResume = int(auto_resume.state)
 
     return ret, fp_ret
 

@@ -531,8 +531,7 @@ class VehicleSettingsManagerView(PanelManagerView):
     })
     tiles.append({
       "title": tr("Gas brings cruise back after a brake"),
-      "subtitle": tr("When your brake turned the cruise off, pressing the gas turns it back on (RES, or your current speed "
-                     "if the old one is much higher). Only on mapped public roads, with the wheel straight. From the next drive."),
+      "subtitle": tr("If your brake turned the cruise off, pressing the gas turns it back on. Only on mapped public roads, wheel straight."),
       "get_state": lambda: params.get_bool("MazdaBrakeAutoResume"),
       "set_state": lambda s: self._controller._on_toggle("MazdaBrakeAutoResume"),
     })

@@ -61,6 +61,16 @@ class CarController(CarControllerBase):
         carlog.exception("mazda set speed slowdown init failed, disabled")
         self.curve_slowdown = None
 
+    # Optional: the gas brings the cruise back after his brake (auto_resume.py; MazdaBrakeAutoResume, default off; the
+    # panda allows its RES / SET- only with the flag the car interface sets for it).
+    self.auto_resume = None
+    try:
+      from opendbc.car.mazda import auto_resume
+      if auto_resume.enabled(CP, self.params):
+        self.auto_resume = auto_resume.AutoResume(CP, self.params)
+    except Exception:
+      carlog.exception("mazda auto resume init failed, disabled")
+      self.auto_resume = None
 
 
   def update(self, CC, CS, now_nanos, starpilot_toggles):
@@ -77,6 +87,7 @@ class CarController(CarControllerBase):
     self.apply_torque_last = apply_torque
 
     if self.CP.flags & MazdaSafetyFlags.GEN1:
+      cancel_sent = False
       if CC.cruiseControl.cancel:
         # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
         # a race condition with the stock system, where the second cancel from openpilot
@@ -87,6 +98,7 @@ class CarController(CarControllerBase):
           # Cancel Stock ACC if it's enabled while OP is disengaged
           # Send at a rate of 10hz until we sync with stock ACC state
           can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
+          cancel_sent = True
       else:
         self.brake_counter = 0
         if CC.cruiseControl.resume and self.frame % 5 == 0:
@@ -94,9 +106,20 @@ class CarController(CarControllerBase):
           # Send Resume button when planner wants car to move
           can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
 
+      if self.auto_resume is not None:
+        try:
+          can_sends.extend(self.auto_resume.update(CC, CS, self.packer, self.CP, self.curve_slowdown, cancel_sent))
+        except Exception:
+          carlog.exception("mazda auto resume failed, disabling")
+          self.auto_resume = None
+
       if self.curve_slowdown is not None:
         try:
-          other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume)
+          # (auto resume) never both sending: ours going or just gone holds the slowdown's presses back, and it is told
+          # when the cruise came on by our RES / SET- (not his press)
+          ours = self.auto_resume is not None and self.auto_resume.busy
+          self.curve_slowdown.logic.own_engage = bool(self.auto_resume is not None and self.auto_resume.logic.own_engage)
+          other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume or ours)
           can_sends.extend(self.curve_slowdown.update(CC, CS, self.packer, self.CP, other_button_active))
         except Exception:
           # Never let this optional feature affect steering: turn it off for the rest of the drive.
