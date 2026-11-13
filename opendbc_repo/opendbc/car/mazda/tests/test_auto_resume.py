@@ -16,7 +16,7 @@ class Sim:
     self.lg = AutoResumeLogic(metric)
     self.i = dict(cruise_enabled=True, cruise_available=True, set_speed=set_mph * MPH, v_ego=v_mph * MPH,
                   gas_pressed=False, brake_pressed=False, plan_alive=True, road_class=5, gps_trust=0, engageable=True,
-                  set_allowed=True, btn_counter=0)
+                  set_allowed=True, btn_counter=0, can_valid=True)
     self.i.update(kw)
     self.accepts = accepts
     self.sent = []          # (frame, button)
@@ -143,8 +143,11 @@ def test_red_light_five_minutes_then_gas():
   s.step(300 * F, brake_pressed=False)          # 5 minutes at the light (brake released, held by the car)
   assert s.lg.state == ar.ARMED and s.lg.dist == 0.0
   s.step(int(0.3 * F), gas_pressed=True, v_ego=2 * MPH)
-  s.step(int(0.6 * F), v_ego=5 * MPH)
-  # 45 stored, 5 now: RES all the same (the stored speed comes back; the street rules take it down from there)
+  s.step(2 * F, v_ego=5 * MPH)
+  # under 10 mph with no car ahead: wait (review G7: a creep away from a light, the car ahead not moving yet)
+  assert s.sent == [] and s.lg.wait_why == "slow, no moving lead" and s.lg.state == ar.ARMED
+  s.step(int(0.5 * F), v_ego=11 * MPH)
+  # 45 stored, 11 now: RES all the same (the stored speed comes back; the street rules take it down from there)
   assert [b for _, b in s.sent] == [RES]
   assert s.i["cruise_enabled"] and abs(s.i["set_speed"] - 45 * MPH) < 1e-6
   assert s.lg.state == ar.DONE and s.kinds("autoResumeSent")[0]["button"] == RES
@@ -162,7 +165,9 @@ def test_parking_lot_then_a_public_road_within_the_distance():
   assert s.sent == []
   # back on a residential street (still < 800 m), gas again
   s.step(F, gas_pressed=False, road_class=12)
-  s.step(F, gas_pressed=True, v_ego=22 * MPH)
+  s.step(int(0.9 * F), gas_pressed=True, v_ego=22 * MPH)
+  assert s.sent == [] and s.lg.wait_why == "road just changed"     # the road only 1.9 s old
+  s.step(int(0.5 * F))
   assert s.sent and s.sent[0][1] == RES and s.lg.state == ar.DONE
 
 
@@ -174,24 +179,76 @@ def test_unknown_road_or_low_trust_is_off():
     assert s.sent == [], kw
 
 
-def test_map_gap_after_a_good_brake():
-  def run(gap_s, yaw_rate=0.0, good_at_brake=True):
-    s = Sim(set_mph=45, v_mph=45, road_class=5 if good_at_brake else 0)
+def test_the_map_must_be_good_at_the_send_and_the_road_settled():
+  # (review of round n, B1) no allowance for a lost map: good at the brake, lost when he presses the gas: no RES
+  s = Sim(set_mph=45, v_mph=45, road_class=5)
+  s.brake_cancel(v_after_mph=30)
+  s.step(3 * F, road_class=0)
+  s.step(F, gas_pressed=True)
+  assert s.sent == [] and s.kinds("autoResumeRefused")[-1]["reason"] == "map"
+  # a press made on the road, the map lost before the frame (turning into a driveway): dropped
+  s = Sim(set_mph=45, v_mph=45, road_class=5)
+  s.brake_cancel(v_after_mph=30)
+  s.step(int(0.4 * F), gas_pressed=True, steering_angle=200.0)
+  assert s.lg.press is not None
+  s.step(F, road_class=0, steering_angle=0.0)
+  assert s.sent == [] and s.lg.press is None and s.kinds("autoResumeRefused")[-1]["reason"] == "map"
+  # the class (or mapd's name) changed less than 2 s before: wait for it to settle
+  for kw in (dict(road_class=7), dict(road_name="Other Rd")):
+    s = Sim(set_mph=45, v_mph=45, road_class=5)
     s.brake_cancel(v_after_mph=30)
-    s.step(int(gap_s * F), road_class=0, yaw_rate=yaw_rate)
-    s.step(F, gas_pressed=True, yaw_rate=0.0)
-    return s
-  assert run(3.0).sent                                   # lost 3 s (+ the press): the brake's road still counts
-  assert not run(6.0).sent                               # lost longer than AUTO_RESUME_MAP_GAP
-  assert not run(3.0, yaw_rate=12.0).sent                # turned 36 deg meanwhile
-  assert not run(3.0, good_at_brake=False).sent          # the map was not good at the brake
-  # standing still in the gap never counts
+    s.step(F)
+    s.step(int(1.5 * F), gas_pressed=True, **kw)
+    assert s.sent == [] and s.lg.wait_why == "road just changed", kw
+    s.step(F)
+    assert s.sent, kw
+  # standing still on a good road never counts against it
   s = Sim(set_mph=45, v_mph=45)
   s.brake_cancel(v_after_mph=0)
-  s.step(60 * F, road_class=0)
-  s.step(int(0.3 * F), gas_pressed=True, v_ego=3 * MPH)
+  s.step(60 * F)
+  s.step(int(0.3 * F), gas_pressed=True, v_ego=12 * MPH)
   s.step(F)
   assert s.sent
+
+
+def test_the_wheel_angle_must_be_small():
+  # (review B2) at junction speed the lateral accel is ~0 with the wheel at 150 deg: still turning
+  s = Sim(set_mph=45, v_mph=45)
+  s.brake_cancel(v_after_mph=11)
+  s.step(2 * F, gas_pressed=True, steering_angle=110.0)
+  assert abs(s.lg.lat) < 1.0 and s.sent == [] and s.lg.wait_why == "turning"
+  s.step(int(0.4 * F), steering_angle=40.0)
+  assert s.sent == []                        # under 45 deg, not for CALM_TIME yet
+  s.step(int(0.2 * F))
+  assert s.sent
+
+
+def test_creep_guard_needs_a_moving_lead_under_10_mph():
+  base = dict(set_mph=45, v_mph=45)
+  for lead, ok in ((dict(lead_status=True, lead_d=15.0, lead_v=3.0), True),      # moving, ahead, not slower
+                   (dict(lead_status=True, lead_d=15.0, lead_v=1.0), False),     # under 3 mph
+                   (dict(lead_status=True, lead_d=60.0, lead_v=3.0), False),     # too far
+                   (dict(lead_status=True, lead_d=15.0, lead_v=1.5), False),     # 1.5 < v 3.1 - 1
+                   (dict(lead_status=False, lead_d=15.0, lead_v=3.0), False)):   # no lead
+    s = Sim(**base)
+    s.brake_cancel(v_after_mph=0)
+    s.step(F)
+    s.step(2 * F, gas_pressed=True, v_ego=7 * MPH, **lead)
+    assert bool(s.sent) == ok, lead
+  # openpilot's CAN not valid: no frame
+  s = Sim(**base)
+  s.brake_cancel(v_after_mph=20)
+  s.step(2 * F, gas_pressed=True, can_valid=False)
+  assert s.sent == [] and s.lg.wait_why == "can invalid"
+
+
+def test_his_res_while_we_send_is_his():
+  s = Sim(accepts=False)
+  s.brake_cancel(v_after_mph=30)
+  s.step(int(0.4 * F), gas_pressed=True)
+  assert s.sent and s.lg.state == ar.SENDING
+  s.step(1, wheel_resume=True, cruise_enabled=True)
+  assert s.lg.state == ar.OFF and not s.kinds("autoResumeSent")
 
 
 def test_his_buttons_and_the_car_state_disarm():
@@ -378,7 +435,9 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
   class SM:
     def __init__(self):
       self.msgs = {"starpilotPlan": SimpleNamespace(mapRoadClass=5, mapGpsTrust=0),
-                   "selfdriveState": SimpleNamespace(engageable=True)}
+                   "selfdriveState": SimpleNamespace(engageable=True),
+                   "radarState": SimpleNamespace(leadOne=SimpleNamespace(status=False, dRel=0.0, vLead=0.0)),
+                   "mapdOut": SimpleNamespace(roadName="A Road")}
       self.alive = dict.fromkeys(self.msgs, True)
       self.recv_frame = dict.fromkeys(self.msgs, 1)
 
@@ -412,7 +471,7 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
       cs = SimpleNamespace(out=SimpleNamespace(
         cruiseState=SimpleNamespace(enabled=st["enabled"], available=True, speed=45 * MPH), vEgo=st["v"],
         gasPressed=st["gas"], brakePressed=st["brake"], steeringAngleDeg=0.0, steeringRateDeg=0.0,
-        gearShifter=structs.CarState.GearShifter.drive, doorOpen=False, seatbeltUnlatched=False),
+        gearShifter=structs.CarState.GearShifter.drive, doorOpen=False, seatbeltUnlatched=False, canValid=True),
         crz_cancel=False, crz_resume=False, crz_set_plus=False, crz_set_minus=False, crz_set_allowed=True,
         crz_not_allowed=False, crz_btns_counter=(frame[0] // 10) % 16)
       cc = SimpleNamespace(cruiseControl=SimpleNamespace(cancel=False, resume=False))
@@ -434,7 +493,7 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
   assert run(2 * F, gas=True) == []
   sm.msgs["starpilotPlan"].mapRoadClass = 5
   run(1, gas=False)
-  out = run(F, gas=True)
+  out = run(3 * F, gas=True)               # (the road settled MAP_STABLE_TIME first)
   assert out and out[0][0] == "frame" and out[0][2] == Buttons.RESUME and w.logic.state == ar.SENDING
   # sent on the cycle a new wheel frame came, with its counter (create_button_cmd adds 1: CTR = wheel + 1)
   assert all(f % 10 == 0 and counter == (f // 10) % 16 for _, counter, _, f in out)
@@ -484,3 +543,28 @@ def test_carcontroller_builds_it_only_with_the_toggle_and_the_flag(monkeypatch):
     CP.openpilotLongitudinalControl = False
     c = carcontroller.CarController({Bus.pt: "mazda_2017"}, CP)
     assert (c.auto_resume is not None) == expect, (toggle, flag)
+
+
+def test_crz_info_never_makes_can_invalid_and_a_stale_value_is_not_allowed():
+  # (review) a missing 0x21B must not raise a CAN error: CRZ_INFO is registered with frequency 0 (only with the flag)
+  from opendbc.can import CANPacker
+  from opendbc.car import Bus, structs
+  from opendbc.car.mazda.carstate import CarState
+  from opendbc.car.mazda.values import CAR, MazdaSafetyFlags
+  CP = structs.CarParams()
+  CP.carFingerprint = CAR.MAZDA_CX5
+  for flag in (0, MazdaSafetyFlags.AUTO_RESUME):
+    CP.flags = int(MazdaSafetyFlags.GEN1 | flag)
+    cp = CarState.get_can_parsers(CP)[Bus.pt]
+    assert ((0x21B in cp.message_states) == bool(flag))
+    if flag:
+      assert cp.message_states[0x21B].ignore_alive
+  packer = CANPacker("mazda_2017")
+  addr, dat, _ = packer.make_can_msg("CRZ_INFO", 0, {"ACC_SET_ALLOWED": 1})
+  t = 1_000_000_000
+  cp.update([(t, [(addr, dat, 0)])])
+  assert cp.vl["CRZ_INFO"]["ACC_SET_ALLOWED"] == 1 and cp.ts_nanos["CRZ_INFO"]["ACC_SET_ALLOWED"] == t
+  # nothing on the bus for a long time: still valid (no alive check for it)
+  for k in range(1, 200):
+    cp.update([(t + k * 10_000_000, [])])
+  assert cp.can_valid

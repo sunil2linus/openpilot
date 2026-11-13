@@ -7,13 +7,17 @@ The owner's design (round n):
      set speed stored. Then his gas (held GAS_HOLD, brake released) brings it back. Any speed, after a stop or a
      slowdown. No time limit: standing still never counts.
   B. Map guard (no timer): only on a mapped public road, the planner's road class known (highway, link, primary ..
-     residential: PUBLIC_ROAD_CLASSES) with GPS trust MAX_GPS_TRUST. Unknown, other classes or a worse trust: no. One
-     allowance: the map was good when he braked and is lost only AUTO_RESUME_MAP_GAP of moving time since it was last
-     good, with the heading changed less than MAP_GAP_TURN since then: the brake's road still counts.
-  C. Wheel calm: nothing is sent while turning (|lateral accel| from the wheel angle and the speed >= MERGE_TURN_LAT, or
-     the wheel winding: curve_slowdown.MergeTurnGate's formula and constants); calm CALM_TIME first. The gas may be down
-     during the turn; the press goes out when the wheel straightens, the gas pressed then (the panda only lets it
-     through with the gas pressed now; within GAS_RECENT of his last gas we wait for it), the brake not.
+     residential: PUBLIC_ROAD_CLASSES) with GPS trust MAX_GPS_TRUST, AT THE SEND, and the road (class and mapd's name)
+     unchanged for MAP_STABLE_TIME before it (mapd keeps the old road a few seconds through a turn). Unknown, other
+     classes or a worse trust: no. (Review of round n: no allowance for a lost map any more, drive 6f t 980.8.)
+  C. Wheel calm: nothing is sent while turning (|lateral accel| from the wheel angle and the speed >= MERGE_TURN_LAT, the
+     wheel winding: curve_slowdown.MergeTurnGate's formula and constants, or |wheel angle| >= AUTO_RESUME_MAX_ANGLE: the
+     lateral accel is ~0 at junction speeds); calm CALM_TIME first. The gas may be down during the turn; the press goes
+     out when the wheel straightens, the gas pressed then (the panda only lets it through with the gas pressed now;
+     within GAS_RECENT of his last gas we wait for it), the brake not.
+  G. Creep guard (review G7): under AUTO_RESUME_CREEP_SPEED only behind a moving car ahead (radarState.leadOne, as the
+     stop logic reads it: within LEAD_NEAR, faster than LEAD_MOVING and not more than LEAD_SLOWER slower than us);
+     otherwise wait (armed) until faster than it with the gas pressed.
   D. Disarm (until the cruise comes on again): his CANCEL / SET / RES on the wheel, the main switch off, not in D, a
      door or his seatbelt, the car's "not allowed" state (CRZ_CTRL byte 4, NOT_ALLOWED_TIME), the stored set speed gone,
      AUTO_RESUME_MAX_DIST driven since the brake. The map guard false at his gas press: that press is not used, a later
@@ -43,8 +47,12 @@ CANCEL_QUIET = 0.5               # s before the fall: no CANCEL frame of ours, n
 GAS_HOLD = 0.3                   # s his gas held (brake released) to count as a press
 GAS_RECENT = 3.0                 # s after his gas was last down a press waiting for the wheel may still go
 CALM_TIME = 0.5                  # s of calm wheel before a frame
-AUTO_RESUME_MAP_GAP = 5.0        # s of moving time the map may be lost after a good brake-time road
-MAP_GAP_TURN = 30.0              # deg: ... with the heading changed less than this since the map was last good
+AUTO_RESUME_MAX_ANGLE = 45.0     # deg: |wheel angle| under this for CALM_TIME too
+MAP_STABLE_TIME = 2.0            # s the road class and name unchanged before a send
+AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
+LEAD_NEAR = 50.0                 # m
+LEAD_MOVING = 3 * MS_PER_MPH     # m/s (1.34)
+LEAD_SLOWER = 1.0                # m/s: the lead not slower than us by more than this
 AUTO_RESUME_MAX_DIST = 800.0     # m driven since the brake without the cruise back: disarm
 # the panda closes its window after 180 s of moving time (mazda.h MAZDA_AR_MAX_MOVING_US): disarm a little before, so
 # no frame of ours is dropped there (a crawl in traffic: 800 m at 10 mph is ~180 s)
@@ -81,7 +89,7 @@ class AutoResumeInputs:
   brake_pressed: bool
   steering_angle: float = 0.0     # deg
   steering_rate: float = 0.0      # deg/s
-  yaw_rate: float = 0.0           # deg/s (from the speed and the wheel angle)
+  yaw_rate: float = 0.0           # deg/s (from the speed and the wheel angle; logged only since the review)
   wheelbase: float = 2.7
   gear_drive: bool = True
   door_open: bool = False
@@ -96,6 +104,11 @@ class AutoResumeInputs:
   other_button_active: bool = False   # openpilot's RESUME (stop and go) this frame
   plan_alive: bool = False        # starpilotPlan
   road_class: int = 0             # starpilotPlan.mapRoadClass
+  road_name: str = ""             # mapdOut.roadName ("" unknown)
+  lead_status: bool = False       # radarState.leadOne (as stopped_car_slowdown reads it)
+  lead_d: float = 0.0             # m
+  lead_v: float = 0.0             # m/s
+  can_valid: bool = False         # CarState.canValid
   gps_trust: int = 4              # starpilotPlan.mapGpsTrust
   engageable: bool = False        # selfdriveState.engageable (False when not received): no openpilot no-entry
   slowdown_busy: bool = False     # curve_slowdown has a press going (pending, a hold, a frame in the last BUSY_AFTER)
@@ -116,8 +129,10 @@ class AutoResumeLogic:
     self.prev_counter = -1
     self.wheel_frame = -10_000
     self.new_wheel = False
-    self.yaw = 0.0
     self.calm_frames = 0
+    self.road = None                 # (class, name) last frame
+    self.road_frame = -10_000        # frame it last changed
+    self.last_wheel_btn = -10_000    # frame his RES / SET was last down
     self.lat = 0.0
     self.gas_frames = 0
     self.last_gas = -10_000
@@ -126,9 +141,6 @@ class AutoResumeLogic:
     self._reset_episode()
 
   def _reset_episode(self):
-    self.brake_map_ok = False
-    self.map_gap = 0.0               # s of moving time since the map was last good
-    self.map_yaw = 0.0               # heading then
     self.dist = 0.0
     self.moving_time = 0.0
     self.press = None                # frame of a gas press waiting to go
@@ -148,9 +160,18 @@ class AutoResumeLogic:
     return bool(i.plan_alive and int(i.road_class) in PUBLIC_ROAD_CLASSES and int(i.gps_trust) <= MAX_GPS_TRUST)
 
   def map_allowed(self, i):
-    if self.map_ok(i):
+    return self.map_ok(i)
+
+  def road_stable(self):
+    return self.frame - self.road_frame >= _frames(MAP_STABLE_TIME)
+
+  @staticmethod
+  def creep_ok(i):
+    """Under AUTO_RESUME_CREEP_SPEED only behind a moving car ahead."""
+    v = max(float(i.v_ego), 0.0)
+    if v >= AUTO_RESUME_CREEP_SPEED:
       return True
-    return self.brake_map_ok and self.map_gap <= AUTO_RESUME_MAP_GAP and abs(self.yaw - self.map_yaw) < MAP_GAP_TURN
+    return bool(i.lead_status and 0.0 < i.lead_d <= LEAD_NEAR and i.lead_v > LEAD_MOVING and i.lead_v >= v - LEAD_SLOWER)
 
   @property
   def busy(self):
@@ -183,7 +204,11 @@ class AutoResumeLogic:
     f = self.frame
     v = max(float(i.v_ego), 0.0)
     moving = v > MOVING_SPEED
-    self.yaw += float(i.yaw_rate) * DT_CTRL
+    road = (int(i.road_class) if i.plan_alive else 0, str(i.road_name or ""))
+    if road != self.road:
+      self.road, self.road_frame = road, f
+    if i.wheel_resume or i.wheel_set:
+      self.last_wheel_btn = f
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_counter
     if self.new_wheel:
       self.wheel_frame = f
@@ -202,7 +227,8 @@ class AutoResumeLogic:
     # wheel calm (curve_slowdown.MergeTurnGate's formula and constants, CALM_TIME)
     self.lat = steer_lateral_accel(v, float(i.steering_angle), float(i.wheelbase) or 2.7)
     winding = abs(i.steering_rate) > MERGE_TURN_RATE and i.steering_angle * i.steering_rate > 0
-    self.calm_frames = self.calm_frames + 1 if (abs(self.lat) < MERGE_TURN_LAT and not winding) else 0
+    straight = abs(float(i.steering_angle)) < AUTO_RESUME_MAX_ANGLE
+    self.calm_frames = self.calm_frames + 1 if (abs(self.lat) < MERGE_TURN_LAT and not winding and straight) else 0
 
     rose = i.cruise_enabled and not self.prev_enabled
     fell = self.prev_enabled and not i.cruise_enabled
@@ -222,7 +248,9 @@ class AutoResumeLogic:
         return None
 
     if rose:
-      if self.state == SENDING and self.button is not None and self.total_sent > 0:
+      # (his own RES / SET on the wheel just before: his engagement, not ours, no "Cruise resumed")
+      if (self.state == SENDING and self.button is not None and self.total_sent > 0 and
+          f - self.last_wheel_btn > _frames(CANCEL_QUIET)):
         self.state = DONE
         self.own_engage_frame = f
         self.refuse_frames = 0
@@ -246,10 +274,6 @@ class AutoResumeLogic:
     self.dist += v * DT_CTRL
     if moving:
       self.moving_time += DT_CTRL
-    if self.map_ok(i):
-      self.map_gap, self.map_yaw = 0.0, self.yaw
-    elif moving:
-      self.map_gap += DT_CTRL
     self.not_allowed_frames = self.not_allowed_frames + 1 if i.not_allowed else 0
     why = None
     if i.wheel_cancel or i.wheel_resume or i.wheel_set:
@@ -305,6 +329,14 @@ class AutoResumeLogic:
       return "turning"
     if not i.gas_pressed:
       return "gas"
+    if not self.map_ok(i):
+      return "map"
+    if not self.road_stable():
+      return "road just changed"
+    if not self.creep_ok(i):
+      return "slow, no moving lead"
+    if not i.can_valid:
+      return "can invalid"
     if i.brake_pressed:
       return "brake"
     if not i.set_allowed:
@@ -387,11 +419,9 @@ class AutoResumeLogic:
       return
     self.state = ARMED
     self.armed_frame = f
-    self.brake_map_ok = self.map_ok(i)
-    self.map_yaw = self.yaw
     self.press_spent = i.gas_pressed     # (a gas already down at the brake is not his press)
     self._event("autoResumeArmed", set_mph=i.set_speed / MS_PER_MPH, vEgo_mph=v / MS_PER_MPH,
-                map_ok=self.brake_map_ok, road_class=int(i.road_class), gps_trust=int(i.gps_trust))
+                map_ok=self.map_ok(i), road_class=int(i.road_class), gps_trust=int(i.gps_trust))
 
 
 def enabled(CP, params):
@@ -413,11 +443,11 @@ class AutoResume:
   """Card-side wrapper: reads starpilotPlan (the map guard) and selfdriveState (openpilot's no-entry), feeds the logic,
   builds the CAN frame and writes the feature events (autoResumeArmed / autoResumeSent / autoResumeRefused)."""
   COLUMNS = ["vEgo_mph", "gas", "brake", "cruise", "set_mph", "state", "lat", "calm", "road_class", "gps_trust",
-             "map_gap", "dist", "set_allowed", "not_allowed", "engageable", "wait", "sent"]
+             "road_age", "dist", "set_allowed", "not_allowed", "engageable", "wait", "sent"]
 
   def __init__(self, CP, params):
     import cereal.messaging as messaging
-    self.sm = messaging.SubMaster(['starpilotPlan', 'selfdriveState'])
+    self.sm = messaging.SubMaster(['starpilotPlan', 'selfdriveState', 'radarState', 'mapdOut'])
     try:
       self.is_metric = bool(params.get_bool("IsMetric"))
     except Exception:
@@ -476,6 +506,11 @@ class AutoResume:
     angle = float(getattr(out, "steeringAngleDeg", 0.0) or 0.0)
     yaw_rate = math.degrees(max(v, 0.0) * math.tan(math.radians(angle) / self.ratio) / self.wheelbase)
     busy = self.slowdown_busy(slowdown)
+    lead = self.sm['radarState'].leadOne if self._alive('radarState') else None
+    try:
+      road_name = str(self.sm['mapdOut'].roadName or "") if self._alive('mapdOut') else ""
+    except (KeyError, AttributeError):
+      road_name = ""
     gear = getattr(out, "gearShifter", None)
     i = AutoResumeInputs(
       cruise_enabled=bool(out.cruiseState.enabled), cruise_available=bool(out.cruiseState.available),
@@ -487,7 +522,9 @@ class AutoResume:
       wheel_set=bool(getattr(CS, "crz_set_plus", False) or getattr(CS, "crz_set_minus", False)),
       set_allowed=bool(getattr(CS, "crz_set_allowed", False)), not_allowed=bool(getattr(CS, "crz_not_allowed", False)),
       op_cancel=bool(CC.cruiseControl.cancel), cancel_sent=bool(cancel_sent), other_button_active=bool(CC.cruiseControl.resume),
-      plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0,
+      plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0, road_name=road_name,
+      lead_status=bool(lead is not None and lead.status), lead_d=float(lead.dRel) if lead is not None else 0.0,
+      lead_v=float(lead.vLead) if lead is not None else 0.0, can_valid=bool(getattr(out, "canValid", False)),
       gps_trust=self._trust(plan) if plan_alive else 4, engageable=engageable,
       slowdown_busy=busy, btn_counter=int(getattr(CS, "crz_btns_counter", -1)),
       is_metric=self.is_metric)
@@ -508,7 +545,7 @@ class AutoResume:
       if self.frame % 10 == 0 or button is not None:
         self.recorder.add_row(t, (round(i.v_ego / MS_PER_MPH, 2), int(i.gas_pressed), int(i.brake_pressed),
                                   int(i.cruise_enabled), round(i.set_speed / MS_PER_MPH, 1), lg.state, round(lg.lat, 2),
-                                  lg.calm_frames, i.road_class, i.gps_trust, round(lg.map_gap, 1), round(lg.dist, 1),
+                                  lg.calm_frames, i.road_class, i.gps_trust, round((lg.frame - lg.road_frame) * DT_CTRL, 1), round(lg.dist, 1),
                                   int(i.set_allowed), int(i.not_allowed), int(i.engageable), lg.wait_why,
                                   button or ""))
       for kind, data in lg.events:

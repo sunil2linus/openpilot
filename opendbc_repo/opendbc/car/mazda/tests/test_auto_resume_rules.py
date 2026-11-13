@@ -101,7 +101,7 @@ def run(monkeypatch, tmp_path, who, stored_mph, plan_fn, frames=6000, brake_at=1
     out = SimpleNamespace(cruiseState=SimpleNamespace(enabled=on, available=True, speed=car.set_speed), vEgo=car.v_ego,
                           aEgo=0.0, gasPressed=gas, brakePressed=brake, standstill=car.v_ego < 0.1, leftBlinker=False,
                           rightBlinker=False, steeringPressed=False, steeringAngleDeg=0.0, steeringRateDeg=0.0,
-                          gearShifter=DRIVE, doorOpen=False, seatbeltUnlatched=False)
+                          gearShifter=DRIVE, doorOpen=False, seatbeltUnlatched=False, canValid=True)
     CS = SimpleNamespace(out=out, crz_set_minus=False, crz_set_plus=False, crz_cancel=False, crz_resume=his_res,
                          crz_btns_counter=(fr // 10) % 16, radar_has_lead=False, radar_lead_distance=0,
                          crz_set_allowed=not brake, crz_not_allowed=False)
