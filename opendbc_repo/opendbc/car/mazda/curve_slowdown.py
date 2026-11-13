@@ -1088,8 +1088,7 @@ class CurveSlowdownLogic:
       before = self.anchor
       self._forget()
       self.blocked = True
-      if not getattr(self, "own_engage", False):    # (auto_resume.py: our SET- engaged it, not his press)
-        self._log_driver(direction, n, before, "after_gap")
+      self._log_driver(direction, n, before, "after_gap")
     elif one_step:
       # A single unexplained step is a driver tap (or the driver's tap matched our pending
       # press first and this is our own press landing). No more lowering for this curve.

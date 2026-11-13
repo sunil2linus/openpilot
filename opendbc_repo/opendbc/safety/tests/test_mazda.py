@@ -208,14 +208,14 @@ class AutoResumeTests(AutoResumeHelpers):
       self.assertFalse(self._tx(self._btn(b)))
     self._brake_cancel()
     self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
-    self.assertTrue(self._tx(self._btn(Buttons.SET_MINUS)))
     self.assertTrue(self._tx(self._btn(Buttons.CANCEL)))
 
-  def test_set_plus_never(self):
+  def test_set_plus_and_set_minus_never(self):
     self._brake_cancel()
     for _ in range(10):
       self.assertFalse(self._tx(self._btn(Buttons.SET_PLUS)))
-    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))     # (SET+ did not use the budget)
+      self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))     # (they did not use the budget)
 
   def test_needs_the_gas_and_no_brake(self):
     self._brake_cancel()

@@ -115,10 +115,8 @@ class CarController(CarControllerBase):
 
       if self.curve_slowdown is not None:
         try:
-          # (auto resume) never both sending: ours going or just gone holds the slowdown's presses back, and it is told
-          # when the cruise came on by our RES / SET- (not his press)
+          # (auto resume) never both sending: ours going or just gone holds the slowdown's presses back
           ours = self.auto_resume is not None and self.auto_resume.busy
-          self.curve_slowdown.logic.own_engage = bool(self.auto_resume is not None and self.auto_resume.logic.own_engage)
           other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume or ours)
           can_sends.extend(self.curve_slowdown.update(CC, CS, self.packer, self.CP, other_button_active))
         except Exception:
