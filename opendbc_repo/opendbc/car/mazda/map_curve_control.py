@@ -79,11 +79,11 @@ try:
   from opendbc.car.mazda.curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
                                               END_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET,
                                               MAP_START_GAP, MAP_LEAD_TIME, MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME,
-                                              MAP_ROAD_ACCEL_TAU)
+                                              MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
 except ImportError:          # offline tests load this file directly
   from curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP, END_GAP,
                             MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET, MAP_START_GAP, MAP_LEAD_TIME,
-                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU)
+                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
 
 MPH = 0.44704
 KPH = 1 / 3.6
@@ -156,6 +156,7 @@ LINK_HOLD = 0.5                 # s
 # motorway / trunk link (these only join a motorway or a trunk). A street slip lane keeps the Max Drop floor.
 HIGHWAY_LINK_CLASSES = (2, 4)
 TRUST_LOW = 2                   # starpilotPlan.mapGpsTrust (map_curves.TRUST_LOW): another road close by, or worse
+TRUST_PAUSED = 3                # ... 3 / 4: GPS paused (no fixes)
 
 # ---- navigation exits (ExitPlan) ----
 NAV_PLAN_EXITS = (1, 2)         # starpilotPlan.mapNavExit: matched on the map, with or without curves (3, no data: no plan)
@@ -276,6 +277,26 @@ HWY_MATCH_STAY = 2.0            # s
 # firm slowdown holds the set speed far below it on purpose.)
 GAS_OVERTURN_TIME = 1.5         # s
 GAS_OVERTURN_GAIN = 3 * MPH     # m/s
+# Owner (round L; drive 6f t 776.9: his gas 30 m past the split, the exit still tentative, declined the exit; the restore
+# went 47 -> 64 and he braked from 57 mph 57 m before a 35 mph curve): when navigation's route takes this exit (it still
+# announced it DECIDE_NEAR or closer, ExitPlan.nav_near), his gas alone never declines it from DECIDE_NEAR on, nor overturns
+# a confirmation (it still pauses our presses while pressed; his SET buttons still make the speed his). The other signal,
+# a lane change away and the missed exit test (the shapes / the trusted road match saying "highway") still do, and so does
+# his gas held (GAS_OVERTURN_*) together with the road match on the highway with GPS trusted HWY_MATCH_STAY past the split
+# (the re-review's false "link" then silence on the highway).
+NAV_GAS_KEEPS = True
+# Review of round L (s1c.py: GPS weak past the split, the shapes said "link" for ~60 m then went silent: confirmed, and his
+# gas held no longer overturned it, 81 -> 39 mph on the highway): his gas held still overturns a confirmation that is not
+# settled, has no trusted link match, and whose last "link" answer is more than GAS_QUIET_LINK m behind. And (s1b.py: the
+# shapes silent past the split, his gas held: the plan ran on to EXIT_PASS_MARGIN and adopted 71 under his 80) his gas held
+# past the split with no "link" answer since is his decision at EXIT_PASS_MARGIN: his speed back, not adopted.
+# (Re-review R1, rl/s1d.py: a real exit with GPS paused past the split and his foot lightly on the gas at +20..+120 m was
+# ended at +250 m and fast-restored on the ramp, 56-70 mph at an 85 m curve: only while fixes arrive (not GPS paused),
+# and back by the usual taps, no fast restore.)
+GAS_QUIET_LINK = 40.0           # m
+# navigation no longer announcing the exit (a cancel, a reroute to another exit) farther than this before its exit point:
+# its route does not take it (nav_near off). Closer, it is the usual clearing at the split (drive 53: 46 m and 9 m before)
+NAV_NEAR_CLEAR = 80.0           # m
 
 # ---- the camera's view of our lane (LaneView) ----
 # modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
@@ -549,10 +570,16 @@ class ExitPlan:
     self.grace = 0.0              # s navigation has not shown it (far from it)
     self.seen_shape = False       # the planner gives the shape check
     self.why = ""                 # how it ended (logs)
+    self.nav_near = False         # navigation still announced it DECIDE_NEAR or closer: its route takes it (NAV_GAS_KEEPS)
+    self.link_odo = None          # the control's odometer at the shapes' last "link" answer (GAS_QUIET_LINK)
+    self.gas_past = False         # his gas held (GAS_OVERTURN_*) past the split with no "link" answer since
+    self.nav_miss_s = 0.0         # s navigation has not announced it near it (NAV_NEAR_CLEAR)
     self.update_nav(odo, f)
 
   def update_nav(self, odo, f):
     self.exit_at = odo + f.nav_exit_distance + self.start_off
+    if f.nav_exit_distance + self.start_off <= DECIDE_NEAR:
+      self.nav_near = True
     if f.nav_exit_side:
       self.side = f.nav_exit_side
     if f.nav_curve_radius > 0:
@@ -623,7 +650,7 @@ class MapCurveControl:
     self.street_limit_max = STREET_LIMIT_MAX[m] * self.unit
     self.street_floor = RAMP_FLOOR   # (curve_slowdown.MIN_SET_SPEED: the controller never goes under it for a curve target)
     self.curve = MapCurveTarget(lat_accel, decel)
-    self.follower = MapCurveFollower(firm=True)          # (firm only for a ramp curve, see update)
+    self.follower = MapCurveFollower(firm=True, lead_time=MAP_RAMP_LEAD_TIME)   # (firm only for a ramp curve, see update)
     self.road_follower = MapCurveFollower(undershoot=MAP_ROAD_UNDERSHOOT, lead_time=MAP_ROAD_LEAD_TIME, closed_loop=True)
     self.a_f = None                 # the car's acceleration, filtered (MAP_ROAD_ACCEL_TAU), for the road follower
     self.nav = MapCurveTarget(lat_accel, decel)
@@ -715,6 +742,13 @@ class MapCurveControl:
     """Adopt / follow / drop the plan from navigation's exit."""
     p = self.plan
     announced = f.nav_exit in NAV_PLAN_EXITS and f.nav_exit_distance > 0 and not on_link
+    if p is not None and p.nav_near and p.exit_at - self.odo > NAV_NEAR_CLEAR and not (announced and p.same(self.odo, f)):
+      # (NAV_NEAR_CLEAR) cancelled, or another exit, for NAV_GRACE (a one-frame drop is not): not navigation's route
+      p.nav_miss_s += DT_CTRL
+      if p.nav_miss_s >= NAV_GRACE - 1e-6:
+        p.nav_near = False
+    elif p is not None:
+      p.nav_miss_s = 0.0
     if announced:
       if p is not None and p.same(self.odo, f):
         p.update_nav(self.odo, f)
@@ -775,6 +809,8 @@ class MapCurveControl:
       if rem < -QUIET_FROM:
         p.answered = True
     p.link_s = p.link_s + DT_CTRL if (f.exit_shape == 2 and rem <= EXIT_EARLY) else 0.0
+    if f.exit_shape == 2:
+      p.link_odo = self.odo
     p.hwy_s = p.hwy_s + DT_CTRL if (f.exit_shape == 1 and rem < 0) else (0.0 if f.exit_shape == 2 else p.hwy_s)
     # the model path (ModelPath): "link" / "highway" on consecutive answers
     mv = self.model_v = self.model.verdict(f)
@@ -808,6 +844,20 @@ class MapCurveControl:
       p.gas_v0 = v_ego
     p.gas_s = p.gas_s + DT_CTRL if gas else 0.0
     gas_firm = gas and (p.gas_s >= GAS_OVERTURN_TIME - 1e-6 or v_ego > p.gas_v0 + GAS_OVERTURN_GAIN)
+    # (NAV_GAS_KEEPS) navigation's route takes it: his gas alone is not his decision from DECIDE_NEAR on; held, with the
+    # trusted road match on the highway past the split, it still is
+    nav_keep = NAV_GAS_KEEPS and p.nav_near and rem <= DECIDE_NEAR
+    gas_hwy = gas_firm and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6
+    # (GAS_QUIET_LINK) no "link" answer for GAS_QUIET_LINK m (none at all past the split counts from the exit point)
+    link_quiet = self.odo - (p.link_odo if p.link_odo is not None else p.exit_at) > GAS_QUIET_LINK
+    gas_quiet = p.confirmed and not p.settled and not link_match and link_quiet
+    gas_decides = not nav_keep or gas_hwy or (gas_firm and gas_quiet)
+    if gas_firm and rem < 0 and not p.confirmed and link_quiet and not link_match:
+      p.gas_past = True
+    elif f.exit_shape == 2 or link_match:
+      p.gas_past = False
+    if f.gps_trust >= TRUST_PAUSED:
+      p.gas_past = False      # (re-review R1, rl/s1d.py) a GPS pause: the "exit lost" hold governs, not his gas
     stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
@@ -828,9 +878,9 @@ class MapCurveControl:
       # keep-left signal or a lane change on a 2-lane ramp restored the speed: E1 35-49 mph into its 32 mph curve)
       model_hwy = not_link and m_hwy >= EXIT_STAY_TIME - 1e-6
       why = ("still on the highway" if (stayed or model_hwy) else
-             "gas" if gas_firm else
+             "gas" if (gas_firm and gas_decides) else
              "" if not not_link else
-             "gas" if gas else
+             "gas" if (gas and gas_decides) else
              "the other signal" if (signal and side and signal == -side) else
              "lane change away" if (side and self.lane.change == -side) else "")
       if why:
@@ -859,7 +909,7 @@ class MapCurveControl:
         # permanent decline there, then back into the exit lane, took E1 at 71 mph into its 32 mph curve)
         p.declined = not (rem > DECIDE_NEAR)
         self._end_slowing(p, restore=True)
-    if gas and (decide or (rem <= 0 and gas_firm)) and not p.declined:
+    if gas and (decide or (rem <= 0 and gas_firm)) and not p.declined and gas_decides:
       p.declined = True
       self._end_slowing(p, restore=True)
     # missed: past the exit point the shapes say "highway" (fast restore); with no shape answer (an older planner, a GPS
@@ -869,6 +919,9 @@ class MapCurveControl:
       self._end("missed", restore=True)
       return none
     if rem < -EXIT_PASS_MARGIN:
+      if p.gas_past and not p.declined:
+        self._end("not confirmed, his gas")   # (GAS_QUIET_LINK) his speed back by the usual taps, not adopted
+        return none
       if rem < -EXIT_LOST_MAX or p.last_cmd is None or p.declined:
         # (final review: adopted 20-50 mph under his speed) matched to a highway then (GPS trusted): his speed back
         # (the usual taps, no fast restore); else the held set speed becomes his
@@ -1102,8 +1155,12 @@ class MapCurveControl:
     # a road curve is never planned below the driver's Curve Max Drop (the controller would not go there anyway, and
     # planning for a lower speed only starts the slowdown earlier than that speed needs)
     floor = max(driver_speed - max_drop, 0.0) if (road_curve and max_drop > 0) else 0.0
+    # (round L) a ramp curve (status 2): MAP_RAMP_LEAD_TIME, the cruise's reaction at the car's own speed (map_curve_speed
+    # takes the curve's speed when higher), not his set speed; a road curve as before
+    ramp_st = f.status == STATUS_RAMP_CURVE
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
-                              lead_time=MAP_ROAD_LEAD_TIME if road_curve else MAP_LEAD_TIME)
+                              lead_time=MAP_ROAD_LEAD_TIME if road_curve else (MAP_RAMP_LEAD_TIME if ramp_st else MAP_LEAD_TIME),
+                              reaction_speed=v_ego if (ramp_st and v_ego > 0) else None)
     ramp_curve = a and f.status == STATUS_RAMP_CURVE and (f.on_ramp or onramp)
     speed, why = NO_CURVE, ""
     if a:

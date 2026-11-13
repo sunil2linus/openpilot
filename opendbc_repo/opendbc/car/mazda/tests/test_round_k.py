@@ -445,6 +445,24 @@ def test_a_90_degree_turn_peaking_at_3_4_then_straight_starts_about_a_second_aft
     if ok and ok_at is None:
       ok_at = t
   straight = next(f * 0.01 for f in range(300) if 3.4 * math.sin(math.pi * f * 0.01 / 3.0) < 1.0 and f > 150)
+  # (round L, cs.MERGE_TURN_UNWIND) the wheel unwinding fast: ok once |lat| is under MERGE_TURN_UNWIND_LAT on the way out
+  unwound = next(f * 0.01 for f in range(300) if 3.4 * math.sin(math.pi * f * 0.01 / 3.0) < cs.MERGE_TURN_UNWIND_LAT and f > 150)
+  assert ok_at is not None and unwound - 0.02 <= ok_at <= unwound + 0.05, (ok_at, unwound)
+  # the calm path alone (the unwind path off): about a second after the wheel is straight, as before
+  old = cs.MERGE_TURN_UNWIND
+  try:
+    cs.MERGE_TURN_UNWIND = False
+    gate, prev, ok_at = cs.MergeTurnGate(), 0.0, None
+    for f in range(600):
+      t = f * 0.01
+      lat = 3.4 * math.sin(math.pi * t / 3.0) if t < 3.0 else 0.0
+      a = _angle_for(lat, v)
+      ok, _ = gate.update(v, a, (a - prev) / 0.01, WB)
+      prev = a
+      if ok and ok_at is None:
+        ok_at = t
+  finally:
+    cs.MERGE_TURN_UNWIND = old
   assert ok_at is not None and 3.0 + 0.0 <= ok_at <= 3.0 + 1.0 and ok_at >= straight + 1.0 - 0.02, (ok_at, straight)
 
 

@@ -2580,11 +2580,13 @@ def test_drive_54_road_curves_slow_later_and_less_ramps_and_exits_unchanged():
   # further SET- while the car already slows as hard as the room left needs
   ctl = CTL.MapCurveControl(3.0)
   assert _near(ctl.road_follower.undershoot, 1 * MPH) and _near(ctl.road_follower.lead_time, 0.5) and ctl.road_follower.closed_loop
-  for fol in (ctl.follower, ctl.nav_follower):                  # ramp curves and exits keep theirs
-    assert _near(fol.undershoot, CT.MAP_UNDERSHOOT) and _near(fol.lead_time, CT.MAP_LEAD_TIME) and not fol.closed_loop
-  assert _near(CT.MAP_UNDERSHOOT, 5 * MPH) and _near(CT.MAP_LEAD_TIME, 1.0)
+  # ramp curves and exits keep theirs (round L: a ramp curve's lead time is MAP_RAMP_LEAD_TIME, test_round_l)
+  for fol, lead in ((ctl.follower, CT.MAP_RAMP_LEAD_TIME), (ctl.nav_follower, CT.MAP_LEAD_TIME)):
+    assert _near(fol.undershoot, CT.MAP_UNDERSHOOT) and _near(fol.lead_time, lead) and not fol.closed_loop
+  assert _near(CT.MAP_UNDERSHOOT, 5 * MPH) and _near(CT.MAP_LEAD_TIME, 1.0) and _near(CT.MAP_RAMP_LEAD_TIME, 0.5)
   # the car side's road plan and the planner's agree (the notice and the slowdown start together)
   assert _near(MC.PLAN_ROAD_LEAD_TIME, CT.MAP_ROAD_LEAD_TIME) and _near(MC.PLAN_LEAD_TIME, CT.MAP_LEAD_TIME)
+  assert _near(MC.PLAN_RAMP_LEAD_TIME, CT.MAP_RAMP_LEAD_TIME)
   _, sp = ctl.curve.update(91.0, 300.0, 20.0, 0.0, ctl.decel, floor=15.6, lead_time=CT.MAP_ROAD_LEAD_TIME)
   assert abs(MC.plan_speed(91.0, 300.0, 0.0, 20.0, decel=ctl.decel, floor=15.6, lead_time=MC.PLAN_ROAD_LEAD_TIME) - sp) < 1e-9
   # the measured cruise: at the curve's speed closer to the entry than with the old 1 s lead (46 m there), still at it

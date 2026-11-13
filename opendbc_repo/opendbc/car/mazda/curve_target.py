@@ -135,6 +135,9 @@ MAP_LATERAL_ACCEL = 2.2       # m/s^2: map curves are planned at most at this (r
 # 5-9 mph under the speed: the car slowed 0.4-0.8 m/s^2 and entered an 85 m exit curve at 38-39 mph for 31).
 MAP_DECEL = 0.45              # m/s^2: what a 5-6 mph set speed gap gives on this cruise (6-8 mph: 0.66 m/s^2 measured)
 MAP_LEAD_TIME = 1.0           # s: be at the curve's speed this long before its entry (slow before the curve, not in it)
+# Round L: ramp curves (on a ramp, or an on-ramp's first curve ahead) 0.5 s, the planner's map_curves.PLAN_RAMP_LEAD_TIME
+# (navigation exits keep MAP_LEAD_TIME: their split / chime planning is built on it)
+MAP_RAMP_LEAD_TIME = 0.5      # s
 MAP_REACTION_TIME = 1.5       # s: the stock cruise starts slowing about this long after a SET- press
 ADVISORY_OVER = 10 * MS_PER_MPH  # m/s: never more than this over a yellow advisory sign the map has for the curve
 # map curves start at the first 1 mph step (the map does not flicker, and a later start would need a bigger, quicker
@@ -244,8 +247,11 @@ class MapCurveTarget:
     self.active = False
     self.speed = NO_CURVE
 
-  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None, floor=0.0, lead_time=MAP_LEAD_TIME):
-    self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory, reaction_speed=driver_speed,
+  def update(self, radius, distance, driver_speed, advisory=0.0, decel=None, floor=0.0, lead_time=MAP_LEAD_TIME,
+             reaction_speed=None):
+    """reaction_speed: the speed the cruise's reaction time is counted at (None: the driver's speed)."""
+    react = driver_speed if reaction_speed is None else reaction_speed
+    self.speed = map_curve_speed(radius, distance, self.lat_accel, advisory, reaction_speed=react,
                                  decel=self.decel if decel is None else decel, floor=floor, lead_time=lead_time)
     if not self.active:
       self.active = radius > 0 and self.speed <= driver_speed - MAP_START_GAP
