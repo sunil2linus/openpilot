@@ -235,12 +235,13 @@ def test_wrapper_counts_the_exit_plan_on_through_a_planner_gap_and_passes_the_ga
   _drive(c, 100, v_mph=44)
   moved = 44 * MPH * 100 * cs.DT_CTRL
   assert abs(c.map_control.exit_rem - (rem - moved)) < 1e-3, (c.map_control.exit_rem, rem - moved)
-  # planner back, near the exit point, his foot on the gas: his decision (the exit slowing ends)
+  # planner back, near the exit point, his foot on the gas: passed on (round L, NAV_GAS_KEEPS: navigation's route takes
+  # this exit, so his gas alone does not decline it)
   sm.alive["starpilotPlan"] = True
   c.update(W.CC, W.car_state(44, 45), None, None, False)
-  assert not c.map_control.plan.declined
+  assert not c.map_control.plan.declined and c.map_control.plan.gas_s == 0.0
   c.update(W.CC, W.car_state(44, 45, gas=True), None, None, False)
-  assert c.map_control.plan.declined
+  assert c.map_control.plan.gas_s > 0.0 and not c.map_control.plan.declined
 
 
 def _lane_model(m, right_edge=True):

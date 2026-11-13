@@ -297,6 +297,15 @@ MERGE_RED_STUCK_PLAN_GONE = 2.0  # s without a stop planned by the model
 RESUME_RESTORE = True
 RED_STOP_BLOCK_MAX = 20.0     # s with cruise on (stopped_car_slowdown.RED_RELEASE_HOLD_MAX): a stuck flag blocks no longer; gas overrides
 RESUME_RESTORE_MAX = 60.0     # s
+# Round L (drive 6f t 777-782: his gas past an exit's split declined it, the fast restore then went 47 -> 64 with 5 SET+
+# taps under the stop-light detector, into a 35 mph curve): round k's "no SET+ back up under a red light" covered only
+# the restore from one of our stop slowdowns (stop_episode) and gave way to the gas. Now no SET+ of ours back up from any
+# lowering (the fast restore / restore_pending, the restore after a reason ended, the restore on his gas, a curve's own
+# raise inside it, a restore hold already going) while the detector is on as the stop trigger sees it (red_stop: its
+# red_ok, not on a highway at highway speed nor on a ramp onto one), for at most RED_STOP_BLOCK_MAX of it with cruise on,
+# his gas included (it only pauses: the restore goes on once the light is gone). A merge boost's way up keeps its own
+# rule (MERGE_RED_PAUSE, MERGE_RED_STUCK).
+RED_NO_RESTORE_UP = True
 RAMP_START_FORGET = True
 MERGE_TURN_LAT = 1.0          # m/s^2 (the architect will tune it from logs; 1.5+ fires mid-loop)
 MERGE_TURN_CALM = 1.0         # s
@@ -485,6 +494,7 @@ class CurveSlowdownLogic:
     self.plan_free_frames = 0        # frames since the model last planned a stop (MERGE_RED_STUCK_PLAN_GONE)
     self.red_stop_frames = 0         # frames with red_stop on and cruise on since it came on (RED_STOP_BLOCK_MAX)
     self.red_block = False           # no SET+ back up from our stop slowdown now (red_stop, RESUME_RESTORE)
+    self.red_up_block = False        # no SET+ back up of ours at all now (red_stop, RED_NO_RESTORE_UP)
     self.set_while_off = False       # the driver pressed SET- with cruise off: cruise engages at a new speed
     self.pending = None              # the newest Press, until it lands or times out
     self.inflight = []               # [Press] not yet (fully) seen on the set speed, oldest first
@@ -1228,6 +1238,9 @@ class CurveSlowdownLogic:
     self.red_stop_frames = (self.red_stop_frames + (1 if cruise_ok else 0)) if i.red_stop else 0
     red_block = i.red_stop and self.red_stop_frames <= _frames(RED_STOP_BLOCK_MAX) and not i.gas_pressed
     self.red_block = red_block
+    # (RED_NO_RESTORE_UP) no SET+ back up of ours under it, his gas or not; a merge boost going up has its own rule
+    self.red_up_block = (RED_NO_RESTORE_UP and i.red_stop and self.red_stop_frames <= _frames(RED_STOP_BLOCK_MAX) and
+                         not (self.boost is not None and "ended" not in self.boost))
     if (RESUME_RESTORE and cruise_ok and self.cruise_gap and self.stop_episode and self.anchor is not None and
         self.last_set_speed is not None and abs(i.set_speed - self.last_set_speed) < self.half_step and
         self.offset > 0 and not i.ramp_start):
@@ -1477,7 +1490,7 @@ class CurveSlowdownLogic:
       reason_gone = ((reason is not None or offset >= 0 or self.boost is None) if boost_hold else
                      (reason != kind or target_rose or (kind == "curve" and not i.curve_hold))) if d == SET_MINUS else \
                     ((reason is not None and not curve_ok) or offset <= 0 or self._ceiling() is not None or
-                     (i.stop_slower_ahead and self.stop_episode))
+                     (i.stop_slower_ahead and self.stop_episode) or (self.red_up_block and self.hold_kind != "boost_up"))
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       hold_max = MERGE_UP_HOLD_MAX if self.hold_kind == "boost_up" else HOLD_MAX_SECONDS
       turn_pause = d == SET_PLUS and self._merge_paused(i) and self.boost is not None and "ended" not in self.boost
@@ -1607,6 +1620,8 @@ class CurveSlowdownLogic:
     # (round k, RESUME_RESTORE) no SET+ back up from one of our stop slowdowns while the stop-light detector is on
     if RESUME_RESTORE and self.red_block and self.stop_episode:
       up_ok = False
+    if self.red_up_block:
+      up_ok = False                    # (RED_NO_RESTORE_UP) every restore's SET+, on the gas too
     if want_lower:
       self.restoring = False
       button = SET_MINUS

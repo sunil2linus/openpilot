@@ -628,11 +628,17 @@ def test_a_missed_exit_restores_the_speed_at_once_and_the_tentative_slowdown_cos
 def test_his_gas_or_the_other_signal_ends_the_exit_slowing_at_once():
   fields, exit_x, curve_x = _e2()
   lane = lambda x: 1 if x >= 1200 else None  # noqa: E731
-  # his foot on the gas 150 m before the split while we slow: the speed comes back (SET+), nothing more before the ramp
+  # his foot on the gas 450 m before the split while we slow (his signal far out): the speed comes back (SET+), nothing
+  # more before the ramp
+  far = lambda x: 0.0 if exit_x - 450 <= x < exit_x - 445 else None  # noqa: E731
+  r = drive_exit(fields, 6000, 75, lane=lane, gas=far, signal=SIGNAL_FAR)
+  p = r["ctl"].plan or r["ctl"].last_plan
+  assert p.declined and _plus(r, exit_x - 450, exit_x) and _minus(r, exit_x - 440, exit_x + 120) == []
+  assert _at(r, exit_x, "sets") >= 74
+  # (round L, CTL.NAV_GAS_KEEPS) 150 m before it, navigation's route taking it: his gas alone no longer declines it
   r = drive_exit(fields, 6000, 75, lane=lane, gas=lambda x: 0.0 if exit_x - 150 <= x < exit_x - 145 else None)
   p = r["ctl"].plan or r["ctl"].last_plan
-  assert p.declined and _plus(r, exit_x - 150, exit_x) and _minus(r, exit_x - 140, exit_x + 120) == []
-  assert _at(r, exit_x, "sets") >= 74
+  assert p.nav_near and not p.declined
   # the other signal near the split (a lane change to the left): the same
   r = drive_exit(fields, 6000, 75, lane=lane, signal=lambda x: -1 if exit_x - 150 <= x < exit_x - 130 else 0)
   assert (r["ctl"].plan or r["ctl"].last_plan).declined and _plus(r, exit_x - 150, exit_x)
@@ -651,7 +657,7 @@ def test_his_gas_or_the_other_signal_ends_the_exit_slowing_at_once():
   ctl.update(fields2(exit_x - 95), 75 * MPH, 1, v_ego=70 * MPH)
   assert not ctl.plan.declined and ctl.plan.signalled
   # a last-minute dive after declining: still confirmed and slowed for on the ramp
-  r = drive_exit(fields, 9000, 75, lane=lane, gas=lambda x: 0.0 if exit_x - 150 <= x < exit_x - 145 else None)
+  r = drive_exit(fields, 9000, 75, lane=lane, gas=far, signal=SIGNAL_FAR)
   conf = [xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed"]
   assert conf and _minus(r, conf[0], curve_x)
 
@@ -805,11 +811,14 @@ def test_review_a_false_confirmation_is_overturned_and_restored_at_once():
   # the model path following the highway: the same (logged only, MODEL_DECIDES)
   r2, _ = _hwy_stay(shape_fn=sh, model=lambda x: 0.0)
   assert r2["presses"] == r["presses"] and r2["ctl"].last_plan.why == "overturned: still on the highway"
-  # his gas after a confirmation by a (wrong) road match, the shapes not saying "link": overturned at once (was: gas held
-  # 300 m still ended at 38)
+  # his gas after a confirmation by a (wrong) road match, the shapes not saying "link": overturned (was: gas held
+  # 300 m still ended at 38). Round L (CTL.NAV_GAS_KEEPS): navigation's route takes the exit, so his gas tap alone does
+  # not; the trusted road match on the highway does, HWY_MATCH_STAY after the wrong link match ended (at 1700)
   match = lambda x: 2 if 1610 <= x < 1700 else 1  # noqa: E731
   r, exit_x = _hwy_stay(shape_fn=lambda x: 0, cls_fn=match, gas=lambda x: 0.0 if 1705 <= x < 1710 else None)
-  assert r["ctl"].last_plan.why == "overturned: gas" and abs(r["sets"][-1] - 78) < 1e-6
+  assert r["ctl"].last_plan.why == "overturned: still on the highway" and abs(r["sets"][-1] - 78) < 1e-6
+  over = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "" and xx > 1700)
+  assert over <= 1700 + CTL.HWY_MATCH_STAY * 78 * MPH + 10, over
   # ... the other signal too
   r, exit_x = _hwy_stay(shape_fn=lambda x: 0, cls_fn=match, signal=lambda x: -1 if 1705 <= x < 1720 else 0)
   assert r["ctl"].last_plan.why == "overturned: the other signal"

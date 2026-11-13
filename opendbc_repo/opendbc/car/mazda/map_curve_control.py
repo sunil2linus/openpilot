@@ -276,6 +276,14 @@ HWY_MATCH_STAY = 2.0            # s
 # firm slowdown holds the set speed far below it on purpose.)
 GAS_OVERTURN_TIME = 1.5         # s
 GAS_OVERTURN_GAIN = 3 * MPH     # m/s
+# Owner (round L; drive 6f t 776.9: his gas 30 m past the split, the exit still tentative, declined the exit; the restore
+# went 47 -> 64 and he braked from 57 mph 57 m before a 35 mph curve): when navigation's route takes this exit (it still
+# announced it DECIDE_NEAR or closer, ExitPlan.nav_near), his gas alone never declines it from DECIDE_NEAR on, nor overturns
+# a confirmation (it still pauses our presses while pressed; his SET buttons still make the speed his). The other signal,
+# a lane change away and the missed exit test (the shapes / the trusted road match saying "highway") still do, and so does
+# his gas held (GAS_OVERTURN_*) together with the road match on the highway with GPS trusted HWY_MATCH_STAY past the split
+# (the re-review's false "link" then silence on the highway).
+NAV_GAS_KEEPS = True
 
 # ---- the camera's view of our lane (LaneView) ----
 # modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
@@ -549,10 +557,13 @@ class ExitPlan:
     self.grace = 0.0              # s navigation has not shown it (far from it)
     self.seen_shape = False       # the planner gives the shape check
     self.why = ""                 # how it ended (logs)
+    self.nav_near = False         # navigation still announced it DECIDE_NEAR or closer: its route takes it (NAV_GAS_KEEPS)
     self.update_nav(odo, f)
 
   def update_nav(self, odo, f):
     self.exit_at = odo + f.nav_exit_distance + self.start_off
+    if f.nav_exit_distance + self.start_off <= DECIDE_NEAR:
+      self.nav_near = True
     if f.nav_exit_side:
       self.side = f.nav_exit_side
     if f.nav_curve_radius > 0:
@@ -808,6 +819,11 @@ class MapCurveControl:
       p.gas_v0 = v_ego
     p.gas_s = p.gas_s + DT_CTRL if gas else 0.0
     gas_firm = gas and (p.gas_s >= GAS_OVERTURN_TIME - 1e-6 or v_ego > p.gas_v0 + GAS_OVERTURN_GAIN)
+    # (NAV_GAS_KEEPS) navigation's route takes it: his gas alone is not his decision from DECIDE_NEAR on; held, with the
+    # trusted road match on the highway past the split, it still is
+    nav_keep = NAV_GAS_KEEPS and p.nav_near and rem <= DECIDE_NEAR
+    gas_hwy = gas_firm and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6
+    gas_decides = not nav_keep or gas_hwy
     stayed = stayed or (not_link and p.hwy_match_s >= HWY_MATCH_STAY - 1e-6 and rem < -EXIT_STAY_MARGIN)
     if not p.confirmed:
       if on_link and f.gps_trust < TRUST_LOW and p.match_s >= LINK_CONFIRM - 1e-6 and rem > EXIT_EARLY + NAV_SAME_MIN:
@@ -828,9 +844,9 @@ class MapCurveControl:
       # keep-left signal or a lane change on a 2-lane ramp restored the speed: E1 35-49 mph into its 32 mph curve)
       model_hwy = not_link and m_hwy >= EXIT_STAY_TIME - 1e-6
       why = ("still on the highway" if (stayed or model_hwy) else
-             "gas" if gas_firm else
+             "gas" if (gas_firm and gas_decides) else
              "" if not not_link else
-             "gas" if gas else
+             "gas" if (gas and gas_decides) else
              "the other signal" if (signal and side and signal == -side) else
              "lane change away" if (side and self.lane.change == -side) else "")
       if why:
@@ -859,7 +875,7 @@ class MapCurveControl:
         # permanent decline there, then back into the exit lane, took E1 at 71 mph into its 32 mph curve)
         p.declined = not (rem > DECIDE_NEAR)
         self._end_slowing(p, restore=True)
-    if gas and (decide or (rem <= 0 and gas_firm)) and not p.declined:
+    if gas and (decide or (rem <= 0 and gas_firm)) and not p.declined and gas_decides:
       p.declined = True
       self._end_slowing(p, restore=True)
     # missed: past the exit point the shapes say "highway" (fast restore); with no shape answer (an older planner, a GPS
