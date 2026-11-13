@@ -289,12 +289,119 @@ class AutoResumeTests(AutoResumeHelpers):
     self.assertFalse(self._tx(self._btn(Buttons.SET_MINUS)))
 
 
-class TestMazdaAutoResumeSafety(AutoResumeTests, TestMazdaTorqueInterceptorSafety):
+class AutoResumeReviewTests(AutoResumeHelpers):
+  """Review of round n (S/rn/mut): the negatives the first tests missed."""
+  def _btn_raw(self, b0):
+    p = self._btn(Buttons.RESUME)
+    p.data[0] = b0
+    return p
+
+  def test_only_res_alone(self):
+    self._brake_cancel()
+    for b0 in (0x24, 0x14, 0x05, 0x84, 0x44, 0x0C, 0x06, 0x20, 0x10):
+      self.assertFalse(self._tx(self._btn_raw(b0)), hex(b0))
+    self.assertTrue(self._tx(self._btn_raw(0x04)))
+
+  def test_init_resets_the_window(self):
+    self._brake_cancel()
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, int(self.SAFETY_PARAM))
+    self._rx(self._crz(0))
+    self._rx(self._engine(50, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_init_with_the_cruise_on_forgets_it(self):
+    # re-init while the cruise is on: the first CRZ_CTRL frame with it off is not a falling edge of this config
+    self._rx(self._crz(1))
+    self._rx(self._engine(50))
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, int(self.SAFETY_PARAM))
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._crz(0))
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._engine(50, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_the_moving_time_never_wraps_around(self):
+    # 71.7 minutes of moving after a brake cancel (a uint32 microsecond count wraps at 71.6 min): still closed
+    self._brake_cancel(kph=30, t=1_000_000)
+    for s in range(2, 4302, 2):              # (4299 s: a wrapped count would read ~4 s)
+      self.safety.set_timer((s * 1_000_000) & 0xFFFFFFFF)   # (the panda's timer wraps too)
+      self._rx(self._engine(30, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_a_brake_with_the_cruise_already_off_opens_nothing(self):
+    # the cruise never on: his brake with CRZ_CTRL frames during it, released, gas
+    self._rx(self._crz(0))
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._crz(0))
+    self._rx(self._crz(0))
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._engine(50, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_a_new_brake_with_crz_frames_never_refills_the_budget(self):
+    self._brake_cancel()
+    for _ in range(8):
+      self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._crz(0))
+    self._rx(self._crz(0))
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._crz(0))
+    self._rx(self._engine(50, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_moving_time_counts_from_a_falling_edge_at_a_later_time(self):
+    t0 = 500                               # s: the brake cancel well into the drive
+    self._brake_cancel(kph=30, t=t0 * 1_000_000)
+    for s in range(1, 180):
+      self.safety.set_timer((t0 + s) * 1_000_000)
+      self._rx(self._engine(30, gas=40))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    for s in range(180, 182):
+      self.safety.set_timer((t0 + s) * 1_000_000)
+      self._rx(self._engine(30, gas=40))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_moving_state_at_the_falling_edge_is_the_cars(self):
+    # standing at the falling edge: the first interval after it is not counted as moving
+    t0 = 100
+    self._brake_cancel(kph=0, t=t0 * 1_000_000)
+    self.safety.set_timer((t0 + 175) * 1_000_000)
+    self._rx(self._engine(0, gas=40))      # 175 s standing (one interval: counted, the window would close)
+    for s in range(176, 184):
+      self.safety.set_timer((t0 + s) * 1_000_000)
+      self._rx(self._engine(30, gas=40))
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_not_with_the_rx_checks_failing(self):
+    self._brake_cancel(t=1_000_000)
+    self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    # ENGINE_DATA / PEDALS stop: 3 s later the RX checks are invalid (gas / brake could be stale)
+    self.safety.set_timer(4_000_000)
+    self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self.safety.safety_config_valid())
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+  def test_res_with_controls_allowed_does_not_use_the_budget(self):
+    self._brake_cancel()
+    self._rx(self._crz(1))
+    for _ in range(20):
+      self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self._rx(self._user_brake_msg(1))
+    self._rx(self._crz(0))
+    self._rx(self._user_brake_msg(0))
+    self._rx(self._engine(50, gas=40))
+    for _ in range(8):
+      self.assertTrue(self._tx(self._btn(Buttons.RESUME)))
+    self.assertFalse(self._tx(self._btn(Buttons.RESUME)))
+
+
+class TestMazdaAutoResumeSafety(AutoResumeReviewTests, AutoResumeTests, TestMazdaTorqueInterceptorSafety):
   """Gen1 + TI with the flag: every test of the classes above runs with it too (nothing else changes)."""
   SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR | MazdaSafetyFlags.AUTO_RESUME
 
 
-class TestMazdaAutoResumeNoTiSafety(AutoResumeTests, TestMazdaSafety):
+class TestMazdaAutoResumeNoTiSafety(AutoResumeReviewTests, AutoResumeTests, TestMazdaSafety):
   """Gen1 without a Torque Interceptor, with the flag (the window does not depend on the TI)."""
   SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.AUTO_RESUME
 

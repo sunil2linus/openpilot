@@ -113,8 +113,9 @@ static void mazda_auto_resume_time(void) {
 
 static bool mazda_auto_resume_allowed(uint8_t button) {
   bool allowed = false;
+  // (review: not with the RX checks failing, gas / brake / cruise could be stale)
   if (auto_resume && gen1 && !no_mrcc && !radar_interceptor && mazda_ar_window && (button == MAZDA_BTN_RES) && acc_main_on &&
-      !brake_pressed && gas_pressed && (mazda_ar_moving_us <= MAZDA_AR_MAX_MOVING_US) &&
+      !brake_pressed && gas_pressed && !safety_rx_checks_invalid && (mazda_ar_moving_us <= MAZDA_AR_MAX_MOVING_US) &&
       (mazda_ar_frames < MAZDA_AR_MAX_FRAMES)) {
     mazda_ar_frames += 1U;
     allowed = true;
@@ -289,8 +290,9 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
       // allow resume spamming while controls allowed, but
       // only allow cancel while controls not allowed (and the auto-resume window's RES, see above)
       bool cancel_cmd = (msg->data[0] == 0x1U);
-      if (!controls_allowed && !cancel_cmd && !mazda_auto_resume_allowed(msg->data[0])) {
-        tx = false;
+      if (!controls_allowed && !cancel_cmd) {
+        // (MISRA 13.5: the check with a side effect, the window's frame budget, is not an operand of &&)
+        tx = mazda_auto_resume_allowed(msg->data[0]);
       }
     }
   }
