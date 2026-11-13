@@ -276,6 +276,11 @@ MERGE_HIGH_GAP = 0.3          # s the flag drops between two alerts (the events 
 # a posted limit raise right after a stop episode's release (the light just went green, the queue moving): taps, the
 # hold only from this long after it (raise_fast)
 RAISE_FAST_AFTER_STOP = 5.0   # s
+# ... not for a merge (limit_boost) after a stop episode that never took the car below MERGE_STOP_ROLLING_SPEED and that
+# he did not brake to a stop in (round L, drive 6f: a camera stop held 30 mph through the on-ramp loop; the light went at
+# 676 and the merge's first SET+ came 5 s later, at the highway): no queue or light it was for is left behind
+MERGE_STOP_ROLLING_SPEED = 15 * MS_PER_MPH   # m/s (stopped_car_slowdown.RED_MIN_SPEED)
+STOPPED_SPEED = 1.0           # m/s: his brake below this is a brake to a stop
 # the merge boost only on the link, or for MERGE_BOOST_HWY onto its highway; a street matched MERGE_BOOST_STREET ends it
 MERGE_BOOST_HWY = 20.0        # s
 MERGE_BOOST_STREET = 1.0      # s
@@ -327,9 +332,38 @@ MERGE_TURN_RATIO = 18.9
 MERGE_TURN_SLIP = 0.001       # s^2/m^2
 MERGE_TURN_CURVE_R = 90.0     # m
 MERGE_TURN_CURVE_D = 60.0     # m
+# Round L (drive 6f, the S Rochester Rd loop: the stop released 1 s before the loop opened, the wheel unwinding -36 -> -8
+# deg over 2 s; the calm gate waited for |lat| < MERGE_TURN_LAT for MERGE_TURN_CALM): the unwind path is ok too: the
+# wheel's |angle| shrinking at MERGE_TURN_UNWIND_RATE or more for MERGE_TURN_UNWIND_TIME, |lat| now under
+# MERGE_TURN_UNWIND_LAT (MERGE_TURN_LAT: with MERGE_TURN_PAUSE_LAT, or 1.2, a long loop easing to 1.1 m/s^2 and tightening
+# again started mid-loop, test_round_k; so the unwind path is the calm path without its MERGE_TURN_CALM wait while the
+# wheel unwinds), no tight ramp curve near (the same check), no map curve under MERGE_TURN_CURVE_R within
+# MERGE_TURN_UNWIND_AHEAD, and the car not slowing (its acceleration, filtered MERGE_TURN_ACCEL_TAU, above
+# MERGE_TURN_UNWIND_DECEL: replay of 12 on-ramp entries, a6l/replay3c.py: drive 65 t 651, a 120 deg turn unwinding to 25
+# deg at 1 m/s^2 of slowing and then a 112 deg turn the other way; the map had no curve there). It stays ok while the wheel
+# goes on unwinding or the turn is calm; a wheel winding up or MERGE_TURN_PAUSE_LAT pauses as before.
+MERGE_TURN_UNWIND = True
+MERGE_TURN_UNWIND_RATE = 8.0  # deg/s
+MERGE_TURN_UNWIND_TIME = 0.3  # s
+MERGE_TURN_UNWIND_LAT = MERGE_TURN_LAT   # m/s^2 (tightened from MERGE_TURN_PAUSE_LAT, see above)
+MERGE_TURN_UNWIND_AHEAD = 100.0   # m
+MERGE_TURN_UNWIND_DECEL = -0.5    # m/s^2
+MERGE_TURN_ACCEL_TAU = 0.3        # s
 # No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
 HWY_ROAD_CLASSES = (1, 3)
 CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
+# Round L (drive 6f, the S Rochester Rd loop onto M-59 E: the on-ramp's first curve governed from 640.8 as an on-ramp ahead
+# (mapOnRampAhead), then the map's curve status went HELD (5) for 2 s at 647.7-649.7 before the link was matched: the curve
+# target dropped, the road was not the link yet, and a camera-only stop under the stop-light detector started at ~649,
+# holding the set at 30 through the loop until the light went at 676; the merge's first SET+ came at 681 with the car at
+# 30 where the ramp met the highway). A map curve target that drops still counts as on for the red light head start
+# (stopped_car_slowdown.RED_IN_CURVE_OFF) for CURVE_ON_HOLD, and the "on a ramp onto a highway" rule for camera-only
+# stops (red_ok) also applies while the governing curve is an on-ramp's first curve before the turn onto it within
+# ONRAMP_RED_OFF_DIST (mapOnRampAhead), and for ONRAMP_RED_OFF_HOLD after that drops. (A stop already running keeps
+# seeing them, as before; a stopped or slower car seen by the radar still counts.)
+CURVE_ON_HOLD = 3.0           # s
+ONRAMP_RED_OFF_DIST = 100.0   # m to the on-ramp's first curve
+ONRAMP_RED_OFF_HOLD = 3.0     # s
 # A restore asked for at once (restore_pending: a stop ahead that cleared, a red light gone) while a followed map curve's
 # target is on: the restore hold (RESTORE_HOLD_MIN_GAIN) runs up to the curve's target with its usual margin below it,
 # then taps (never above the curve's target, see up_ok); before, inside any curve a restore only tapped (drive 54, t
@@ -443,16 +477,33 @@ class MergeTurnGate:
   up."""
   def __init__(self):
     self.calm_frames = 0
+    self.unwind_frames = 0
+    self.unwound = False             # the unwind path said ok (MERGE_TURN_UNWIND), kept while it unwinds or is calm
     self.paused = False
     self.lat = 0.0
+    self.v_prev = None
+    self.a_f = 0.0                   # m/s^2, the car's acceleration filtered (MERGE_TURN_ACCEL_TAU)
 
-  def update(self, v, angle_deg, rate_deg, wheelbase, ramp_curve_near=False):
+  def update(self, v, angle_deg, rate_deg, wheelbase, ramp_curve_near=False, curve_ahead=False):
     self.lat = steer_lateral_accel(max(v, 0.0), angle_deg, wheelbase)
     winding = abs(rate_deg) > MERGE_TURN_RATE and angle_deg * rate_deg > 0
     calm = abs(self.lat) < MERGE_TURN_LAT and not winding and not ramp_curve_near
     self.calm_frames = self.calm_frames + 1 if calm else 0
-    ok = self.calm_frames >= _frames(MERGE_TURN_CALM)
+    if self.v_prev is not None:
+      self.a_f += (max(v, 0.0) - self.v_prev) / DT_CTRL * DT_CTRL / (MERGE_TURN_ACCEL_TAU + DT_CTRL) - \
+        self.a_f * DT_CTRL / (MERGE_TURN_ACCEL_TAU + DT_CTRL)
+    self.v_prev = max(v, 0.0)
+    unwinding = (MERGE_TURN_UNWIND and abs(rate_deg) >= MERGE_TURN_UNWIND_RATE and angle_deg * rate_deg < 0 and
+                 not ramp_curve_near and not curve_ahead)
+    self.unwind_frames = self.unwind_frames + 1 if unwinding else 0
+    if (self.unwind_frames >= _frames(MERGE_TURN_UNWIND_TIME) and abs(self.lat) < MERGE_TURN_UNWIND_LAT and
+        self.a_f > MERGE_TURN_UNWIND_DECEL):
+      self.unwound = True
+    elif not (unwinding or calm):
+      self.unwound = False
+    ok = self.calm_frames >= _frames(MERGE_TURN_CALM) or self.unwound
     if abs(self.lat) >= MERGE_TURN_PAUSE_LAT or winding:
+      self.unwound = False
       self.paused = True
     elif ok:
       self.paused = False
@@ -563,6 +614,8 @@ class CurveSlowdownLogic:
     self.raise_fast_at = None        # frame from which a raise right after a stop episode's release may go fast
     self.resume_restore_frame = None # his RES at our lowered set speed, its fast restore not started yet (RESUME_RESTORE)
     self.stop_off_frame = -1_000_000 # the last frame a stop reason went off
+    self.stop_min_v = 0.0            # m/s: the lowest speed in the last stop episode (MERGE_STOP_ROLLING_SPEED)
+    self.stop_braked = False         # ... and he braked to a stop in it
     self.prev_stop_active = False
     self.restore_in_curve = False    # restore_pending came while a curve target was on (capped by it, see update)
     self.standstill_frames = 0
@@ -1420,6 +1473,12 @@ class CurveSlowdownLogic:
       self.restore_pending = False
     if self.prev_stop_active and not i.stop_active:
       self.stop_off_frame = self.frame
+    if i.stop_active:
+      if not self.prev_stop_active:
+        self.stop_min_v, self.stop_braked = i.v_ego, False
+      self.stop_min_v = min(self.stop_min_v, i.v_ego)
+    if (i.stop_active or self.prev_stop_active) and i.brake_pressed and (i.standstill or i.v_ego < STOPPED_SPEED):
+      self.stop_braked = True
     self.prev_stop_active = i.stop_active
     if self.offset <= 0 or i.stop_active or i.csc_active or self.blocked:
       self.raise_fast = False
@@ -1571,8 +1630,10 @@ class CurveSlowdownLogic:
     # ramp), and only with the steering calm, no red light and not in the post-stop wait (RAISE_FAST_AFTER_STOP)
     merge = i.limit_boost > 0
     raise_ref = set_speed if (merge and RAMP_START_SET_REF) else driver_speed
-    merge_wait = merge and (not i.merge_turn_ok or self._merge_red(i) or
-                            self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP))
+    # (MERGE_STOP_ROLLING_SPEED) a merge after a rolling stop episode: no post-stop wait
+    rolling = merge and self.stop_min_v >= MERGE_STOP_ROLLING_SPEED and not self.stop_braked
+    stop_wait = self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP) and not rolling
+    merge_wait = merge and (not i.merge_turn_ok or self._merge_red(i) or stop_wait)
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
         not i.hold_restore and self.last_set_speed is not None and i.limit_raise > raise_ref + self.half_step and
         not merge_wait and self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
@@ -1585,7 +1646,7 @@ class CurveSlowdownLogic:
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
       # a raise goes up at once, with a SET+ hold when it is far (drive 61: merges 35 -> 70 and a street's 43 -> 48 by
       # slow single taps after an earlier stop episode); right after a stop episode's release taps first (review)
-      if self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP):
+      if not stop_wait:
         self.raise_fast = True
       else:
         self.raise_fast_at = self.stop_off_frame + _frames(RAISE_FAST_AFTER_STOP)
@@ -1979,6 +2040,8 @@ class CurveSlowdown:
     self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
     self.unattributed_high_frames = 0  # an unexplained raise left the set speed high on a highway / link (UNATTRIBUTED_HIGH_*)
     self.curve_on = False            # a curve target (camera or a followed map curve) was on last frame (no red head start)
+    self.map_curve_frames = 0        # frames a map curve target still counts as on after it dropped (CURVE_ON_HOLD)
+    self.onramp_red_frames = 0       # frames camera-only stops stay off for an on-ramp just ahead (ONRAMP_RED_OFF_HOLD)
     self.recorder = None
     self.curve_event = None
     self.stop_event = None
@@ -2151,6 +2214,14 @@ class CurveSlowdown:
       # onramp_now; never before the turn onto it). An exit's link (entered from a highway) keeps them: it may end at a
       # street's light
       if self.map_control is not None and self.map_control.onramp_now:
+        red_ok = False
+      # ... nor just before the turn onto one (ONRAMP_RED_OFF_*: navigation or his signal says this on-ramp)
+      if (self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
+          0.0 <= float(getattr(plan, "mapCurveDistance", 0.0)) <= ONRAMP_RED_OFF_DIST):
+        self.onramp_red_frames = int(ONRAMP_RED_OFF_HOLD / DT_CTRL)
+      elif self.onramp_red_frames > 0:
+        self.onramp_red_frames -= 1
+      if self.onramp_red_frames > 0:
         red_ok = False
     except Exception:
       red_ok = True
@@ -2347,7 +2418,12 @@ class CurveSlowdown:
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
     )
     button, offset = self.logic.update(inputs)
-    self.curve_on = bool(curve_active)
+    # (CURVE_ON_HOLD) a map curve target that drops still counts a while (a HELD flicker before the ramp's link)
+    if self.map_out is not None and self.map_out.active:
+      self.map_curve_frames = int(CURVE_ON_HOLD / DT_CTRL)
+    elif self.map_curve_frames > 0:
+      self.map_curve_frames -= 1
+    self.curve_on = bool(curve_active) or self.map_curve_frames > 0
     try:
       self._unattributed_change(inputs, plan if self._alive('starpilotPlan') else None)
     except Exception:
@@ -2650,13 +2726,16 @@ class CurveSlowdown:
 
   def _merge_turn(self, CS, CP, v_ego, plan):
     """The ramp start's turn gate (MergeTurnGate): (a merge may start, a merge going up pauses)."""
-    from opendbc.car.mazda.map_curve_control import STATUS_RAMP_CURVE
-    ramp_near = bool(plan is not None and int(getattr(plan, "mapCurveStatus", 0) or 0) == STATUS_RAMP_CURVE and
-                     0 < float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) < MERGE_TURN_CURVE_R and
-                     float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) < MERGE_TURN_CURVE_D)
+    from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE
+    status = int(getattr(plan, "mapCurveStatus", 0) or 0) if plan is not None else 0
+    tight = plan is not None and 0 < float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) < MERGE_TURN_CURVE_R
+    dist = float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) if plan is not None else 0.0
+    ramp_near = bool(status == STATUS_RAMP_CURVE and tight and dist < MERGE_TURN_CURVE_D)
+    # (MERGE_TURN_UNWIND) the unwind path: no map curve that tight within MERGE_TURN_UNWIND_AHEAD
+    curve_ahead = bool(status in (STATUS_CURVE, STATUS_RAMP_CURVE) and tight and dist < MERGE_TURN_UNWIND_AHEAD)
     return self.turn_gate.update(v_ego, float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0),
                                  float(getattr(CS.out, "steeringRateDeg", 0.0) or 0.0),
-                                 float(getattr(CP, "wheelbase", 0.0) or 2.7), ramp_near)
+                                 float(getattr(CP, "wheelbase", 0.0) or 2.7), ramp_near, curve_ahead=curve_ahead)
 
   def _street_active(self, plan):
     """speed_limit_follow rules 8 / 9 act (Speed Limit Follow and Map Curves On, the planner's map curves On)."""

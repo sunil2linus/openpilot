@@ -191,3 +191,160 @@ def test_6f_a_set_minus_of_ours_landing_as_a_jump_up_is_ours_and_lowering_goes_o
   # his own SET+ edge then: his (the old rule)
   lg, set_mph, _, _ = _gas_release_run(jump_window=1.0, driver_tap_at=150)
   assert lg.jump_down_claims == 0 and lg.blocked
+
+
+# ---- 3b / 3c: the loop on-ramp's merge after a rolling stop, the unwind path (drive 6f t 676-681) ----
+
+WB = 2.7
+
+
+def _loop_merge(profile, frames=4000, v_min=13.4):
+  """Set 30 on the loop (13.4 m/s), the angle -36 deg, a stop latched (frames 0-2000), released; 1 s later the wheel
+  unwinds as profile(t) gives (t s from the onset, deg). limit_raise 75, limit_boost 20 throughout. Returns the frame of
+  the first SET+ of ours relative to the unwind's onset (s), or None."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  gate = cs.MergeTurnGate()
+  release, onset = 2000, 2100
+  set_mph, prev = 30.0, -36.0
+  lg.update(_inp(set_speed=30 * MPH, v_ego=13.4))
+  for f in range(frames):
+    t = (f - onset) * cs.DT_CTRL
+    ang = -36.0 if t < 0 else profile(t)
+    rate = (ang - prev) / cs.DT_CTRL
+    prev = ang
+    v = v_min if f < release else 13.4
+    ok, pause = gate.update(v, ang, rate, WB)
+    stop = f < release
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v, stop_active=stop, stop_target=30 * MPH,
+                          limit_raise=75 * MPH,
+                          limit_boost=20 * MPH, merge_turn_ok=ok, merge_turn_pause=pause, btn_counter=(f // 10) % 16))
+    if b == cs.SET_PLUS:
+      return t
+  return None
+
+
+def _pw(points):
+  def f(t):
+    for (t0, a0), (t1, a1) in zip(points, points[1:]):
+      if t <= t1:
+        return a0 + (a1 - a0) * (t - t0) / (t1 - t0)
+    return points[-1][1]
+  return f
+
+
+SIXF = _pw([(0.0, -36.0), (0.25, -27.0), (1.0, -20.0), (2.0, -8.0), (3.0, -3.0)])       # as logged (676.9-679.0)
+EVEN = _pw([(0.0, -36.0), (2 / 3, -27.0), (4 / 3, -20.0), (2.0, -8.0), (3.0, -3.0)])
+
+
+def test_6f_loop_merge_starts_as_the_wheel_unwinds_after_a_rolling_stop():
+  # the unwind path (|lat| under MERGE_TURN_UNWIND_LAT = MERGE_TURN_LAT, at -19 deg here, while it unwinds): ~1.1 s after the
+  # onset, the calm path's 1 s wait saved (the analysis asked for 0.5 s, which needs |lat| < 1.5 at -29 deg: that also
+  # starts test_round_k's long loop easing to 1.1 m/s^2 mid-loop)
+  t = _loop_merge(SIXF)
+  assert t is not None and 0.9 <= t <= 1.2, t
+  t = _loop_merge(EVEN)
+  assert t is not None and t <= 1.5, t
+  old = cs.MERGE_TURN_UNWIND
+  try:
+    cs.MERGE_TURN_UNWIND = False
+    t_calm = _loop_merge(SIXF)
+  finally:
+    cs.MERGE_TURN_UNWIND = old
+  assert t_calm is not None and t_calm >= _loop_merge(SIXF) + 0.8, t_calm
+  # (before round L: the calm gate and the post-stop wait, RAISE_FAST_AFTER_STOP from the release: 4 s after the onset)
+  old = (cs.MERGE_TURN_UNWIND, cs.MERGE_STOP_ROLLING_SPEED)
+  try:
+    cs.MERGE_TURN_UNWIND, cs.MERGE_STOP_ROLLING_SPEED = False, 1e9
+    t_old = _loop_merge(SIXF)
+  finally:
+    cs.MERGE_TURN_UNWIND, cs.MERGE_STOP_ROLLING_SPEED = old
+  assert t_old is not None and t_old >= cs.RAISE_FAST_AFTER_STOP - 1.0 - 0.05, t_old
+
+
+def test_the_post_stop_wait_stays_after_a_real_stop_or_his_brake_to_a_stop():
+  # the stop took the car below MERGE_STOP_ROLLING_SPEED (a queue, a light): the 5 s wait as before
+  t = _loop_merge(SIXF, v_min=3.0)
+  assert t is not None and t >= cs.RAISE_FAST_AFTER_STOP - 1.0 - 0.05, t
+
+
+def test_the_unwind_path_needs_the_car_not_slowing_and_no_tight_curve_ahead():
+  def run(decel=0.0, ahead=False, n=180):   # (the calm path alone: from ~2.05 s)
+    g = cs.MergeTurnGate()
+    v, prev, oks = 13.4, -36.0, []
+    for f in range(n):
+      t = f * cs.DT_CTRL
+      a = SIXF(t)
+      v -= decel * cs.DT_CTRL
+      ok, _ = g.update(v, a, (a - prev) / cs.DT_CTRL, WB, False, curve_ahead=ahead)
+      prev = a
+      oks.append(ok)
+    return any(oks)
+  assert run()
+  # drive 65 t 651: a 120 deg turn unwinding while the car slows 1 m/s^2, then a turn the other way: not ok
+  assert not run(decel=1.0)
+  # a map curve under 90 m within 100 m ahead (a loop after a short straight): not ok
+  assert not run(ahead=True)
+  # winding up again pauses
+  g = cs.MergeTurnGate()
+  prev = -36.0
+  for f in range(130):
+    a = SIXF(f * cs.DT_CTRL)
+    ok, pz = g.update(13.4, a, (a - prev) / cs.DT_CTRL, WB)
+    prev = a
+  assert ok
+  ok, pz = g.update(13.4, -16.0, -30.0, WB)
+  assert pz and not ok
+
+
+# ---- 3a: no camera-only stop just before the turn onto an on-ramp, nor through a HELD flicker (drive 6f t 647.7-649.7) ----
+
+def _wrapper(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  spec = importlib.util.spec_from_file_location("twi_round_l", os.path.join(HERE, "test_wrapper_inputs.py"))
+  WI = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(WI)
+  c, sm, _ = WI._make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  seen = []
+  orig = c.trigger.update
+  monkeypatch.setattr(c.trigger, "update", lambda i: (seen.append(i), orig(i))[1])
+  return c, sm, seen, WI
+
+
+def test_6f_no_red_light_stop_just_before_the_on_ramp_and_through_its_held_flicker(tmp_path, monkeypatch):
+  c, sm, seen, WI = _wrapper(tmp_path, monkeypatch)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass = 2, 5            # a street
+  WI._drive(c, 20, set_mph=35, v_mph=32)
+  plan.redLight = True
+  # the on-ramp's first curve governs before the turn onto it (navigation / his signal), 150 m ahead: as before
+  plan.mapOnRampAhead, plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = True, 2, 84.0, 150.0
+  WI._drive(c, 3, set_mph=35, v_mph=32)
+  assert seen[-1].red_light
+  # within ONRAMP_RED_OFF_DIST: no camera-only stop
+  plan.mapCurveDistance = 64.0
+  WI._drive(c, 3, set_mph=35, v_mph=32)
+  assert not seen[-1].red_light and not seen[-1].plan_stop
+  # the map's status HELD (5) for 2 s before the link is matched: still off; ONRAMP_RED_OFF_HOLD later back
+  plan.mapOnRampAhead, plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = False, 5, 212.0, 37.0
+  WI._drive(c, int(2.0 / cs.DT_CTRL), set_mph=35, v_mph=32)
+  assert not any(i.red_light for i in seen[-200:])
+  WI._drive(c, int(1.2 / cs.DT_CTRL), set_mph=35, v_mph=32)
+  assert seen[-1].red_light
+
+
+def test_6f_a_map_curve_target_that_drops_still_counts_for_the_red_head_start(tmp_path, monkeypatch):
+  c, sm, seen, WI = _wrapper(tmp_path, monkeypatch)
+  from opendbc.car.mazda.map_curve_control import MapOutput
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass = 2, 5
+  out = {"mo": MapOutput(active=True, speed=30 * MPH, why="ramp")}
+  monkeypatch.setattr(c.map_control, "update", lambda *a, **k: out["mo"])
+  WI._drive(c, 5, set_mph=35, v_mph=32)
+  assert seen[-1].curve_active
+  out["mo"] = MapOutput()
+  WI._drive(c, int(2.9 / cs.DT_CTRL), set_mph=35, v_mph=32)
+  assert all(i.curve_active for i in seen[-280:])
+  WI._drive(c, int(0.3 / cs.DT_CTRL), set_mph=35, v_mph=32)
+  assert not seen[-1].curve_active
+
