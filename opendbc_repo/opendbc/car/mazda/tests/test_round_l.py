@@ -321,8 +321,11 @@ def test_6f_no_red_light_stop_just_before_the_on_ramp_and_through_its_held_flick
   plan.mapOnRampAhead, plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = True, 2, 84.0, 150.0
   WI._drive(c, 3, set_mph=35, v_mph=32)
   assert seen[-1].red_light
-  # within ONRAMP_RED_OFF_DIST: no camera-only stop
+  # within ONRAMP_RED_OFF_DIST: no camera-only stop (64 m: still as before since the review's 50 m)
   plan.mapCurveDistance = 64.0
+  WI._drive(c, 3, set_mph=35, v_mph=32)
+  assert seen[-1].red_light
+  plan.mapCurveDistance = 40.0
   WI._drive(c, 3, set_mph=35, v_mph=32)
   assert not seen[-1].red_light and not seen[-1].plan_stop
   # the map's status HELD (5) for 2 s before the link is matched: still off; ONRAMP_RED_OFF_HOLD later back
@@ -674,3 +677,28 @@ def test_review_l_f1_nav_near_clears_when_navigation_drops_or_reroutes():
   assert not plan_at(150.0).nav_near                  # cancelled 150 m before the exit point
   assert not plan_at(150.0, other=True).nav_near      # rerouted to an exit farther on
   assert plan_at(20.0).nav_near                       # the usual clearing at the split
+
+
+# ---- review of round L, F3: a red light at a signalled turn onto an on-ramp (Dequindre type): the stop keeps running ----
+
+def test_review_l_f3_a_red_light_stop_started_before_the_on_ramp_keeps_running(tmp_path, monkeypatch):
+  c, sm, seen, WI = _wrapper(tmp_path, monkeypatch)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass = 2, 5
+  WI._drive(c, 20, set_mph=35, v_mph=34)
+  # the light seen 150 m before the turn onto the on-ramp (his signal: mapOnRampAhead), its first curve just past the turn
+  plan.redLight = True
+  plan.mapOnRampAhead, plan.mapCurveStatus, plan.mapCurveRadius = True, 2, 400.0
+  d, log = 150.0, []
+  while d > 0.0:
+    plan.mapCurveDistance = d
+    c.update(WI.W.CC, WI.W.car_state(34, 35), None, None, False)
+    log.append((d, c.trigger.active, seen[-1].red_light))
+    d -= 34 * MPH * cs.DT_CTRL
+  start = next((dd for dd, act, _ in log if act), None)
+  print("stop episode from", start)
+  assert start is not None and start > cs.ONRAMP_RED_OFF_DIST, start
+  # ... and it keeps the light and runs on to the turn (within ONRAMP_RED_OFF_DIST too)
+  assert all(act and red for dd, act, red in log if dd <= start), [x for x in log if x[0] <= start and not (x[1] and x[2])][:3]
+  # without an episode the camera stops stay off within ONRAMP_RED_OFF_DIST (test_6f_no_red_light_stop_...)
+  assert cs.ONRAMP_RED_OFF_DIST == 50.0

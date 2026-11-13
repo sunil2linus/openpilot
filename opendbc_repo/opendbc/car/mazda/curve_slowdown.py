@@ -370,7 +370,7 @@ CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
 # ONRAMP_RED_OFF_DIST (mapOnRampAhead), and for ONRAMP_RED_OFF_HOLD after that drops. (A stop already running keeps
 # seeing them, as before; a stopped or slower car seen by the radar still counts.)
 CURVE_ON_HOLD = 3.0           # s
-ONRAMP_RED_OFF_DIST = 100.0   # m to the on-ramp's first curve
+ONRAMP_RED_OFF_DIST = 50.0    # m to the on-ramp's first curve (review of round L, F3: 100 cut a real light at the turn)
 ONRAMP_RED_OFF_HOLD = 3.0     # s
 # Round L (drive 6f t 624.7-627.3: the street's match on engage raised the set 47 -> 53 with the on-ramp's 30 mph curve
 # ~400 m ahead): no street raise while an on-ramp ahead's curve below the set speed is pending (SlowdownInputs.onramp_pending)
