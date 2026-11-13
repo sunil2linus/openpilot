@@ -11,6 +11,7 @@ ButtonType = structs.CarState.ButtonEvent.Type
 
 STOCK_LKAS_OFF_SPEED = 35 * CV.MPH_TO_MS   # m/s
 STOCK_LKAS_OFF_TIME = 5.0                  # s
+CRZ_INFO_STALE = 20                        # frames (0.2 s; CRZ_INFO comes at 50 Hz): older means "not allowed"
 
 class CarState(CarStateBase):
   def __init__(self, CP, FPCP):
@@ -30,6 +31,8 @@ class CarState(CarStateBase):
     self.radar_lead_distance = 0  # its distance bucket (0-5)
     self.crz_set_allowed = False  # gas auto-resume (auto_resume.py): CRZ_INFO.ACC_SET_ALLOWED, the car would take RES / SET now
     self.crz_not_allowed = False  # ... CRZ_CTRL byte 4 non-zero: the cruise cannot be set (0x0c after P, drive 44 seg 24)
+    self.crz_info_ts = 0          # CRZ_INFO's last parse (ns) and the frames since it changed
+    self.crz_info_age = 10_000
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
@@ -155,7 +158,12 @@ class CarState(CarStateBase):
         # for up to ~10 s at a standstill after it (logs): a "not now", never a disarm. CRZ_CTRL byte 4 is 0 or 0x0c in
         # all logs; 0x0c (from P on, drive 44 seg 17-25) is the state where RES and SET did nothing (no DBC signal: the
         # raw byte, inside NEW_SIGNAL_9).
-        self.crz_set_allowed = cp.vl["CRZ_INFO"]["ACC_SET_ALLOWED"] == 1
+        # (review) CRZ_INFO is registered with frequency 0 (get_can_parsers): it is never part of canValid, so a missing
+        # 0x21B cannot raise a CAN error; instead a value not refreshed for CRZ_INFO_STALE frames reads "not allowed".
+        ts = cp.ts_nanos["CRZ_INFO"]["ACC_SET_ALLOWED"]
+        self.crz_info_age = 0 if (ts and ts != self.crz_info_ts) else self.crz_info_age + 1
+        self.crz_info_ts = ts
+        self.crz_set_allowed = cp.vl["CRZ_INFO"]["ACC_SET_ALLOWED"] == 1 and ts > 0 and self.crz_info_age < CRZ_INFO_STALE
         self.crz_not_allowed = cp.vl_raw["CRZ_CTRL"][4] != 0
 
     # stock lkas should be on
@@ -270,8 +278,12 @@ class CarState(CarStateBase):
     if not (CP.flags & (MazdaSafetyFlags.GEN2 | MazdaSafetyFlags.GEN3)):
       cam_signals.append(("CAM_TRAFFIC_SIGNS", 0))
 
+    pt_signals = []
+    if CP.flags & MazdaSafetyFlags.AUTO_RESUME:
+      # gas auto-resume: CRZ_INFO with frequency 0, as CAM_TRAFFIC_SIGNS: parsed, never in canValid (carstate: stale -> no)
+      pt_signals.append(("CRZ_INFO", 0))
     return {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_signals, 0),
       Bus.body: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_signals, 2),
     }

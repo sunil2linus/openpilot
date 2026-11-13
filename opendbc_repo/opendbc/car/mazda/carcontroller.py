@@ -62,7 +62,7 @@ class CarController(CarControllerBase):
         self.curve_slowdown = None
 
     # Optional: the gas brings the cruise back after his brake (auto_resume.py; MazdaBrakeAutoResume, default off; the
-    # panda allows its RES / SET- only with the flag the car interface sets for it).
+    # panda allows its RES only with the flag the car interface sets for it).
     self.auto_resume = None
     try:
       from opendbc.car.mazda import auto_resume
