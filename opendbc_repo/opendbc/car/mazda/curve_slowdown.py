@@ -283,6 +283,10 @@ BOOST_DOWN_NO_BACKOFF = True
 # highway / the ramp flag drops (SlowdownInputs.merge_taper), one bounded SET- hold takes the set to the target +
 # MERGE_TAPER_OVER (80): never lower before the boost's end (the target - MERGE_BOOST_END, its way down to the target as
 # before), and no SET+ of ours after it.
+# Round P (drive 73 t 1160.7, the loop on-ramp): the camera curve target's release ramp was under the new boosted anchor for
+# one sample and ended the boost in the frame it began (anchor 75 instead of the boost). A curve target ends the boost
+# only once on MERGE_CSC_END with its speed under the target - MERGE_BOOST_END.
+MERGE_CSC_END = 0.5           # s
 MERGE_TAPER = True
 MERGE_TAPER_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
 MERGE_TAPER_OVER = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
@@ -671,6 +675,7 @@ class CurveSlowdownLogic:
     self.prev_radar_lead = False
     self.boost_reopen = None         # {"target", "frame"}: a boost ended for a lead gone in a turn (MERGE_LEAD_GONE_REOPEN)
     self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
+    self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -803,6 +808,7 @@ class CurveSlowdownLogic:
     b = self.boost
     if b is None:
       self.boost_stuck = False
+      self.boost_csc_frames = 0
       return
     tgt = b["target"]
     if (MERGE_LEAD_GONE_REOPEN and "ended" not in b and lead_gone and i.merge_turning and
@@ -817,8 +823,11 @@ class CurveSlowdownLogic:
       b["frame"] += 1                  # (second review) MERGE_BOOST_TIME does not run out while the way up is paused
     # (review) only his SET+ makes the speed his; his SET- above the target lowers it, our restore takes it on down
     his = self.blocked and self.last_driver_edge[SET_PLUS] >= self.last_driver_edge[SET_MINUS]
+    low_curve = i.csc_active and i.csc_speed < tgt - MERGE_BOOST_END
+    self.boost_csc_frames = self.boost_csc_frames + 1 if low_curve else 0
+    csc_end = low_curve and self.boost_csc_frames >= _frames(MERGE_CSC_END)      # (MERGE_CSC_END)
     if "ended" not in b:
-      if (i.v_ego >= tgt - MERGE_BOOST_END or not cruise_ok or self.blocked or i.stop_active or i.csc_active or
+      if (i.v_ego >= tgt - MERGE_BOOST_END or not cruise_ok or self.blocked or i.stop_active or csc_end or
           self._lead_blocks_boost(i) or i.brake_pressed or not i.boost_road_ok or
           self.frame - b["frame"] > _frames(MERGE_BOOST_TIME)):
         if his:
@@ -1588,7 +1597,8 @@ class CurveSlowdownLogic:
     if (i.stop_active or self.prev_stop_active) and i.brake_pressed and (i.standstill or i.v_ego < STOPPED_SPEED):
       self.stop_braked = True
     self.prev_stop_active = i.stop_active
-    if self.offset <= 0 or i.stop_active or i.csc_active or self.blocked:
+    boost_up = self.boost is not None and "ended" not in self.boost     # (a curve blip does not end it: MERGE_CSC_END)
+    if self.offset <= 0 or i.stop_active or (i.csc_active and not boost_up) or self.blocked:
       self.raise_fast = False
       self.raise_fast_at = None
     elif self.raise_fast_at is not None and self.frame >= self.raise_fast_at:

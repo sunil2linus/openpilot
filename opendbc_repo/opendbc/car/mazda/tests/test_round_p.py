@@ -218,3 +218,33 @@ def test_73_exit_46_with_his_signal_the_firm_follow_starts_at_the_split():
   r0, _, _ = _e46(signal_on=False)
   assert "exit signalled" not in r0["why"] and "exit tentative" in r0["why"]
   assert TE._at(r0, curve_x) > v_c + 2.0, (TE._at(r0, curve_x), v_c)
+
+
+# ---- fix 5: a curve target blip does not end the boost in the frame it began (drive 73 t 1160.7, the loop on-ramp) ----
+
+def _blip_run(on_frames, csc_mph=72.8):
+  def inp(f, car, lg):
+    on = f in on_frames
+    return {"csc_active": on, "csc_speed": csc_mph * MPH if on else 0.0}
+  return _boost73(frames=1500, inp=inp)
+
+
+def test_73_a_curve_release_blip_of_0_2_s_under_the_anchor_keeps_the_boost_and_its_hold():
+  car, lg, log = _blip_run(range(53, 73))            # (the merge adopted at frame 50, the blip from 53 for 0.2 s)
+  assert lg.boost is not None and "ended" not in lg.boost
+  assert all(a is None or abs(a / MPH - 90) < 1e-6 for f, *_, a, _ in log if 50 <= f < 1400)
+  ups = [h for h in lg.hold_log if h["direction"] == cs.SET_PLUS]
+  assert ups and ups[0]["frame"] < 120, ups[:1]        # the boost's hold goes on right after the blip
+  assert max(s for _, s, *_ in log) >= 89.5            # ... and the set to the cap
+  # a curve target under the target for MERGE_CSC_END or more still ends it (as before)
+  car, lg, log = _blip_run(range(53, 53 + int(cs.MERGE_CSC_END / DT) + 5))
+  assert lg.boost is None or "ended" in lg.boost
+  assert max(s for _, s, *_ in log) <= 75 + 1e-6
+  # (before round P: ended in the blip's first frame)
+  old = cs.MERGE_CSC_END
+  try:
+    cs.MERGE_CSC_END = 0.0
+    car, lg, log = _blip_run(range(53, 73))
+  finally:
+    cs.MERGE_CSC_END = old
+  assert max(s for _, s, *_ in log) <= 75 + 1e-6
