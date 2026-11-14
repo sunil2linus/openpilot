@@ -2,13 +2,14 @@ import copy
 import json
 import os
 import random
+from types import SimpleNamespace
 from PIL import Image, ImageDraw, ImageFont
 
 from cereal import log, car
 from cereal.messaging import SubMaster
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
-from openpilot.selfdrive.selfdrived.events import Alert, EVENTS, ET
+from openpilot.selfdrive.selfdrived.events import Alert, EVENTS, ET, mazda_cam_fault_alert
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 from openpilot.selfdrive.test.process_replay.process_replay import CONFIGS
 from openpilot.starpilot.common.starpilot_variables import get_starpilot_toggles
@@ -65,7 +66,12 @@ class TestAlerts:
                       ImageFont.truetype(regular_font_path, 66)],
     }
 
-    for alert in ALERTS:
+    # (Mazda, round P) the camera fault notice's texts by kind: lane lines off (1) and the camera's ERR bits (2)
+    measured = list(ALERTS) + [
+      mazda_cam_fault_alert(self.CP, self.CS, {"starpilotCarState": SimpleNamespace(mazdaCamFault=fault)}, False, 100,
+                            log.LongitudinalPersonality.standard, self.starpilot_toggles) for fault in (1, 2)]
+
+    for alert in measured:
       if not isinstance(alert, Alert):
         alert = alert(self.CP, self.CS, self.sm, metric=False, soft_disable_time=100,
                       personality=log.LongitudinalPersonality.standard, starpilot_toggles=self.starpilot_toggles)
