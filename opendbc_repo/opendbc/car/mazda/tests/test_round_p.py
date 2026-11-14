@@ -900,3 +900,10 @@ def test_review_a_taper_with_the_set_still_low_raises_to_the_target_plus_5():
   t70_0 = next(f for f, s, v, *_ in log0 if v >= 70)
   assert t70 is not None and t70 <= t70_0 + 150, (t70, t70_0)       # (was: the set left at 45, 70 mph far later)
   assert max(s for _, s, *_ in log) <= 80 + 1e-6 and abs(car.set_speed / MPH - 75) < 1e-6
+
+
+def test_rereview_n1_res_while_passing_never_takes_the_set_above_his_anchor():
+  # rp_review2/b1_scen.py: our curve lowering 50 -> 45, his brake, RES while passing on the gas at 62: back to his 50
+  for extra in (lambda f, car: {}, lambda f, car: dict(engage_goal=55 * MPH)):
+    car, lg, log = _res_run(45, 62, 50, frames=2500, res=300, gas_until=350, extra=extra)
+    assert max(s for _, s, *_ in log) <= 50 + 1e-6 and abs(car.set_speed / MPH - 50) < 1e-6, max(s for _, s, *_ in log)

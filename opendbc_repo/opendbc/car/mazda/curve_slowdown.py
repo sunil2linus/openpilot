@@ -843,7 +843,10 @@ class CurveSlowdownLogic:
       # another road: his old speed only up to the street's target (or the car's speed when that is unknown)
       goal = min(goal, i.engage_goal if i.engage_goal > 0 else v_up)
     if set_v < v - self._metric_pick(ENGAGE_BELOW):
-      goal = max(goal, v_up if i.engage_goal <= 0 else min(v_up, i.engage_goal))   # never left under the car's speed
+      # never left under the car's speed: on the same road only up to his anchor (re-review N1: passing at 62 with his 50,
+      # RES must not make it 62); after a turn up to the car's speed, bounded by the street's target when known
+      lift = min(v_up, self.anchor) if not i.road_changed else (v_up if i.engage_goal <= 0 else min(v_up, i.engage_goal))
+      goal = max(goal, lift)
     if goal <= set_v + self.half_step:
       return None
     return {"frame": self.frame, "goal": min(goal, self._set_top())}
