@@ -211,13 +211,15 @@ class CarState(CarStateBase):
       # parking-lot speed with cruise off, drive 3a) would only show as weaker steering: flag it once it has
       # lasted STOCK_LKAS_OFF_TIME above STOCK_LKAS_OFF_SPEED (the stock LKAS is on there when healthy).
       # (re-review of round P, N2) latched for the drive once seen; cleared only by the lane lines back for
-      # STOCK_LKAS_OFF_TIME above STOCK_LKAS_OFF_SPEED (under it nothing changes: the camera's lines are not checked there)
+      # STOCK_LKAS_OFF_TIME above STOCK_LKAS_OFF_SPEED (under it the latch holds and the count starts over)
       if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
         if ret.vEgo > STOCK_LKAS_OFF_SPEED:
           lines_off = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
           self.stock_lkas_off_frames = (self.stock_lkas_off_frames + 1) if lines_off == (not self.stock_lkas_off) else 0
           if self.stock_lkas_off_frames >= STOCK_LKAS_OFF_TIME * 100:
             self.stock_lkas_off, self.stock_lkas_off_frames = lines_off, 0
+        else:
+          self.stock_lkas_off_frames = 0     # (third review, T3) the 5 s continuous above it, as before; the latch holds
       ret.invalidLkasSetting = self.lkas_disabled
       self.cam_lkas = cp_cam.vl["CAM_LKAS"]
       self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]

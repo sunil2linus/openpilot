@@ -1036,3 +1036,25 @@ def test_third_review_t2_cleared_only_when_no_fault_is_left():
   assert run(1, 5.0) == ["fault"] and run(2, 5.0) == ["fault"] and run(1, 10.0) == []
   run = mk()                                                # 2 -> 0
   assert run(2, 5.0) == ["fault"] and run(0, 5.0) == ["cleared"]
+
+
+def test_third_review_t3_lines_off_needs_5_s_continuous_above_35_mph():
+  c, ps, packer, Bus, _ = _carstate()
+  t = [5_000_000_000]
+
+  def frames(n, kph, lines):
+    for _ in range(n):
+      a1, d1, _ = packer.make_can_msg("WHEEL_SPEEDS", 0, {"FL": kph, "FR": kph, "RL": kph, "RR": kph})
+      a2, d2, _ = packer.make_can_msg("CAM_LANEINFO", 2, {"LANE_LINES": lines})
+      ps[Bus.pt].update([(t[0], [(a1, d1, 0)])])
+      ps[Bus.cam].update([(t[0], [(a2, d2, 2)])])
+      t[0] += 10_000_000
+      c.update(ps, None)
+  frames(350, 80, 0)
+  frames(100, 30, 0)                                        # under 35 mph: the count starts over
+  frames(350, 80, 0)
+  assert not c.stock_lkas_off
+  frames(200, 80, 0)                                        # 5.5 s continuous: latched
+  assert c.stock_lkas_off
+  frames(300, 30, 3)                                        # under 35 mph the latch holds
+  assert c.stock_lkas_off
