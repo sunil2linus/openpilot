@@ -254,6 +254,16 @@ TENT_DIP_MAX = 8 * MPH          # m/s
 # verified): the short ramp's split speed is planned with these
 TENT_PLAN_DECEL = 0.35          # m/s^2
 TENT_PLAN_CONFIRM = 7.0         # s
+# Round P (drive 73 t 491-524, exit 46: "exit tentative" 498-503 kept the set within TENT_GAP of the speed, ~0.45 m/s^2, the
+# confirmation came 6 s after the split, 41 mph at a 33 mph curve): navigation takes the exit (nav_near) and his signal was
+# toward it before / at the split (signalled): no TENT_GAP / TENT_* bounds, the ramp's own follow (firm when the room needs
+# it) from the split. His decisions still end it as before (the other signal, a lane change away, the shapes / the trusted
+# road match saying "highway", his gas held with the shapes quiet). Not confirmed TENT_HARD_MAX after the split: the
+# tentative rules from there (no more slowing until confirmed; conservative, round P). His signal must have been on within
+# NAV_SIGNAL_NEAR before the split (drive 73: off ~100 m before it; test_exit_plan's false "link" streams with a signal
+# 260-300 m out keep the tentative bounds: a firm slowdown there let a 34 m "link" answer last the confirmation's 1.5 s).
+NAV_SIGNAL_FIRM = True
+NAV_SIGNAL_NEAR = 200.0         # m
 # the firm slowdown after the confirmation as planned for the short ramp's split speed: it takes ~2 s to build up (the
 # SET- hold, the cruise's answer) to its ~0.95-1.0 (drive 53 replay: 0.94 m/s^2 on average from the confirmation to E2's
 # curve), so a little under CHIME_DECEL
@@ -547,6 +557,7 @@ class ExitPlan:
     self.confirmed = False
     self.declined = False         # his decision (gas, the other signal, a lane change away): no exit slowing before the ramp
     self.signalled = False        # he signalled toward the exit (kept: the signal may go off once in the exit lane)
+    self.signal_odo = None        # the control's odometer where his signal toward it was last on (NAV_SIGNAL_NEAR)
     self.chimed = False           # the brake chime before the split
     self.slowing = False          # the slowdown before the split is on
     self.evidence = False         # exit lane evidence (signal toward it, the camera's edge lane) DECIDE_NEAR before it
@@ -895,6 +906,7 @@ class MapCurveControl:
     if signal:
       if side and signal == side and rem > 0:
         p.signalled, p.declined = True, False      # (a new signal toward it takes a decision back)
+        p.signal_odo = self.odo                    # (NAV_SIGNAL_NEAR)
       elif side and signal == -side:
         p.signalled = False                        # (review: one the other way far out kept the old signal)
         if decide:
@@ -1009,7 +1021,10 @@ class MapCurveControl:
       p.tent_s += DT_CTRL
       if p.tent_v0 is None:
         p.tent_v0 = v_ego
-      cmd, sp, v_c, why, fol, _ = self._ramp_command(f, p, driver_speed, v_ego, on_link)
+      cmd, sp, v_c, why, fol, firm = self._ramp_command(f, p, driver_speed, v_ego, on_link)
+      sig_near = p.signal_odo is not None and p.exit_at - p.signal_odo <= NAV_SIGNAL_NEAR
+      if cmd < NO_CURVE and NAV_SIGNAL_FIRM and p.nav_near and p.signalled and sig_near and p.tent_s <= TENT_HARD_MAX:
+        return self._cmd(p, cmd, sp, v_c, "exit signalled", fol, firm)    # (NAV_SIGNAL_FIRM)
       if cmd < NO_CURVE:
         # (no shape answer at all since QUIET_FROM past the split: an answer either way is followed as such); carried on
         # past TENT_MAX only while the model path does not say "highway", never past TENT_HARD_MAX nor TENT_DIP_MAX

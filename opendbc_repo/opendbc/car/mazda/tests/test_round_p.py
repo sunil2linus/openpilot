@@ -1,4 +1,5 @@
 """Round P (drives 72 / 73): the logged scenarios as tests."""
+import dataclasses
 import importlib.util
 import os
 
@@ -182,3 +183,38 @@ def test_the_wrapper_tapers_on_the_highway_match_or_when_the_ramp_flag_drops():
   assert taper(SimpleNamespace(mapRoadClass=1, mapOnRamp=False))               # the highway matched
   w.logic.boost = None
   assert not taper(None) and not w.boost_ramp_seen
+
+
+# ---- fix 3: navigation's exit with his signal toward it: the ramp's follow from the split (drive 73 t 491-524, exit 46) ----
+
+TE = _load("tep_round_p", os.path.join(HERE, "test_exit_plan.py"))
+
+
+def _e46(signal_on=True):
+  """Drive 73, exit 46: 75 set on the 70 highway, the 85 m exit curve (100 m as published, map_curves.RAMP_LAT) 476 m past
+  the split, the shapes saying "link" only 150 m past it, his right signal ~400-60 m before the split."""
+  exit_x, curve_x = 2000.0, 2476.0
+  base = TE.exit_fields(exit_x, curve_x, r=100.0, ann=900.0, clear=10.0, link_at=150.0, ramp_at=190.0, curve_held=200.0)
+  # (navigation's notice had no curve: only the planner's exit curve, so no short ramp split speed; 69 mph at the split)
+  fields = lambda x: dataclasses.replace(base(x), nav_curve_radius=0.0, nav_curve_distance=0.0)  # noqa: E731
+  sig = (lambda x: 1 if exit_x - 400 <= x < exit_x - 60 else 0) if signal_on else None
+  lane = lambda x: 1 if x >= exit_x - 300 else None  # noqa: E731
+  r = TE.drive_exit(fields, 9000, 75, signal=sig, lane=lane)
+  return r, exit_x, curve_x
+
+
+def test_73_exit_46_with_his_signal_the_firm_follow_starts_at_the_split():
+  r, exit_x, curve_x = _e46()
+  v_split = TE._at(r, exit_x)
+  assert 67 <= v_split <= 72, v_split
+  # a firm SET- hold within 0.5 s of the split (was: the tentative TENT_GAP taps, the confirmation 6 s later)
+  f_split = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x)
+  holds = [p for p in r["presses"] if p[0] >= f_split and p[2] == cs.SET_MINUS and p[3] == "hold"]
+  assert holds and holds[0][0] - f_split <= 50, (holds[:1], f_split)
+  assert "exit signalled" in r["why"]
+  v_c = TE._at(r, curve_x)
+  assert v_c <= 35.0, v_c
+  # without his signal: as before (the tentative slowdown, the confirmation later, faster at the curve)
+  r0, _, _ = _e46(signal_on=False)
+  assert "exit signalled" not in r0["why"] and "exit tentative" in r0["why"]
+  assert TE._at(r0, curve_x) > v_c + 2.0, (TE._at(r0, curve_x), v_c)
