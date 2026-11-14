@@ -1071,3 +1071,33 @@ def test_third_review_t4_after_a_turn_onto_an_unknown_street_res_while_passing_t
   car, lg, log = _res_run(45, 62, 50, frames=2500, res=300, gas_until=350, extra=lambda f, car: dict(road_changed=True),
                           stop_episode=True)
   assert max(s for _, s, *_ in log) <= 50 + 1e-6
+
+
+def test_last_review_a_wobbling_own_target_does_not_tap_the_floor_up_and_down():
+  # the curve's own target 30 +- 0.6 (a square wave, 1.2 s), the floor on: at most 2 presses, the set never above own
+  car = T.Car(45, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = 45 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+  presses, over, settled = [], [], None
+  for f in range(3500):
+    kw = {}
+    if 100 <= f < 3400:
+      own = 30.0 + (0.6 if (f // 120) % 2 else -0.6) if f >= 1000 else 30.4
+      fol = 24.4                                                  # (the follower's undershoot: only the floor acts)
+      kw = dict(csc_active=True, csc_speed=fol * MPH, curve_track=True, curve_raise=False, curve_hold=True,
+                curve_floor=min(fol, own) * MPH, curve_budget=60, lkas_keep=min(cs.LKAS_KEEP_SPEED[0], own * MPH))
+      if f >= 1200:
+        over.append(car.set_speed / MPH - own)
+    b, _ = lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego, btn_counter=(f // 10) % 16, stop_clear_ahead=True,
+                          stop_pulling_away=True, **kw))
+    if b is not None:
+      car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
+      if settled is not None and f < 3400:
+        presses.append(b)
+    car.tick()
+    if settled is None and f >= 1000 and car.set_speed / MPH >= 29 - 1e-6:
+      settled = f                                                 # (the raise back up to the floor is done)
+  assert settled is not None and settled < 2000, settled
+  assert len(presses) <= 2, presses
+  assert max(over) <= 1e-6, max(over)

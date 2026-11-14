@@ -744,6 +744,7 @@ class CurveSlowdownLogic:
     self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
     self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"]}
     self.keep_on = False             # the LKAS_KEEP floor acts in this curve (LKAS_KEEP_MARGIN)
+    self.keep_held = None            # ... at the lowest floor seen while on (m/s)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -1810,9 +1811,12 @@ class CurveSlowdownLogic:
         self.keep_on = True
       if keep <= 0 or (self.keep_on and keep < i.v_ego - margin):
         self.keep_on = False             # (T1) the curve tightened under the car: the baseline approach to the new floor
-      targets.append(("curve", max(curve_t, floor, keep if self.keep_on else 0.0)))
+      # (last review of round P) while it is on in this curve the floor only goes down: the lowest seen (a curve's own
+      # target wobbling across a whole mph tapped SET-/SET+ about once a second)
+      self.keep_held = (keep if self.keep_held is None else min(self.keep_held, keep)) if self.keep_on else None
+      targets.append(("curve", max(curve_t, floor, self.keep_held if self.keep_on else 0.0)))
     else:
-      self.keep_on = False
+      self.keep_on, self.keep_held = False, None
     if i.stop_active:
       # (review of round P, B3: a stop, a red light or a stopped car goes under LKAS_KEEP_SPEED in a curve as before)
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
@@ -2005,7 +2009,7 @@ class CurveSlowdownLogic:
       # short ramp: the raise goes on up to it, the anchor bounds it)
       up_ok = False
     # (LKAS_KEEP_MARGIN) the set under the floor once the car is down near it: SET+ taps up to it (bounded by it)
-    keep_t = self._keep_floor(i, driver_speed)
+    keep_t = self.keep_held if (self.keep_on and self.keep_held is not None) else 0.0
     lead_slow = i.radar_lead and (i.lead_v < 0 or i.lead_v < i.v_ego - MERGE_LEAD_CLOSING)
     keep_raise = (LKAS_KEEP and self.keep_on and reason == "curve" and i.lkas_keep > 0 and not self.blocked and
                   set_speed + self.step <= keep_t + UP_STEP_TOL * self.step and not i.stop_active and not i.hold_restore and
