@@ -370,6 +370,15 @@ ENGAGE_RAISE = True
 ENGAGE_RAISE_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
 ENGAGE_BELOW = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
 ENGAGE_RAISE_MAX = 20.0       # s
+# Round P (drive 73 t 1296.2, the South Blvd exit with stopped cars on the ramp): the exit's end by adoption (map_curve_control
+# adopt, adopt_forgets) took the 26 its slowdown and the queue left as his speed though the street cap was 48 (he held SET+
+# 26 -> 50 himself at 1330). After a stop (our stop episode, the trigger or a standstill within EXIT_HANDOVER_STOP) or with the
+# set more than EXIT_HANDOVER_LOW under the exit's street target (handover_target: its limit + the offset, or the 43
+# fallback), the low set is not adopted: his speed becomes that target, raised with ENGAGE_RAISE's guards (red light, stop,
+# the car ahead, a curve under it; else the usual restore to it).
+EXIT_HANDOVER = True
+EXIT_HANDOVER_LOW = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
+EXIT_HANDOVER_STOP = 60.0     # s
 RAMP_START_FORGET = True
 MERGE_TURN_LAT = 1.0          # m/s^2 (the architect will tune it from logs; 1.5+ fires mid-loop)
 MERGE_TURN_CALM = 1.0         # s
@@ -813,6 +822,16 @@ class CurveSlowdownLogic:
                  i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN) < self.engage["goal"] - self.half_step)
     waited = self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP)
     return not (i.stop_active or i.hold_restore or red_block or i.red_stop or curve_low) and lead_ok and waited
+
+  def handover(self, goal):
+    """(EXIT_HANDOVER) the exit's slowdown ends by adoption: his speed becomes the street's target `goal` (m/s), raised as
+    his RES would be (ENGAGE_RAISE's guards); a goal not above the set speed: the set is his (as before)."""
+    if self.anchor is None or self.last_set_speed is None or goal <= self.last_set_speed + self.half_step:
+      self._forget()
+      return
+    self.anchor = min(self.anchor, goal)
+    self.restoring = False
+    self.engage = {"frame": self.frame, "goal": self.anchor, "fixed": True}
 
   def _engage_go(self):
     return self.engage is not None and bool(self.engage.get("go"))
@@ -1504,8 +1523,8 @@ class CurveSlowdownLogic:
         self.engage = None
       elif not e.get("go") and self._engage_clear(i, red_block):
         # (ENGAGE_RAISE) his speed for this road, then the fast restore at once (the goal as things are now: a lower
-        # limit's cap, rule 3 / 4, still bounds it)
-        g = self._engage_goal(i)
+        # limit's cap, rule 3 / 4, still bounds it; EXIT_HANDOVER's is fixed)
+        g = {"goal": e["goal"]} if e.get("fixed") else self._engage_goal(i)
         cap = self._cap()
         goal = None if g is None else (g["goal"] if cap is None else min(g["goal"], max(cap, i.set_speed)))
         if goal is None or goal <= i.set_speed + self.half_step:
@@ -2104,6 +2123,15 @@ class CurveSlowdownLogic:
     return button, off
 
 
+def exit_handover(lg, set_speed, target, stopped_recently):
+  """(EXIT_HANDOVER) the street target (m/s) the exit's adoption hands over to instead of making the set his, or 0: our
+  lowering under the set (offset > 0), the target known, and a stop since the exit or the set EXIT_HANDOVER_LOW under it."""
+  if not EXIT_HANDOVER or lg.offset <= 0 or target <= 0 or set_speed <= 0:
+    return 0.0
+  low = set_speed < target - lg._metric_pick(EXIT_HANDOVER_LOW) - lg.half_step
+  return target if (stopped_recently or low) and target > set_speed + lg.half_step else 0.0
+
+
 def adopt_forgets(lg, mo, set_speed):
   """map_curve_control's adopt (the set speed becomes his) forgets the controller's anchor: a restore pending above it,
   or (third review, drive 54 t 745.2) an anchor one step under the street speed just reached (our last press landing in
@@ -2176,6 +2204,7 @@ class CurveSlowdown:
     self.boost_street_frames = 0     # updates matched to a street (the merge boost ends: _boost_road_ok)
     self.boost_hwy_frames = 0        # updates matched to a highway since the last link
     self.boost_ramp_seen = False     # the planner's ramp flag was on during the current merge boost (MERGE_TAPER)
+    self.exit_stop_frame = -1_000_000  # the last frame stopped or in a stop episode (EXIT_HANDOVER_STOP)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
     self.curve_enabled = curve_enabled
@@ -2455,6 +2484,8 @@ class CurveSlowdown:
 
     # Our own curve target from the road curvature (see curve_target.py), against the driver's own speed
     lg = self.logic
+    if bool(CS.out.standstill) or lg.stop_episode or (stop_active and self.stop_mode == ON):
+      self.exit_stop_frame = self.frame        # (EXIT_HANDOVER_STOP)
     plan_alive = self._alive('starpilotPlan')
     blinker = bool(CS.out.leftBlinker or CS.out.rightBlinker)
     self._blinker = blinker
@@ -2515,7 +2546,14 @@ class CurveSlowdown:
                                            (set_speed / self.limit_follow.step) if set_speed > 0 else None)
         self.map_control.lower_event = None
       if mo.adopt and self.map_mode == MAP_ON and adopt_forgets(lg, mo, set_speed):
-        lg._forget()        # off an exit onto a street: the lowered set speed is now the driver's speed
+        # off an exit onto a street: the lowered set speed is now the driver's speed, unless a stop or the street's target
+        # far above it says otherwise (EXIT_HANDOVER)
+        goal = exit_handover(lg, set_speed if cruise_enabled else 0.0, self.map_control.handover_target(),
+                             self.frame - self.exit_stop_frame <= _frames(EXIT_HANDOVER_STOP))
+        if goal > 0:
+          lg.handover(goal)
+        else:
+          lg._forget()
       self.map_on_used = self.map_mode == MAP_ON and plan.mapCurveMode == MAP_ON
       if self.map_on_used:
         # a followed road curve: the camera's target counts at the lowest it has been in it, so the follower's step

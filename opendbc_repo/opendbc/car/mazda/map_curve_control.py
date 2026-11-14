@@ -684,6 +684,7 @@ class MapCurveControl:
     self.chime_why = ""
     self.on_street_exit = False
     self.street_last = None         # m/s: the last speed a slowdown asked for on this exit onto a street (STREET_DEFAULT)
+    self.exit_street_to = 0.0       # m/s: this exit's street target (its limit + the offset, else the fallback), 0 none
     self.ramp_frames = 0            # consecutive updates on a ramp
     self.ramp_end_first = 0.0       # distance to the ramp's end when it was first matched
     self.link_frames = 0            # consecutive updates matched to a link road
@@ -1259,6 +1260,10 @@ class MapCurveControl:
       if street_to < speed:
         speed, why, track, settled, firm = street_to, "street cap", False, False, False
       capped = True
+    if exit_to_street:
+      self.exit_street_to = street_to if f.ramp_to_speed > 0 else self.street_fallback   # (handover_target)
+    elif f.road_class in HIGHWAY_CLASSES and not f.on_ramp:
+      self.exit_street_to = 0.0
     if exit_to_street and (a or na):
       self.street_last = speed
     elif not f.on_ramp:
@@ -1346,6 +1351,16 @@ class MapCurveControl:
       self.xs_since, self.xs_done = 0.0, False      # the exit's street: its target applies (_exit_street)
       if self.plan is not None:
         self._end("on a street")
+
+  def handover_target(self):
+    """m/s: the street target an exit hands over to when its slowdown ends by adoption (round P, the wrapper's
+    EXIT_HANDOVER): the exit's street target once the street is matched, else this exit's street cap (its limit + the
+    offset, or STREET_FALLBACK); 0 none."""
+    if self.xs_since is not None:
+      t = self.street_target()
+      if t < NO_CURVE:
+        return t
+    return self.exit_street_to
 
   def street_target(self):
     """m/s: the exit's street target now (the street's steady limit plus the setting's offset, else STREET_FALLBACK),

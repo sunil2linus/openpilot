@@ -373,3 +373,100 @@ def test_res_with_nothing_lowered_but_the_set_far_under_the_car_raises_it_to_the
       car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
     car.tick() if cruise else None
   assert car.set_speed / MPH >= 39 - 1e-6, car.set_speed / MPH
+
+
+# ---- fix 6: the exit's adoption after a stop hands over to the street's target (drive 73 t 1296.2, South Blvd) ----
+
+F = CTL.MapFields
+
+
+def test_73_south_blvd_the_exits_street_cap_is_the_handover_target():
+  ctl = CTL.MapCurveControl(3.0, street_mode=1)                 # (his Street Speed +3: the street cap 48 for the 45 road)
+  ramp = dict(road_class=2, on_ramp=True, ramp_type=1, ramp_to_speed=45 * MPH, ramp_to_highway=False)
+  for k in range(400):
+    ctl.update(F(mode=CTL.ON, ramp_end_distance=max(300.0 - k, 0.0), **ramp), 75 * MPH, 0, v_ego=9.0, set_speed=26 * MPH)
+  mo = ctl.update(F(mode=CTL.ON, road_class=5), 75 * MPH, 0, v_ego=9.0, set_speed=26 * MPH)
+  assert mo.adopt and abs(ctl.handover_target() / MPH - 48) < 1e-6, ctl.handover_target() / MPH
+  # (the street's limit unknown: the fallback, 43)
+  ctl = CTL.MapCurveControl(3.0, street_mode=1)
+  ramp["ramp_to_speed"] = 0.0
+  for k in range(400):
+    ctl.update(F(mode=CTL.ON, ramp_end_distance=max(300.0 - k, 0.0), **ramp), 75 * MPH, 0, v_ego=9.0, set_speed=26 * MPH)
+  assert abs(ctl.handover_target() / MPH - 43) < 1e-6
+
+
+def _handover_run(stopped=True, set0=26, target=48, extra=lambda f: {}, frames=1500):
+  """The exit's slowdown and a queue left the set at 26 (his 75); at frame 10 (before anything of ours) the exit ends by
+  adoption."""
+  car = T.Car(set0, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = 20 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+  lg.anchor = 75 * MPH
+  goals, log = [], []
+  for f in range(frames):
+    if f == 10:
+      g = cs.exit_handover(lg, car.set_speed, target * MPH, stopped)
+      goals.append(g)
+      lg.handover(g) if g > 0 else lg._forget()
+    kw = dict(stop_clear_ahead=True, stop_pulling_away=True)
+    kw.update(extra(f))
+    btn, _ = lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego, btn_counter=(f // 10) % 16, **kw))
+    if btn is not None:
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    car.tick()
+    log.append((f, car.set_speed / MPH, btn))
+  return car, lg, goals, log
+
+
+def test_73_south_blvd_after_the_queue_the_set_goes_to_the_street_cap_not_left_at_26():
+  car, lg, goals, log = _handover_run()
+  assert abs(goals[0] / MPH - 48) < 1e-6
+  assert abs(car.set_speed / MPH - 48) < 1e-6 and max(s for _, s, _ in log) <= 48 + 1e-6
+  first = next(f for f, s, b in log if b == cs.SET_PLUS)
+  assert first - 10 <= 50, first
+  # (before round P: adopted, 26 his speed, nothing raised)
+  old = cs.EXIT_HANDOVER
+  try:
+    cs.EXIT_HANDOVER = False
+    car0, _, goals0, log0 = _handover_run()
+  finally:
+    cs.EXIT_HANDOVER = old
+  assert goals0 == [0.0] and abs(car0.set_speed / MPH - 26) < 1e-6
+  # the same guards as his RES: a red light: no SET+ now (the target stays his speed for later)
+  car, lg, goals, log = _handover_run(extra=lambda f: dict(red_stop=True), frames=800)
+  assert not any(b == cs.SET_PLUS for _, _, b in log) and abs(lg.anchor / MPH - 48) < 1e-6
+  car, lg, goals, log = _handover_run(extra=lambda f: dict(stop_slower_ahead=True, stop_clear_ahead=False,
+                                                           stop_pulling_away=False), frames=800)
+  # (a slower car: not the fast raise; the usual restore to the street's target, the radar keeping the gap)
+  assert not lg._engage_go()
+  assert max(s for _, s, _ in log) <= 48 + 1e-6
+
+
+def test_an_exit_without_a_stop_and_the_set_near_the_streets_target_is_still_adopted():
+  car, lg, goals, log = _handover_run(stopped=False, set0=45)
+  assert goals == [0.0] and lg.anchor is None and abs(car.set_speed / MPH - 45) < 1e-6
+  # far under it without a stop: handed over too
+  car, lg, goals, log = _handover_run(stopped=False, set0=30)
+  assert abs(goals[0] / MPH - 48) < 1e-6 and abs(car.set_speed / MPH - 48) < 1e-6
+
+
+def test_the_wrapper_hands_the_exit_over_to_the_street_cap_after_a_stop(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  WI = _load("twi_round_p", os.path.join(HERE, "test_wrapper_inputs.py"))
+  c, sm, _ = WI._make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = sm.msgs["starpilotPlan"]
+  plan.mapCurveMode, plan.mapRoadClass, plan.mapOnRamp, plan.mapRampType, plan.mapRampToSpeed = 2, 2, True, 1, 45 * MPH
+  plan.mapRampToHighway, plan.mapRampEndDistance = False, 300.0
+  WI._drive(c, 50, set_mph=26, v_mph=20)
+  c.logic.anchor = 75 * MPH                                      # (his highway 75, our exit slowdown left 26)
+  for k in range(250):
+    plan.mapRampEndDistance = max(300.0 - k, 0.0)
+    cs_ = WI.W.car_state(0.0 if 100 <= k < 150 else 9.0, 26)
+    cs_.out.standstill = 100 <= k < 150                          # (the queue on the ramp)
+    c.update(WI.W.CC, cs_, None, None, False)
+  plan.mapOnRamp, plan.mapRoadClass = False, 5                   # off the ramp onto the street: the adoption
+  WI._drive(c, 3, set_mph=26, v_mph=9)
+  assert c.logic.anchor is not None and abs(c.logic.anchor / MPH - 50) < 1e-6, c.logic.anchor   # (the default +5)
+  assert c.logic.engage is not None and c.logic.engage.get("fixed")
