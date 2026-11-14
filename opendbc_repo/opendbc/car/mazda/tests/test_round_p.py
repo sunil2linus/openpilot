@@ -1022,3 +1022,17 @@ def test_third_review_t1_a_tightening_curve_comes_down_after_the_floors_raise():
   # (the floor is the curve's own 26.0; without it the follower's undershoot takes the car 0.7 mph lower)
   assert v_on <= 26.2 and v_on - v_off <= 0.8, (v_on, v_off)
   assert max(s for f, s, v in on[1300:3000]) <= 30 + 1e-6
+
+
+def test_third_review_t2_cleared_only_when_no_fault_is_left():
+  _, spe = _events_modules()
+
+  def mk():
+    n = spe.MazdaCamNotice(dt=0.05)
+    return lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]
+  run = mk()                                                # 2 -> 1: the ERR bits gone, the lane lines still off
+  assert run(2, 5.0) == ["fault"] and run(1, 10.0) == ["fault"] and run(0, 5.0) == []   # (the lines notice, no "cleared")
+  run = mk()                                                # 1 -> 2 -> 1
+  assert run(1, 5.0) == ["fault"] and run(2, 5.0) == ["fault"] and run(1, 10.0) == []
+  run = mk()                                                # 2 -> 0
+  assert run(2, 5.0) == ["fault"] and run(0, 5.0) == ["cleared"]

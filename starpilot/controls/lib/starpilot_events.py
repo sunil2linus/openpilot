@@ -56,8 +56,15 @@ class MazdaCamNotice:
       self.clear_s += self.dt
       if self.clear_s >= CAM_FAULT_CLEAR - 1e-6:
         self.active = False
-        if self.shown:
-          self.shown = False
+        shown, self.shown = self.shown, False
+        # (third review, T2) "cleared" only when nothing is left; the ERR bits gone with the lane lines still off: the
+        # lane lines notice instead, if not shown yet this drive
+        if lines:
+          if not self.lines_shown:
+            self.lines_shown = True
+            return "fault"
+          return None
+        if shown:
           return "cleared"
     return None
 
