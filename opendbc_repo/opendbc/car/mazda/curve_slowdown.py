@@ -376,6 +376,17 @@ ENGAGE_RAISE_MAX = 20.0       # s
 # set more than EXIT_HANDOVER_LOW under the exit's street target (handover_target: its limit + the offset, or the 43
 # fallback), the low set is not adopted: his speed becomes that target, raised with ENGAGE_RAISE's guards (red light, stop,
 # the car ahead, a curve under it; else the usual restore to it).
+# Round P (a73r, full CAN: the EPS blocks the stock LKAS torque below 45 km/h, back only above ~52; then only the Torque
+# Interceptor steers, about half the lateral capability; drive 73's loop: our set 26 (42 km/h) took the car to 44 km/h at
+# 1132 and the LKAS stayed blocked through the loop). With a TI: a curve target (map curves, the camera's, a ramp's firm
+# undershoot, a stop's dip inside a followed curve) is floored at LKAS_KEEP_SPEED whenever the curve's own target is
+# map_curve_control.TI_ONLY_BELOW (28 mph) or more, so the set never takes the car under the cut-off for a curve that does
+# not need it; a curve that does (its target under 28 mph), or any curve while the LKAS is blocked (LKAS_BLOCK, kept
+# TI_ONLY_HYST after it clears), is planned TI-only instead (map_curve_control.TI_ONLY_LAT, curve_target.CurveTarget.ti_lat)
+# and not floored. Stop slowdowns outside curves are unaffected.
+LKAS_KEEP = True
+LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
+TI_ONLY_HYST = 2.0            # s
 EXIT_HANDOVER = True
 EXIT_HANDOVER_LOW = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 EXIT_HANDOVER_STOP = 60.0     # s
@@ -532,6 +543,8 @@ class SlowdownInputs:
   # the street's target (m/s, 0 unknown) at his RES (ENGAGE_RAISE): the street's steady limit plus the Street Speed offset,
   # or after an exit the exit's street target (map_curve_control.street_target, its fallback)
   engage_goal: float = 0.0
+  # m/s, 0 none (LKAS_KEEP): curve targets (and a stop's inside a followed curve) are never under this, nor his speed
+  lkas_keep: float = 0.0
 
 
 def steer_lateral_accel(v, angle_deg, wheelbase, ratio=MERGE_TURN_RATIO, slip=MERGE_TURN_SLIP):
@@ -1749,9 +1762,13 @@ class CurveSlowdownLogic:
       curve_t = i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN)
       if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
         curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
-      targets.append(("curve", max(curve_t, floor)))
+      keep = min(i.lkas_keep, driver_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0   # (LKAS_KEEP)
+      targets.append(("curve", max(curve_t, floor, keep)))
     if i.stop_active:
-      targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
+      stop_t = max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)
+      if LKAS_KEEP and i.lkas_keep > 0 and i.csc_active and i.curve_track:
+        stop_t = max(stop_t, min(i.lkas_keep, driver_speed))   # (LKAS_KEEP) a stop's dip inside a followed curve
+      targets.append(("stop", stop_t))
     reason, target = min(targets, key=lambda rt: rt[1]) if targets else (None, None)
 
     # A hold in progress: keep sending its frames at the stock cadence, nothing else. Stop at once
@@ -2205,6 +2222,10 @@ class CurveSlowdown:
     self.boost_hwy_frames = 0        # updates matched to a highway since the last link
     self.boost_ramp_seen = False     # the planner's ramp flag was on during the current merge boost (MERGE_TAPER)
     self.exit_stop_frame = -1_000_000  # the last frame stopped or in a stop episode (EXIT_HANDOVER_STOP)
+    self.lkas_blocked = False        # the EPS blocks the stock LKAS (LKAS_BLOCK, held TI_ONLY_HYST after it clears)
+    self.lkas_clear_frames = 0
+    self.ti_only = False             # (TI_ONLY_*) curves are planned for the TI alone now
+    self.lkas_keep = 0.0             # this frame's LKAS_KEEP floor (m/s, 0 none)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
     self.curve_enabled = curve_enabled
@@ -2212,6 +2233,9 @@ class CurveSlowdown:
     self.has_ti = bool(CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
+    if self.has_ti:
+      from opendbc.car.mazda.map_curve_control import TI_ONLY_LAT, TI_ONLY_BELOW
+      self.curve_target.ti_lat, self.curve_target.ti_below = TI_ONLY_LAT, TI_ONLY_BELOW
     # The car profile: what earlier drives learned about this car (answer time, hold overrun, cruise decel), see
     # car_profile.py. Loaded here (a few KB), applied to the logic, saved in the background as it learns. The learned
     # cruise decel is still measured and logged, but map curves no longer plan with it: it measures the pace of the
@@ -2245,6 +2269,7 @@ class CurveSlowdown:
         split_mode = 0               # (an older params build without the key: the default, the highway's limit)
       self.map_control = MapCurveControl(self.lat_limit, self.decel_used, split_mode=split_mode,
                                          metric=bool(params.get_bool("IsMetric")), street_mode=street_mode)
+      self.map_control.ti_plan = self.has_ti       # (TI_ONLY_*)
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
     self.learner = None
@@ -2504,6 +2529,7 @@ class CurveSlowdown:
     # dropped) on a link, or while the map control keeps a ramp curve's command, a signal does not turn it off; a lane
     # change on the highway or a turn on a street as before
     mc = self.map_control
+    self._lkas_state(CS)
     # (second review: only a held / governing ramp curve, not every link: the merge's lane change at the ramp's end)
     ramp_ctx = mc is not None and mc.ramp_last_cmd is not None
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
@@ -2633,6 +2659,7 @@ class CurveSlowdown:
       curve_no_accel=curve_no_accel,
       curve_hold=curve_hold,
       street_lower=curve_street,
+      lkas_keep=self._lkas_keep(curve_active, curve_street),
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -3017,6 +3044,33 @@ class CurveSlowdown:
       self.boost_street_frames += 1
     return (self.boost_street_frames < _frames(MERGE_BOOST_STREET) and
             self.boost_hwy_frames < _frames(MERGE_BOOST_HWY))
+
+  def _lkas_state(self, CS):
+    """(TI_ONLY_*) the stock LKAS blocked (LKAS_BLOCK, held TI_ONLY_HYST after it clears): curves planned for the TI."""
+    raw = bool(getattr(CS, "lkas_block", False))
+    self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
+    self.lkas_blocked = raw or (self.lkas_blocked and self.lkas_clear_frames < _frames(TI_ONLY_HYST))
+    self.ti_only = bool(self.has_ti and self.lkas_blocked)
+    self.curve_target.ti_only = self.ti_only
+    if self.map_control is not None:
+      self.map_control.ti_only = self.ti_only
+
+  def _lkas_keep(self, curve_active, curve_street):
+    """(LKAS_KEEP) m/s, the floor for this frame's curve target: a TI car, the LKAS not blocked, a curve whose own target
+    (the map's at its planned lateral, the camera's) is TI_ONLY_BELOW or more; 0 none."""
+    self.lkas_keep = 0.0
+    if not (LKAS_KEEP and self.has_ti and curve_active) or self.ti_only or curve_street:
+      return 0.0
+    from opendbc.car.mazda.map_curve_control import TI_ONLY_BELOW
+    owns = []
+    mo = self.map_out
+    if self.map_on_used and mo is not None and mo.active and mo.curve_speed < 100.0:
+      owns.append(mo.curve_speed)
+    if self.curve_enabled and self.curve_target.active:
+      owns.append(self.curve_target.speed)
+    if owns and min(owns) >= TI_ONLY_BELOW:
+      self.lkas_keep = LKAS_KEEP_SPEED[1 if self.logic.step < MS_PER_MPH else 0]
+    return self.lkas_keep
 
   def _engage_target(self):
     """(ENGAGE_RAISE) m/s, the street's target for his RES: the street's steady limit + the Street Speed offset (on a

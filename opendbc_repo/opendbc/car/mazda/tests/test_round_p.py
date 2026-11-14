@@ -470,3 +470,111 @@ def test_the_wrapper_hands_the_exit_over_to_the_street_cap_after_a_stop(tmp_path
   WI._drive(c, 3, set_mph=26, v_mph=9)
   assert c.logic.anchor is not None and abs(c.logic.anchor / MPH - 50) < 1e-6, c.logic.anchor   # (the default +5)
   assert c.logic.engage is not None and c.logic.engage.get("fixed")
+
+
+# ---- fix 8: never under the stock LKAS cut-off for a curve that does not need it; TI-only planning when it does ----
+
+CT = _load("ct_round_p", os.path.join(HERE, "..", "curve_target.py"))
+
+
+def test_map_curves_ti_only_lateral_by_branch():
+  c = CTL.MapCurveControl(3.0)
+  c.ti_plan = True
+  # drive 73's loop (71 m on the map, published 84 m for RAMP_LAT): its target 30.3 mph needs no TI-only plan
+  assert abs(c._lat(84.0, scaled=True) - CTL.MAP_LATERAL_ACCEL) < 1e-9
+  assert CTL.map_curve_target(84.0, c._lat(84.0, scaled=True)) / MPH >= 28
+  # a 50 m road curve (23.5 mph at 2.2): under 28 mph, planned for the TI alone (1.8: 21.2 mph)
+  assert abs(c._lat(50.0) - CTL.TI_ONLY_LAT) < 1e-9
+  assert abs(CTL.map_curve_target(50.0, c._lat(50.0)) / MPH - 21.2) < 0.1
+  # the LKAS blocked: every curve TI-only; a ramp curve's published radius at TI_ONLY_LAT for its real radius
+  c.ti_only = True
+  assert abs(c._lat(84.0, scaled=True) - CTL.TI_ONLY_LAT * CTL.TI_ONLY_RAMP_SCALE) < 1e-9
+  assert abs(CTL.map_curve_target(84.0, c._lat(84.0, scaled=True)) - math.sqrt(1.8 * 71.0)) < 0.05
+  assert abs(c._lat(90.0) - CTL.TI_ONLY_LAT) < 1e-9                              # (West Utica, a road curve: 28.5 mph)
+  # no TI: never
+  c.ti_plan = False
+  assert c._lat(50.0) == c.lat_accel
+
+
+def test_the_camera_target_ti_only_under_28_mph_or_while_blocked():
+  t = CT.CurveTarget(3.0)
+  t.ti_lat, t.ti_below = CTL.TI_ONLY_LAT, CTL.TI_ONLY_BELOW
+  k_tight, k_mild = 3.0 / (25 * MPH) ** 2, 3.0 / (40 * MPH) ** 2      # 25 mph and 40 mph at 3.0 m/s^2
+  for _ in range(150):
+    t.update(k_tight, 60 * MPH)
+  assert abs(t.speed - math.sqrt(1.8 / k_tight)) < 1e-6                 # under 28: at 1.8
+  t.reset()
+  for _ in range(150):
+    t.update(k_mild, 60 * MPH)
+  assert abs(t.speed / MPH - 40) < 1e-6                                 # 40 mph: as before
+  t.ti_only = True
+  for _ in range(150):
+    t.update(k_mild, 60 * MPH)
+  assert abs(t.speed - math.sqrt(1.8 / k_mild)) < 1e-6                  # blocked: at 1.8
+
+
+def test_the_controller_floors_curve_targets_and_a_stop_in_a_followed_curve_at_lkas_keep():
+  keep = cs.LKAS_KEEP_SPEED[0]
+
+  def run(**kw):
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=45 * MPH, v_ego=45 * MPH))
+    set_mph = 45.0
+    for f in range(1500):
+      b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=max(set_mph - 1, 31) * MPH, btn_counter=(f // 10) % 16, **kw))
+      if b == cs.SET_MINUS and lg.last_action != "hold":
+        set_mph -= 1
+      elif b == cs.SET_MINUS and f % 10 == 0:
+        set_mph -= 1
+    return set_mph
+  # the firm ramp follow asks 24.3 (30.3 - 6) on a link: floored at 30
+  firm = dict(csc_active=True, csc_speed=24.3 * MPH, curve_track=True, curve_hold=True, curve_floor=24.3 * MPH,
+              curve_budget=60)
+  assert run(**firm) <= 26 and run(lkas_keep=keep, **firm) >= 30 - 1e-6
+  # a stop's dip inside a followed curve: floored too; outside any curve: not
+  stop = dict(stop_active=True, stop_target=20 * MPH, stop_urgent=True)
+  inside = dict(csc_active=True, csc_speed=31 * MPH, curve_track=True, curve_floor=25 * MPH)
+  assert run(lkas_keep=keep, **stop, **inside) >= 30 - 1e-6
+  assert run(**stop, **inside) <= 25
+  assert run(lkas_keep=keep, **stop) <= 25
+
+
+def _loop73(keep_on=True, frames=4000):
+  """Drive 73's loop on-ramp (t 1112-1150): 45 mph with his 53 on the street, the 84 m (published) ramp curve from 300 m,
+  its target 30.3 mph; the wrapper's LKAS_KEEP floor while the LKAS is not blocked."""
+  car = T.Car(49, dash_offset_mph=0.0, lag=10, accel=0.6, **TE.TM.MEASURED_CRUISE)
+  car.v_ego = 45 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+  lg.anchor = 53 * MPH
+  ctl = CTL.MapCurveControl(3.0)
+  ctl.ti_plan = True
+  mix = CTL.CurveMix(cs.CURVE_MARGIN)
+  x, sets, vs = 0.0, [], []
+  for f in range(frames):
+    d = 300.0 - x
+    fld = F(mode=CTL.ON, status=2, radius=84.0, distance=max(d, 0.0), on_ramp=d < 120, ramp_type=2, ramp_to_highway=True,
+            road_class=2 if d < 120 else 5, onramp_ahead=d >= 120) if d > -150 else F(mode=CTL.ON, road_class=2)
+    driver = car.set_speed + lg.offset * lg.step
+    mo = ctl.update(fld, driver, 0, v_ego=car.v_ego, max_drop=10 * MPH, set_speed=car.set_speed)
+    act, sp, fl, bud, tr, ra = mix.update(False, CTL.NO_CURVE, mo, drop_floor=max(driver - 10 * MPH, cs.MIN_SET_SPEED))
+    keep = cs.LKAS_KEEP_SPEED[0] if (keep_on and act and mo.curve_speed >= CTL.TI_ONLY_BELOW and mo.curve_speed < 100) else 0.0
+    b, _ = lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego, csc_active=act, csc_speed=min(sp, 100.0), curve_floor=fl,
+                          curve_budget=bud, curve_track=tr, curve_raise=ra, curve_hold=mix.firm, curve_no_accel=mix.no_accel,
+                          lkas_keep=keep, btn_counter=(f // 10) % 16))
+    if b is not None:
+      car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
+    car.tick()
+    x += car.v_ego * DT
+    if -150 < d < 300:
+      sets.append(car.set_speed / MPH)
+      vs.append(car.v_ego / MPH)
+  return sets, vs
+
+
+def test_73_loop_the_set_never_under_30_for_its_30_3_mph_target():
+  sets, vs = _loop73()
+  assert min(sets) >= 30 - 1e-6, min(sets)
+  assert min(vs) >= 28.5, min(vs)                       # (45 km/h = 28 mph: the LKAS stays on)
+  sets0, vs0 = _loop73(keep_on=False)
+  assert min(sets0) < 29, min(sets0)                    # (before: the firm undershoot under the cut-off)

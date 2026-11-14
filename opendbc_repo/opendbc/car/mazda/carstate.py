@@ -39,6 +39,10 @@ class CarState(CarStateBase):
     self.lkas_disabled = False
     self.stock_lkas_off_frames = 0
     self.stock_lkas_off = False
+    # STEER_RATE (0x241, bus 0, already parsed): the EPS blocks the stock LKAS torque (LKAS_BLOCK: below ~45 km/h until ~52,
+    # a hands-off lockout, a camera fault) and the torque it applies (LKAS_EFFECTIVE); the curve planning reads them (round P)
+    self.lkas_block = False
+    self.lkas_effective = 0
     self.cam_lkas = 0
     self.params = CarControllerParams(CP)
 
@@ -122,6 +126,8 @@ class CarState(CarStateBase):
 
     # Either due to low speed or hands off
     lkas_blocked = cp.vl["STEER_RATE"]["LKAS_BLOCK"] == 1
+    self.lkas_block = bool(lkas_blocked)
+    self.lkas_effective = int(cp.vl["STEER_RATE"]["LKAS_EFFECTIVE"])
 
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down

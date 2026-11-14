@@ -263,6 +263,15 @@ TENT_PLAN_CONFIRM = 7.0         # s
 # NAV_SIGNAL_NEAR before the split (drive 73: off ~100 m before it; test_exit_plan's false "link" streams with a signal
 # 260-300 m out keep the tentative bounds: a firm slowdown there let a 34 m "link" answer last the confirmation's 1.5 s).
 NAV_SIGNAL_FIRM = True
+# Round P (drive 73 / a73r, full CAN): the EPS blocks the stock LKAS torque below 45 km/h and gives it back only above ~52;
+# then only the Torque Interceptor steers, about half the lateral capability (command 1.0 gave 1.85-2.25 m/s^2 in drive 73's
+# loop, 0.56-0.73 for the same lateral in 6f with the LKAS on). A curve whose own target is under TI_ONLY_BELOW (it takes
+# the car under the cut-off anyway), or any curve while the LKAS is blocked (ti_only, set by the wrapper), is planned at
+# TI_ONLY_LAT instead of MAP_LATERAL_ACCEL; a ramp / exit curve's radius comes scaled for map_curves.RAMP_LAT (2.6), so its
+# lateral is TI_ONLY_LAT scaled the same way (TI_ONLY_RAMP_SCALE). The wrapper floors the others at its LKAS_KEEP_SPEED.
+TI_ONLY_LAT = 1.8               # m/s^2
+TI_ONLY_BELOW = 28 * MPH        # m/s
+TI_ONLY_RAMP_SCALE = 2.2 / 2.6  # map_curves.PLAN_LAT / RAMP_LAT
 NAV_SIGNAL_NEAR = 200.0         # m
 # the firm slowdown after the confirmation as planned for the short ramp's split speed: it takes ~2 s to build up (the
 # SET- hold, the cruise's answer) to its ~0.95-1.0 (drive 53 replay: 0.94 m/s^2 on average from the confirmation to E2's
@@ -713,6 +722,18 @@ class MapCurveControl:
     # on (or just before) a ramp onto a highway, as far as known this update: the wrapper keeps camera-only stops (the
     # stop-light detector, the model's planned stop) out there (CurveSlowdown.update's red_ok)
     self.onramp_now = False
+    self.ti_only = False            # (TI_ONLY_*) the stock LKAS is blocked: every curve at TI_ONLY_LAT (the wrapper sets it)
+    self.ti_plan = False            # a Torque Interceptor car: TI_ONLY_* apply (the wrapper sets it)
+
+  def _lat(self, radius, advisory=0.0, scaled=False):
+    """m/s^2 a map curve of `radius` m is planned at (TI_ONLY_*): TI_ONLY_LAT (scaled for a ramp / exit curve's
+    published radius) when it needs less than TI_ONLY_BELOW, or while the stock LKAS is blocked; else lat_accel."""
+    ti = TI_ONLY_LAT * (TI_ONLY_RAMP_SCALE if scaled else 1.0)
+    if not self.ti_plan or radius <= 0 or ti >= self.lat_accel:
+      return self.lat_accel
+    if self.ti_only or map_curve_target(radius, self.lat_accel, advisory) < TI_ONLY_BELOW:
+      return ti
+    return self.lat_accel
 
   @property
   def exit_rem(self):
@@ -880,7 +901,7 @@ class MapCurveControl:
         self.split_active = False
         self.split_follower.reset()
         r, at, adv = self._curve_now(f, p)
-        if r > 0 and reach_needed(v_ego, map_curve_target(r, self.lat_accel, adv), decel=CHIME_MAX, lead=0.0) > at:
+        if r > 0 and reach_needed(v_ego, map_curve_target(r, self._lat(r, adv, True), adv), decel=CHIME_MAX, lead=0.0) > at:
           self._chime("confirmed, too little room")
     near = rem <= DECIDE_NEAR
     if p.confirmed and not p.settled:
@@ -967,7 +988,7 @@ class MapCurveControl:
     if rem > 0 and in_lane and p.curve[0] > 0 and self.split_mode != SPLIT_OFF:
       # a short ramp: the split speed that still makes its curve (never raising: only below what it would be)
       r, at, adv = p.curve
-      v_c = map_curve_target(r, self.lat_accel, adv)
+      v_c = map_curve_target(r, self._lat(r, adv, True), adv)
       base = vs if vs > 0 else driver_speed
       v_short = short_split_speed(at - p.exit_at, v_c, base)
       if v_short < base - 0.05:
@@ -986,7 +1007,8 @@ class MapCurveControl:
         if cam_only:
           v_at = max(v_at, p.cam_floor)
         r, at, adv = p.curve
-        if exit_room_needed(v_at, map_curve_target(r, self.lat_accel, adv), decel=CHIME_MAX, lead=0.0) > at - p.exit_at:
+        if exit_room_needed(v_at, map_curve_target(r, self._lat(r, adv, True), adv), decel=CHIME_MAX,
+                            lead=0.0) > at - p.exit_at:
           p.chimed = True
           self._chime("before the split")
       if p.evidence and not in_lane and not p.signalled and p.cam_floor is not None:
@@ -1096,11 +1118,12 @@ class MapCurveControl:
         return none
       held = p.last_cmd if p.last_cmd is not None else p.hold
       return (held, held, held, "exit hold", None, False) if held is not None else none
+    self.nav.lat_accel = self._lat(r, adv, True)
     a, sp = self.nav.update(r, max(d, 0.0), driver_speed, adv)
     if not a:
       self.nav_follower.reset()
       return none
-    v_c = map_curve_target(r, self.lat_accel, adv)
+    v_c = map_curve_target(r, self.nav.lat_accel, adv)
     if v_ego <= 0:
       return sp, sp, v_c, "nav exit", None, False
     cmd = self.nav_follower.update(v_ego, v_c, max(d, 0.0), sp)
@@ -1174,6 +1197,7 @@ class MapCurveControl:
     # (round L) a ramp curve (status 2): MAP_RAMP_LEAD_TIME, the cruise's reaction at the car's own speed (map_curve_speed
     # takes the curve's speed when higher), not his set speed; a road curve as before
     ramp_st = f.status == STATUS_RAMP_CURVE
+    self.curve.lat_accel = self._lat(radius, f.advisory, ramp_st)          # (TI_ONLY_*)
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
                               lead_time=MAP_ROAD_LEAD_TIME if road_curve else (MAP_RAMP_LEAD_TIME if ramp_st else MAP_LEAD_TIME),
                               reaction_speed=v_ego if (ramp_st and v_ego > 0) else None)
@@ -1188,7 +1212,7 @@ class MapCurveControl:
       # a ramp curve's may turn firm (the cruise's strongest) when the room left needs it, a road curve's never
       fol, other = (self.follower, self.road_follower) if ramp_curve else (self.road_follower, self.follower)
       other.reset()
-      out.curve_speed = map_curve_target(radius, self.lat_accel, f.advisory, floor)
+      out.curve_speed = map_curve_target(radius, self.curve.lat_accel, f.advisory, floor)
       speed = fol.update(v_ego, out.curve_speed, f.distance, sp, a_ego=self.a_f if fol is self.road_follower else None)
       track, settled, firm = True, fol.settled, fol.firm
       low = fol.low
