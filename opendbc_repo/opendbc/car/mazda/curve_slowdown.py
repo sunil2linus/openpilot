@@ -358,8 +358,9 @@ RESUME_RESTORE_MAX = 60.0     # s
 RED_NO_RESTORE_UP = True
 # Round P (drive 73 t 540.9: his RES at 29 mph with the set at 25 our exit slowdown left, the first SET+ 2 s later, taps only,
 # 14.7 s to 53 while the car slowed 31 -> 28.5; drive 72 t 406.6: RES at 45 mph with the set at 20, the car braked to 35):
-# his engagement (RES: the set we left) with our lowering under it (the anchor above the set), a street / limit / map
-# target ENGAGE_RAISE_GAP or more above the set, or the set ENGAGE_BELOW or more under the car's speed: once no stop is on
+# his engagement (RES: the set we left) with our lowering under it (the anchor above the set; review of round P, B1: only
+# then, never a set he chose himself), up to his speed, or the car's speed when the set is ENGAGE_BELOW or more under it
+# (bounded by the street's target, SlowdownInputs.engage_goal, which never creates a goal): once no stop is on
 # or planned, no red light (red_block), no slower or stopped car ahead (the stop trigger's clear / pulling away), no curve
 # target under the goal and not in the post-stop wait (RAISE_FAST_AFTER_STOP), the fast
 # restore at once (a SET+ hold, a SET+ jump to the current speed just after his gas when it lands at or under the goal,
@@ -367,7 +368,6 @@ RED_NO_RESTORE_UP = True
 # target, SlowdownInputs.engage_goal, or the car's speed). The goal is never under the car's speed when nothing asks for
 # slowing (no braking surprise). Within ENGAGE_RAISE_MAX of his RES, else the usual restore.
 ENGAGE_RAISE = True
-ENGAGE_RAISE_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
 ENGAGE_BELOW = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
 ENGAGE_RAISE_MAX = 20.0       # s
 # Round P (drive 73 t 1296.2, the South Blvd exit with stopped cars on the ramp): the exit's end by adoption (map_curve_control
@@ -828,19 +828,20 @@ class CurveSlowdownLogic:
     return pair[1] if self.step < MS_PER_MPH else pair[0]
 
   def _engage_goal(self, i):
-    """(ENGAGE_RAISE) at his RES: {"frame", "goal"} when the set is to come up at once, else None."""
+    """(ENGAGE_RAISE) at his RES: {"frame", "goal"} when the set is to come up at once, else None. Only after our own
+    lowering (the anchor above the set: review of round P, B1; a set he chose himself is never raised). The street's
+    target (engage_goal) only ever lowers the goal: after a turn his old speed only up to it (the car's speed when it is
+    unknown); the car's speed (ENGAGE_BELOW) never above it either."""
     set_v, v = i.set_speed, max(i.v_ego, 0.0)
+    if self.anchor is None or self.anchor <= set_v + self.half_step:
+      return None
     v_up = math.ceil(v / self.step - 0.25) * self.step          # the car's speed, as a whole step
-    goal = 0.0
-    if self.anchor is not None and self.anchor > set_v + self.half_step:
-      goal = self.anchor
-      if i.road_changed:
-        # another road: his old speed only up to the street's target (or the car's speed when that is unknown)
-        goal = min(goal, i.engage_goal if i.engage_goal > 0 else v_up)
-    elif i.engage_goal >= set_v + self._metric_pick(ENGAGE_RAISE_GAP) - self.half_step:
-      goal = i.engage_goal
+    goal = self.anchor
+    if i.road_changed:
+      # another road: his old speed only up to the street's target (or the car's speed when that is unknown)
+      goal = min(goal, i.engage_goal if i.engage_goal > 0 else v_up)
     if set_v < v - self._metric_pick(ENGAGE_BELOW):
-      goal = max(goal, v_up)                                     # never left under the car's speed
+      goal = max(goal, v_up if i.engage_goal <= 0 else min(v_up, i.engage_goal))   # never left under the car's speed
     if goal <= set_v + self.half_step:
       return None
     return {"frame": self.frame, "goal": min(goal, self._set_top())}
@@ -3163,11 +3164,15 @@ class CurveSlowdown:
   def _engage_target(self):
     """(ENGAGE_RAISE) m/s, the street's target for his RES: the street's steady limit + the Street Speed offset (on a
     street), else after an exit the exit's street target (or its fallback); 0 unknown."""
+    from opendbc.car.mazda.speed_limit_follow import ON as LIMIT_ON
+    from opendbc.car.mazda.map_curve_control import ON as MAP_ON
     lf, mc = self.limit_follow, self.map_control
     try:
-      if lf is not None and lf.stable and lf._street():
+      # (review of round P, B1: Test modes never press) the limit only with Speed Limit Follow On, the exit's street only
+      # with Map Curves On
+      if lf is not None and self.limit_mode == LIMIT_ON and lf.stable and lf._street():
         return float((lf.stable + lf._add()) * lf.step)
-      if mc is not None and mc.xs_since is not None:
+      if mc is not None and self.map_mode == MAP_ON and mc.xs_since is not None:
         from opendbc.car.mazda.map_curve_control import NO_CURVE
         t = mc.street_target()
         return float(t if t < NO_CURVE else mc.street_fallback)

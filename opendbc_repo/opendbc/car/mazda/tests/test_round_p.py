@@ -359,20 +359,36 @@ def test_res_after_a_turn_takes_the_old_speed_only_up_to_the_streets_target():
   assert 33 - 1e-6 <= max(s for _, s, *_ in log) <= 34 + 1e-6, max(s for _, s, *_ in log)
 
 
-def test_res_with_nothing_lowered_but_the_set_far_under_the_car_raises_it_to_the_speed():
-  # his own set 25 (nothing of ours anchored), RES at 40 mph: the set never left under the car's speed
-  car = T.Car(25, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
-  car.v_ego = 40 * MPH
-  lg = cs.CurveSlowdownLogic(False, 10)
-  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
-  for f in range(800):
-    cruise = not (50 <= f < 200)
-    btn, _ = lg.update(_inp(cruise_enabled=cruise, set_speed=car.set_speed if cruise else 0.0, v_ego=car.v_ego,
-                            stop_clear_ahead=True, stop_pulling_away=True, btn_counter=(f // 10) % 16))
-    if btn is not None and cruise:
-      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
-    car.tick() if cruise else None
-  assert car.set_speed / MPH >= 39 - 1e-6, car.set_speed / MPH
+def test_res_with_nothing_lowered_never_raises_his_own_set():
+  # (review of round P, B1) his own set 25 (nothing of ours anchored), RES at 40 mph, a 45 street: his set stays
+  for extra in ({}, {"engage_goal": 50 * MPH}):
+    car = T.Car(25, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+    car.v_ego = 40 * MPH
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+    for f in range(800):
+      cruise = not (50 <= f < 200)
+      btn, _ = lg.update(_inp(cruise_enabled=cruise, set_speed=car.set_speed if cruise else 0.0, v_ego=car.v_ego,
+                              stop_clear_ahead=True, stop_pulling_away=True, btn_counter=(f // 10) % 16, **extra))
+      assert btn is None, (f, extra)
+      if cruise:
+        car.tick()
+    assert lg.engage is None and abs(car.set_speed / MPH - 25) < 1e-6
+
+
+def test_review_b1_his_own_set_on_a_street_is_never_raised_test_or_on(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  WI = _load("twi_round_pb1", os.path.join(HERE, "test_wrapper_inputs.py"))
+  for limit_mode, gas_v in ((1, None), (2, None), (0, 45)):
+    c, sm, _ = WI._make(tmp_path, monkeypatch, limit_mode=limit_mode, stop_mode=2)
+    sm.msgs["starpilotPlan"].mapRoadClass = 5                    # his own 30 on the 45 street
+    for k in range(1200):
+      cruise = not (300 <= k < 400)                              # his CANCEL, then RES at his own 30
+      gas = gas_v is not None and 380 <= k < 460
+      st = WI.W.car_state(gas_v if gas else 30, 30 if cruise else 0.0, cruise=cruise, gas=gas)
+      out = c.update(WI.W.CC, st, None, None, False)
+      assert not (out and k >= 400), (limit_mode, k, c.logic.last_action)
 
 
 # ---- fix 6: the exit's adoption after a stop hands over to the street's target (drive 73 t 1296.2, South Blvd) ----
