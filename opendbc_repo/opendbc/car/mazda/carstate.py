@@ -218,7 +218,9 @@ class CarState(CarStateBase):
       self.cam_lkas = cp_cam.vl["CAM_LKAS"]
       self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
       self.cam_err = bool(cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 or cp_cam.vl["CAM_LKAS"]["ERR_BIT_2"] == 1)
-      self.cam_fault = 2 if self.cam_err else (1 if self.stock_lkas_off else 0)
+      # (review of round P, S1) the notice, its events and the TI-only planning are a Torque Interceptor's: 0 without one
+      ti = bool(self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
+      self.cam_fault = (2 if self.cam_err else (1 if self.stock_lkas_off else 0)) if ti else 0
       ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
     self.cp_cam = cp_cam
     self.cp = cp

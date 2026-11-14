@@ -874,3 +874,14 @@ def test_review_s3_the_floor_is_continuous_and_never_raises_the_set():
   # the set already under the floor (26, the floor 30): never a SET+ for the floor
   s, ups = run(24.4, 30.0, set0=26)
   assert ups == 0 and s <= 26 + 1e-6, (s, ups)
+
+
+def test_review_s1_a_mazda_without_a_ti_has_no_camera_fault_notice_or_events():
+  from opendbc.car.mazda.values import MazdaSafetyFlags
+  c, ps, packer, Bus, _ = _carstate()
+  c.CP.flags = int(MazdaSafetyFlags.GEN1)                            # (no Torque Interceptor)
+  t = 3_000_000_000
+  a2, d2, _ = packer.make_can_msg("CAM_LKAS", 2, {"ERR_BIT_1": 1, "ERR_BIT_2": 1})
+  ps[Bus.cam].update([(t, [(a2, d2, 2)])])
+  c.update(ps, None)
+  assert c.cam_err and c.cam_fault == 0

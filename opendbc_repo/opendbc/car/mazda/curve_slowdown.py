@@ -3102,8 +3102,8 @@ class CurveSlowdown:
     self.lkas_block_now, self.ti_state_now = raw, int(getattr(CS, "ti_state_log", 0) or 0)
     self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
     self.lkas_blocked = raw or (self.lkas_blocked and self.lkas_clear_frames < _frames(TI_ONLY_HYST))
-    fault = (bool(getattr(CS, "cam_err", False)) or bool(getattr(CS, "stock_lkas_off", False)) or
-             (raw and v_ego > LKAS_CUTOFF))
+    fault = self.has_ti and (bool(getattr(CS, "cam_err", False)) or bool(getattr(CS, "stock_lkas_off", False)) or
+                             (raw and v_ego > LKAS_CUTOFF))
     self.fault_clear_frames = 0 if fault else self.fault_clear_frames + 1
     self.ti_fault = fault or (self.ti_fault and self.fault_clear_frames < _frames(TI_ONLY_HYST))
     self.ti_only = bool(self.has_ti and (self.lkas_blocked or self.ti_fault))
@@ -3133,7 +3133,7 @@ class CurveSlowdown:
     """(round P) a 'camFault' event when the car's camera reports a fault (carstate cam_fault), 'camFaultCleared' when it
     clears, each with the panda's per-bus CAN error counts."""
     kinds = {1: "lane lines off", 2: "ERR bits"}
-    f = self.cam_fault_now
+    f = self.cam_fault_now if self.has_ti else 0         # (review of round P, S1: a TI car's)
     if f and self.cam_fault_since is None:
       self.cam_fault_since = (t, kinds.get(f, str(f)))
       self.recorder.record("camFault", t, {"kind": kinds.get(f, str(f)), "vEgo_mph": i.v_ego / MS_PER_MPH,
