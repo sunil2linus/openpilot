@@ -878,6 +878,12 @@ class CurveSlowdownLogic:
     self.restoring = False
     self.engage = {"frame": self.frame, "goal": self.anchor, "fixed": True}
 
+  def _keep_floor(self, i, driver_speed):
+    """(LKAS_KEEP) m/s, the floor now: min(lkas_keep, his speed) rounded down to a whole step; 0 none."""
+    if not LKAS_KEEP or i.lkas_keep <= 0:
+      return 0.0
+    return math.floor(min(i.lkas_keep, driver_speed) / self.step + 1e-3) * self.step
+
   def _engage_go(self):
     return self.engage is not None and bool(self.engage.get("go"))
 
@@ -1795,11 +1801,13 @@ class CurveSlowdownLogic:
       if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
         curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
       # (LKAS_KEEP, LKAS_KEEP_MARGIN) only once the car is down near the floor in this curve
-      keep = min(i.lkas_keep, driver_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0
-      if keep > 0 and i.v_ego <= keep + self._metric_pick(LKAS_KEEP_MARGIN):
+      # (third review, T1) rounded down to a whole step: the set always ends at or under the curve's own target
+      keep = self._keep_floor(i, driver_speed)
+      margin = self._metric_pick(LKAS_KEEP_MARGIN)
+      if keep > 0 and i.v_ego <= keep + margin:
         self.keep_on = True
-      if keep <= 0:
-        self.keep_on = False
+      if keep <= 0 or (self.keep_on and keep < i.v_ego - margin):
+        self.keep_on = False             # (T1) the curve tightened under the car: the baseline approach to the new floor
       targets.append(("curve", max(curve_t, floor, keep if self.keep_on else 0.0)))
     else:
       self.keep_on = False
@@ -1995,7 +2003,7 @@ class CurveSlowdownLogic:
       # short ramp: the raise goes on up to it, the anchor bounds it)
       up_ok = False
     # (LKAS_KEEP_MARGIN) the set under the floor once the car is down near it: SET+ taps up to it (bounded by it)
-    keep_t = min(i.lkas_keep, driver_speed)
+    keep_t = self._keep_floor(i, driver_speed)
     lead_slow = i.radar_lead and (i.lead_v < 0 or i.lead_v < i.v_ego - MERGE_LEAD_CLOSING)
     keep_raise = (LKAS_KEEP and self.keep_on and reason == "curve" and i.lkas_keep > 0 and not self.blocked and
                   set_speed + self.step <= keep_t + UP_STEP_TOL * self.step and not i.stop_active and not i.hold_restore and
@@ -2005,7 +2013,7 @@ class CurveSlowdownLogic:
       self.restoring = False
       button = SET_MINUS
     elif keep_raise:
-      self.restoring = True
+      # (T1) not `restoring`: a tightening curve's re-lowering needs one step of room, not two
       button = SET_PLUS
       raise_in_curve = True            # (taps only, as the curve's own raise)
     elif (i.curve_track and i.curve_raise and reason == "curve" and not self.blocked and offset > 0 and up_ok and

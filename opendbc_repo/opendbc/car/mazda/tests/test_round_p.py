@@ -990,3 +990,35 @@ def test_rereview_minor_the_early_raise_reads_lkas_block_on_ti_cars_only():
   assert cs.CurveSlowdown._merge_early(w, cc, plan)                 # no TI: its LKAS_BLOCK says nothing here
   w.has_ti = True
   assert not cs.CurveSlowdown._merge_early(w, cc, plan)
+
+
+def test_third_review_t1_a_tightening_curve_comes_down_after_the_floors_raise():
+  # the floor raised the set 25 -> 30 (own 30.4); the curve then tightens (own 28.5 / 26.0): the set comes down
+  def run(own2, keep_on=True, frames=3200):
+    car = T.Car(45, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+    car.v_ego = 45 * MPH
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+    log = []
+    for f in range(frames):
+      kw = {}
+      if 100 <= f < 3000:
+        fol, own = (24.4, 30.4) if f < 1300 else (25.0 if f < 2000 else own2, own2)
+        kw = dict(csc_active=True, csc_speed=fol * MPH, curve_track=True, curve_raise=fol >= own - 0.5, curve_hold=True,
+                  curve_floor=min(fol, own) * MPH, curve_budget=60,
+                  lkas_keep=min(cs.LKAS_KEEP_SPEED[0], own * MPH) if keep_on else 0.0)
+      b, _ = lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego, btn_counter=(f // 10) % 16, stop_clear_ahead=True,
+                            stop_pulling_away=True, **kw))
+      if b is not None:
+        car.hold_frame(b) if lg.last_action == "hold" else car.press(b)
+      car.tick()
+      log.append((f, car.set_speed / MPH, car.v_ego / MPH))
+    return log
+  log = run(28.5)
+  assert abs(log[1290][1] - 30) < 1e-6                                   # (the floor's raise happened)
+  assert log[2900][1] <= 28 + 1e-6 and log[2900][2] <= 28.6, log[2900]   # down to the tighter part's whole step
+  on, off = run(26.0), run(26.0, keep_on=False)
+  v_on, v_off = min(v for f, s, v in on[2000:3000]), min(v for f, s, v in off[2000:3000])
+  # (the floor is the curve's own 26.0; without it the follower's undershoot takes the car 0.7 mph lower)
+  assert v_on <= 26.2 and v_on - v_off <= 0.8, (v_on, v_off)
+  assert max(s for f, s, v in on[1300:3000]) <= 30 + 1e-6
