@@ -730,7 +730,7 @@ def test_review_l_f5_a_ramp_queue_creeping_at_18_to_25_mph_blocks_the_boost():
 def _gone_run(turning_fn, frames=3000):
   """The boost open behind a moving lead (40 -> 75 up), the lead gone at frame 700 (the radar flag drops)."""
   lg = cs.CurveSlowdownLogic(False, 10)
-  v = 45 * MPH
+  v = 40 * MPH            # (round P: more than MERGE_TAPER_GAP under the target, no taper)
   lg.update(_inp(set_speed=40 * MPH, v_ego=v))
   set_mph, log, due = 40.0, [], []
   for f in range(frames):

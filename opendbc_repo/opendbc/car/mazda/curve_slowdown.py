@@ -278,6 +278,14 @@ MERGE_UP_HOLD_MAX = 9.0       # s
 MERGE_BOOST_MAX = (90, 145)
 SET_MAX_LEARN = (88, 142)
 BOOST_DOWN_NO_BACKOFF = True
+# Owner (round P: "come down earlier"; a72/sim1.py: ~1.2-1.5 s more to 73, the peak ~75 instead of 81): during the boost,
+# once the car is within MERGE_TAPER_GAP of the target (65 on a 70 road, the target 75) or the road is matched as the
+# highway / the ramp flag drops (SlowdownInputs.merge_taper), one bounded SET- hold takes the set to the target +
+# MERGE_TAPER_OVER (80): never lower before the boost's end (the target - MERGE_BOOST_END, its way down to the target as
+# before), and no SET+ of ours after it.
+MERGE_TAPER = True
+MERGE_TAPER_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
+MERGE_TAPER_OVER = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 MERGE_HIGH_OVER = 10 * MS_PER_MPH
 MERGE_HIGH_REPEAT = 5.0       # s
 MERGE_HIGH_GAP = 0.3          # s the flag drops between two alerts (the events are read at 20 Hz)
@@ -456,6 +464,7 @@ class SlowdownInputs:
   limit_raise: float = 0.0
   limit_boost: float = 0.0        # a merge raise: the set speed may go this far (m/s) above limit_raise meanwhile (MERGE_BOOST)
   boost_road_ok: bool = True      # the merge boost may go on: on the link, or just onto its highway (a street ends it)
+  merge_taper: bool = False       # the road matched as the highway, or the ramp flag dropped, during the boost (MERGE_TAPER)
   # the ramp start's turn gate (MergeTurnGate, MERGE_TURN_*): a merge may start (calm steering for MERGE_TURN_CALM, no
   # tight ramp curve just ahead); merge_turn_pause: a merge going up pauses its SET+ (a loop / turn begins)
   merge_turn_ok: bool = True
@@ -750,6 +759,10 @@ class CurveSlowdownLogic:
     caps = [c for c in (self._cap(), self.limit_ceiling) if c is not None]
     return min(caps) if caps else None
 
+  def _metric_pick(self, pair):
+    """(mph value, km/h value) in m/s: the one for our unit."""
+    return pair[1] if self.step < MS_PER_MPH else pair[0]
+
   def _set_top(self):
     """The highest set speed the car takes (m/s): MERGE_BOOST_MAX in our unit, or the one learned this drive if lower."""
     top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
@@ -817,6 +830,15 @@ class CurveSlowdownLogic:
           self.anchor = tgt
         self.restore_pending = True
         b["ended"] = self.frame
+      elif MERGE_TAPER and "taper" not in b and not his and (i.v_ego >= tgt - self._metric_pick(MERGE_TAPER_GAP) or
+                                                             i.merge_taper):
+        # (MERGE_TAPER) one bounded SET- hold to the target + MERGE_TAPER_OVER, then no more SET+
+        over = tgt + self._metric_pick(MERGE_TAPER_OVER)
+        top = self.anchor if self.anchor is not None else (self.last_set_speed or 0.0)
+        b["taper"] = self.frame
+        if top > over + self.half_step:
+          self.anchor = over
+          self.restore_pending = True
       return
     if his or (self.anchor is not None and abs(self.anchor - tgt) > self.half_step):
       self.boost, self.boost_stuck = None, False
@@ -1026,7 +1048,7 @@ class CurveSlowdownLogic:
       elif self.hold_kind == "curve":
         self.curve_holds = max(0, self.curve_holds - 1)
       elif self.hold_kind == "boost" and self.boost is not None:
-        self.boost.pop("held", None)
+        self.boost.pop("held" if "ended" in self.boost else "taper_held", None)
       # no new hold for a moment (taps meanwhile): a hold the release rules stop before its first frame (a restore hold
       # started on the gas, which the hold's own rules then release) must not start again every other frame
       self.hold_block_until = self.frame + _frames(HOLD_NO_EFFECT_SECONDS)
@@ -1801,6 +1823,8 @@ class CurveSlowdownLogic:
       up_ok = False
     if self.red_up_block:
       up_ok = False                    # (RED_NO_RESTORE_UP) every restore's SET+, on the gas too
+    if MERGE_TAPER and self.boost is not None and "taper" in self.boost:
+      up_ok = False                    # (MERGE_TAPER) no SET+ of ours after the taper
     if want_lower:
       self.restoring = False
       button = SET_MINUS
@@ -1897,10 +1921,12 @@ class CurveSlowdownLogic:
     gas_hold_ok = not i.gas_pressed or (button == SET_PLUS and not want_lower and not faster)
     # the merge boost's way down: one SET- hold (MERGE_DOWN_HOLD), waited for MERGE_DOWN_HOLD_WAIT, else taps
     bst = self.boost
+    # (MERGE_TAPER) the taper's own hold before the boost's end (its bound: the anchor, the target + MERGE_TAPER_OVER)
+    held_key = "held" if (bst is None or "ended" in bst) else "taper_held"
     boost_down = (MERGE_DOWN_HOLD and button == SET_MINUS and not want_lower and reason is None and bst is not None and
-                  "ended" in bst and not bst.get("held") and not i.gas_pressed)
+                  ("ended" in bst or "taper" in bst) and not bst.get(held_key) and not i.gas_pressed)
     if boost_down and not (self.holds_allowed and flight_ok and not jump):
-      if self.frame - bst["ended"] < _frames(MERGE_DOWN_HOLD_WAIT):
+      if self.frame - bst.get("ended", bst.get("taper", 0)) < _frames(MERGE_DOWN_HOLD_WAIT):
         return None, None
       boost_down = False
     if self.holds_allowed and flight_ok and not jump and gas_hold_ok:
@@ -1930,7 +1956,7 @@ class CurveSlowdownLogic:
       elif boost_down:
         # the merge boost's way down (MERGE_DOWN_HOLD): bounded at the target, as a stop hold at its floor (the release
         # keeps the overrun margin above it: nothing lands below the target)
-        hard = max(self.boost["target"], MIN_SET_SPEED)
+        hard = max(self.boost["target"] if held_key == "held" else self.anchor, MIN_SET_SPEED)
         hold = set_speed - worst >= hard - self.half_step
         if hold:
           self.hold_bound = hard
@@ -1980,7 +2006,7 @@ class CurveSlowdownLogic:
         p.jump = True
         p.reserve = p.remaining = max(1, int(round(top / self.step)) - int(round(i.set_speed / self.step)))
     if hold and self.hold_kind == "boost" and self.boost is not None:
-      self.boost["held"] = True       # (once: the taps do what is left)
+      self.boost[held_key] = True     # (once: the taps do what is left)
     if button == SET_MINUS and want_lower:
       if reason == "curve":
         self.lower_presses += 1
@@ -2064,6 +2090,7 @@ class CurveSlowdown:
     self.limit_want = 0.0
     self.boost_street_frames = 0     # updates matched to a street (the merge boost ends: _boost_road_ok)
     self.boost_hwy_frames = 0        # updates matched to a highway since the last link
+    self.boost_ramp_seen = False     # the planner's ramp flag was on during the current merge boost (MERGE_TAPER)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
     self.curve_enabled = curve_enabled
@@ -2503,6 +2530,7 @@ class CurveSlowdown:
       limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
       limit_boost=self._merge_boost(),
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
+      merge_taper=self._merge_taper(plan if self._alive('starpilotPlan') else None),
       merge_turn_ok=turn_ok, merge_turn_pause=turn_pause, merge_turning=bool(self.turn_gate.turning),
       onramp_pending=bool(self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
                           0 < float(getattr(plan, "mapCurveTarget", 0.0) or 0.0) < set_speed - lg.half_step),
@@ -2865,6 +2893,18 @@ class CurveSlowdown:
       self.boost_street_frames += 1
     return (self.boost_street_frames < _frames(MERGE_BOOST_STREET) and
             self.boost_hwy_frames < _frames(MERGE_BOOST_HWY))
+
+  def _merge_taper(self, plan):
+    """(MERGE_TAPER) during the merge boost: the road matched as the highway, or the planner's ramp flag dropped."""
+    if self.logic.boost is None or plan is None:
+      self.boost_ramp_seen = self.boost_ramp_seen and self.logic.boost is not None
+      return False
+    try:
+      rc, on_ramp = int(getattr(plan, "mapRoadClass", 0) or 0), bool(getattr(plan, "mapOnRamp", False))
+    except (TypeError, ValueError):
+      return False
+    self.boost_ramp_seen = self.boost_ramp_seen or on_ramp
+    return rc in HWY_ROAD_CLASSES or (self.boost_ramp_seen and not on_ramp)
 
   def _merge_boost(self):
     """The merge boost (m/s) for the follower's offer: a merge raise (rule 5) only (MERGE_BOOST)."""

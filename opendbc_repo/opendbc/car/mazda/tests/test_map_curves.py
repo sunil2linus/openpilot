@@ -411,8 +411,10 @@ def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before
   ups = [h for h in logic.hold_log if h["direction"] == cs.SET_PLUS]
   downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
   # (35 -> 90 is longer than one hold may run, HOLD_MAX_SECONDS: a second one goes on)
-  assert 1 <= len(ups) <= 2 and len(downs) == 1, logic.hold_log
-  assert abs(downs[0]["bound_mph"] - 75) < 1e-6
+  # (round P, MERGE_TAPER: from 65 mph the set comes down to 80 first; with the car's holds not measured the way down is
+  # taps, as for any SET- hold that could overrun its bound)
+  assert 1 <= len(ups) <= 2 and len(downs) <= 1, logic.hold_log
+  assert all(abs(d["bound_mph"] - 75) < 1e-6 or abs(d["bound_mph"] - 80) < 1e-6 for d in downs)
   # one hold up to the boost less the overrun margin (two quanta before the car's holds are measured: 80 under round P's
   # 90 cap), then taps; it never passes the boost (review)
   up = next(f for f, s, v in log if s >= 80 - 0.01)
@@ -425,7 +427,8 @@ def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before
   peak = max(v for f, s, v in log)
   assert peak <= 75 + 4, peak                              # owner: at most ~4 above the target
   t35_75 = next(f for f, s, v in log if v >= 75 - 0.5) - 400
-  assert t35_75 <= 1900, t35_75                            # 35 -> 75 in ~18 s on the measured cruise
+  # 35 -> 75 in ~18 s on the measured cruise (~21 s with round P's taper to 80 from 65 mph: the owner's trade)
+  assert t35_75 <= 2150, t35_75
   assert abs(car.set_speed / MPH - 75) < 1e-6 and logic.boost is None and not logic.boost_stuck
   # without the boost: the same raise by a hold, never above 75; the car gets to 72 later
   car0, logic0, top0, log0 = _merge_run(9000, 0, limit=75)
@@ -2729,8 +2732,9 @@ def test_the_boosts_way_down_waits_for_his_gas_then_holds():
       ended, gas_until = f, f + 1200                       # on the gas 12 s from the boost's end
     stuck = stuck or logic.boost_stuck
   assert minus_on_gas == 0 and not stuck
-  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
-  assert len(downs) == 1 and downs[0]["frame"] >= gas_until and abs(car.set_speed / MPH - 75) < 1e-6
+  # (round P: the taper took the set to 80 before the end, MERGE_TAPER; what is left of the way down after his gas)
+  downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS and h["frame"] >= ended]
+  assert len(downs) <= 1 and all(d["frame"] >= gas_until for d in downs) and abs(car.set_speed / MPH - 75) < 1e-6
 
 
 def test_drive_69_a_firm_exit_curve_under_40_mph_keeps_the_set_speed_6_under_it():

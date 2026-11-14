@@ -120,3 +120,65 @@ def test_a_back_off_never_blocks_the_way_down_and_a_third_one_does_not_forget_it
   finally:
     cs.BOOST_DOWN_NO_BACKOFF = old
   assert cs.SET_MINUS not in outs
+
+
+# ---- fix 2: the earlier come-down (owner): a taper to the target + 5 from 10 under it (a72/sim1.py) ----
+
+def _after(log, f0):
+  return [x for x in log if x[0] >= f0]
+
+
+def test_73_the_taper_holds_90_to_80_from_65_mph_then_75_from_73_and_no_set_plus_after():
+  car, lg, log = _boost73()
+  f65 = next(f for f, s, v, *_ in log if v >= 65)
+  f73 = next(f for f, s, v, *_ in log if v >= 73)
+  downs = [x for x in _after(log, f65) if x[3] == cs.SET_MINUS]
+  assert downs and downs[0][0] - f65 <= 60 and downs[0][4] == "hold", downs[:2]     # one SET- hold at once
+  assert all(s >= 80 - 1e-6 for f, s, *_ in log if f65 <= f < f73), "never below the target + 5 before the end"
+  assert any(abs(s - 80) < 1e-6 for f, s, *_ in log if f65 <= f < f73)
+  assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if f >= f65), "no SET+ after the taper"
+  back = next(f for f, s, *_ in log if f > f73 and s <= 75 + 1e-6)
+  assert back - f73 <= 300 and abs(car.set_speed / MPH - 75) < 1e-6
+  peak = max(v for _, _, v, *_ in log)
+  # (without the taper: the set 90 until 73 mph, the peak higher)
+  old = cs.MERGE_TAPER
+  try:
+    cs.MERGE_TAPER = False
+    _, _, log0 = _boost73()
+  finally:
+    cs.MERGE_TAPER = old
+  t73, t73_0 = f73, next(f for f, s, v, *_ in log0 if v >= 73)
+  # (a72/sim1.py: ~1.2-1.5 s more to 73, the peak ~75; on the drive the back-off made it 81)
+  assert peak <= 76.0 and 0 <= t73 - t73_0 <= 200, (peak, t73, t73_0)
+
+
+def test_the_taper_also_when_the_highway_is_matched_or_the_ramp_flag_drops():
+  # the ramp flag drops at 55 mph (the planner's merge_taper): the taper at once, the set never under 80 before the end
+  state = {}
+
+  def inp(f, car, lg):
+    if car.v_ego >= 55 * MPH and "f" not in state:
+      state["f"] = f
+    return {"merge_taper": "f" in state}
+  car, lg, log = _boost73(inp=inp)
+  f55 = state["f"]
+  f73 = next(f for f, s, v, *_ in log if v >= 73)
+  assert next(f for f, s, v, b, *_ in log if f >= f55 and b == cs.SET_MINUS) - f55 <= 60
+  assert all(s >= 80 - 1e-6 for f, s, *_ in log if f55 <= f < f73)
+  assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if f >= f55 + 5)
+  assert abs(car.set_speed / MPH - 75) < 1e-6
+
+
+def test_the_wrapper_tapers_on_the_highway_match_or_when_the_ramp_flag_drops():
+  from types import SimpleNamespace
+  w = SimpleNamespace(logic=SimpleNamespace(boost=None), boost_ramp_seen=False)
+  taper = lambda plan: cs.CurveSlowdown._merge_taper(w, plan)  # noqa: E731
+  assert not taper(SimpleNamespace(mapRoadClass=1, mapOnRamp=False))           # no boost: nothing
+  w.logic.boost = {"target": 75 * MPH, "frame": 0}
+  assert not taper(SimpleNamespace(mapRoadClass=2, mapOnRamp=False))           # a link, the flag never seen: not yet
+  assert not taper(SimpleNamespace(mapRoadClass=2, mapOnRamp=True))
+  assert taper(SimpleNamespace(mapRoadClass=2, mapOnRamp=False))               # the ramp flag dropped
+  w.boost_ramp_seen = False
+  assert taper(SimpleNamespace(mapRoadClass=1, mapOnRamp=False))               # the highway matched
+  w.logic.boost = None
+  assert not taper(None) and not w.boost_ramp_seen

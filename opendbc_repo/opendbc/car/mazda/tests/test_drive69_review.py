@@ -136,7 +136,7 @@ def test_a_boost_left_high_is_taken_back_and_the_alert_repeats():
   # the car answers no SET- after the end: the alert, again every MERGE_HIGH_REPEAT while 10+ above the target
 
   def ev2(f, st, car, lg):
-    st["block"] = lg.boost is not None and "ended" in lg.boost
+    st["block"] = lg.boost is not None and ("ended" in lg.boost or "taper" in lg.boost)   # (round P: from the taper)
   car, lg, log, rises = _boost_run(9000, ev2)
   assert car.set_speed / MPH >= 85 and rises >= 3, rises
   # forgotten (the car not answering, his cancel and RES): the boost's ended branch anchors the target again
