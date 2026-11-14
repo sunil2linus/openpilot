@@ -2136,7 +2136,9 @@ class CurveSlowdownLogic:
         # to 45 and the quantum after the release: 50)
         # (ENGAGE_RAISE) ... or his RES with the car far faster and off the gas (GAS_JUMP_RECENT over: no jump seen there,
         # drives 4c-4f): the hold at once (drive 72 t 406.6: taps from 20 at 45 mph, the car braked to 35)
-        hold = hold and (not faster or v_hi <= bound_steps or (self._engage_go() and not may_jump))
+        # (review of round P, S2) and only with the goal at or above the car's speed: a jump could never land above it
+        hold = hold and (not faster or v_hi <= bound_steps or (self._engage_go() and not may_jump and
+                                                                int(round(self.engage["goal"] / self.step)) >= v_hi))
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True

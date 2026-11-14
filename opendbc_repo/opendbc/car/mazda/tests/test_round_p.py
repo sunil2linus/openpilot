@@ -836,3 +836,13 @@ def test_review_b2_a_false_exit_without_a_link_answer_is_firm_for_tent_max_at_mo
   assert r["sets"][-1] >= 54 - 1e-6, r["sets"][-1]                           # the adopted set: not under baseline's 54
   r, exit_x, past = _false_exit(shape=True)
   assert min(v for v, *_ in past) >= 50.0 and abs(r["sets"][-1] - 75) < 1e-6  # (was 40.3)
+
+
+def test_review_s2_no_hold_with_the_car_faster_than_a_goal_under_its_speed():
+  # after a turn the street's 40 bounds his old 75; RES with the set 20 at 45 mph (off the gas): taps only (a hold's first
+  # frame jumping to 45 would land above the 40)
+  extra = lambda f, car: dict(road_changed=True, engage_goal=40 * MPH)  # noqa: E731
+  car, lg, log = _res_run(20, 45, 75, frames=900, extra=extra, stop_episode=True)
+  assert lg.engage is None or abs(lg.engage["goal"] / MPH - 40) < 1e-6
+  assert not any(b == cs.SET_PLUS and a == "hold" for f, s, v, b, a in log if f >= 300 and v > 41)
+  assert max(s for _, s, *_ in log) <= 40 + 1e-6
