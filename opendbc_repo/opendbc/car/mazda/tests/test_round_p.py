@@ -796,3 +796,27 @@ def test_the_wrappers_early_conditions(tmp_path, monkeypatch):
   for _ in range(200):
     ok = c._merge_early(cc, plan)
   assert ok
+
+
+# ---- review of round P, B2: a false exit with his signal near the split (he stays on the highway) ----
+
+def _false_exit(shape=False, untrusted=True, stay_from=200.0):
+  exit_x, curve_x = 2000.0, 2300.0
+  base = TE.exit_fields(exit_x, curve_x, r=60.0, ann=900.0, clear=10.0, stay=True, shape=shape, stay_from=stay_from)
+  fields = (lambda x: dataclasses.replace(base(x), gps_trust=2) if x > exit_x else base(x)) if untrusted else base
+  sig = lambda x: 1 if exit_x - 150 <= x < exit_x - 60 else 0  # noqa: E731
+  lane = lambda x: 1 if exit_x - 300 <= x < exit_x + 30 else None  # noqa: E731
+  r = TE.drive_exit(fields, 11000, 75, signal=sig, lane=lane)
+  past = [(v, s, w, xx) for v, s, w, xx in zip(r["vs"], r["sets"], r["why"], r["xs"], strict=True) if xx >= exit_x]
+  return r, exit_x, past
+
+
+def test_review_b2_a_false_exit_without_a_link_answer_is_firm_for_tent_max_at_most():
+  r, exit_x, past = _false_exit()
+  firm_x = [xx for v, s, w, xx in past if w == "exit signalled"]
+  v_split = TE._at(r, exit_x)
+  assert firm_x and (max(firm_x) - exit_x) / (v_split * MPH) <= CTL.TENT_MAX + 0.5, max(firm_x) - exit_x
+  assert min(v for v, *_ in past) >= 50.0, min(v for v, *_ in past)          # (was 38.2; baseline 53.5)
+  assert r["sets"][-1] >= 54 - 1e-6, r["sets"][-1]                           # the adopted set: not under baseline's 54
+  r, exit_x, past = _false_exit(shape=True)
+  assert min(v for v, *_ in past) >= 50.0 and abs(r["sets"][-1] - 75) < 1e-6  # (was 40.3)

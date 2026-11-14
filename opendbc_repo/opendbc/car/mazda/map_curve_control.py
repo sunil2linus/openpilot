@@ -567,6 +567,7 @@ class ExitPlan:
     self.declined = False         # his decision (gas, the other signal, a lane change away): no exit slowing before the ramp
     self.signalled = False        # he signalled toward the exit (kept: the signal may go off once in the exit lane)
     self.signal_odo = None        # the control's odometer where his signal toward it was last on (NAV_SIGNAL_NEAR)
+    self.firm_used = False        # the firm follow ran past the split before any "link" answer (NAV_SIGNAL_FIRM)
     self.chimed = False           # the brake chime before the split
     self.slowing = False          # the slowdown before the split is on
     self.evidence = False         # exit lane evidence (signal toward it, the camera's edge lane) DECIDE_NEAR before it
@@ -1046,8 +1047,16 @@ class MapCurveControl:
         p.tent_v0 = v_ego
       cmd, sp, v_c, why, fol, firm = self._ramp_command(f, p, driver_speed, v_ego, on_link)
       sig_near = p.signal_odo is not None and p.exit_at - p.signal_odo <= NAV_SIGNAL_NEAR
-      if cmd < NO_CURVE and NAV_SIGNAL_FIRM and p.nav_near and p.signalled and sig_near and p.tent_s <= TENT_HARD_MAX:
+      # (review of round P, B2) a "link" answer past the split (the shapes, the model path, the road match) carries the firm
+      # follow on; without one it lasts TENT_MAX, then the tentative rules (TENT_DIP_MAX included); the model path saying
+      # "highway" ends it at once
+      linked = ((p.link_odo is not None and p.link_odo >= p.exit_at - EXIT_EARLY) or m_link > 0.0 or p.match_s > 0.0)
+      if (cmd < NO_CURVE and NAV_SIGNAL_FIRM and p.nav_near and p.signalled and sig_near and m_hwy <= 0.0 and
+          (linked or p.tent_s <= TENT_MAX) and p.tent_s <= TENT_HARD_MAX):
+        p.firm_used = True
         return self._cmd(p, cmd, sp, v_c, "exit signalled", fol, firm)    # (NAV_SIGNAL_FIRM)
+      # (after an unconfirmed firm start: never lower than the tentative rules alone could have taken it, TENT_DIP_MAX)
+      dip_floor = (p.tent_v0 - TENT_DIP_MAX) if p.firm_used else 0.0
       if cmd < NO_CURVE:
         # (no shape answer at all since QUIET_FROM past the split: an answer either way is followed as such); carried on
         # past TENT_MAX only while the model path does not say "highway", never past TENT_HARD_MAX nor TENT_DIP_MAX
@@ -1055,13 +1064,13 @@ class MapCurveControl:
         quiet = p.tent_s <= TENT_MAX_QUIET and not p.answered and model_ok
         more = model_ok and (p.link_s >= TENT_LINK - 1e-6 or m_link >= TENT_LINK - 1e-6)
         if (p.tent_s <= TENT_MAX or quiet or more) and p.tent_s <= TENT_HARD_MAX and v_ego > p.tent_v0 - TENT_DIP_MAX:
-          cmd = max(cmd, v_ego - TENT_GAP)
+          cmd = max(cmd, v_ego - TENT_GAP, dip_floor)
           if p.hold is not None and p.slowing and p.tent_s <= TENT_MAX:
             cmd = min(cmd, p.hold)
         else:
           # no more slowing until it is confirmed: the set speed back to the speed (SET+ taps), never above his; on a
           # ramp matched as such (drive 54, exit 2: a SET+ 55 -> 57 on the real ramp just before its curve) none
-          cmd = min(max(cmd, v_ego), driver_speed)
+          cmd = min(max(cmd, v_ego, dip_floor), driver_speed)
           if (on_link or f.on_ramp) and p.last_cmd is not None:
             cmd = min(cmd, p.last_cmd)
           return self._cmd(p, cmd, cmd, cmd, "exit wait", None)
