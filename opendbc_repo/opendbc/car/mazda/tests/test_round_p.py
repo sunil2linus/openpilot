@@ -529,7 +529,7 @@ def test_the_camera_target_ti_only_under_28_mph_or_while_blocked():
   assert abs(t.speed - math.sqrt(1.8 / k_mild)) < 1e-6                  # blocked: at 1.8
 
 
-def test_the_controller_floors_curve_targets_and_a_stop_in_a_followed_curve_at_lkas_keep():
+def test_the_controller_floors_curve_targets_but_never_a_stop_at_lkas_keep():
   keep = cs.LKAS_KEEP_SPEED[0]
 
   def run(**kw):
@@ -547,10 +547,10 @@ def test_the_controller_floors_curve_targets_and_a_stop_in_a_followed_curve_at_l
   firm = dict(csc_active=True, csc_speed=24.3 * MPH, curve_track=True, curve_hold=True, curve_floor=24.3 * MPH,
               curve_budget=60)
   assert run(**firm) <= 26 and run(lkas_keep=keep, **firm) >= 30 - 1e-6
-  # a stop's dip inside a followed curve: floored too; outside any curve: not
+  # (review of round P, B3) a stop's dip, also inside a followed curve: not floored, under 30 as before
   stop = dict(stop_active=True, stop_target=20 * MPH, stop_urgent=True)
   inside = dict(csc_active=True, csc_speed=31 * MPH, curve_track=True, curve_floor=25 * MPH)
-  assert run(lkas_keep=keep, **stop, **inside) >= 30 - 1e-6
+  assert run(lkas_keep=keep, **stop, **inside) <= 25
   assert run(**stop, **inside) <= 25
   assert run(lkas_keep=keep, **stop) <= 25
 

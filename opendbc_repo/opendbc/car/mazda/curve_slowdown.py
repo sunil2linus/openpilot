@@ -379,7 +379,7 @@ ENGAGE_RAISE_MAX = 20.0       # s
 # Round P (a73r, full CAN: the EPS blocks the stock LKAS torque below 45 km/h, back only above ~52; then only the Torque
 # Interceptor steers, about half the lateral capability; drive 73's loop: our set 26 (42 km/h) took the car to 44 km/h at
 # 1132 and the LKAS stayed blocked through the loop). With a TI: a curve target (map curves, the camera's, a ramp's firm
-# undershoot, a stop's dip inside a followed curve) is floored at LKAS_KEEP_SPEED whenever the curve's own target is
+# undershoot; never a stop slowdown's target: review of round P, B3) is floored at LKAS_KEEP_SPEED whenever the curve's own target is
 # map_curve_control.TI_ONLY_BELOW (28 mph) or more, so the set never takes the car under the cut-off for a curve that does
 # not need it; a curve that does (its target under 28 mph), or any curve while the LKAS is blocked (LKAS_BLOCK, kept
 # TI_ONLY_HYST after it clears), is planned TI-only instead (map_curve_control.TI_ONLY_LAT, curve_target.CurveTarget.ti_lat)
@@ -562,7 +562,7 @@ class SlowdownInputs:
   # the street's target (m/s, 0 unknown) at his RES (ENGAGE_RAISE): the street's steady limit plus the Street Speed offset,
   # or after an exit the exit's street target (map_curve_control.street_target, its fallback)
   engage_goal: float = 0.0
-  # m/s, 0 none (LKAS_KEEP): curve targets (and a stop's inside a followed curve) are never under this, nor his speed
+  # m/s, 0 none (LKAS_KEEP): curve targets are never under this (nor his speed); stop targets are not floored
   lkas_keep: float = 0.0
 
 
@@ -1785,10 +1785,8 @@ class CurveSlowdownLogic:
       keep = min(i.lkas_keep, driver_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0   # (LKAS_KEEP)
       targets.append(("curve", max(curve_t, floor, keep)))
     if i.stop_active:
-      stop_t = max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)
-      if LKAS_KEEP and i.lkas_keep > 0 and i.csc_active and i.curve_track:
-        stop_t = max(stop_t, min(i.lkas_keep, driver_speed))   # (LKAS_KEEP) a stop's dip inside a followed curve
-      targets.append(("stop", stop_t))
+      # (review of round P, B3: a stop, a red light or a stopped car goes under LKAS_KEEP_SPEED in a curve as before)
+      targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
     reason, target = min(targets, key=lambda rt: rt[1]) if targets else (None, None)
 
     # A hold in progress: keep sending its frames at the stock cadence, nothing else. Stop at once
