@@ -890,3 +890,13 @@ def test_review_s1_a_mazda_without_a_ti_has_no_camera_fault_notice_or_events():
 def test_review_m1_no_early_raise_while_the_wheel_winds_up():
   lg, log = _early_run(frames=290, merge_turn_pause=True)
   assert not any(b == cs.SET_PLUS for f, s, b, a in log)
+
+
+def test_review_a_taper_with_the_set_still_low_raises_to_the_target_plus_5():
+  # the highway matched 1.5 s into the boost (a short ramp), the set still ~45: up to 80, then no SET+ (rp_review taper)
+  car, lg, log = _boost73(frames=4000, inp=lambda f, car, lg: {"merge_taper": f >= 150})
+  t70 = next((f for f, s, v, *_ in log if v >= 70), None)
+  _, _, log0 = _boost73(frames=4000)
+  t70_0 = next(f for f, s, v, *_ in log0 if v >= 70)
+  assert t70 is not None and t70 <= t70_0 + 150, (t70, t70_0)       # (was: the set left at 45, 70 mph far later)
+  assert max(s for _, s, *_ in log) <= 80 + 1e-6 and abs(car.set_speed / MPH - 75) < 1e-6

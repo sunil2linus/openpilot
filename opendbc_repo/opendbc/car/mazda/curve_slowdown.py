@@ -1974,8 +1974,10 @@ class CurveSlowdownLogic:
       up_ok = False
     if self.red_up_block:
       up_ok = False                    # (RED_NO_RESTORE_UP) every restore's SET+, on the gas too
-    if MERGE_TAPER and self.boost is not None and "taper" in self.boost:
-      up_ok = False                    # (MERGE_TAPER) no SET+ of ours after the taper
+    if MERGE_TAPER and self.boost is not None and self.boost.get("taper_held"):
+      # (MERGE_TAPER) no SET+ of ours after the taper's hold down (a taper with the set still under the target + 5, a
+      # short ramp: the raise goes on up to it, the anchor bounds it)
+      up_ok = False
     if want_lower:
       self.restoring = False
       button = SET_MINUS
