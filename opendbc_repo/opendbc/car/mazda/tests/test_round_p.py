@@ -684,3 +684,42 @@ def test_the_signal_rows_and_the_cam_fault_events(tmp_path, monkeypatch):
   assert kinds.count("camFault") == 1 and kinds.count("camFaultCleared") == 1
   fault = next(d for kd, d in records if kd == "camFault")
   assert fault["kind"] == "ERR bits" and fault["panda_can"] == []        # (no pandaStates in the test's SubMaster)
+
+
+# ---- fix 10: the camera fault notice (text by kind, again after clearing, "cleared") ----
+
+def _events_modules():
+  import pytest
+  try:
+    from openpilot.selfdrive.selfdrived import events
+    from openpilot.starpilot.controls.lib import starpilot_events as spe
+  except Exception as e:                                          # (needs the device's native modules, or their stubs)
+    pytest.skip(f"events.py not importable here: {e}")
+  return events, spe
+
+
+def test_the_camera_fault_notice_text_by_kind():
+  from types import SimpleNamespace as N
+  events, _ = _events_modules()
+  a = events.mazda_cam_fault_alert(None, None, {"starpilotCarState": N(mazdaCamFault=2)}, False, 0, None, N())
+  assert a.alert_text_1 == "Car's camera reports a fault"
+  # (the UI's width, test_alerts.test_alert_text_length: 1809 of 1860 px at Inter-SemiBold 66)
+  assert a.alert_text_2 == "Collision warning, lane keep may be off · steering weaker"
+  b = events.mazda_cam_fault_alert(None, None, {"starpilotCarState": N(mazdaCamFault=1)}, False, 0, None, N())
+  assert b.alert_text_1 == "Car's Lane Keep Assist is off" and "Restart" not in b.alert_text_2
+  assert events.mazda_cam_fault_alert(None, None, {}, False, 0, None, N()).alert_text_1 == "Car's Lane Keep Assist is off"
+  E = events.STARPILOT_EVENTS
+  assert E[events.StarPilotEventName.mazdaStockLkasOff][events.ET.PERMANENT] is events.mazda_cam_fault_alert
+  assert E[events.StarPilotEventName.mazdaCamFaultCleared][events.ET.PERMANENT].alert_text_1 == "Car's camera fault cleared"
+
+
+def test_the_camera_fault_notice_comes_back_after_clearing_at_most_every_60_s():
+  _, spe = _events_modules()
+  n = spe.MazdaCamNotice(dt=0.05)
+  run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
+  assert run(2, 5.0) == ["fault"]                           # once while it lasts
+  assert run(0, 1.0) == [] and run(2, 1.0) == []            # a short dropout: the same episode
+  assert run(0, 3.0) == ["cleared"]                         # gone 2 s: "cleared"
+  assert run(1, 5.0) == [] and run(0, 3.0) == []            # back within 60 s of the notice: held back (and no "cleared")
+  run(0, 60.0)
+  assert run(2, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]   # back after 60 s: again

@@ -221,6 +221,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mazdaLimitSlowing @49;
     mazdaSetSpeedHigh @50;
     mazdaCruiseResumed @51;
+    mazdaCamFaultCleared @52;
   }
 }
 

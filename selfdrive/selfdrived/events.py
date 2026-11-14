@@ -278,6 +278,28 @@ def limit_slowing_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMa
     Priority.LOW, VisualAlert.none, AudibleAlert.none, 5.)
 
 
+def mazda_cam_fault_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
+                          personality, starpilot_toggles: SimpleNamespace) -> Alert:
+  # Mazda + TI (round P): the car's camera reports a fault (CAM_LKAS ERR bits: drive 73, the LKAS blocked at speed, the
+  # car's collision warning may be off too), or only its lane lines are off at speed (the milder text); both fit the UI
+  # (test_alerts.test_alert_text_length)
+  try:
+    fault = int(getattr(sm["starpilotCarState"], "mazdaCamFault", 0) or 0)
+  except Exception:
+    fault = 0
+  if fault == 2:
+    return Alert(
+      "Car's camera reports a fault",
+      "Collision warning, lane keep may be off · steering weaker",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.)
+  return Alert(
+    "Car's Lane Keep Assist is off",
+    "Steering is weaker in curves",
+    AlertStatus.userPrompt, AlertSize.mid,
+    Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.)
+
+
 def stopped_lead_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int,
                        personality, starpilot_toggles: SimpleNamespace) -> Alert:
   # the stopped car warning also warns for a much slower moving car (stop_warning.SLOW_LEAD_*): "CAR AHEAD - BRAKE" then,
@@ -1344,11 +1366,15 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   StarPilotEventName.mazdaStockLkasOff: {
+    ET.PERMANENT: mazda_cam_fault_alert,
+  },
+
+  StarPilotEventName.mazdaCamFaultCleared: {
     ET.PERMANENT: Alert(
-      "Car's Lane Keep Assist is off",
-      "Steering is weaker in curves. Restart the car to reset it",
-      AlertStatus.userPrompt, AlertSize.mid,
-      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.),
+      "Car's camera fault cleared",
+      "",
+      StarPilotAlertStatus.starpilot, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 3.),
   },
 
   StarPilotEventName.holidayActive: {

@@ -17,6 +17,43 @@ RANDOM_EVENTS_LENGTH = 5
 RANDOM_EVENT_START = StarPilotEventName.accel30
 RANDOM_EVENT_END = StarPilotEventName.youveGotMail
 
+# Mazda + TI (round P): the car's camera fault notice (starpilotCarState.mazdaCamFault, mazdaStockLkasOff) again when the
+# fault comes back after clearing, at most every CAM_FAULT_REPEAT; "cleared" once it has been gone CAM_FAULT_CLEAR
+CAM_FAULT_REPEAT = 60.0      # s
+CAM_FAULT_CLEAR = 2.0        # s
+
+
+class MazdaCamNotice:
+  """The camera fault's notices: update(fault) each planner frame (DT_MDL) -> "fault", "cleared" or None."""
+  def __init__(self, dt=DT_MDL):
+    self.dt = dt
+    self.t = 0.0
+    self.active = False          # a fault episode is on (its notice shown, or held back by CAM_FAULT_REPEAT)
+    self.shown = False           # ... and its notice was shown
+    self.last = None             # t of the last fault notice
+    self.clear_s = 0.0
+
+  def update(self, fault):
+    self.t += self.dt
+    if fault:
+      self.clear_s = 0.0
+      if not self.active:
+        self.active = True
+        self.shown = self.last is None or self.t - self.last >= CAM_FAULT_REPEAT - 1e-6
+        if self.shown:
+          self.last = self.t
+          return "fault"
+      return None
+    if self.active:
+      self.clear_s += self.dt
+      if self.clear_s >= CAM_FAULT_CLEAR - 1e-6:
+        self.active = False
+        if self.shown:
+          self.shown = False
+          return "cleared"
+    return None
+
+
 class StarPilotEvents:
   def __init__(self, StarPilotPlanner, error_log, ThemeManager):
     self.starpilot_planner = StarPilotPlanner
@@ -116,9 +153,17 @@ class StarPilotEvents:
       self.events.add(StarPilotEventName.mazdaCruiseResumed)
     self.prev_auto_resume = auto_resume
 
-    if sm["starpilotCarState"].mazdaStockLkasOff and not getattr(self, "mazda_lkas_off_shown", False):
-      self.mazda_lkas_off_shown = True
+    # Mazda + TI: the car's camera reports a fault (ERR bits) or its lane lines are off at speed: the notice, again when it
+    # comes back after clearing (MazdaCamNotice), and a short one when it has cleared
+    scs = sm["starpilotCarState"]
+    fault = int(getattr(scs, "mazdaCamFault", 0) or 0) or (1 if scs.mazdaStockLkasOff else 0)
+    if getattr(self, "mazda_cam_notice", None) is None:
+      self.mazda_cam_notice = MazdaCamNotice()
+    notice = self.mazda_cam_notice.update(fault)
+    if notice == "fault":
       self.events.add(StarPilotEventName.mazdaStockLkasOff)
+    elif notice == "cleared":
+      self.events.add(StarPilotEventName.mazdaCamFaultCleared)
 
     map_curves = getattr(self.starpilot_planner, "map_curves", None)
     if map_curves is not None and map_curves.notice:
