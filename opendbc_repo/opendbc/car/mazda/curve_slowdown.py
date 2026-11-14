@@ -413,6 +413,20 @@ MERGE_TURN_CURVE_D = 60.0     # m
 # MERGE_TURN_UNWIND_DECEL: replay of 12 on-ramp entries, a6l/replay3c.py: drive 65 t 651, a 120 deg turn unwinding to 25
 # deg at 1 m/s^2 of slowing and then a 112 deg turn the other way; the map had no curve there). It stays ok while the wheel
 # goes on unwinding or the turn is calm; a wheel winding up or MERGE_TURN_PAUSE_LAT pauses as before.
+# Round P (owner: "start raising when the curve is about to end"; the replay of six loop on-ramps, rp_work/loops.py: the
+# lateral starts falling with the ramp's end ~40-57 m ahead and that end is reached 0-2 s after |lat| < 1.0; the map's curve
+# end is ~7 s early, not used): on a link to a highway with a merge raise waiting for the turn gate, once the ramp's end is
+# MERGE_EARLY_REND or closer (map_curve_control.hwy_ramp_left, the planner's mapRampEndDistance counted on by the speed),
+# |lat| at most MERGE_EARLY_LAT, the steering with reserve (the median |steer command| of the last second under
+# MERGE_EARLY_RESERVE), no tight ramp curve near (as the gate), the stock LKAS not blocked and no camera fault
+# (SlowdownInputs.merge_early, the wrapper), and no red light, stop or slow car ahead: SET+ taps to at most the car's speed +
+# MERGE_EARLY_STEP; the full boost when the gate is ok, as before.
+MERGE_EARLY = True
+MERGE_EARLY_REND = 40.0       # m
+MERGE_EARLY_LAT = 2.2         # m/s^2
+MERGE_EARLY_RESERVE = 0.9     # |actuators.torque|, median over MERGE_EARLY_RESERVE_TIME
+MERGE_EARLY_RESERVE_TIME = 1.0  # s
+MERGE_EARLY_STEP = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 MERGE_TURN_UNWIND = True
 MERGE_TURN_UNWIND_RATE = 8.0  # deg/s
 MERGE_TURN_UNWIND_TIME = 0.3  # s
@@ -511,6 +525,7 @@ class SlowdownInputs:
   # tight ramp curve just ahead); merge_turn_pause: a merge going up pauses its SET+ (a loop / turn begins)
   merge_turn_ok: bool = True
   merge_turn_pause: bool = False
+  merge_early: bool = False       # the wrapper's MERGE_EARLY conditions (the ramp's end near, the turn easing, reserve, LKAS ok)
   red_light: bool = False         # starpilotPlan.redLight (raw): no merge start under it, its way up pauses
   # ... as the stop trigger sees it (its red_ok: not at highway speed on a highway, not on a ramp onto one): no SET+ back
   # up from one of our stop slowdowns under it (RESUME_RESTORE, at most RED_STOP_BLOCK_MAX from its onset)
@@ -1889,6 +1904,19 @@ class CurveSlowdownLogic:
       # a merge raise waits only for our presses still in flight (drive 69, merge 1: the restore's 1 mph taps 38 -> 47
       # kept presses in flight for 4 s and the merge's hold started at 47), or the turn gate / a red light / the
       # post-stop wait: nothing more meanwhile (no restore to an old anchor either), then its hold
+      # ... except the early raise at the ramp's end (MERGE_EARLY): SET+ taps to the car's speed + MERGE_EARLY_STEP
+      early_top = min(i.v_ego + self._metric_pick(MERGE_EARLY_STEP), i.limit_raise)
+      if (MERGE_EARLY and i.merge_early and merge and not i.merge_turn_ok and not self._merge_red(i) and not stop_wait and
+          not i.stop_active and not self._lead_blocks_boost(i) and i.boost_road_ok and not i.gas_pressed and
+          not self.inflight and self.pending is None and self.hold is None and
+          set_speed + self.step <= early_top + UP_STEP_TOL * self.step and
+          self.frame - self.last_send_frame > BUTTON_GAP_FRAMES and
+          self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
+        self.anchor = early_top          # (his speed for now: the merge's adoption takes it on from here)
+        off = self._send(SET_PLUS)
+        if off is not None:
+          self.last_action = "early"
+          return SET_PLUS, off
       return None, None
     if (self.boost is not None and "ended" not in self.boost and self._merge_paused(i) and
         self.anchor is not None and self.offset > 0):
@@ -2239,6 +2267,9 @@ class CurveSlowdown:
     self.lkas_block_now = False
     self.ti_state_now = 0
     self.cam_fault_since = None      # (t, kind) of the camera fault going on (camFault / camFaultCleared events)
+    from collections import deque
+    self.steer_cmds = deque(maxlen=max(1, int(round(MERGE_EARLY_RESERVE_TIME * 10))))   # |actuators.torque| at 10 Hz
+    self.merge_early_now = False     # this frame's MERGE_EARLY conditions (logs)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
     self.curve_enabled = curve_enabled
@@ -2696,6 +2727,7 @@ class CurveSlowdown:
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
       merge_taper=self._merge_taper(plan if self._alive('starpilotPlan') else None),
       merge_turn_ok=turn_ok, merge_turn_pause=turn_pause, merge_turning=bool(self.turn_gate.turning),
+      merge_early=self._merge_early(CC, plan if self._alive('starpilotPlan') else None),
       onramp_pending=bool(self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
                           0 < float(getattr(plan, "mapCurveTarget", 0.0) or 0.0) < set_speed - lg.half_step),
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
@@ -3142,6 +3174,33 @@ class CurveSlowdown:
     except (AttributeError, TypeError):
       pass
     return 0.0
+
+  def _merge_early(self, CC, plan):
+    """(MERGE_EARLY) the ramp onto a highway ends within MERGE_EARLY_REND, the turn eases (|lat| <= MERGE_EARLY_LAT), the
+    steering has reserve (median |steer command| of the last MERGE_EARLY_RESERVE_TIME under MERGE_EARLY_RESERVE), no tight
+    ramp curve near, the stock LKAS not blocked and no camera fault."""
+    if self.frame % 10 == 0:
+      try:
+        self.steer_cmds.append(abs(float(CC.actuators.torque)))
+      except (AttributeError, TypeError, ValueError):
+        self.steer_cmds.append(1.0)          # (unknown: no reserve)
+    self.merge_early_now = False
+    if not MERGE_EARLY or plan is None or self.lkas_blocked or self.ti_fault:
+      return False
+    mc = self.map_control
+    left = mc.hwy_ramp_left if mc is not None else None
+    if left is None and bool(getattr(plan, "mapOnRamp", False)) and bool(getattr(plan, "mapRampToHighway", False)):
+      left = float(getattr(plan, "mapRampEndDistance", 0.0) or 0.0) or None
+    if left is None or left > MERGE_EARLY_REND or abs(self.turn_gate.lat) > MERGE_EARLY_LAT:
+      return False
+    from opendbc.car.mazda.map_curve_control import STATUS_RAMP_CURVE
+    near = (int(getattr(plan, "mapCurveStatus", 0) or 0) == STATUS_RAMP_CURVE and
+            0 < float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) < MERGE_TURN_CURVE_R and
+            float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) < MERGE_TURN_CURVE_D)
+    cmds = sorted(self.steer_cmds)
+    reserve = bool(cmds) and cmds[len(cmds) // 2] < MERGE_EARLY_RESERVE
+    self.merge_early_now = bool(reserve and not near)
+    return self.merge_early_now
 
   def _merge_taper(self, plan):
     """(MERGE_TAPER) during the merge boost: the road matched as the highway, or the planner's ramp flag dropped."""

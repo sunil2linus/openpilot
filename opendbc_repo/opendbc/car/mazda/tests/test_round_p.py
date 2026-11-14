@@ -723,3 +723,76 @@ def test_the_camera_fault_notice_comes_back_after_clearing_at_most_every_60_s():
   assert run(1, 5.0) == [] and run(0, 3.0) == []            # back within 60 s of the notice: held back (and no "cleared")
   run(0, 60.0)
   assert run(2, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]   # back after 60 s: again
+
+
+# ---- fix 7: the early raise at the end of a loop on-ramp (owner: "start raising when the curve is about to end") ----
+
+def _early_run(early_from=100, gate_from=300, frames=600, **kw):
+  """On a loop's link at 30 mph with the set 30, a merge raise to 75 (+ the boost) waiting for the turn gate (ok from
+  `gate_from`); the wrapper's MERGE_EARLY conditions from `early_from`."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=30 * MPH, v_ego=30 * MPH))
+  set_mph, log = 30.0, []
+  for f in range(frames):
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=30 * MPH, limit_raise=75 * MPH, limit_boost=20 * MPH,
+                          merge_turn_ok=f >= gate_from, merge_early=f >= early_from, btn_counter=(f // 10) % 16, **kw))
+    if b == cs.SET_PLUS and (lg.last_action != "hold" or f % 10 == 0):
+      set_mph += 1 if lg.last_action != "hold" else 5
+    log.append((f, set_mph, b, lg.last_action))
+  return lg, log
+
+
+def test_the_early_raise_taps_to_the_speed_plus_5_then_the_boost_when_the_gate_opens():
+  lg, log = _early_run()
+  ups = [(f, a) for f, s, b, a in log if b == cs.SET_PLUS]
+  assert ups and 100 <= ups[0][0] <= 130 and ups[0][1] == "early", ups[:2]
+  assert max(s for f, s, *_ in log if f < 300) == 35, max(s for f, s, *_ in log if f < 300)   # the speed + 5, no more
+  assert all(a == "early" for f, a in ups if f < 300)
+  assert lg.boost is not None and max(s for f, s, *_ in log) > 40                              # the boost from the gate
+  # without the conditions: nothing before the gate (as before)
+  lg, log = _early_run(early_from=10_000)
+  assert not any(b == cs.SET_PLUS for f, s, b, a in log if f < 300)
+
+
+def test_no_early_raise_under_a_red_light_a_stop_or_a_slow_car_ahead():
+  for kw in (dict(red_light=True), dict(stop_active=True, stop_target=20 * MPH), dict(radar_lead=True, lead_v=5.0),
+             dict(hold_restore=True)):
+    lg, log = _early_run(frames=290, **kw)
+    assert not any(b == cs.SET_PLUS for f, s, b, a in log), kw
+
+
+def test_the_wrappers_early_conditions(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace as N
+  WI = _load("twi_round_p7", os.path.join(HERE, "test_wrapper_inputs.py"))
+  c, sm, _ = WI._make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  plan = N(mapOnRamp=True, mapRampToHighway=True, mapRampEndDistance=35.0, mapCurveStatus=0, mapCurveRadius=0.0,
+           mapCurveDistance=0.0)
+  c.map_control.hwy_ramp_left = 35.0
+  cc = N(actuators=N(torque=0.5))
+  c.turn_gate.lat = -1.8
+  for _ in range(20):
+    ok = c._merge_early(cc, plan)
+  assert ok
+  c.turn_gate.lat = -2.4                                            # still turning hard
+  assert not c._merge_early(cc, plan)
+  c.turn_gate.lat = -1.0
+  c.map_control.hwy_ramp_left = 60.0                                # the ramp's end still 60 m away
+  assert not c._merge_early(cc, plan)
+  c.map_control.hwy_ramp_left = 30.0
+  plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = 2, 70.0, 40.0   # a tight ramp curve near
+  assert not c._merge_early(cc, plan)
+  plan.mapCurveStatus = 0
+  c.lkas_blocked = True                                             # the stock LKAS blocked: only the TI steers
+  assert not c._merge_early(cc, plan)
+  c.lkas_blocked, c.ti_fault = False, True                          # the camera's fault
+  assert not c._merge_early(cc, plan)
+  c.ti_fault = False
+  sat = N(actuators=N(torque=1.0))
+  for _ in range(200):
+    ok = c._merge_early(sat, plan)
+  assert not ok                                                     # the steering saturated: no reserve
+  for _ in range(200):
+    ok = c._merge_early(cc, plan)
+  assert ok
