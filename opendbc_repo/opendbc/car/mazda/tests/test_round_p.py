@@ -587,12 +587,12 @@ def _loop73(keep_on=True, frames=4000):
   return sets, vs
 
 
-def test_73_loop_the_set_never_under_30_for_its_30_3_mph_target():
+def test_73_loop_the_approach_as_before_and_the_car_kept_above_the_cut_off():
+  # (re-review N3) the approach is baseline's (the firm undershoot included), the car stays above 28.5 mph in the loop
   sets, vs = _loop73()
-  assert min(sets) >= 30 - 1e-6, min(sets)
-  assert min(vs) >= 28.5, min(vs)                       # (45 km/h = 28 mph: the LKAS stays on)
   sets0, vs0 = _loop73(keep_on=False)
-  assert min(sets0) < 29, min(sets0)                    # (before: the firm undershoot under the cut-off)
+  assert min(sets) == min(sets0) and abs(vs[len(vs) // 2] - vs0[len(vs0) // 2]) < 0.3
+  assert min(vs) >= 28.5, min(vs)                       # (45 km/h = 28 mph: the LKAS stays on)
 
 
 # ---- fix 9: the camera's fault / LKAS_BLOCK above the cut-off: TI-only (and the merge's early raise off) ----
@@ -904,9 +904,9 @@ def test_review_s3_the_floor_is_continuous_and_never_raises_the_set():
   # a 30.4 mph curve asking 24.4: floored at 30
   s, _ = run(24.4, min(keep / MPH, 30.4))
   assert 30 - 1e-6 <= s <= 30 + 1e-6, s
-  # the set already under the floor (26, the floor 30): never a SET+ for the floor
+  # (re-review N3) the set under the floor with the car down near it: SET+ taps up to the floor, never above it
   s, ups = run(24.4, 30.0, set0=26)
-  assert ups == 0 and s <= 26 + 1e-6, (s, ups)
+  assert ups == 4 and abs(s - 30) < 1e-6, (s, ups)
 
 
 def test_review_s1_a_mazda_without_a_ti_has_no_camera_fault_notice_or_events():
@@ -940,3 +940,40 @@ def test_rereview_n1_res_while_passing_never_takes_the_set_above_his_anchor():
   for extra in (lambda f, car: {}, lambda f, car: dict(engage_goal=55 * MPH)):
     car, lg, log = _res_run(45, 62, 50, frames=2500, res=300, gas_until=350, extra=extra)
     assert max(s for _, s, *_ in log) <= 50 + 1e-6 and abs(car.set_speed / MPH - 50) < 1e-6, max(s for _, s, *_ in log)
+
+
+def test_rereview_n3_the_floor_raises_a_low_set_only_near_it_and_only_with_nothing_asking_for_less():
+  # drive 73 t 1128-1131: the firm undershoot left the set at 26 (the follower asking 24.4, not settled) with the car at 31
+  def run(v_mph, **kw):
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=26 * MPH, v_ego=v_mph * MPH))
+    lg.anchor = 53 * MPH
+    set_mph, presses = 26.0, []
+    for f in range(600):
+      b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v_mph * MPH, csc_active=True, csc_speed=24.4 * MPH, curve_track=True,
+                            curve_hold=True, curve_floor=24.4 * MPH, curve_budget=60, lkas_keep=30 * MPH,
+                            btn_counter=(f // 10) % 16, **kw))
+      if b is not None:
+        presses.append(b)
+        set_mph += 1 if b == cs.SET_PLUS else -1
+    return set_mph, presses
+  s, p = run(31.0)
+  assert abs(s - 30) < 1e-6 and cs.SET_MINUS not in p, (s, p)        # up to the floor by taps, no SET-/SET+ churn
+  s, p = run(40.0)
+  assert s <= 26 + 1e-6 and cs.SET_PLUS not in p                     # still 8 mph over it: the approach, as before
+  for kw in (dict(red_stop=True), dict(stop_active=True, stop_target=20 * MPH), dict(hold_restore=True),
+             dict(radar_lead=True, lead_v=8.0), dict(stop_slower_ahead=True)):
+    s, p = run(31.0, **kw)
+    assert cs.SET_PLUS not in p, kw
+
+
+def test_rereview_n3_the_floor_is_never_above_the_curves_own_target():
+  from types import SimpleNamespace as N
+  w = N(lkas_keep=0.0, has_ti=True, ti_only=False, map_on_used=True, curve_enabled=True, logic=N(step=MPH),
+        map_out=N(active=True, curve_speed=27.8 * MPH), curve_target=N(active=False, speed=0.0))
+  for own in (20.0, 27.8, 29.9, 30.4, 45.0):
+    w.map_out.curve_speed = own * MPH
+    keep = cs.CurveSlowdown._lkas_keep(w, True, False)
+    assert keep <= own * MPH + 1e-9 and abs(keep - min(cs.LKAS_KEEP_SPEED[0], own * MPH)) < 1e-9
+  w.ti_only = True
+  assert cs.CurveSlowdown._lkas_keep(w, True, False) == 0.0          # the LKAS blocked: no floor (TI-only plan)

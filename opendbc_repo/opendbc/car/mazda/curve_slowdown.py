@@ -382,11 +382,17 @@ ENGAGE_RAISE_MAX = 20.0       # s
 # undershoot; never a stop slowdown's target: review of round P, B3) is floored at min(LKAS_KEEP_SPEED, the curve's own
 # target at its normal lateral): the set never takes the car under the cut-off for a curve that does not need it, nor under
 # a slower curve's own speed (review of round P, S3: continuous, no re-plan of a 27.9 mph curve to 21.6 while the LKAS
-# works). The floor never goes above the set speed, so it never causes a SET+. While the LKAS is blocked (LKAS_BLOCK, kept
+# works). It acts only near it (LKAS_KEEP_MARGIN, re-review N3: then its one bounded SET+ raise). While the LKAS is blocked (LKAS_BLOCK, kept
 # TI_ONLY_HYST after it clears) every curve is planned TI-only instead (map_curve_control.TI_ONLY_LAT,
 # curve_target.CurveTarget.ti_lat) and not floored. Stop slowdowns are unaffected.
 LKAS_KEEP = True
 LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
+# Re-review of round P, N3 (rp_review2/keep_tight.py: a floor on the approach made the car enter a 30.4 mph curve at 33.5
+# instead of 30.8): the approach is as before (the follower's undershoot under the floor included); the floor acts only once
+# the car has come down to within LKAS_KEEP_MARGIN of it in that curve (then kept for the rest of it, no SET-/SET+ churn):
+# no SET- under it, and a set under it is brought up to it by SET+ taps (never above the floor, which is never above the
+# curve's own target nor his speed) while no stop, red light, planned stop or slower car ahead asks for less.
+LKAS_KEEP_MARGIN = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
 TI_ONLY_HYST = 2.0            # s
 # ... and while the car's camera reports a fault (CAM_LKAS ERR_BIT_1 / ERR_BIT_2, or its lane lines off at speed:
 # carstate stock_lkas_off) or LKAS_BLOCK is set above the cut-off (LKAS_CUTOFF): curves TI-only as above and the merge's
@@ -737,6 +743,7 @@ class CurveSlowdownLogic:
     self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
     self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
     self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"]}
+    self.keep_on = False             # the LKAS_KEEP floor acts in this curve (LKAS_KEEP_MARGIN)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -1787,9 +1794,15 @@ class CurveSlowdownLogic:
       curve_t = i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN)
       if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
         curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
-      # (LKAS_KEEP) never above the set speed (with our presses in flight): the floor only stops a lowering, never a SET+
-      keep = min(i.lkas_keep, driver_speed, set_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0
-      targets.append(("curve", max(curve_t, floor, keep)))
+      # (LKAS_KEEP, LKAS_KEEP_MARGIN) only once the car is down near the floor in this curve
+      keep = min(i.lkas_keep, driver_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0
+      if keep > 0 and i.v_ego <= keep + self._metric_pick(LKAS_KEEP_MARGIN):
+        self.keep_on = True
+      if keep <= 0:
+        self.keep_on = False
+      targets.append(("curve", max(curve_t, floor, keep if self.keep_on else 0.0)))
+    else:
+      self.keep_on = False
     if i.stop_active:
       # (review of round P, B3: a stop, a red light or a stopped car goes under LKAS_KEEP_SPEED in a curve as before)
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
@@ -1981,9 +1994,20 @@ class CurveSlowdownLogic:
       # (MERGE_TAPER) no SET+ of ours after the taper's hold down (a taper with the set still under the target + 5, a
       # short ramp: the raise goes on up to it, the anchor bounds it)
       up_ok = False
+    # (LKAS_KEEP_MARGIN) the set under the floor once the car is down near it: SET+ taps up to it (bounded by it)
+    keep_t = min(i.lkas_keep, driver_speed)
+    lead_slow = i.radar_lead and (i.lead_v < 0 or i.lead_v < i.v_ego - MERGE_LEAD_CLOSING)
+    keep_raise = (LKAS_KEEP and self.keep_on and reason == "curve" and i.lkas_keep > 0 and not self.blocked and
+                  set_speed + self.step <= keep_t + UP_STEP_TOL * self.step and not i.stop_active and not i.hold_restore and
+                  not i.red_stop and not self.red_up_block and not i.stop_slower_ahead and not lead_slow and not restore_only and
+                  dwell_ok and (ceiling is None or set_speed + self.step <= ceiling + 1e-3))
     if want_lower:
       self.restoring = False
       button = SET_MINUS
+    elif keep_raise:
+      self.restoring = True
+      button = SET_PLUS
+      raise_in_curve = True            # (taps only, as the curve's own raise)
     elif (i.curve_track and i.curve_raise and reason == "curve" and not self.blocked and offset > 0 and up_ok and
           not restore_only and dwell_ok and not i.stop_active and not i.hold_restore and not self._engage_go()):
       # A followed map curve's command came back up (the car is nearly at the curve's speed, see
