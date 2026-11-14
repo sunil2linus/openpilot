@@ -1,6 +1,7 @@
 """Round P (drives 72 / 73): the logged scenarios as tests."""
 import dataclasses
 import importlib.util
+import math
 import os
 
 HERE = os.path.dirname(__file__)
@@ -248,3 +249,127 @@ def test_73_a_curve_release_blip_of_0_2_s_under_the_anchor_keeps_the_boost_and_i
   finally:
     cs.MERGE_CSC_END = old
   assert max(s for _, s, *_ in log) <= 75 + 1e-6
+
+
+# ---- fix 4: his RES after our lowering: the fast raise at once (drive 73 t 540.9, drive 72 t 406.6) ----
+
+def _res_run(set0, v0, anchor, frames=1500, res=300, gas_until=None, extra=lambda f, car: {}, stop_episode=False):
+  """Cruise off (his brake) until his RES at `res` with the set our slowdown left (set0) and his `anchor`; his gas held
+  from frame 100 until `gas_until` (the car speeding up on it)."""
+  car = T.Car(set0, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = v0 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+  lg.anchor, lg.stop_episode = anchor * MPH, stop_episode
+  log = []
+  for f in range(frames):
+    cruise = f >= res
+    gas = gas_until is not None and 100 <= f < gas_until
+    kw = dict(stop_clear_ahead=True, stop_pulling_away=True)
+    kw.update(extra(f, car))
+    btn, _ = lg.update(_inp(cruise_enabled=cruise, set_speed=car.set_speed if cruise else 0.0, v_ego=car.v_ego,
+                            gas_pressed=gas, btn_counter=(f // 10) % 16, **kw))
+    if btn is not None and cruise:
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    if gas:
+      car.gas_frame = car.frame
+    if cruise and not gas:
+      car.tick()
+    else:
+      car.frame += 1
+      car.tick() if cruise else None
+      car.v_ego += (1.5 if gas else 0.0) * DT
+    log.append((f, car.set_speed / MPH, car.v_ego / MPH, btn, lg.last_action))
+  return car, lg, log
+
+
+def _street43(f, car):
+  # the exit's street target (map_curve_control "exit street": the fallback 43, settled)
+  return dict(csc_active=True, csc_speed=43 * MPH, curve_track=True, curve_raise=True, street_lower=True,
+              curve_floor=25 * MPH)
+
+
+def test_73_res_at_29_with_the_set_at_25_raises_at_once_after_his_gas_to_the_street_target():
+  res, gas_end = 300, 360                        # his RES on the gas at 29 mph, the gas released 0.6 s later
+  car, lg, log = _res_run(25, 29, 75, res=res, gas_until=gas_end, extra=_street43)
+  ups = [f for f, s, v, b, a in log if b == cs.SET_PLUS]
+  assert ups and ups[0] - gas_end <= 30, (ups[:3], gas_end)        # within 0.3 s of the gas release
+  assert log[ups[0]][4] in ("jump", "hold"), log[ups[0]]             # a jump to the speed or a hold, not a 1 mph tap
+  assert max(s for f, s, *_ in log) <= 43 + 1e-6                     # never above the street's target
+  t43 = next(f for f, s, *_ in log if s >= 43 - 1e-6)
+  assert t43 - gas_end <= 400, t43 - gas_end                        # (was: 14.7 s to 53 by taps)
+  assert min(v for f, s, v, *_ in log if f >= gas_end) >= 28.5
+  # (before round P: the first SET+ 2 s later, taps only)
+  old = cs.ENGAGE_RAISE
+  try:
+    cs.ENGAGE_RAISE = False
+    car0, lg0, log0 = _res_run(25, 29, 75, res=res, gas_until=gas_end, extra=_street43)
+  finally:
+    cs.ENGAGE_RAISE = old
+  t43_0 = next((f for f, s, *_ in log0 if s >= 43 - 1e-6), 10**9)
+  assert t43_0 > t43 + 150, (t43_0, t43)
+
+
+def _lead46(f, car):
+  return dict(radar_lead=True, lead_v=20.6)
+
+
+def test_72_res_at_45_with_the_set_at_20_raises_to_his_speed_at_once():
+  res = 300
+  car, lg, log = _res_run(20, 45, 48, res=res, gas_until=res - 100, extra=_lead46, stop_episode=True)
+  ups = [f for f, s, v, b, a in log if b == cs.SET_PLUS]
+  assert ups and ups[0] - res <= 50, ups[:3]
+  assert log[ups[0]][4] == "hold"                                    # the hold at once (was: 1 mph taps)
+  # (the hold to 40, a quantum of margin under his 48, then taps: the measured hold margins)
+  t40 = next(f for f, s, *_ in log if f >= res and s >= 40 - 1e-6)
+  assert t40 - res <= 300, t40 - res
+  v_res = log[res][2]                                                # (his gas took the car to ~48.4 by then)
+  assert max(s for f, s, *_ in log) <= max(48, math.ceil(v_res - 0.25)) + 1e-6
+  v_low = min(v for f, s, v, *_ in log if f >= res)
+  old = cs.ENGAGE_RAISE
+  try:
+    cs.ENGAGE_RAISE = False
+    _, _, log0 = _res_run(20, 45, 48, res=res, gas_until=res - 100, extra=_lead46, stop_episode=True)
+  finally:
+    cs.ENGAGE_RAISE = old
+  v_low0 = min(v for f, s, v, *_ in log0 if f >= res)
+  assert v_low >= v_low0 + 1.0 and v_low >= 41.0, (v_low, v_low0)
+
+
+def test_res_with_a_red_light_or_a_slower_lead_or_a_lower_curve_no_set_plus():
+  res = 300
+  for extra in (lambda f, car: dict(red_stop=True),
+                lambda f, car: dict(radar_lead=True, lead_v=8.0, stop_clear_ahead=False, stop_pulling_away=False),
+                lambda f, car: dict(stop_slower_ahead=True),
+                lambda f, car: dict(stop_active=True, stop_target=20 * MPH),
+                lambda f, car: dict(csc_active=True, csc_speed=30 * MPH)):
+    car, lg, log = _res_run(20, 45, 48, frames=900, res=res, gas_until=res - 100, extra=extra, stop_episode=True)
+    assert not lg._engage_go()
+    assert not any(b == cs.SET_PLUS and a == "hold" for f, s, v, b, a in log if f >= res)
+
+
+def test_res_after_a_turn_takes_the_old_speed_only_up_to_the_streets_target():
+  res = 300
+  extra = lambda f, car: dict(road_changed=True, engage_goal=40 * MPH)  # noqa: E731
+  car, lg, log = _res_run(25, 30, 75, res=res, extra=extra, stop_episode=True)
+  assert abs(car.set_speed / MPH - 40) < 1e-6 and max(s for _, s, *_ in log) <= 40 + 1e-6
+  # nothing known about the street: the car's speed at least, never his old highway speed
+  extra = lambda f, car: dict(road_changed=True)  # noqa: E731
+  car, lg, log = _res_run(25, 33, 75, res=res, extra=extra, stop_episode=True)
+  assert 33 - 1e-6 <= max(s for _, s, *_ in log) <= 34 + 1e-6, max(s for _, s, *_ in log)
+
+
+def test_res_with_nothing_lowered_but_the_set_far_under_the_car_raises_it_to_the_speed():
+  # his own set 25 (nothing of ours anchored), RES at 40 mph: the set never left under the car's speed
+  car = T.Car(25, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19)
+  car.v_ego = 40 * MPH
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego))
+  for f in range(800):
+    cruise = not (50 <= f < 200)
+    btn, _ = lg.update(_inp(cruise_enabled=cruise, set_speed=car.set_speed if cruise else 0.0, v_ego=car.v_ego,
+                            stop_clear_ahead=True, stop_pulling_away=True, btn_counter=(f // 10) % 16))
+    if btn is not None and cruise:
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    car.tick() if cruise else None
+  assert car.set_speed / MPH >= 39 - 1e-6, car.set_speed / MPH
