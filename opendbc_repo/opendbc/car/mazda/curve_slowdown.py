@@ -387,6 +387,10 @@ ENGAGE_RAISE_MAX = 20.0       # s
 LKAS_KEEP = True
 LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
 TI_ONLY_HYST = 2.0            # s
+# ... and while the car's camera reports a fault (CAM_LKAS ERR_BIT_1 / ERR_BIT_2, or its lane lines off at speed:
+# carstate stock_lkas_off) or LKAS_BLOCK is set above the cut-off (LKAS_CUTOFF): curves TI-only as above and the merge's
+# early raise off (ti_fault, held TI_ONLY_HYST after the flags clear)
+LKAS_CUTOFF = 45 * MS_PER_KPH  # m/s
 EXIT_HANDOVER = True
 EXIT_HANDOVER_LOW = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 EXIT_HANDOVER_STOP = 60.0     # s
@@ -2225,6 +2229,8 @@ class CurveSlowdown:
     self.lkas_blocked = False        # the EPS blocks the stock LKAS (LKAS_BLOCK, held TI_ONLY_HYST after it clears)
     self.lkas_clear_frames = 0
     self.ti_only = False             # (TI_ONLY_*) curves are planned for the TI alone now
+    self.ti_fault = False            # the camera's fault / LKAS_BLOCK above the cut-off (held TI_ONLY_HYST after it clears)
+    self.fault_clear_frames = 0
     self.lkas_keep = 0.0             # this frame's LKAS_KEEP floor (m/s, 0 none)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
@@ -2529,7 +2535,7 @@ class CurveSlowdown:
     # dropped) on a link, or while the map control keeps a ramp curve's command, a signal does not turn it off; a lane
     # change on the highway or a turn on a street as before
     mc = self.map_control
-    self._lkas_state(CS)
+    self._lkas_state(CS, v_ego)
     # (second review: only a held / governing ramp curve, not every link: the merge's lane change at the ramp's end)
     ramp_ctx = mc is not None and mc.ramp_last_cmd is not None
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
@@ -3045,12 +3051,17 @@ class CurveSlowdown:
     return (self.boost_street_frames < _frames(MERGE_BOOST_STREET) and
             self.boost_hwy_frames < _frames(MERGE_BOOST_HWY))
 
-  def _lkas_state(self, CS):
-    """(TI_ONLY_*) the stock LKAS blocked (LKAS_BLOCK, held TI_ONLY_HYST after it clears): curves planned for the TI."""
+  def _lkas_state(self, CS, v_ego):
+    """(TI_ONLY_*) the stock LKAS blocked (LKAS_BLOCK), the camera's fault (ERR bits, lane lines off) or LKAS_BLOCK above
+    the cut-off (ti_fault), each held TI_ONLY_HYST after it clears: curves planned for the TI."""
     raw = bool(getattr(CS, "lkas_block", False))
     self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
     self.lkas_blocked = raw or (self.lkas_blocked and self.lkas_clear_frames < _frames(TI_ONLY_HYST))
-    self.ti_only = bool(self.has_ti and self.lkas_blocked)
+    fault = (bool(getattr(CS, "cam_err", False)) or bool(getattr(CS, "stock_lkas_off", False)) or
+             (raw and v_ego > LKAS_CUTOFF))
+    self.fault_clear_frames = 0 if fault else self.fault_clear_frames + 1
+    self.ti_fault = fault or (self.ti_fault and self.fault_clear_frames < _frames(TI_ONLY_HYST))
+    self.ti_only = bool(self.has_ti and (self.lkas_blocked or self.ti_fault))
     self.curve_target.ti_only = self.ti_only
     if self.map_control is not None:
       self.map_control.ti_only = self.ti_only

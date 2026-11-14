@@ -43,6 +43,10 @@ class CarState(CarStateBase):
     # a hands-off lockout, a camera fault) and the torque it applies (LKAS_EFFECTIVE); the curve planning reads them (round P)
     self.lkas_block = False
     self.lkas_effective = 0
+    # CAM_LKAS (0x243, bus 2, already parsed) ERR_BIT_1 / ERR_BIT_2: the camera reports a fault (drive 73 t 163.6-308.9:
+    # both set, the LKAS blocked at 77 km/h); cam_fault 0 none, 1 lane lines off (stock_lkas_off), 2 the ERR bits
+    self.cam_err = False
+    self.cam_fault = 0
     self.cam_lkas = 0
     self.params = CarControllerParams(CP)
 
@@ -211,6 +215,8 @@ class CarState(CarStateBase):
       ret.invalidLkasSetting = self.lkas_disabled
       self.cam_lkas = cp_cam.vl["CAM_LKAS"]
       self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
+      self.cam_err = bool(cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 or cp_cam.vl["CAM_LKAS"]["ERR_BIT_2"] == 1)
+      self.cam_fault = 2 if self.cam_err else (1 if self.stock_lkas_off else 0)
       ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 if not self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else False
     self.cp_cam = cp_cam
     self.cp = cp

@@ -578,3 +578,68 @@ def test_73_loop_the_set_never_under_30_for_its_30_3_mph_target():
   assert min(vs) >= 28.5, min(vs)                       # (45 km/h = 28 mph: the LKAS stays on)
   sets0, vs0 = _loop73(keep_on=False)
   assert min(sets0) < 29, min(sets0)                    # (before: the firm undershoot under the cut-off)
+
+
+# ---- fix 9: the camera's fault / LKAS_BLOCK above the cut-off: TI-only (and the merge's early raise off) ----
+
+def _carstate():
+  from opendbc.can import CANPacker
+  from opendbc.car import Bus, structs
+  from opendbc.car.mazda.carstate import CarState
+  from opendbc.car.mazda.values import CAR, MazdaSafetyFlags
+  CP = structs.CarParams()
+  CP.carFingerprint = CAR.MAZDA_CX5
+  CP.flags = int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR)
+  c = CarState(CP, None)
+  ps = CarState.get_can_parsers(CP)
+  before = {b: set(ps[b].message_states) for b in (Bus.pt, Bus.cam)}
+  c.update(ps, None)                     # (the parsers register the messages read)
+  return c, ps, CANPacker("mazda_2017"), Bus, before
+
+
+def test_carstate_reads_lkas_block_and_the_cameras_err_bits_from_messages_already_parsed():
+  c, ps, packer, Bus, _ = _carstate()
+  pt_msgs, cam_msgs = set(ps[Bus.pt].message_states), set(ps[Bus.cam].message_states)
+  assert 0x241 in pt_msgs and 0x243 in cam_msgs
+  t = 2_000_000_000
+  for blk, e1, e2, fault in ((1, 0, 1, 2), (0, 1, 0, 2), (0, 0, 0, 0)):
+    a1, d1, _ = packer.make_can_msg("STEER_RATE", 0, {"LKAS_BLOCK": blk, "LKAS_EFFECTIVE": 37})
+    a2, d2, _ = packer.make_can_msg("CAM_LKAS", 2, {"ERR_BIT_1": e1, "ERR_BIT_2": e2})
+    ps[Bus.pt].update([(t, [(a1, d1, 0)])])
+    ps[Bus.cam].update([(t, [(a2, d2, 2)])])
+    t += 10_000_000
+    c.update(ps, None)
+    assert c.lkas_block == bool(blk) and c.lkas_effective == 37 and c.cam_err == bool(e1 or e2) and c.cam_fault == fault
+  # no new message for either parser (canValid unchanged)
+  assert set(ps[Bus.pt].message_states) == pt_msgs and set(ps[Bus.cam].message_states) == cam_msgs
+
+
+def test_the_wrapper_plans_ti_only_while_the_camera_reports_a_fault_and_reverts_after_2_s(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  WI = _load("twi_round_p9", os.path.join(HERE, "test_wrapper_inputs.py"))
+  c, sm, _ = WI._make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+
+  def step(n, v_mph=50, **flags):
+    for _ in range(n):
+      s = WI.W.car_state(v_mph, 55)
+      for k, val in flags.items():
+        setattr(s, k, val)
+      c.update(WI.W.CC, s, None, None, False)
+  step(10)
+  assert not c.ti_only and not c.ti_fault
+  step(10, cam_err=True)
+  assert c.ti_only and c.ti_fault and c.map_control.ti_only and c.curve_target.ti_only
+  step(150)                                                  # cleared: held TI_ONLY_HYST
+  assert c.ti_fault
+  step(60)
+  assert not c.ti_fault and not c.ti_only and not c.map_control.ti_only
+  step(10, stock_lkas_off=True)
+  assert c.ti_fault
+  step(250)
+  # LKAS_BLOCK above the cut-off is a fault; under it (the EPS's own low-speed block) only TI-only planning
+  step(10, v_mph=40, lkas_block=True)
+  assert c.ti_fault and c.ti_only
+  step(250, v_mph=40)
+  step(10, v_mph=20, lkas_block=True)
+  assert c.ti_only and not c.ti_fault
