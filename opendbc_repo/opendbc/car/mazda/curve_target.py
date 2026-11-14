@@ -86,10 +86,9 @@ def curve_speed(curvature, lat_accel):
 class CurveTarget:
   def __init__(self, lat_accel, confirm_time=CONFIRM_TIME):
     self.lat_accel = lat_accel
-    # (round P, curve_slowdown.TI_ONLY_*) with a Torque Interceptor: a curve whose target is under ti_below, or any curve
-    # while ti_only (the stock LKAS blocked), is planned at ti_lat (only the TI steers there); None: off
+    # (round P, curve_slowdown.TI_ONLY_*) with a Torque Interceptor: every curve while ti_only (the stock LKAS blocked, the
+    # camera's fault) is planned at ti_lat (only the TI steers there); None: off
     self.ti_lat = None
-    self.ti_below = 0.0
     self.ti_only = False
     self.window = deque(maxlen=max(1, int(round(confirm_time / DT_CTRL))))
     self.active = False
@@ -109,7 +108,7 @@ class CurveTarget:
       return False, NO_CURVE
     self.raw = NO_CURVE if blinker else curve_speed(curvature, self.lat_accel)
     if (self.ti_lat is not None and self.ti_lat < self.lat_accel and self.raw < NO_CURVE and
-        (self.ti_only or self.raw < self.ti_below)):
+        self.ti_only):
       self.raw = curve_speed(curvature, self.ti_lat)
     self.window.append(self.raw)
     self.speed = max(self.window)

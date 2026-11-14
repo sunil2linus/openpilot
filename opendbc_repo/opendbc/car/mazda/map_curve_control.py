@@ -265,12 +265,12 @@ TENT_PLAN_CONFIRM = 7.0         # s
 NAV_SIGNAL_FIRM = True
 # Round P (drive 73 / a73r, full CAN): the EPS blocks the stock LKAS torque below 45 km/h and gives it back only above ~52;
 # then only the Torque Interceptor steers, about half the lateral capability (command 1.0 gave 1.85-2.25 m/s^2 in drive 73's
-# loop, 0.56-0.73 for the same lateral in 6f with the LKAS on). A curve whose own target is under TI_ONLY_BELOW (it takes
-# the car under the cut-off anyway), or any curve while the LKAS is blocked (ti_only, set by the wrapper), is planned at
-# TI_ONLY_LAT instead of MAP_LATERAL_ACCEL; a ramp / exit curve's radius comes scaled for map_curves.RAMP_LAT (2.6), so its
-# lateral is TI_ONLY_LAT scaled the same way (TI_ONLY_RAMP_SCALE). The wrapper floors the others at its LKAS_KEEP_SPEED.
+# loop, 0.56-0.73 for the same lateral in 6f with the LKAS on). While the LKAS is blocked or the camera reports a fault
+# (ti_only, set by the wrapper) every curve is planned at TI_ONLY_LAT instead of MAP_LATERAL_ACCEL; a ramp / exit curve's
+# radius comes scaled for map_curves.RAMP_LAT (2.6), so its lateral is TI_ONLY_LAT scaled the same way (TI_ONLY_RAMP_SCALE).
+# (Review of round P, S3: a curve under 28 mph is no longer re-planned TI-only while the LKAS still works; the wrapper's
+# LKAS_KEEP floor keeps it from going under its own target instead.)
 TI_ONLY_LAT = 1.8               # m/s^2
-TI_ONLY_BELOW = 28 * MPH        # m/s
 TI_ONLY_RAMP_SCALE = 2.2 / 2.6  # map_curves.PLAN_LAT / RAMP_LAT
 NAV_SIGNAL_NEAR = 200.0         # m
 # the firm slowdown after the confirmation as planned for the short ramp's split speed: it takes ~2 s to build up (the
@@ -728,11 +728,11 @@ class MapCurveControl:
 
   def _lat(self, radius, advisory=0.0, scaled=False):
     """m/s^2 a map curve of `radius` m is planned at (TI_ONLY_*): TI_ONLY_LAT (scaled for a ramp / exit curve's
-    published radius) when it needs less than TI_ONLY_BELOW, or while the stock LKAS is blocked; else lat_accel."""
+    published radius) while the stock LKAS is blocked or the camera reports a fault; else lat_accel."""
     ti = TI_ONLY_LAT * (TI_ONLY_RAMP_SCALE if scaled else 1.0)
     if not self.ti_plan or radius <= 0 or ti >= self.lat_accel:
       return self.lat_accel
-    if self.ti_only or map_curve_target(radius, self.lat_accel, advisory) < TI_ONLY_BELOW:
+    if self.ti_only:
       return ti
     return self.lat_accel
 

@@ -379,11 +379,12 @@ ENGAGE_RAISE_MAX = 20.0       # s
 # Round P (a73r, full CAN: the EPS blocks the stock LKAS torque below 45 km/h, back only above ~52; then only the Torque
 # Interceptor steers, about half the lateral capability; drive 73's loop: our set 26 (42 km/h) took the car to 44 km/h at
 # 1132 and the LKAS stayed blocked through the loop). With a TI: a curve target (map curves, the camera's, a ramp's firm
-# undershoot; never a stop slowdown's target: review of round P, B3) is floored at LKAS_KEEP_SPEED whenever the curve's own target is
-# map_curve_control.TI_ONLY_BELOW (28 mph) or more, so the set never takes the car under the cut-off for a curve that does
-# not need it; a curve that does (its target under 28 mph), or any curve while the LKAS is blocked (LKAS_BLOCK, kept
-# TI_ONLY_HYST after it clears), is planned TI-only instead (map_curve_control.TI_ONLY_LAT, curve_target.CurveTarget.ti_lat)
-# and not floored. Stop slowdowns outside curves are unaffected.
+# undershoot; never a stop slowdown's target: review of round P, B3) is floored at min(LKAS_KEEP_SPEED, the curve's own
+# target at its normal lateral): the set never takes the car under the cut-off for a curve that does not need it, nor under
+# a slower curve's own speed (review of round P, S3: continuous, no re-plan of a 27.9 mph curve to 21.6 while the LKAS
+# works). The floor never goes above the set speed, so it never causes a SET+. While the LKAS is blocked (LKAS_BLOCK, kept
+# TI_ONLY_HYST after it clears) every curve is planned TI-only instead (map_curve_control.TI_ONLY_LAT,
+# curve_target.CurveTarget.ti_lat) and not floored. Stop slowdowns are unaffected.
 LKAS_KEEP = True
 LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
 TI_ONLY_HYST = 2.0            # s
@@ -1782,7 +1783,8 @@ class CurveSlowdownLogic:
       curve_t = i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN)
       if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
         curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
-      keep = min(i.lkas_keep, driver_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0   # (LKAS_KEEP)
+      # (LKAS_KEEP) never above the set speed (with our presses in flight): the floor only stops a lowering, never a SET+
+      keep = min(i.lkas_keep, driver_speed, set_speed) if (LKAS_KEEP and i.lkas_keep > 0) else 0.0
       targets.append(("curve", max(curve_t, floor, keep)))
     if i.stop_active:
       # (review of round P, B3: a stop, a red light or a stopped car goes under LKAS_KEEP_SPEED in a curve as before)
@@ -2279,8 +2281,8 @@ class CurveSlowdown:
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
     if self.has_ti:
-      from opendbc.car.mazda.map_curve_control import TI_ONLY_LAT, TI_ONLY_BELOW
-      self.curve_target.ti_lat, self.curve_target.ti_below = TI_ONLY_LAT, TI_ONLY_BELOW
+      from opendbc.car.mazda.map_curve_control import TI_ONLY_LAT
+      self.curve_target.ti_lat = TI_ONLY_LAT
     # The car profile: what earlier drives learned about this car (answer time, hold overrun, cruise decel), see
     # car_profile.py. Loaded here (a few KB), applied to the logic, saved in the background as it learns. The learned
     # cruise decel is still measured and logged, but map curves no longer plan with it: it measures the pace of the
@@ -3146,19 +3148,18 @@ class CurveSlowdown:
 
   def _lkas_keep(self, curve_active, curve_street):
     """(LKAS_KEEP) m/s, the floor for this frame's curve target: a TI car, the LKAS not blocked, a curve whose own target
-    (the map's at its planned lateral, the camera's) is TI_ONLY_BELOW or more; 0 none."""
+    the lower of LKAS_KEEP_SPEED and the curve's own target (the map's at its planned lateral, the camera's); 0 none."""
     self.lkas_keep = 0.0
     if not (LKAS_KEEP and self.has_ti and curve_active) or self.ti_only or curve_street:
       return 0.0
-    from opendbc.car.mazda.map_curve_control import TI_ONLY_BELOW
     owns = []
     mo = self.map_out
     if self.map_on_used and mo is not None and mo.active and mo.curve_speed < 100.0:
       owns.append(mo.curve_speed)
     if self.curve_enabled and self.curve_target.active:
       owns.append(self.curve_target.speed)
-    if owns and min(owns) >= TI_ONLY_BELOW:
-      self.lkas_keep = LKAS_KEEP_SPEED[1 if self.logic.step < MS_PER_MPH else 0]
+    if owns:
+      self.lkas_keep = min(LKAS_KEEP_SPEED[1 if self.logic.step < MS_PER_MPH else 0], min(owns))
     return self.lkas_keep
 
   def _engage_target(self):

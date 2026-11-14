@@ -499,9 +499,8 @@ def test_map_curves_ti_only_lateral_by_branch():
   # drive 73's loop (71 m on the map, published 84 m for RAMP_LAT): its target 30.3 mph needs no TI-only plan
   assert abs(c._lat(84.0, scaled=True) - CTL.MAP_LATERAL_ACCEL) < 1e-9
   assert CTL.map_curve_target(84.0, c._lat(84.0, scaled=True)) / MPH >= 28
-  # a 50 m road curve (23.5 mph at 2.2): under 28 mph, planned for the TI alone (1.8: 21.2 mph)
-  assert abs(c._lat(50.0) - CTL.TI_ONLY_LAT) < 1e-9
-  assert abs(CTL.map_curve_target(50.0, c._lat(50.0)) / MPH - 21.2) < 0.1
+  # (review of round P, S3) a 50 m road curve (23.5 mph at 2.2) with the LKAS working: its normal plan, no TI-only re-plan
+  assert abs(c._lat(50.0) - CTL.MAP_LATERAL_ACCEL) < 1e-9
   # the LKAS blocked: every curve TI-only; a ramp curve's published radius at TI_ONLY_LAT for its real radius
   c.ti_only = True
   assert abs(c._lat(84.0, scaled=True) - CTL.TI_ONLY_LAT * CTL.TI_ONLY_RAMP_SCALE) < 1e-9
@@ -512,13 +511,13 @@ def test_map_curves_ti_only_lateral_by_branch():
   assert c._lat(50.0) == c.lat_accel
 
 
-def test_the_camera_target_ti_only_under_28_mph_or_while_blocked():
+def test_the_camera_target_ti_only_while_blocked():
   t = CT.CurveTarget(3.0)
-  t.ti_lat, t.ti_below = CTL.TI_ONLY_LAT, CTL.TI_ONLY_BELOW
+  t.ti_lat = CTL.TI_ONLY_LAT
   k_tight, k_mild = 3.0 / (25 * MPH) ** 2, 3.0 / (40 * MPH) ** 2      # 25 mph and 40 mph at 3.0 m/s^2
   for _ in range(150):
     t.update(k_tight, 60 * MPH)
-  assert abs(t.speed - math.sqrt(1.8 / k_tight)) < 1e-6                 # under 28: at 1.8
+  assert abs(t.speed / MPH - 25) < 1e-6                                 # (S3) under 28 with the LKAS working: as before
   t.reset()
   for _ in range(150):
     t.update(k_mild, 60 * MPH)
@@ -574,7 +573,7 @@ def _loop73(keep_on=True, frames=4000):
     driver = car.set_speed + lg.offset * lg.step
     mo = ctl.update(fld, driver, 0, v_ego=car.v_ego, max_drop=10 * MPH, set_speed=car.set_speed)
     act, sp, fl, bud, tr, ra = mix.update(False, CTL.NO_CURVE, mo, drop_floor=max(driver - 10 * MPH, cs.MIN_SET_SPEED))
-    keep = cs.LKAS_KEEP_SPEED[0] if (keep_on and act and mo.curve_speed >= CTL.TI_ONLY_BELOW and mo.curve_speed < 100) else 0.0
+    keep = min(cs.LKAS_KEEP_SPEED[0], mo.curve_speed) if (keep_on and act and mo.curve_speed < 100) else 0.0
     b, _ = lg.update(_inp(set_speed=car.set_speed, v_ego=car.v_ego, csc_active=act, csc_speed=min(sp, 100.0), curve_floor=fl,
                           curve_budget=bud, curve_track=tr, curve_raise=ra, curve_hold=mix.firm, curve_no_accel=mix.no_accel,
                           lkas_keep=keep, btn_counter=(f // 10) % 16))
@@ -846,3 +845,32 @@ def test_review_s2_no_hold_with_the_car_faster_than_a_goal_under_its_speed():
   assert lg.engage is None or abs(lg.engage["goal"] / MPH - 40) < 1e-6
   assert not any(b == cs.SET_PLUS and a == "hold" for f, s, v, b, a in log if f >= 300 and v > 41)
   assert max(s for _, s, *_ in log) <= 40 + 1e-6
+
+
+def test_review_s3_the_floor_is_continuous_and_never_raises_the_set():
+  keep = cs.LKAS_KEEP_SPEED[0]
+
+  def run(csc_mph, keep_mph, set0=45, frames=1500):
+    lg = cs.CurveSlowdownLogic(False, 10)
+    lg.update(_inp(set_speed=set0 * MPH, v_ego=set0 * MPH))
+    lg.anchor = 50 * MPH
+    set_mph, ups = float(set0), 0
+    for f in range(frames):
+      b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=max(set_mph - 1, 20) * MPH, csc_active=True, csc_speed=csc_mph * MPH,
+                            curve_track=True, curve_raise=True, curve_hold=True, curve_floor=20 * MPH, curve_budget=60,
+                            lkas_keep=keep_mph * MPH, btn_counter=(f // 10) % 16))
+      if b == cs.SET_MINUS and (lg.last_action != "hold" or f % 10 == 0):
+        set_mph -= 1
+      elif b == cs.SET_PLUS:
+        ups += 1
+        set_mph += 1
+    return set_mph, ups
+  # a 27.9 mph curve (its own target; the follower asks 21.9): floored at its own speed, not 30, not re-planned to 21.6
+  s, _ = run(21.9, min(keep / MPH, 27.9))
+  assert 27 <= s <= 28 + 1e-6, s
+  # a 30.4 mph curve asking 24.4: floored at 30
+  s, _ = run(24.4, min(keep / MPH, 30.4))
+  assert 30 - 1e-6 <= s <= 30 + 1e-6, s
+  # the set already under the floor (26, the floor 30): never a SET+ for the floor
+  s, ups = run(24.4, 30.0, set0=26)
+  assert ups == 0 and s <= 26 + 1e-6, (s, ups)
