@@ -1058,3 +1058,16 @@ def test_third_review_t3_lines_off_needs_5_s_continuous_above_35_mph():
   assert c.stock_lkas_off
   frames(300, 30, 3)                                        # under 35 mph the latch holds
   assert c.stock_lkas_off
+
+
+def test_third_review_t4_after_a_turn_onto_an_unknown_street_res_while_passing_takes_at_most_his_old_speed():
+  from types import SimpleNamespace as N
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=45 * MPH, v_ego=62 * MPH))
+  lg.anchor = 50 * MPH
+  goal = lambda eg: lg._engage_goal(N(set_speed=45 * MPH, v_ego=62 * MPH, road_changed=True, engage_goal=eg * MPH))  # noqa: E731
+  assert abs(goal(0.0)["goal"] / MPH - 50) < 1e-6                     # (was 62: the car's speed alone)
+  assert abs(goal(55.0)["goal"] / MPH - 55) < 1e-6                    # a known street target: capped by it, as before
+  car, lg, log = _res_run(45, 62, 50, frames=2500, res=300, gas_until=350, extra=lambda f, car: dict(road_changed=True),
+                          stop_episode=True)
+  assert max(s for _, s, *_ in log) <= 50 + 1e-6
