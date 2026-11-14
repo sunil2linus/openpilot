@@ -17,8 +17,10 @@ RANDOM_EVENTS_LENGTH = 5
 RANDOM_EVENT_START = StarPilotEventName.accel30
 RANDOM_EVENT_END = StarPilotEventName.youveGotMail
 
-# Mazda + TI (round P): the car's camera fault notice (starpilotCarState.mazdaCamFault, mazdaStockLkasOff) again when the
-# fault comes back after clearing, at most every CAM_FAULT_REPEAT; "cleared" once it has been gone CAM_FAULT_CLEAR
+# Mazda + TI (round P): the car's camera fault notice (starpilotCarState.mazdaCamFault 2, the ERR bits) again when the
+# fault comes back after clearing, at most every CAM_FAULT_REPEAT; "cleared" once it has been gone CAM_FAULT_CLEAR. Its lane
+# lines off (mazdaCamFault 1, mazdaStockLkasOff, latched by carstate for the drive): the notice once per drive, never a
+# "cleared" (re-review of round P, N2)
 CAM_FAULT_REPEAT = 60.0      # s
 CAM_FAULT_CLEAR = 2.0        # s
 
@@ -32,9 +34,15 @@ class MazdaCamNotice:
     self.shown = False           # ... and its notice was shown
     self.last = None             # t of the last fault notice
     self.clear_s = 0.0
+    self.lines_shown = False     # the lane lines off notice (once per drive)
 
   def update(self, fault):
     self.t += self.dt
+    lines = fault == 1
+    fault = fault == 2
+    if lines and not self.active and not self.lines_shown:
+      self.lines_shown = True
+      return "fault"
     if fault:
       self.clear_s = 0.0
       if not self.active:

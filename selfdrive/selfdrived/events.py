@@ -295,7 +295,7 @@ def mazda_cam_fault_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.Sub
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.)
   return Alert(
     "Car's Lane Keep Assist is off",
-    "Steering is weaker in curves",
+    "Steering is weaker in curves. Restart the car to reset it",
     AlertStatus.userPrompt, AlertSize.mid,
     Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.)
 

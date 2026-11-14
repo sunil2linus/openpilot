@@ -605,6 +605,7 @@ def _carstate():
   CP = structs.CarParams()
   CP.carFingerprint = CAR.MAZDA_CX5
   CP.flags = int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR)
+  CP.wheelSpeedFactor = 1.0
   c = CarState(CP, None)
   ps = CarState.get_can_parsers(CP)
   before = {b: set(ps[b].message_states) for b in (Bus.pt, Bus.cam)}
@@ -721,7 +722,7 @@ def test_the_camera_fault_notice_text_by_kind():
   # (the UI's width, test_alerts.test_alert_text_length: 1809 of 1860 px at Inter-SemiBold 66)
   assert a.alert_text_2 == "Collision warning, lane keep may be off · steering weaker"
   b = events.mazda_cam_fault_alert(None, None, {"starpilotCarState": N(mazdaCamFault=1)}, False, 0, None, N())
-  assert b.alert_text_1 == "Car's Lane Keep Assist is off" and "Restart" not in b.alert_text_2
+  assert b.alert_text_1 == "Car's Lane Keep Assist is off" and b.alert_text_2.endswith("Restart the car to reset it")
   assert events.mazda_cam_fault_alert(None, None, {}, False, 0, None, N()).alert_text_1 == "Car's Lane Keep Assist is off"
   E = events.STARPILOT_EVENTS
   assert E[events.StarPilotEventName.mazdaStockLkasOff][events.ET.PERMANENT] is events.mazda_cam_fault_alert
@@ -732,12 +733,44 @@ def test_the_camera_fault_notice_comes_back_after_clearing_at_most_every_60_s():
   _, spe = _events_modules()
   n = spe.MazdaCamNotice(dt=0.05)
   run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
-  assert run(2, 5.0) == ["fault"]                           # once while it lasts
+  assert run(2, 5.0) == ["fault"]                           # the ERR bits: once while it lasts
   assert run(0, 1.0) == [] and run(2, 1.0) == []            # a short dropout: the same episode
   assert run(0, 3.0) == ["cleared"]                         # gone 2 s: "cleared"
-  assert run(1, 5.0) == [] and run(0, 3.0) == []            # back within 60 s of the notice: held back (and no "cleared")
+  assert run(2, 5.0) == [] and run(0, 3.0) == []            # back within 60 s of the notice: held back (and no "cleared")
   run(0, 60.0)
   assert run(2, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]   # back after 60 s: again
+
+
+def test_rereview_n2_lane_lines_off_once_per_drive_never_cleared():
+  _, spe = _events_modules()
+  n = spe.MazdaCamNotice(dt=0.05)
+  run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
+  assert run(1, 5.0) == ["fault"]
+  for _ in range(5):                                        # (whatever the flag does: never "cleared", never again)
+    assert run(0, 10.0) == [] and run(1, 70.0) == []
+  assert run(2, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]   # the ERR bits as built
+
+
+def test_rereview_n2_carstate_latches_lane_lines_off_under_35_mph():
+  c, ps, packer, Bus, _ = _carstate()
+  t = [4_000_000_000]
+
+  def frames(n, kph, lines):
+    for _ in range(n):
+      a1, d1, _ = packer.make_can_msg("WHEEL_SPEEDS", 0, {"FL": kph, "FR": kph, "RL": kph, "RR": kph})
+      a2, d2, _ = packer.make_can_msg("CAM_LANEINFO", 2, {"LANE_LINES": lines})
+      ps[Bus.pt].update([(t[0], [(a1, d1, 0)])])
+      ps[Bus.cam].update([(t[0], [(a2, d2, 2)])])
+      t[0] += 10_000_000
+      c.update(ps, None)
+  frames(600, 80, 0)                                        # lines off at 50 mph for 6 s: latched
+  assert c.stock_lkas_off and c.cam_fault == 1
+  frames(600, 30, 3)                                        # under 35 mph (lines back or not): still latched
+  assert c.stock_lkas_off
+  frames(300, 80, 3)                                        # lines back at speed for 3 s: still
+  assert c.stock_lkas_off
+  frames(300, 80, 3)                                        # ... 5 s and more: cleared
+  assert not c.stock_lkas_off and c.cam_fault == 0
 
 
 # ---- fix 7: the early raise at the end of a loop on-ramp (owner: "start raising when the curve is about to end") ----
