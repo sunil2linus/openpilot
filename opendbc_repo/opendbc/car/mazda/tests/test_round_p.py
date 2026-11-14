@@ -885,3 +885,8 @@ def test_review_s1_a_mazda_without_a_ti_has_no_camera_fault_notice_or_events():
   ps[Bus.cam].update([(t, [(a2, d2, 2)])])
   c.update(ps, None)
   assert c.cam_err and c.cam_fault == 0
+
+
+def test_review_m1_no_early_raise_while_the_wheel_winds_up():
+  lg, log = _early_run(frames=290, merge_turn_pause=True)
+  assert not any(b == cs.SET_PLUS for f, s, b, a in log)

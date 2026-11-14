@@ -420,7 +420,8 @@ MERGE_TURN_CURVE_D = 60.0     # m
 # MERGE_EARLY_REND or closer (map_curve_control.hwy_ramp_left, the planner's mapRampEndDistance counted on by the speed),
 # |lat| at most MERGE_EARLY_LAT, the steering with reserve (the median |steer command| of the last second under
 # MERGE_EARLY_RESERVE), no tight ramp curve near (as the gate), the stock LKAS not blocked and no camera fault
-# (SlowdownInputs.merge_early, the wrapper), and no red light, stop or slow car ahead: SET+ taps to at most the car's speed +
+# (SlowdownInputs.merge_early, the wrapper), the wheel not winding up (merge_turn_pause: review of round P, M1), and no red
+# light, stop or slow car ahead: SET+ taps to at most the car's speed +
 # MERGE_EARLY_STEP; the full boost when the gate is ok, as before.
 MERGE_EARLY = True
 MERGE_EARLY_REND = 40.0       # m
@@ -1907,7 +1908,8 @@ class CurveSlowdownLogic:
       # post-stop wait: nothing more meanwhile (no restore to an old anchor either), then its hold
       # ... except the early raise at the ramp's end (MERGE_EARLY): SET+ taps to the car's speed + MERGE_EARLY_STEP
       early_top = min(i.v_ego + self._metric_pick(MERGE_EARLY_STEP), i.limit_raise)
-      if (MERGE_EARLY and i.merge_early and merge and not i.merge_turn_ok and not self._merge_red(i) and not stop_wait and
+      if (MERGE_EARLY and i.merge_early and merge and not i.merge_turn_ok and not i.merge_turn_pause and
+          not self._merge_red(i) and not stop_wait and
           not i.stop_active and not self._lead_blocks_boost(i) and i.boost_road_ok and not i.gas_pressed and
           not self.inflight and self.pending is None and self.hold is None and
           set_speed + self.step <= early_top + UP_STEP_TOL * self.step and
