@@ -2182,7 +2182,10 @@ class CurveSlowdown:
                    # navigation exits (map_curve_control.ExitPlan, LaneView; the planner's shape check): see EXIT_LOG_*
                    "exit_rem", "exit_shape", "shape_link_m", "shape_hwy_m", "shape_link_deg", "shape_hwy_deg", "exit_fork",
                    "exit_curve_r", "exit_curve_d", "lane_probs", "edge_gap_l", "edge_gap_r", "lane_edge", "lane_change",
-                   "model_rel", "model_verdict", "bend_hwy", "bend_link"]
+                   "model_rel", "model_verdict", "bend_hwy", "bend_link",
+                   # (round P) the car's camera fault (0 none, 1 lane lines off, 2 ERR bits), the EPS's LKAS block, the TI's
+                   # state, curves planned TI-only (TI_ONLY_*)
+                   "cam_fault", "lkas_block", "ti_state", "ti_only"]
   # The exit log (owner's request): one "mapExit" event per navigation exit, from EXIT_LOG_BEFORE before its exit point
   # to EXIT_LOG_AFTER past it (or the plan's end), with the rows above, so a drive can show what the camera's lane check,
   # the shape check and the confirmation did. No GPS position in it.
@@ -2232,6 +2235,10 @@ class CurveSlowdown:
     self.ti_fault = False            # the camera's fault / LKAS_BLOCK above the cut-off (held TI_ONLY_HYST after it clears)
     self.fault_clear_frames = 0
     self.lkas_keep = 0.0             # this frame's LKAS_KEEP floor (m/s, 0 none)
+    self.cam_fault_now = 0           # carstate's cam_fault / lkas_block / TI state this frame (the signal rows)
+    self.lkas_block_now = False
+    self.ti_state_now = 0
+    self.cam_fault_since = None      # (t, kind) of the camera fault going on (camFault / camFaultCleared events)
     self.limit_cap_logged = None     # the follower's cap (rule 3) last logged
     self.limit_ceiling_logged = None # the follower's provisional ceiling last logged
     self.curve_enabled = curve_enabled
@@ -2279,7 +2286,8 @@ class CurveSlowdown:
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
     self.learner = None
-    services = ['starpilotPlan', 'radarState', 'modelV2']
+    # (round P) pandaStates: the per-bus CAN error counts for the camFault / camFaultCleared events (10 Hz, logs only)
+    services = ['starpilotPlan', 'radarState', 'modelV2', 'pandaStates']
     if follow_mode:
       services.append('drivingModelData')   # the model follower's fallback for the model's accel (model_follow.py)
     if limit_mode:
@@ -3055,6 +3063,8 @@ class CurveSlowdown:
     """(TI_ONLY_*) the stock LKAS blocked (LKAS_BLOCK), the camera's fault (ERR bits, lane lines off) or LKAS_BLOCK above
     the cut-off (ti_fault), each held TI_ONLY_HYST after it clears: curves planned for the TI."""
     raw = bool(getattr(CS, "lkas_block", False))
+    self.cam_fault_now = int(getattr(CS, "cam_fault", 0) or 0)
+    self.lkas_block_now, self.ti_state_now = raw, int(getattr(CS, "ti_state_log", 0) or 0)
     self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
     self.lkas_blocked = raw or (self.lkas_blocked and self.lkas_clear_frames < _frames(TI_ONLY_HYST))
     fault = (bool(getattr(CS, "cam_err", False)) or bool(getattr(CS, "stock_lkas_off", False)) or
@@ -3065,6 +3075,41 @@ class CurveSlowdown:
     self.curve_target.ti_only = self.ti_only
     if self.map_control is not None:
       self.map_control.ti_only = self.ti_only
+
+  def _panda_errors(self):
+    """pandaStates' CAN error counts per bus (logs; {} when not received): [{bus: {...}}] per panda."""
+    try:
+      if not self._alive('pandaStates'):
+        return []
+      out = []
+      for p in self.sm['pandaStates']:
+        buses = {}
+        for b in range(3):
+          c = getattr(p, f"canState{b}")
+          buses[b] = {"total_err": int(c.totalErrorCnt), "rx_err": int(c.receiveErrorCnt), "tx_err": int(c.transmitErrorCnt),
+                      "bus_off": int(c.busOffCnt), "rx_lost": int(c.totalRxLostCnt), "tx_lost": int(c.totalTxLostCnt),
+                      "last_err": str(c.lastError)}
+        out.append(buses)
+      return out
+    except Exception:
+      return []
+
+  def _cam_fault_event(self, t, i):
+    """(round P) a 'camFault' event when the car's camera reports a fault (carstate cam_fault), 'camFaultCleared' when it
+    clears, each with the panda's per-bus CAN error counts."""
+    kinds = {1: "lane lines off", 2: "ERR bits"}
+    f = self.cam_fault_now
+    if f and self.cam_fault_since is None:
+      self.cam_fault_since = (t, kinds.get(f, str(f)))
+      self.recorder.record("camFault", t, {"kind": kinds.get(f, str(f)), "vEgo_mph": i.v_ego / MS_PER_MPH,
+                                           "lkas_block": self.lkas_block_now, "ti_state": self.ti_state_now,
+                                           "panda_can": self._panda_errors()}, min_gap=1.0, signals=False)
+    elif not f and self.cam_fault_since is not None:
+      t0, kind = self.cam_fault_since
+      self.cam_fault_since = None
+      self.recorder.record("camFaultCleared", t, {"kind": kind, "lasted_s": round(t - t0, 1), "vEgo_mph": i.v_ego / MS_PER_MPH,
+                                                  "lkas_block": self.lkas_block_now, "panda_can": self._panda_errors()},
+                           min_gap=1.0, signals=False)
 
   def _lkas_keep(self, curve_active, curve_street):
     """(LKAS_KEEP) m/s, the floor for this frame's curve target: a TI car, the LKAS not blocked, a curve whose own target
@@ -3446,7 +3491,8 @@ class CurveSlowdown:
         str(getattr(plan, "slcSpeedLimitSource", "") or "") if plan is not None else "",
         self.limit_follow.stable_speed / MS_PER_MPH if self.limit_follow else 0.0,
         self.limit_follow.offer_speed / MS_PER_MPH if self.limit_follow else 0.0, self.limit_want / MS_PER_MPH,
-        *self._exit_row(plan)))
+        *self._exit_row(plan), self.cam_fault_now, self.lkas_block_now, self.ti_state_now, self.ti_only))
+    self._cam_fault_event(t, i)
     if lg.driver_events:
       # driver set speed changes while we managed it (what happened to the restore): one summary-only event per
       # frame (drive 44: five 400-row events in a few seconds helped make card lag); the episode events have the rows

@@ -127,6 +127,9 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaSetSpeedHigh @37 :Bool;       # Mazda: after a merge boost the set speed did not come back down to the highway speed
   mazdaWheelButton @38 :UInt8;       # Mazda: the car's own cruise switch (CRZ_BTNS, not our presses): 0 none, 1 SET+, 2 SET-, 3 RES, 4 CANCEL
   mazdaAutoResume @39 :UInt8;        # Mazda: the gas brings the cruise back after a brake (auto_resume.py): 0 off, 1 armed, 2 sending, 3 done, 4 gave up
+  mazdaCamFault @40 :UInt8;          # Mazda + TI: the car's camera (CAM_LKAS): 0 none, 1 lane lines off at speed, 2 its ERR bits set
+  mazdaLkasBlock @41 :Bool;          # Mazda: the EPS blocks the stock LKAS torque (STEER_RATE LKAS_BLOCK: under ~45 km/h, a fault)
+  mazdaTiState @42 :UInt8;           # Mazda + TI: TI_FEEDBACK STATE (0 discover, 1 off, 2 driver override, 3 run); 0 without a TI
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {

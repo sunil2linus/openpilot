@@ -643,3 +643,44 @@ def test_the_wrapper_plans_ti_only_while_the_camera_reports_a_fault_and_reverts_
   step(250, v_mph=40)
   step(10, v_mph=20, lkas_block=True)
   assert c.ti_only and not c.ti_fault
+
+
+# ---- fix 11: logging (starpilotCarState, the signal rows, camFault / camFaultCleared) ----
+
+def test_starpilot_car_state_carries_the_cameras_fault_the_lkas_block_and_the_ti_state():
+  from types import SimpleNamespace as N
+  from cereal import custom
+  from opendbc.car.interfaces import mazda_lkas_state
+  assert mazda_lkas_state(N()) == (0, False, 0)                                     # (not a Mazda)
+  assert mazda_lkas_state(N(cam_fault=2, lkas_block=True, ti_state_log=3)) == (2, True, 3)
+  m = custom.StarPilotCarState.new_message()
+  m.mazdaCamFault, m.mazdaLkasBlock, m.mazdaTiState = mazda_lkas_state(N(cam_fault=1, lkas_block=False, ti_state_log=2))
+  assert (m.mazdaCamFault, m.mazdaLkasBlock, m.mazdaTiState) == (1, False, 2)
+
+
+def test_the_signal_rows_and_the_cam_fault_events(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  WI = _load("twi_round_p11", os.path.join(HERE, "test_wrapper_inputs.py"))
+  c, sm, records = WI._make(tmp_path, monkeypatch, limit_mode=0, map_mode=2)
+  rows = []
+  monkeypatch.setattr(c.recorder, "add_row", lambda t, row: rows.append(row))
+
+  def step(n, **flags):
+    for _ in range(n):
+      s = WI.W.car_state(50, 55)
+      for k, val in flags.items():
+        setattr(s, k, val)
+      c.update(WI.W.CC, s, None, None, False)
+  step(20)
+  step(50, cam_fault=2, cam_err=True, lkas_block=True, ti_state_log=3)
+  step(50)
+  cols = cs.CurveSlowdown.EVENT_COLUMNS
+  assert rows and all(len(r) == len(cols) for r in rows)
+  k = cols.index("cam_fault")
+  assert {r[k] for r in rows} == {0, 2} and any(r[cols.index("lkas_block")] for r in rows)
+  assert any(r[cols.index("ti_state")] == 3 for r in rows) and any(r[cols.index("ti_only")] for r in rows)
+  kinds = [kd for kd, _ in records]
+  assert kinds.count("camFault") == 1 and kinds.count("camFaultCleared") == 1
+  fault = next(d for kd, d in records if kd == "camFault")
+  assert fault["kind"] == "ERR bits" and fault["panda_can"] == []        # (no pandaStates in the test's SubMaster)

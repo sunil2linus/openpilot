@@ -469,12 +469,20 @@ class CarInterfaceBase(ABC):
       fp_ret.mazdaLimitSlowLimit = float(getattr(slowdown, "limit_slow_limit", 0.0) or 0.0)
       fp_ret.mazdaSetSpeedHigh = bool(getattr(slowdown, "set_speed_high", False))
     fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
+    # Mazda (round P): the camera's fault, the EPS's LKAS block, the TI's state (carstate; logged with the curve slowdown's rows)
+    fp_ret.mazdaCamFault, fp_ret.mazdaLkasBlock, fp_ret.mazdaTiState = mazda_lkas_state(self.CS)
     fp_ret.mazdaWheelButton = mazda_wheel_button(self.CS)
     auto_resume = getattr(self.CC, "auto_resume", None)    # Mazda: the gas brings the cruise back (auto_resume.py)
     if auto_resume is not None:
       fp_ret.mazdaAutoResume = int(auto_resume.state)
 
     return ret, fp_ret
+
+
+def mazda_lkas_state(CS) -> tuple[int, bool, int]:
+  """starpilotCarState.mazdaCamFault / mazdaLkasBlock / mazdaTiState from the Mazda carstate (0 / False / 0 otherwise)."""
+  clip = lambda v: max(0, min(255, int(v or 0)))  # noqa: E731
+  return clip(getattr(CS, "cam_fault", 0)), bool(getattr(CS, "lkas_block", False) is True), clip(getattr(CS, "ti_state_log", 0))
 
 
 def mazda_wheel_button(CS) -> int:

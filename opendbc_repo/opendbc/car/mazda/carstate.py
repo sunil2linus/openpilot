@@ -57,6 +57,7 @@ class CarState(CarStateBase):
     self.ti_violation = 0
     self.ti_error = 0
     self.ti_lkas_allowed = False
+    self.ti_state_log = 0         # starpilotCarState.mazdaTiState: TI_FEEDBACK STATE with a TI, 0 without (round P)
 
     self._prev_steering_angle = 0
 
@@ -108,6 +109,7 @@ class CarState(CarStateBase):
 
       ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.TI_STEER_THRESHOLD
       self.ti_lkas_allowed = not self.ti_ramp_down and self.ti_state == TI_STATE.RUN
+      self.ti_state_log = int(self.ti_state)
     else:
       ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
       ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
