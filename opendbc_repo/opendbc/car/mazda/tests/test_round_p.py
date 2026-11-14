@@ -977,3 +977,16 @@ def test_rereview_n3_the_floor_is_never_above_the_curves_own_target():
     assert keep <= own * MPH + 1e-9 and abs(keep - min(cs.LKAS_KEEP_SPEED[0], own * MPH)) < 1e-9
   w.ti_only = True
   assert cs.CurveSlowdown._lkas_keep(w, True, False) == 0.0          # the LKAS blocked: no floor (TI-only plan)
+
+
+def test_rereview_minor_the_early_raise_reads_lkas_block_on_ti_cars_only():
+  from types import SimpleNamespace as N
+  from collections import deque
+  plan = N(mapOnRamp=True, mapRampToHighway=True, mapRampEndDistance=30.0, mapCurveStatus=0, mapCurveRadius=0.0,
+           mapCurveDistance=0.0)
+  w = N(frame=0, steer_cmds=deque([0.3] * 10, maxlen=10), merge_early_now=False, lkas_blocked=True, ti_fault=False,
+        has_ti=False, map_control=N(hwy_ramp_left=30.0), turn_gate=N(lat=1.0))
+  cc = N(actuators=N(torque=0.3))
+  assert cs.CurveSlowdown._merge_early(w, cc, plan)                 # no TI: its LKAS_BLOCK says nothing here
+  w.has_ti = True
+  assert not cs.CurveSlowdown._merge_early(w, cc, plan)

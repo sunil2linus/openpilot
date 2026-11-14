@@ -3222,7 +3222,7 @@ class CurveSlowdown:
       except (AttributeError, TypeError, ValueError):
         self.steer_cmds.append(1.0)          # (unknown: no reserve)
     self.merge_early_now = False
-    if not MERGE_EARLY or plan is None or self.lkas_blocked or self.ti_fault:
+    if not MERGE_EARLY or plan is None or (self.has_ti and self.lkas_blocked) or self.ti_fault:
       return False
     mc = self.map_control
     left = mc.hwy_ramp_left if mc is not None else None
