@@ -406,17 +406,18 @@ def test_merge_boost_takes_the_set_speed_above_the_highway_speed_and_back_before
   # boost 20 above it by one SET+ hold, kept until the car is 2 mph under the target, then ONE SET- hold down that never
   # lands below the target, taps for the rest
   car, logic, top, log = _merge_run(9000, 20, limit=75)
-  assert 95 - 1e-6 <= top / MPH <= 95 + 1e-6, top / MPH
+  # (round P: never above the car's maximum set speed, 90 mph: curve_slowdown.MERGE_BOOST_MAX)
+  assert 90 - 1e-6 <= top / MPH <= 90 + 1e-6, top / MPH
   ups = [h for h in logic.hold_log if h["direction"] == cs.SET_PLUS]
   downs = [h for h in logic.hold_log if h["direction"] == cs.SET_MINUS]
   # (35 -> 90 is longer than one hold may run, HOLD_MAX_SECONDS: a second one goes on)
   assert 1 <= len(ups) <= 2 and len(downs) == 1, logic.hold_log
   assert abs(downs[0]["bound_mph"] - 75) < 1e-6
-  # one hold up to the boost less the overrun margin (two quanta before the car's holds are measured: 85), then taps;
-  # it never passes the boost (review)
-  up = next(f for f, s, v in log if s >= 85 - 0.01)
+  # one hold up to the boost less the overrun margin (two quanta before the car's holds are measured: 80 under round P's
+  # 90 cap), then taps; it never passes the boost (review)
+  up = next(f for f, s, v in log if s >= 80 - 0.01)
   assert up - 400 <= 650, up
-  assert next(f for f, s, v in log if s >= 95 - 0.01) - 400 <= 1000
+  assert next(f for f, s, v in log if s >= 90 - 0.01) - 400 <= 1000
   t73 = next(f for f, s, v in log if v >= 73)
   assert all(s >= 75 - 1e-6 for f, s, v in log if f >= t73), "never below the target"
   back = next(f for f, s, v in log if f > t73 and s <= 75 + 1e-6)

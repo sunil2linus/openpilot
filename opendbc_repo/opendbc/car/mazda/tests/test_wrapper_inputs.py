@@ -197,8 +197,8 @@ def test_wrapper_merge_on_and_test(tmp_path, monkeypatch):
     # (owner after drive 69: the highway's limit + 5, MERGE_OVER)
     assert len(adopt) == 1 and adopt[0]["kind"] == "merge" and abs(adopt[0]["new_mph"] - 75) < 1e-6, (mode, records)
     if mode == 2:
-      # (the merge boost: the set speed may go 20 above the merge target meanwhile)
-      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 95) < 1e-6 and any(s for s in sent)
+      # (the merge boost: the set speed may go 20 above the merge target meanwhile, at most the car's 90: round P)
+      assert adopt[0]["mode"] == "on" and abs(c.logic.anchor / MPH - 90) < 1e-6 and any(s for s in sent)
       assert abs(c.logic.boost["target"] / MPH - 75) < 1e-6
     else:
       assert adopt[0]["mode"] == "test" and c.logic.anchor is None and not any(sent)

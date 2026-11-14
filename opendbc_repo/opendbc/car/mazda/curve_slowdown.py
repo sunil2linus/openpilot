@@ -269,7 +269,15 @@ MERGE_UP_HOLD_MAX = 9.0       # s
 # Review of drive 69's fixes: the boosted set speed never above MERGE_BOOST_MAX (mph / km/h); while it stays this far
 # above the target after the boost the alert comes back every MERGE_HIGH_REPEAT (the set speed left at 90-95: his
 # cancel and RES, openpilot off, the car not answering)
-MERGE_BOOST_MAX = (100, 160)
+# Round P (drive 73 t 405-447): the car's own maximum set speed is 90 mph (the set stayed 90.1, the dash's 145 km/h); the
+# anchor was 95, six SET+ taps at 90 were ignored and the no-effect back-off (10 s) lay exactly over the boost's way down
+# (set 85+ for 11.7 s on M-59, two "Set speed is high" chimes). The boosted anchor is capped at the car's maximum (145 km/h
+# when metric: not seen on a metric dash, so also learned): a SET+ of ours at SET_MAX_LEARN or above that does not land
+# makes the set speed then the car's maximum for the drive (not a no-effect press). Never a SET+ at / above it, and a
+# no-effect back-off never blocks or delays the boost's way down (BOOST_DOWN_NO_BACKOFF).
+MERGE_BOOST_MAX = (90, 145)
+SET_MAX_LEARN = (88, 142)
+BOOST_DOWN_NO_BACKOFF = True
 MERGE_HIGH_OVER = 10 * MS_PER_MPH
 MERGE_HIGH_REPEAT = 5.0       # s
 MERGE_HIGH_GAP = 0.3          # s the flag drops between two alerts (the events are read at 20 Hz)
@@ -653,6 +661,7 @@ class CurveSlowdownLogic:
     self.boost_stuck = False         # the set speed did not come back down to the highway speed after it
     self.prev_radar_lead = False
     self.boost_reopen = None         # {"target", "frame"}: a boost ended for a lead gone in a turn (MERGE_LEAD_GONE_REOPEN)
+    self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -741,6 +750,17 @@ class CurveSlowdownLogic:
     caps = [c for c in (self._cap(), self.limit_ceiling) if c is not None]
     return min(caps) if caps else None
 
+  def _set_top(self):
+    """The highest set speed the car takes (m/s): MERGE_BOOST_MAX in our unit, or the one learned this drive if lower."""
+    top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
+    return top if self.set_max is None else min(top, self.set_max)
+
+  def _boost_way_down(self):
+    """The merge boost's way down is pending: ended (or tapered) with the set speed still above the anchor."""
+    b = self.boost
+    return (b is not None and ("ended" in b or "taper" in b) and self.anchor is not None and
+            self.last_set_speed is not None and self.last_set_speed > self.anchor + self.half_step)
+
   @staticmethod
   def _lead_blocks_boost(i):
     """A radar lead holds the merge boost back / ends it, unless it is moving away with us (MERGE_MOVING_LEAD)."""
@@ -763,7 +783,7 @@ class CurveSlowdownLogic:
         self.boost_reopen = None
       elif (i.merge_turn_ok and not self._merge_paused(i) and not i.merge_turning and not self._lead_blocks_boost(i) and
             self.last_set_speed is not None and self.last_set_speed <= ro["target"] + self.half_step):
-        top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
+        top = self._set_top()
         self.boost = {"target": ro["target"], "frame": ro["frame"]}
         self.anchor = max(min(ro["target"] + i.limit_boost, top), ro["target"])
         self.boost_reopen = None
@@ -1406,8 +1426,13 @@ class CurveSlowdownLogic:
 
     # A press that has not shown up yet: count it; it stays in flight for a late arrival.
     if self.pending is not None and not self.pending.hold and self.frame - self.pending.frame > _frames(PENDING_TIMEOUT):
-      self.pending = None
-      self.no_effect += 1
+      p, self.pending = self.pending, None
+      learn = SET_MAX_LEARN[1 if self.step < MS_PER_MPH else 0] * self.step
+      if p.direction == SET_PLUS and self.last_set_speed is not None and self.last_set_speed >= learn - self.half_step:
+        # (SET_MAX_LEARN) refused by the car's maximum, not ignored: never a no-effect press
+        self.set_max = self.last_set_speed if self.set_max is None else min(self.set_max, self.last_set_speed)
+      else:
+        self.no_effect += 1
     window = self._in_flight_window()
     for p in [p for p in self.inflight if not p.hold and self.frame - p.frame > window]:
       self.inflight.remove(p)
@@ -1427,7 +1452,11 @@ class CurveSlowdownLogic:
       self.no_effect = 0
       self.no_effect_trips += 1
       self.backoff_until = self.frame + _frames(NO_EFFECT_BACKOFF)
-      if self.no_effect_trips >= NO_EFFECT_TRIPS:
+      way_down = BOOST_DOWN_NO_BACKOFF and self._boost_way_down()
+      if way_down:
+        # (BOOST_DOWN_NO_BACKOFF) only the way down's own ignored presses can give it up
+        self.boost["down_trips"] = self.boost.get("down_trips", 0) + 1
+      if self.no_effect_trips >= NO_EFFECT_TRIPS and not (way_down and self.boost["down_trips"] < NO_EFFECT_TRIPS):
         self._forget()   # the car is not responding: leave the set speed alone
 
     # Curve tracking. Frozen while the planner is missing or the driver is on the gas
@@ -1675,8 +1704,10 @@ class CurveSlowdownLogic:
       return None, None
 
     # One unconfirmed press at a time, a bounded number in flight, nothing while a hold settles;
-    # also wait during a back-off.
-    if (self.pending is not None or len(self.inflight) >= MAX_IN_FLIGHT or self.frame < self.backoff_until or
+    # also wait during a back-off (not the merge boost's way down: BOOST_DOWN_NO_BACKOFF).
+    backoff = self.frame < self.backoff_until and not (
+      BOOST_DOWN_NO_BACKOFF and self._boost_way_down() and self.boost.get("down_trips", 0) < NO_EFFECT_TRIPS)
+    if (self.pending is not None or len(self.inflight) >= MAX_IN_FLIGHT or backoff or
         any(p.hold for p in self.inflight)):
       return None, None
 
@@ -1700,7 +1731,7 @@ class CurveSlowdownLogic:
       self.anchor = i.limit_raise
       if i.limit_boost > 0 and not self._lead_blocks_boost(i) and i.boost_road_ok:
         self.boost = {"target": i.limit_raise, "frame": self.frame}
-        top = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
+        top = self._set_top()
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
       # a raise goes up at once, with a SET+ hold when it is far (drive 61: merges 35 -> 70 and a street's 43 -> 48 by
       # slow single taps after an earlier stop episode); right after a stop episode's release taps first (review)
@@ -1794,6 +1825,8 @@ class CurveSlowdownLogic:
       self.stop_episode = False
       self.holds_this_episode = 0
 
+    if button == SET_PLUS and set_speed >= self._set_top() - self.half_step:
+      return None, None                # (MERGE_BOOST_MAX, SET_MAX_LEARN) at the car's maximum: it would not take it
     # a SET+ while the car is faster than the set speed jumps to the current speed (see GAS_JUMP_*)
     v_hi = int(round(i.v_ego / self.step)) + JUMP_UNCERT
     faster = button == SET_PLUS and v_hi >= int(round(i.set_speed / self.step)) + JUMP_STEPS
@@ -1912,7 +1945,7 @@ class CurveSlowdownLogic:
         # taps while a lower limit's cap or ceiling is pending, or a slower car is in our lane after a red light gone: they
         # release a hold)
         # (inside a followed map curve: bounded by the curve's target as well, never above it: RESTORE_IN_CURVE_HOLD)
-        driver_steps = int(round(top / self.step))
+        driver_steps = min(int(round(top / self.step)), int(round(self._set_top() / self.step)))
         if in_curve:
           driver_steps = min(driver_steps, int(math.floor(target / self.step + 1e-3)))
         set_steps = int(round(set_speed / self.step))
