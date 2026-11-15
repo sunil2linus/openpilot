@@ -33,6 +33,7 @@ Rules (all need the camera's lane lines (probability >= CAM_LANE_PROB), the spee
       on a ramp), the camera's fault (no live data to trust), the curvature ahead rising, his SET- / CANCEL / brake
       (the controller's blocked rules), the Speed Limit / Map Curves Test modes (never a press there).
 """
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -90,6 +91,8 @@ def model_peak(xs, kappas, v, t0, t1):
   best = 0.0
   for x, k in zip(xs, kappas, strict=False):
     if d0 <= x <= d1:
+      if not (math.isfinite(k) and math.isfinite(x)):
+        return None               # (review of round Q, M2) a broken model point: no answer, not "straight"
       best = max(best, abs(k))
   return best * v * v
 
@@ -97,7 +100,10 @@ def model_peak(xs, kappas, v, t0, t1):
 def model_kappas(pos_x, rate_z, vel_x):
   """1/m at each point of modelV2's plan: orientationRate.z / velocity.x (the plan's own speed, at least 1 m/s)."""
   n = min(len(pos_x), len(rate_z), len(vel_x))
-  return list(pos_x[:n]), [rate_z[k] / max(vel_x[k], 1.0) for k in range(n)]
+  ks = [rate_z[k] / max(vel_x[k], 1.0) if math.isfinite(vel_x[k]) else float("nan") for k in range(n)]
+  if not all(math.isfinite(k) for k in ks) or not all(math.isfinite(x) for x in pos_x[:n]):
+    return [], []                 # (M2) the model invalid this frame
+  return list(pos_x[:n]), ks
 
 
 @dataclass

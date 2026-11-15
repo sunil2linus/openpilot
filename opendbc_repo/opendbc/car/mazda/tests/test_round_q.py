@@ -655,3 +655,10 @@ def test_review_s2_the_curve_end_also_lets_go_of_a_followed_map_curve(tmp_path, 
                                True, True, False, False, False, False, True, 32 * MPH))
   ends = [r for r in out if r[9]]
   assert ends and not ends[-1][0] and ends[-1][8], ends[-1:]        # the map curve's hold let go, SET+ holds
+
+
+def test_review_m2_a_non_finite_model_point_is_no_model_not_a_straight_road():
+  xs, ks = _path(lambda x: 0.0)
+  ks[10] = float("nan")
+  assert CC.model_peak(xs, ks, 20.0, 0.0, 9.0) is None
+  assert CC.model_kappas([0.0, 5.0], [0.0, float("inf")], [10.0, 10.0]) == ([], [])
