@@ -39,7 +39,17 @@ Design rules (each enforced by the logic itself, not by timing assumptions):
     and a back-off when the car ignores presses (give up after NO_EFFECT_TRIPS back-offs).
 """
 import math
+import time
 from dataclasses import dataclass, field, replace
+
+# (review of round Q, M5) what the per-frame camera curve path needs, at module level; the pure logic below does not need it
+try:
+  from opendbc.car.mazda.camera_curve import CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT
+  from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_PAUSED, TEST as MAP_TEST
+  from opendbc.car.mazda.speed_limit_follow import TEST as LIMIT_TEST
+  from opendbc.car.mazda.curve_target import map_curve_speed
+except ImportError:   # (offline tests that load this file alone: the wrapper is not used there)
+  CamInputs = None
 
 DT_CTRL = 0.01                     # car controller runs at 100 Hz
 MS_PER_MPH = 0.44704
@@ -3149,10 +3159,6 @@ class CurveSlowdown:
                     cam_active0, cam_speed0):
     """(round Q, camera_curve.py) the live camera decides inside a curve: the phantom release, the +1 taps, the curve's
     end. Returns the curve inputs for the controller (changed or as they were) and whether the curve is ending."""
-    from opendbc.car.mazda.camera_curve import CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT
-    from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_PAUSED, TEST as MAP_TEST
-    from opendbc.car.mazda.speed_limit_follow import TEST as LIMIT_TEST
-    from opendbc.car.mazda.curve_target import map_curve_speed
     lg, mc, mo = self.logic, self.map_control, self.map_out
     if self._alive('modelV2') and (self.sm.updated['modelV2'] or self.cam_model is None):
       m = self.sm['modelV2']
@@ -3200,7 +3206,6 @@ class CurveSlowdown:
       # (B1) the end cancelled: no restore of ours left in the way of the camera target taking the set down again
       lg.restore_pending, lg.restoring = False, False
     if self.recorder is not None and out.events:
-      import time
       for kind, data in out.events:
         self.recorder.record(kind, time.monotonic(), data, min_gap=0.0, signals=False)
     res = (curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold, curve_no_accel,
