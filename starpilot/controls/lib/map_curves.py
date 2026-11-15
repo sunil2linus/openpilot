@@ -1175,6 +1175,7 @@ class CurveMemory:
       self.entries = []
     self.saving = False
     self.dirty = False
+    self.gen = 0               # (CURVE_OFFSET_*) counts every change (save()): what was read from the records may be kept until then
 
   def _find(self, lat, lon, direction=None):
     """The record for the curve at (lat, lon) driven in `direction` (deg), or None: the nearest record within
@@ -1415,6 +1416,7 @@ class CurveMemory:
 
   def save(self):
     """Write the file in the background; a pass added while writing is written right after."""
+    self.gen = getattr(self, "gen", 0) + 1
     self.dirty = True
     if self.saving:
       return
@@ -1668,6 +1670,7 @@ class MapCurves:
     self.nav_all = []            # navigation's first maneuvers (ONRAMP_NAV_ALL)
     self.offset_set = 0.0        # (CURVE_OFFSET_*) m/s the setting asks for (the planner sets it at the start of a drive)
     self._ofs = {}               # id(curve) -> this update's (granted m/s, state, cap radius m)
+    self._ofs_mem = {}           # (id(curve), direction, id(memory), setting) -> (memory gen, curve, the memory's part)
     self.reset()
 
   def reset(self):
@@ -1863,8 +1866,26 @@ class MapCurves:
       if mem is None or d is None or self.trust_status != TRUST_OK or not hasattr(mem, "no_offset"):
         return 0.0, OFS_NOT, 0.0
       key = (self.chain_id, c["s_a"])
-      if self.veto.is_vetoed(key) or self.veto.flips(key) > 0 or mem.ghost(c, d, way=curve_way(c)) > 0 or \
-         mem.speed_cap(c, d) is not None:
+      if self.veto.is_vetoed(key) or self.veto.flips(key) > 0:
+        return 0.0, OFS_NOT, 0.0
+      # what the curve memory says (a few scans of its records): kept until the memory changes
+      mkey, gen = (id(c), d, id(mem), self.offset_set), getattr(mem, "gen", None)
+      hit = self._ofs_mem.get(mkey)
+      if gen is not None and hit is not None and hit[0] == gen and hit[1] is c:
+        return hit[2]
+      out = self._offset_mem(c, d, mem)
+      if gen is not None:
+        if len(self._ofs_mem) > 256:
+          self._ofs_mem = {}
+        self._ofs_mem[mkey] = (gen, c, out)
+      return out
+    except (KeyError, TypeError, ValueError, AttributeError):
+      return 0.0, OFS_NOT, 0.0
+
+  def _offset_mem(self, c, d, mem):
+    """_offset_calc's part from the curve memory (ghost marks, a speed cap, the radii, the curve's mark) and the cap."""
+    try:
+      if mem.ghost(c, d, way=curve_way(c)) > 0 or mem.speed_cap(c, d) is not None:
         return 0.0, OFS_NOT, 0.0
       if c.get("ramp"):
         measured = mem.ramp_measured(c, d)
