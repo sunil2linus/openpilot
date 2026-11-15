@@ -559,7 +559,8 @@ def test_r7_the_planner_publishes_a_ramp_curve_s_apex_once_inside_it():
 _LI0 = SS.slf.LimitInputs
 
 
-def _nogps_run(monkeypatch, set_mph, no_gps_until=3000, street_from=3000, limit=45, gps_bad=True, frames=6000, driver=None):
+def _nogps_run(monkeypatch, set_mph, no_gps_until=3000, street_from=3000, limit=45, gps_bad=True, frames=6000, driver=None,
+               gas_v=38):
   """Cruise on at frame ENGAGE (his SET at set_mph); no position (no_gps) until no_gps_until, nothing matched (road class 0)
   until street_from, then a street with `limit` (gps_bad False: GPS fine all along, the road simply not in our map)."""
   orig = _LI0
@@ -572,9 +573,9 @@ def _nogps_run(monkeypatch, set_mph, no_gps_until=3000, street_from=3000, limit=
   def road(f):
     st["f"] = f
     return 7 if f >= street_from else 0
-  # (drive 76: he drove on the gas from 23 to 33 mph after his SET at 19)
+  # (his gas to a road's speed, 38 mph, for 6 s after his SET: review of round R, F2, NOGPS_MIN_SPEED)
   return SS.street_sim(frames, lambda f: limit if f >= street_from else 0, set_mph, v_mph=24, road=road, driver=driver,
-                       gas=lambda f: 33 * MPH if SS.ENGAGE <= f < SS.ENGAGE + 600 else None, **SS._engage())
+                       gas=lambda f: gas_v * MPH if SS.ENGAGE <= f < SS.ENGAGE + 600 else None, **SS._engage())
 
 
 def test_r8_no_gps_at_the_engagement_raises_to_43_then_the_streets_rules_take_over(monkeypatch):
@@ -593,6 +594,9 @@ def test_r8_never_with_gps_fine_on_an_unmapped_street_nor_over_his_higher_set_no
   assert r["presses"] == [] and abs(r["sets"][-1] - 19) < 0.6           # a 25 mph subdivision street: his 19 stays
   r = _nogps_run(monkeypatch, 50, street_from=10 ** 6)
   assert not SS._plus(r) and not SS._minus(r)                           # his own higher set: never lowered by this
+  # (F2) his gas only to 33 (drive 76's 23 -> 33 mph after his SET at 19): never at a road's speed for 3 s, nothing
+  r = _nogps_run(monkeypatch, 19, gas_v=33, street_from=10 ** 6)
+  assert not SS._plus(r), r["presses"][:3]
   # his SET+ after the fallback: his; the street matched later does not decide rule 8 again (rules 1 / 2 as always)
   r = _nogps_run(monkeypatch, 19, driver=lambda f: cs.SET_PLUS if f == 2000 else None)
   assert sum(1 for x in SS._reasons(r) if x.startswith("start: cruise on")) == 1, SS._reasons(r)
@@ -610,3 +614,83 @@ def test_r8_the_wrapper_tells_no_gps_from_a_road_not_in_the_map(tmp_path, monkey
   assert not c._no_gps(P(mapCurveStatus=3, mapRoadClass=7), True)
   assert not c._no_gps(P(mapCurveStatus=3, mapCurveMode=0), True)      # Map Curves off: nothing known, no raise
   assert not c._no_gps(P(mapCurveStatus=3), False)
+
+
+T8 = _load("tcs8_round_r", "test_curve_slowdown.py")
+
+
+def _nogps_wrapper(tmp_path, monkeypatch, v0, engage_f=2000, frames=4000, acc_m=0.0, status=3, gas_until=None, gas_v=None,
+                   gas_from=0):
+  """(review of round R, F2) the real CurveSlowdown.update with Speed Limit Follow and Map Curves On: the drive's start with no
+  fix (Map Curves On, status no data, accuracy 0, road class 0); his SET at v0 in a subdivision / lot, then maybe his gas."""
+  from types import SimpleNamespace as NS
+  from opendbc.car.mazda import mazdacan
+  from opendbc.car.mazda.values import Buttons
+  sent = []
+  monkeypatch.setattr(mazdacan, "create_button_cmd", lambda packer, CP, ctr, btn: sent.append(btn) or ("btn", btn))
+  monkeypatch.setattr(W.messaging, "SubMaster", lambda services: W.FakeSM())
+  monkeypatch.setattr(W.cp, "PROFILE_PATH", str(tmp_path / "profile.json"))
+  CP0 = NS(flags=W.MazdaSafetyFlags.GEN1 | W.MazdaSafetyFlags.TORQUE_INTERCEPTOR, carFingerprint="MAZDA_CX5", maxLateralAccel=1.09)
+  c = cs.CurveSlowdown(CP0, W.FakeParams({"IsMetric": False}), curve_enabled=True, stop_mode=2, learning=False, map_mode=2,
+                       limit_mode=2)
+  if c.recorder is not None:
+    c.recorder.root = str(tmp_path / "events")
+  car = T8.Car(v0, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19, step=MPH)
+  car.v_ego = v0 * MPH
+  plan, m = c.sm.msgs["starpilotPlan"], c.sm.msgs["modelV2"]
+  m.laneLineProbs, m.meta = [0.5, 0.9, 0.9, 0.5], NS(laneChangeState=0)
+  xs = [190.0 * (j / 32) ** 2 for j in range(33)]
+  CP = NS(wheelbase=2.7, steerRatio=15.5, carFingerprint="MAZDA_CX5")
+  CCm = NS(enabled=True, cruiseControl=NS(cancel=False, resume=False), latActive=True, actuators=NS(torque=0.0))
+  out, presses = [], []
+  for f in range(frames):
+    on = f >= engage_f
+    if f == engage_f:
+      car.set_speed = round(car.v_ego / MPH) * MPH
+    plan.mapCurveMode, plan.mapCurveStatus, plan.mapGpsAccuracy, plan.mapRoadClass, plan.mapGpsTrust = 2, status, acc_m, 0, 0
+    if f % 5 == 0:
+      v = max(car.v_ego, 1.0)
+      m.position, m.velocity, m.orientationRate = NS(x=xs, y=[0.0] * 33), NS(x=[v] * 33, t=[0.0] * 33), NS(z=[0.0] * 33)
+      c.sm.updated["modelV2"] = c.sm.updated["starpilotPlan"] = True
+    else:
+      c.sm.updated["modelV2"] = c.sm.updated["starpilotPlan"] = False
+    gas = gas_until is not None and engage_f + gas_from <= f < gas_until and on
+    CS = W.car_state(car.v_ego / MPH, car.set_speed / MPH if on else 0.0, cruise=on, set_minus=engage_f <= f < engage_f + 10,
+                     gas=gas)
+    CS.crz_btns_counter = (f // 10) % 16
+    nb = len(sent)
+    c.update(CCm, CS, None, CP, False)
+    if len(sent) > nb:
+      btn = cs.SET_MINUS if sent[-1] == Buttons.SET_MINUS else cs.SET_PLUS
+      presses.append((f, btn))
+      car.hold_frame(btn) if c.logic.last_action == "hold" else car.press(btn)
+    if gas:
+      car.gas_frame = car.frame
+    v_prev = car.v_ego
+    car.tick()
+    if not on:
+      car.v_ego = v0 * MPH
+    if gas and gas_v is not None:
+      car.v_ego = min(gas_v * MPH, v_prev + 1.5 * 0.01)       # (his foot: +1.5 m/s^2 up to gas_v)
+    out.append((f, car.set_speed / MPH if on else 0.0, car.v_ego / MPH))
+  return out, presses
+
+
+def test_r8_f2_no_raise_in_a_subdivision_or_a_lot_only_at_a_roads_speed(tmp_path, monkeypatch):
+  # the reviewer's cases: his SET at 12-25 mph, or at 15 and then his gas to 26 / 30 mph: nothing
+  for v0 in (12, 15, 19, 25):
+    out, presses = _nogps_wrapper(tmp_path, monkeypatch, v0)
+    assert not [p for p in presses if p[1] == cs.SET_PLUS], (v0, presses[:3])
+  for gv in (26, 30):
+    for gf in (500, 3000):
+      out, presses = _nogps_wrapper(tmp_path, monkeypatch, 15, frames=gf + 4000, gas_until=2000 + gf + 1500, gas_v=gv,
+                                    gas_from=gf)
+      assert not [p for p in presses if p[1] == cs.SET_PLUS], (gv, gf, presses[:3])
+  # his gas to 40 mph for 15 s (a road's speed): then the fallback, never above 43
+  out, presses = _nogps_wrapper(tmp_path, monkeypatch, 19, frames=6000, gas_until=3500, gas_v=40)
+  ups = [p for p in presses if p[1] == cs.SET_PLUS]
+  assert ups and ups[0][0] >= 2000 + 700, ups[:2]
+  assert max(s for _, s, _ in out) <= 43 + 0.6 and abs(out[-1][1] - 43) < 0.6, out[-1]
+  # a usable fix with no road matched (outside the curve files): nothing
+  out, presses = _nogps_wrapper(tmp_path, monkeypatch, 19, frames=6000, gas_until=3500, gas_v=40, acc_m=5.0)
+  assert not [p for p in presses if p[1] == cs.SET_PLUS]

@@ -276,6 +276,12 @@ ENGAGE_LIMIT_STEADY = 5.0    # s
 # rule 8 decides again from his speed then (our 43: up or down to the street's limit + the offset).
 NOGPS_FALLBACK = True
 NOGPS_MATCH_WINDOW = 120.0   # s
+# Review of round R, F2 (a subdivision / parking lot at the drive's start: engaged at 25, 20 SET+ to 43 after 3 s): the
+# fallback's offer has no LIMIT_OFFER_TIME expiry, but is offered only once the car has been at NOGPS_MIN_SPEED or more for
+# NOGPS_MIN_TIME (his gas or the cruise: he is already driving at a road's speed), never from a lower speed; a usable fix
+# with no street matched drops it (the normal rules then).
+NOGPS_MIN_SPEED = (35, 56)   # mph / km/h
+NOGPS_MIN_TIME = 3.0         # s
 # Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
 LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
 # Round Q (drive 74 t 1104-1142: a 35 road, the set restored 30 -> 43 -> 51 -> 53): "the candidate's GPS trust" was the worst
@@ -482,6 +488,8 @@ class SpeedLimitFollower:
     self.lower_skip = None         # the limit a slowdown ended for by his decision: not again for it
     self.engage_frame = None       # cruise came on (rule 8 not decided yet)
     self.nogps_open = None         # (NOGPS_FALLBACK) frame rule 8 took the fallback with no GPS: decided again once matched
+    self.nogps_fast_frames = 0     # (NOGPS_MIN_SPEED) frames at road speed
+    self.nogps_now = False
     self.trust0_frames = 0         # consecutive frames with GPS trust 0
     self.unknown_frames = 0        # consecutive frames with no posted limit reported
     self.cand_name = ""            # the road name when the candidate limit first appeared ...
@@ -610,6 +618,9 @@ class SpeedLimitFollower:
       self._exit_limit(reported, None, d, i, self.frame)
     self._provisional(reported, d, i)
     self._merge(i, d)
+    self.nogps_now = i.no_gps
+    m = 1 if self.step < MS_PER_MPH else 0
+    self.nogps_fast_frames = self.nogps_fast_frames + 1 if i.v_ego >= NOGPS_MIN_SPEED[m] * self.step - 0.01 else 0
     self._street_speed(i, d, reported)
     return self._offered(d)
 
@@ -1273,8 +1284,15 @@ class SpeedLimitFollower:
       return 0.0
     # a merge stays open while on the link and LIMIT_OFFER_TIME after it (drive 53, ramp 2: a loop's curve held the set
     # speed for 31 s, to the merge)
+    if o.source == "no GPS":
+      # (NOGPS_MIN_SPEED) no expiry; offered only at a road's speed; a usable fix with nothing matched: the normal rules
+      if not self.nogps_now and self.engage_frame is None:
+        self.offer = None
+        return 0.0
+      if self.nogps_fast_frames < _frames(NOGPS_MIN_TIME):
+        return 0.0 if d is None or abs(d - o.driver) < 0.5 else self._his(o, d)
     since = max(o.frame, self.link_last) if o.kind == "merge" else o.frame
-    if self.frame - since > _frames(LIMIT_OFFER_TIME):
+    if self.frame - since > _frames(LIMIT_OFFER_TIME) and o.source != "no GPS":
       self.offer = None
       self._not_followed(o.old, o.new, o.source, "not taken in time (cruise off, a slowdown or the driver on the buttons)")
       return 0.0
@@ -1290,6 +1308,9 @@ class SpeedLimitFollower:
       return 0.0
     if abs(d - o.driver) < 0.5:
       return o.target * self.step
+    return self._his(o, d)
+
+  def _his(self, o, d):
     self.offer = None                # the driver chose another speed: theirs
     self._not_followed(o.old, o.new, o.source, f"driver changed his speed to {round(d)}")
     return 0.0
