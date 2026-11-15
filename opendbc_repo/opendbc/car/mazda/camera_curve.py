@@ -41,7 +41,10 @@ DT_CTRL = 0.01
 MS_PER_MPH = 0.44704
 
 CAM_TAP_DT = 0.5                # s between two in-curve +1 taps
-CAM_LAT_LKAS = 1.8              # m/s^2: the lateral a +1 may predict at most (stock LKAS + TI: the working limit ~2.0)
+CAM_LAT_LKAS = 1.7              # m/s^2: the lateral a +1 may predict at most (stock LKAS + TI: the working limit ~2.0)
+# (C1: the owner's 20 Hz rlogs, the steering command saturated in 47 % of frames at 2.0-2.3 m/s^2; the steer-angle lateral
+# reads 0.1-0.2 low in curves against livePose) the measured lateral is taken CAM_MEAS_MARGIN higher in every comparison
+CAM_MEAS_MARGIN = 0.15          # m/s^2
 CAM_LAT_TI = 1.4                # m/s^2: ... with the TI alone (LKAS blocked, the camera's fault)
 CAM_END_LAT = 1.0               # m/s^2: the model's peak over 2-3 s under this: the curve ends
 CAM_PHANTOM_LAT = 1.0           # m/s^2
@@ -194,7 +197,8 @@ class CameraCurve:
   def update(self, i: CamInputs) -> CamOutput:
     self.frame += 1
     out = CamOutput()
-    lat = abs(float(i.lat))
+    lat_raw = abs(float(i.lat))
+    lat = lat_raw + CAM_MEAS_MARGIN      # (C1; the tightening test keeps the raw one: there the margin is the unsafe side)
     self.lat_hist.append(lat)
     self.trq_hist.append(abs(float(i.torque)))
     lim = CAM_LAT_TI if i.ti_only else CAM_LAT_LKAS
@@ -239,7 +243,7 @@ class CameraCurve:
       return self._done(out, i)
     in_curve = max(self.lat_hist) >= CAM_IN_CURVE_LAT if self.lat_hist else False
     pk_now = model_peak(i.model_x, i.model_k, v, 0.5, 2.0)
-    tightening = pk_now is None or pk_now >= lat * CAM_TIGHTEN_GAIN + CAM_TIGHTEN_ADD
+    tightening = pk_now is None or pk_now >= lat_raw * CAM_TIGHTEN_GAIN + CAM_TIGHTEN_ADD
     pk_cur = model_peak(i.model_x, i.model_k, v, 0.5, 3.0)
     out.keep = pk_cur is not None and pk_cur < lim and lat < lim and not tightening
     # (d) the curve ending
