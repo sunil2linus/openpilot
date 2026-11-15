@@ -592,3 +592,34 @@ def test_review_s1_what_the_taps_reached_never_stays_above_a_target_that_dropped
     r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, setv, 45 * MPH, True, 28 * MPH, 0.0, 0, True,
                         False, False, False, False, False, True, 28 * MPH)
   assert r[0] and r[1] / MPH < 30, r[1] / MPH
+
+
+def test_review_s2_the_curve_end_also_lets_go_of_a_followed_map_curve(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace as N
+  W = _load("tcpw_round_q_s2", os.path.join(HERE, "test_car_profile_wrapper.py"))
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  v = 35 * MPH
+  xs = [190.0 * (k / 32) ** 2 for k in range(33)]
+  m = c.sm.msgs["modelV2"]
+  m.position, m.velocity = N(x=xs, y=[0.0] * 33), N(x=[v] * 33, t=[0.0] * 33)
+  m.laneLineProbs = [0.5, 0.9, 0.9, 0.5]
+  cs_ = W.car_state(35, 30)
+  cs_.out.steeringAngleDeg = 1.4 * 18.9 * 2.7 * (1 + 0.001 * v * v) / (v * v) * 57.29578
+  c.logic.anchor = 45 * MPH
+  plan = c.sm.msgs["starpilotPlan"]
+  plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance, plan.mapRoadClass, plan.mapGpsTrust = 1, 90.0, 0.0, 7, 0
+  c.map_on_used = True
+  c.map_out = N(active=True, track=True, plan=30 * MPH, speed=30 * MPH, floor=0.0, budget=40, settled=True, firm=False,
+                link=False)
+  out = []
+  for f in range(400):
+    c.frame += 1
+    # in the curve 2 s, then the model sees the road straighten 1.5 s ahead
+    m.orientationRate = N(z=[1.4 / v if (f < 200 or x < 1.5 * v) else 0.0 for x in xs])
+    c.sm.updated["modelV2"] = True
+    out.append(c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 30 * MPH, 45 * MPH, True, 30 * MPH, 0.0, 40,
+                               True, True, False, False, False, False, True, 32 * MPH))
+  ends = [r for r in out if r[9]]
+  assert ends and not ends[-1][0] and ends[-1][8], ends[-1:]        # the map curve's hold let go, SET+ holds

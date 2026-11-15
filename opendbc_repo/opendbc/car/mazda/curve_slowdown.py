@@ -3202,10 +3202,13 @@ class CurveSlowdown:
     if out.ending:
       # (d) the camera's target let go; a map curve still asking for less keeps governing (its plan caps the restore)
       self.cam_floor, self.cam_goal = None, None
-      if map_gov and not out.phantom:
+      if map_gov and not out.phantom and dist > 10.0:
+        # a map curve ahead (not the one we are in) governs: it keeps its follow, its plan caps the raise
         a, sp, fl, bu, tr, ra = self.curve_mix.update(False, CAM_NONE, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step,
                                                                                         MIN_SET_SPEED))
         return (a, sp, fl, bu, tr, ra, self.curve_mix.firm, self.curve_mix.no_accel, res[8], True)
+      # (review of round Q, S2) the map curve we are in no longer holds the set (map curve ends are unreliable): the end's
+      # raise toward the anchor / merge goal, capped as below
       if out.end_goal < CAM_NONE:
         # (B1, CAM_END_STEP) nothing known beyond the model's horizon: the end raises (taps) only this far
         goal = min(out.end_goal, driver_speed)
