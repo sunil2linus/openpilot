@@ -53,7 +53,9 @@ CAM_IN_CURVE_LAT = 1.2          # m/s^2: a curve was driven: |lateral| this high
 CAM_IN_CURVE_TIME = 2.0         # s ... within this
 CAM_LANE_PROB = 0.3
 CAM_MIN_SPEED = 25 * MS_PER_MPH  # m/s
-CAM_TORQUE_RESERVE = 0.85       # median |torque command| over CAM_TORQUE_TIME under this
+CAM_TORQUE_RESERVE = 0.70       # median |torque command| over CAM_TORQUE_TIME under this (C3; was 0.85)
+CAM_TORQUE_SAT = 0.99           # (C3) |torque| at or above this ...
+CAM_TORQUE_SAT_SHARE = 0.10     # ... in at most this share of the last CAM_TORQUE_TIME
 CAM_TORQUE_TIME = 1.0           # s
 CAM_TIGHTEN_GAIN = 1.1
 CAM_TIGHTEN_ADD = 0.2           # m/s^2
@@ -257,6 +259,8 @@ class CameraCurve:
     # (d) the curve ending
     pk_end = model_peak(i.model_x, i.model_k, v, 2.0, 3.0)
     trq = sorted(self.trq_hist)[len(self.trq_hist) // 2] if self.trq_hist else 1.0
+    sat = (sum(1 for q in self.trq_hist if q >= CAM_TORQUE_SAT) / len(self.trq_hist)) if self.trq_hist else 1.0
+    no_reserve = trq >= CAM_TORQUE_RESERVE or sat > CAM_TORQUE_SAT_SHARE      # (C3)
     n_rise = int(CAM_RISE_TIME / DT_CTRL)
     rising = len(self.lat_hist) > 1 and lat - self.lat_hist[max(len(self.lat_hist) - 1 - n_rise, 0)] > CAM_RISE
     low_target = i.target < max(v, i.set_speed + i.step) - 1e-3 or i.map_ahead < v     # (R1 a)
@@ -266,14 +270,14 @@ class CameraCurve:
                "model peak" if pk_now is None or pk_now >= lim else
                "curve ahead" if pk_end is None or pk_end >= CAM_END_LAT + CAM_END_HYST else
                "lateral rising" if rising or lat >= lim else
-               "steering reserve" if trq >= CAM_TORQUE_RESERVE else
+               "steering reserve" if no_reserve else
                "target dropping" if i.target < min(self.end_t0, i.set_speed) - CAM_END_DROP else "")
       if why_c:
         self._cancel(out, why_c, lat)
         self.ending = False
     end_ok = (not self.ending and not self.end_done and not low_target and in_curve and pk_end is not None and
               pk_end < CAM_END_LAT and
-              pk_now is not None and pk_now < lim and lat < lim and trq < CAM_TORQUE_RESERVE and not rising)
+              pk_now is not None and pk_now < lim and lat < lim and not no_reserve and not rising)
     self.end_frames = self.end_frames + 1 if end_ok else 0
     if end_ok and self.end_frames >= int(CAM_END_CONFIRM / DT_CTRL):
       self.ending = True
@@ -298,7 +302,7 @@ class CameraCurve:
            "lateral" if pred >= lim else
            "set above the speed" if set_steps + 1 > int(round(v / i.step)) + 1 else
            "tightening" if tightening or rising else
-           "steering reserve" if trq >= CAM_TORQUE_RESERVE else
+           "steering reserve" if no_reserve else
            "cap" if goal > i.cap + 1e-3 else
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
            "camera curve ahead" if goal > i.cam_target + 1e-3 else

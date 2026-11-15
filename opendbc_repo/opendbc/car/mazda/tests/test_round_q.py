@@ -198,7 +198,10 @@ def test_q3_no_tap_without_the_margin_or_the_reserve():
   taps, _, outs = _cam_run(3.0, kappa=lambda x: 1.6 / (v * v) if x > 20 else 1.2 / (v * v))
   assert not taps and outs[-1].why == "tightening" and not outs[-1].keep
   # the steering command near its limit
-  taps, _, outs = _cam_run(3.0, torque=0.9)
+  taps, _, outs = _cam_run(3.0, torque=0.75)
+  assert not taps and outs[-1].why == "steering reserve"
+  # (C3) saturated (>= 0.99) in more than 10 % of the last second, the median low: none either
+  taps, _, outs = _cam_run(3.0, torque=lambda f: 1.0 if f % 5 == 0 else 0.3)
   assert not taps and outs[-1].why == "steering reserve"
   # a map curve ahead whose plan is under the next step (drive 56: a loop just beyond the model's horizon)
   taps, _, outs = _cam_run(3.0, map_ahead=33.2 * MPH)
