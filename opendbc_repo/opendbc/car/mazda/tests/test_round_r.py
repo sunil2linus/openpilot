@@ -405,7 +405,7 @@ def test_r1_its_guards_red_light_a_slow_lead_a_tighter_curve_target():
     assert f_up is None or f_up >= 400, f_up
 
 
-def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0.9, link=True, plan=None, rend=60.0):
+def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0.9, link=True, plan=None, rend=15.0):
   from types import SimpleNamespace as NS
   c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
   m = c.sm.msgs["modelV2"]
@@ -453,6 +453,9 @@ def test_r1_the_wrappers_model_view_and_its_guards(tmp_path, monkeypatch):
   assert not _merge_model_wrapper(tmp_path, monkeypatch, plan=ahead)[1]["merge_model_open"]
   # the ramp's end far (a long ramp left: a turn the map lacks may come) or unknown: no
   assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=300.0)[1]["merge_model_open"]
+  # (F4) the ramp's end beyond the model's trusted horizon (31 mph x 3 s = 42 m; the end 30 m by the straight line, 1.3 x
+  # that + 20 m to be seen): no
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=30.0)[1]["merge_model_open"]
   assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=None)[1]["merge_model_open"]
   # the stock LKAS blocked: no
   c, out = _merge_model_wrapper(tmp_path, monkeypatch)

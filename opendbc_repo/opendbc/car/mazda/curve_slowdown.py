@@ -548,6 +548,17 @@ MERGE_MODEL_FAR = 7.0             # s
 # see yet (wsim: an unmapped R30 / R40 turn 80-120 m after the loop came in 4-19 mph faster than with the turn gate); there
 # the turn gate decides, as before. (Drives 76 / 6f: 64 / 57 m left at the model's opening.)
 MERGE_MODEL_REND = 100.0          # m
+# Review of round R, F4 (the model trusted where it cannot see: an unmapped R40 50 m after the loop with a 40 m view: +2.15 mph,
+# 6.09 m/s^2 against 4.8): the model's trusted horizon, min(its path's length, the car's speed x MERGE_MODEL_SEE_TIME, the
+# range camera_curve calls reliable), must reach min(MERGE_MODEL_REND_K x the ramp's end + MERGE_MODEL_SEE_PAD,
+# MERGE_MODEL_SEE_MAX). The planner's mapRampEndDistance is a straight line to the ramp's end (map_curves: dist_m), a lower
+# bound of the road left (no along-road distance is published): MERGE_MODEL_REND_K covers a ramp's end that bends. And the
+# lane lines are checked while a boost the model opened runs (under CAM_LANE_PROB: held back to the turn gate, as a stop).
+MERGE_MODEL_SEE_TIME = 3.0        # s
+MERGE_MODEL_SEE_PAD = 20.0        # m
+MERGE_MODEL_SEE_MAX = 80.0        # m
+NO_SEE = 1e9
+MERGE_MODEL_REND_K = 1.3
 # No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
 HWY_ROAD_CLASSES = (1, 3)
 CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
@@ -652,6 +663,7 @@ class SlowdownInputs:
   merge_lat: float = 0.0
   merge_model_pk: float = -1.0
   merge_winding: bool = False
+  merge_lane_ok: bool = True      # (MERGE_MODEL_OPEN, F4) the camera's lane lines at CAM_LANE_PROB
   red_light: bool = False         # starpilotPlan.redLight (raw): no merge start under it, its way up pauses
   # ... as the stop trigger sees it (its red_ok: not at highway speed on a highway, not on a ramp onto one): no SET+ back
   # up from one of our stop slowdowns under it (RESUME_RESTORE, at most RED_STOP_BLOCK_MAX from its onset)
@@ -1184,7 +1196,7 @@ class CurveSlowdownLogic:
     """(MERGE_MODEL_OPEN) a boost the model opened stops: the lateral up MERGE_MODEL_MARGIN on its start, the wheel winding
     up, the model's 0.5-3 s peak above the start lateral + MERGE_MODEL_MARGIN (no model: the turn gate's pause)."""
     lat0 = self.boost["model"]["lat0"]
-    if i.merge_winding or i.merge_lat > lat0 + MERGE_MODEL_MARGIN:
+    if i.merge_winding or i.merge_lat > lat0 + MERGE_MODEL_MARGIN or not i.merge_lane_ok:
       return True
     if i.merge_model_pk < 0:
       return i.merge_turn_pause
@@ -3807,13 +3819,15 @@ class CurveSlowdown:
     # (the stop rule watches the 0.5-3 s peak and that far window: a tighter turn coming into the model's view)
     pk_stop = max(pk, pk25) if (pk is not None and pk25 is not None) else pk
     out = dict(merge_model_open=False, merge_lat=lat, merge_model_pk=pk_stop if pk_stop is not None else -1.0,
-               merge_winding=winding)
+               merge_winding=winding, merge_lane_ok=bool(view is not None and view[2] >= CAM_LANE_PROB))
     mc = self.map_control
     left = mc.hwy_ramp_left if mc is not None else None
     if left is None and plan is not None and bool(getattr(plan, "mapOnRamp", False)) and bool(getattr(plan, "mapRampToHighway", False)):
       left = float(getattr(plan, "mapRampEndDistance", 0.0) or 0.0) or None
+    seen = min(view[0][-1], v * MERGE_MODEL_SEE_TIME) if view is not None else 0.0      # (F4) the trusted horizon
+    need = min(MERGE_MODEL_REND_K * left + MERGE_MODEL_SEE_PAD, MERGE_MODEL_SEE_MAX) if left is not None else NO_SEE
     ok = (MERGE_MODEL_OPEN and plan is not None and view is not None and pk25 is not None and view[2] >= CAM_LANE_PROB and
-          left is not None and 0.0 < left <= MERGE_MODEL_REND and
+          left is not None and 0.0 < left <= MERGE_MODEL_REND and seen >= need and
           not (self.has_ti and self.lkas_blocked) and not self.ti_fault and not self.plan_stop_raw and
           mc is not None and mc.link_now)
     self.model_open_frames = self.model_open_frames + 1 if (ok and pk25 <= MERGE_MODEL_LAT) else 0
