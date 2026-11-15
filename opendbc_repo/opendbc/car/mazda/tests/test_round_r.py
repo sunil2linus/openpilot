@@ -169,64 +169,121 @@ def test_r3_the_guards_stay_red_light_a_slow_car_ahead_a_curve_and_the_hold_marg
 TE = _load("tep_round_r", "test_exit_plan.py")
 
 
-def _exit_no_curve(ramp_to=45, set_mph=75, frames=12000, lead=40):
-  """Navigation's exit with no curve on its ramp, the link matched with GPS trust 2 (unmatched) after it, the car behind
-  a car at 40 mph that leaves 400 m past the exit point (drive 76 t 700-755, exit to Dobry Dr; synthetic)."""
+def _handover_run(after, set_mph=75, v_mph=62, frames=12000, lead=40, gas=None, driver=None, ramp_to=45, flag=True):
+  """Navigation's exit with no curve on its ramp; after(d, F, hwy) gives the planner's fields d m past the exit point. The
+  wrapper's adopt and its RampHandover (curve_slowdown.CurveSlowdown.update) on drive_exit's loop."""
   exit_x = 1500.0
   F, cs_ = TE.F, TE.cs
+  st = {"f": None, "rh": None, "frame": 0}
 
   def fields(x):
     hwy = dict(road_class=1, limit=70 * MPH, gps_trust=0)
     if x < exit_x - 700:
-      return F(**hwy)
-    if x < exit_x - 40:
-      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_exit_side=1, exit_shape=1, exit_start=exit_x - x,
-               ramp_type=1, ramp_to_speed=ramp_to * MPH, **hwy)
-    if x < exit_x + 60:
-      return F(exit_shape=0, **{**hwy, "gps_trust": 2})
-    return F(exit_shape=2, road_class=2, gps_trust=2)
-  real = cs_.adopt_forgets
+      f = F(**hwy)
+    elif x < exit_x - 40:
+      f = F(nav_exit=1, nav_exit_distance=exit_x - x, nav_exit_side=1, exit_shape=1, exit_start=exit_x - x,
+            ramp_type=1, ramp_to_speed=ramp_to * MPH, **hwy)
+    else:
+      f = after(x - exit_x, F, hwy)
+    st["f"] = f
+    return f
+  real_adopt, real_update = cs_.adopt_forgets, cs_.CurveSlowdownLogic.update
 
-  def wrapper_adopt(lg, mo, set_speed):            # (the wrapper's adopt: curve_slowdown.CurveSlowdown.update)
-    if not real(lg, mo, set_speed):
+  def wrapper_adopt(lg, mo, set_speed):
+    if not real_adopt(lg, mo, set_speed):
       return False
-    return not cs_.exit_ramp_handover(lg, mo, set_speed)
-  cs_.adopt_forgets = wrapper_adopt
+    rh = cs_.exit_ramp_handover(lg, mo, set_speed, lg.last_set_speed and st["v"], lg.frame)
+    if rh is not None:
+      st["rh"] = rh
+    return True                                      # (the set his, as before)
+
+  def update(self, i):
+    st["v"] = i.v_ego
+    f = st["f"]
+    if st["rh"] is not None and f is not None:
+      if not st["rh"].step(self, self.frame, i.set_speed, i.v_ego, f.road_class, f.gps_trust, f.on_ramp, i.cruise_enabled,
+                           i.gas_pressed, i.brake_pressed, i.driver_button is not None):
+        st["rh"] = None
+    return real_update(self, i)
+  cs_.adopt_forgets, cs_.CurveSlowdownLogic.update = wrapper_adopt, update
+  old = TE.CTL.EXIT_RAMP_HANDOVER
+  TE.CTL.EXIT_RAMP_HANDOVER = flag
   try:
-    r = TE.drive_exit(fields, frames, set_mph, v_mph=62, lane=lambda x: 1 if x < exit_x else None,
+    r = TE.drive_exit(fields, frames, set_mph, v_mph=v_mph, lane=lambda x: 1 if x < exit_x else None,
                       signal=lambda x: 1 if exit_x - 300 <= x < exit_x - 250 else 0,
-                      lead=lambda x: lead * MPH if x < exit_x + 400 else None)
+                      lead=(lambda x: lead * MPH if x < exit_x + 400 else None) if lead else None, gas=gas)
   finally:
-    cs_.adopt_forgets = real
+    cs_.adopt_forgets, cs_.CurveSlowdownLogic.update = real_adopt, real_update
+    TE.CTL.EXIT_RAMP_HANDOVER = old
   return r, exit_x
 
 
-def test_r5_the_exit_ending_on_its_ramp_hands_over_to_the_streets_target():
-  r, exit_x = _exit_no_curve()
-  assert (r["ctl"].last_plan.why == "on the ramp, no curve"), r["ctl"].last_plan.why
-  end = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x)
-  assert r["sets"][end] >= 59                                          # (the exit's own lowering left ~60)
-  assert abs(r["sets"][-1] - 50) < 0.6, r["sets"][-1]                  # the announced 45 street + 5, by SET- taps
-  assert not TE._plus(r, exit_x, 10 ** 6)
-  assert r["logic"].anchor_ours or r["logic"].anchor is None
-  # the car does not speed up toward the old set once the car ahead is gone: at most the street's target
-  assert max(r["vs"][end:]) <= 50.5, max(r["vs"][end:])
-  # (before round R: the 60 kept as his speed)
-  old = TE.CTL.EXIT_RAMP_HANDOVER
-  try:
-    TE.CTL.EXIT_RAMP_HANDOVER = False
-    r0, _ = _exit_no_curve()
-  finally:
-    TE.CTL.EXIT_RAMP_HANDOVER = old
-  assert r0["sets"][-1] >= 59 and max(r0["vs"][end:]) > 55
+def _trusted_ramp(street_at=600.0, street_limit=45):
+  """The exit's ramp matched (a link, the planner's ramp flag, GPS trust 0), a 45 street from street_at m past the exit point."""
+  def after(d, F, hwy):
+    if d < 60:
+      return F(exit_shape=0, **{**hwy, "gps_trust": 2})
+    if d < street_at:
+      return F(exit_shape=2, road_class=2, gps_trust=0, on_ramp=True, ramp_type=1, ramp_to_speed=street_limit * MPH,
+               ramp_end_distance=max(street_at - d, 0.0))
+    return F(road_class=7, gps_trust=0, limit=street_limit * MPH)
+  return after
 
 
-def test_r5_the_streets_limit_unknown_takes_the_43_fallback_and_never_a_raise():
-  r, exit_x = _exit_no_curve(ramp_to=0)
+def test_r5_the_exit_ending_on_its_ramp_hands_over_to_the_streets_target_on_a_trusted_ramp():
+  r, exit_x = _handover_run(_trusted_ramp())
+  assert r["ctl"].last_plan.why == "on the ramp, no curve", r["ctl"].last_plan.why
+  k_exit = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x)
+  assert r["sets"][k_exit] >= 59                                       # (the exit's own lowering left ~60)
+  # on the ramp: never more than RAMP_HANDOVER_DROP under the speed at its start (~40 behind the car ahead: 30, so the 50)
+  k_street = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x + 600)
+  assert min(r["sets"][k_exit:k_street]) >= 50 - 0.6
+  assert abs(r["sets"][-1] - 50) < 0.6, r["sets"][-1]                  # the announced 45 street + 5
+  assert max(r["sets"][k_exit + 200:]) <= 60 + 0.6                     # never a raise by it
+  # (before round R: the 60 kept as his speed on the ramp until the street cap 200 m before its end, the car speeding up
+  # toward it once the car ahead left)
+  r0, _ = _handover_run(_trusted_ramp(), flag=False)
+  k0 = next(k for k, xx in enumerate(r0["xs"]) if xx >= exit_x + 380)
+  k1 = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x + 380)
+  assert r0["sets"][k0] >= 59 and r["sets"][k1] <= 51 + 0.6, (r0["sets"][k0], r["sets"][k1])
+  # the street's limit unknown: the 43 fallback once on the street
+  r, _ = _handover_run(_trusted_ramp(street_limit=0), ramp_to=0)
   assert abs(r["sets"][-1] - 43) < 0.6, r["sets"][-1]
-  # the set already under the street's target (his 45 on the highway, a 55 street): left as it was
-  r, exit_x = _exit_no_curve(ramp_to=55, set_mph=50)
-  assert not TE._plus(r, exit_x, 10 ** 6) and r["sets"][-1] <= 50 + 1e-6
+
+
+# review of round R, F1: false exit ends (the car stays on the highway) and an untrusted link: no presses beyond the base's
+FALSE_EXITS = {
+  "shapes link, hwy trust2": lambda d, F, h: F(exit_shape=2 if d < 300 else 0, **{**h, "gps_trust": 2}),
+  "shapes link, hwy trust2 class0": lambda d, F, h: F(exit_shape=2 if d < 300 else 0, road_class=0, gps_trust=2),
+  "shapes link 100m, then hwy trust1": lambda d, F, h: F(exit_shape=2 if d < 100 else 0, **{**h, "gps_trust": 1}),
+  "parallel ramp matched as link": lambda d, F, h: F(exit_shape=2, road_class=2, gps_trust=0, limit=70 * MPH),
+  "a real ramp, GPS trust 2": lambda d, F, h: F(exit_shape=2, road_class=2, gps_trust=2, on_ramp=d > 100),
+}
+
+
+def test_r5_false_exit_ends_and_untrusted_links_press_nothing_beyond_the_base():
+  for tag, aft in FALSE_EXITS.items():
+    for gas in (None, lambda x: 72 * MPH if 2100 <= x < 2300 else None):
+      r, exit_x = _handover_run(aft, set_mph=75, v_mph=70, lead=None, gas=gas, frames=9000)
+      r0, _ = _handover_run(aft, set_mph=75, v_mph=70, lead=None, gas=gas, frames=9000, flag=False)
+      assert [p[2] for p in r["presses"]] == [p[2] for p in r0["presses"]], tag
+      assert abs(r["sets"][-1] - r0["sets"][-1]) < 1e-6, (tag, r["sets"][-1], r0["sets"][-1])
+
+
+def test_r5_his_gas_or_his_button_cancels_it_for_good():
+  # his gas held on the trusted ramp (> GAS_OVERTURN_TIME) before the street: nothing more of the handover afterwards
+  r, exit_x = _handover_run(_trusted_ramp(street_at=900.0), gas=lambda x: 45 * MPH if 1650 <= x < 1750 else None)
+  k = next(k for k, xx in enumerate(r["xs"]) if xx >= 1760)
+  assert not [p for p in r["presses"] if p[0] > k + 100 and p[2] == TE.cs.SET_MINUS], r["presses"][-3:]
+  # any button of his, his brake, cruise off: over at once (the set stays where it is)
+  for kw in (dict(buttons=True), dict(brake=True), dict(cruise=False)):
+    lg = cs.CurveSlowdownLogic(False)
+    lg.last_set_speed = 60 * MPH
+    rh = cs.RampHandover(48 * MPH, 40 * MPH, 0)
+    args = dict(set_speed=60 * MPH, v_ego=40 * MPH, road_class=7, trust=0, on_ramp=False, cruise=True, gas=False, brake=False,
+                buttons=False)
+    args.update(kw)
+    assert not rh.step(lg, 1, **args) and lg.anchor is None, kw
 
 
 # ---------------- R6: a stable lead in a curve: follow it, bounded ----------------

@@ -2447,14 +2447,54 @@ def exit_handover(lg, set_speed, target, stopped_recently):
   return target if (stopped_recently or low) and target > set_speed + lg.half_step else 0.0
 
 
-def exit_ramp_handover(lg, mo, set_speed):
-  """(map_curve_control.EXIT_RAMP_HANDOVER) an exit plan ended on its ramp with our lowering under the set: the street's
-  target (MapOutput.ramp_handover) becomes his speed when it is under the set (lowered to it by SET- taps). True: done."""
+# Review of round R, F1 (a false exit end took 70 -> 50 on the highway, 20 SET- taps from 250 m past the split): the exit's
+# street target is no longer made his speed at the adopt. The adopt is as before (the set his); a RampHandover is opened and
+# lowers it only while the road is matched as this exit's ramp (a link with the planner's ramp flag) or a street, with GPS
+# trust 0; never more than RAMP_HANDOVER_DROP under the car's speed at its start until a street is matched; cancelled for good
+# by his gas held map_curve_control.GAS_OVERTURN_TIME, any button of his, his brake, cruise off, the highway matched with
+# trust 0, or EXIT_TO_SEEN_TIME.
+RAMP_HANDOVER_DROP = 10 * MS_PER_MPH
+
+
+class RampHandover:
+  """(map_curve_control.EXIT_RAMP_HANDOVER, F1) the exit's street target taken on the set only on a trusted ramp / street."""
+  def __init__(self, target, v0, frame):
+    self.target, self.v0, self.frame0, self.gas_frames, self.lowering = target, v0, frame, 0, False
+
+  def step(self, lg, frame, set_speed, v_ego, road_class, trust, on_ramp, cruise, gas, brake, buttons):
+    """One frame (before the controller's update). False: over (forget it)."""
+    from opendbc.car.mazda.map_curve_control import LINK_CLASSES, HIGHWAY_CLASSES, GAS_OVERTURN_TIME, EXIT_TO_SEEN_TIME
+    self.gas_frames = self.gas_frames + 1 if gas else 0
+    hwy = road_class in HIGHWAY_CLASSES and trust == 0
+    if (not cruise or brake or buttons or self.gas_frames >= _frames(GAS_OVERTURN_TIME) or hwy or
+        frame - self.frame0 > _frames(EXIT_TO_SEEN_TIME) or set_speed <= self.target + lg.half_step):
+      self._stop(lg)
+      return False
+    street = trust == 0 and road_class and road_class not in LINK_CLASSES + HIGHWAY_CLASSES
+    ramp = trust == 0 and road_class in LINK_CLASSES and on_ramp
+    if not (street or ramp):
+      self._stop(lg)                   # (paused: the set stays where it is)
+      return True
+    goal = self.target if street else max(self.target,
+                                          math.ceil((self.v0 - RAMP_HANDOVER_DROP) / lg.step - 1e-3) * lg.step)
+    if set_speed > goal + lg.half_step and (lg.anchor is None or abs(lg.anchor - goal) > lg.half_step):
+      lg.ramp_handover(goal)
+      self.lowering = True
+    return True
+
+  def _stop(self, lg):
+    if self.lowering and lg.anchor is not None and lg.anchor_ours and lg.anchor < (lg.last_set_speed or 0.0) - lg.half_step:
+      lg._forget()                     # (our lowering stops where the set is now)
+    self.lowering = False
+
+
+def exit_ramp_handover(lg, mo, set_speed, v_ego=0.0, frame=0):
+  """(map_curve_control.EXIT_RAMP_HANDOVER) an exit plan ended on its ramp with our lowering under the set: a RampHandover
+  toward the street's target (MapOutput.ramp_handover) when it is under the set, else None. The adopt itself is as before."""
   t = getattr(mo, "ramp_handover", 0.0)
   if t <= 0 or set_speed <= t + lg.half_step:
-    return False
-  lg.ramp_handover(t)
-  return True
+    return None
+  return RampHandover(t, v_ego, frame)
 
 
 def adopt_forgets(lg, mo, set_speed):
@@ -2629,6 +2669,7 @@ class CurveSlowdown:
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
     self.auto_resumed = False          # (ENGAGE_AUTO) set by carcontroller: the cruise came on by our auto resume's RES
+    self.ramp_handover = None          # (EXIT_RAMP_HANDOVER, F1) the exit's street target on a trusted ramp / street
     self.lead_track_frames = 0         # (LEAD_CURVE) radarState's lead tracked without a jump
     self.lead_prev_d = None
     self.lead_follow = None            # (LEAD_CURVE) the follow going on: dict of its inputs at its start
@@ -2920,9 +2961,10 @@ class CurveSlowdown:
         # far above it says otherwise (EXIT_HANDOVER)
         goal = exit_handover(lg, set_speed if cruise_enabled else 0.0, self.map_control.handover_target(),
                              self.frame - self.exit_stop_frame <= _frames(EXIT_HANDOVER_STOP))
-        if exit_ramp_handover(lg, mo, set_speed if cruise_enabled else 0.0):
-          pass                                 # (map_curve_control.EXIT_RAMP_HANDOVER) down to the street's target
-        elif goal > 0:
+        rh = exit_ramp_handover(lg, mo, set_speed if cruise_enabled else 0.0, v_ego, self.frame)
+        if rh is not None:
+          self.ramp_handover = rh              # (map_curve_control.EXIT_RAMP_HANDOVER, F1) on a trusted ramp / street only
+        if goal > 0 and rh is None:
           lg.handover(goal)
         else:
           lg._forget()
@@ -3069,6 +3111,15 @@ class CurveSlowdown:
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
       auto_resumed=bool(getattr(self, "auto_resumed", False)),
     )
+    if self.ramp_handover is not None:
+      pa = self._alive('starpilotPlan')
+      buttons = bool(CS.crz_set_minus or CS.crz_set_plus or getattr(CS, "crz_cancel", False) or getattr(CS, "crz_resume", False))
+      if not self.ramp_handover.step(lg, self.frame, inputs.set_speed, v_ego,
+                                     int(getattr(plan, "mapRoadClass", 0) or 0) if pa else 0,
+                                     int(getattr(plan, "mapGpsTrust", 4) or 0) if pa else 4,
+                                     bool(pa and getattr(plan, "mapOnRamp", False)), cruise_enabled and inputs.set_speed > 0,
+                                     inputs.gas_pressed, inputs.brake_pressed, buttons):
+        self.ramp_handover = None
     button, offset = self.logic.update(inputs)
     # (CURVE_ON_HOLD) a map curve target that drops still counts a while (a HELD flicker before the ramp's link)
     # (review of round L, F4: only when the map's target is used, as CurveMix: Map Curves On here and in the planner)

@@ -123,9 +123,11 @@ EXIT_STREET_DONE = 0.6 * MPH    # m/s: the set speed this close to the target: i
 # later brought back 58 toward stopped cars). An exit plan that ends on its ramp (EXIT_RAMP_HANDOVER_WHYS) does not make the
 # highway's set his: MapOutput.ramp_handover is the exit's street target (the street matched, this exit's street cap, the
 # limit the planner announced for this exit's street within EXIT_TO_SEEN_TIME, else STREET_FALLBACK); the wrapper lowers
-# the set to it (SET- taps, an anchor of ours), never raises it with this.
+# the set to it (SET- taps, an anchor of ours), never raises it with this, and only on a trusted ramp / street
+# (curve_slowdown.RampHandover).
 EXIT_RAMP_HANDOVER = True
-EXIT_RAMP_HANDOVER_WHYS = ("on the ramp, no curve", "confirmed, no link match")
+# (review of round R, F1: "confirmed, no link match" is a confirmation by the shapes alone, a false one stays on the highway)
+EXIT_RAMP_HANDOVER_WHYS = ("on the ramp, no curve",)
 EXIT_TO_SEEN_TIME = 60.0        # s
 ADOPT_LANDED_FRAMES = 2         # the street speed reached: adopted this frame and the next (_street_end)
 HWY_RESET = 1.0                 # s matched to a highway: the exit sequence starts over
