@@ -63,6 +63,16 @@ CAM_RISE = 0.3                  # m/s^2
 CAM_RISE_TIME = 1.0             # s
 # ... and a curve driven over CAM_OVER (too fast already: the turnaround's 3.6 m/s^2) gets neither taps nor the end's SET+
 # for the rest of that curve slowdown: the normal restore only
+# Review of round Q, B1 (closed loop: R130, 60 m straight, R90 -> curve 2 entered at 37.8 mph / 3.28 m/s^2 with the set
+# back up): the end is checked again every frame while it lasts and cancelled at once (for the rest of that curve
+# slowdown) when the model's 0.5-2 s peak reaches the limit, its 2-3 s peak CAM_END_LAT + CAM_END_HYST, the lateral rises
+# (CAM_RISE), the steering reserve is gone, or the incoming curve target falls CAM_END_DROP under where it was when the end
+# began. Without map curve data beyond the model's horizon (not on a ramp) the end's raise goes at most CAM_END_STEP over
+# the speed it began at; the rest by the normal restore.
+CAM_END_HYST = 0.3              # m/s^2
+CAM_END_DROP = 1 * MS_PER_MPH   # m/s
+CAM_END_STEP = 10 * MS_PER_MPH  # m/s
+CAM_END_CONFIRM = 0.5           # s the end's conditions hold before it acts (one model frame of "straight" is not an end)
 CAM_OVER = 3.3                  # m/s^2 (the loops of drives 6f / 73 / 75 peaked 2.8-3.1, the turnaround 3.6)
 CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the farthest distance asked for
 
@@ -114,6 +124,8 @@ class CamInputs:
   on_ramp: bool = False           # a link road (a signal there is not a lane change)
   blocked: bool = False           # his SET- / CANCEL / brake (the controller's rules)
   test_mode: bool = False         # a Test mode governs: never press
+  target: float = NO_CURVE        # m/s: the incoming curve target (camera or map) this frame (B1)
+  map_covered: bool = False       # map curve data covers the road beyond the model's horizon (B1)
 
 
 @dataclass
@@ -123,6 +135,8 @@ class CamOutput:
   ending: bool = False            # the curve ends (rule d): the camera's target let go, SET+ holds
   phantom: bool = False           # the governing map curve is released (rule b)
   keep: bool = False              # what earlier taps reached may stay (the live data still shows the margin at this speed)
+  end_goal: float = NO_CURVE      # m/s: while ending, the most the end's raise may take the set to (CAM_END_STEP)
+  end_cancel: bool = False        # the end was cancelled this frame (the wrapper drops its restore at once)
   why: str = ""                   # what held the tap back (logs)
   events: list = field(default_factory=list)       # (kind, data) for the event recorder
 
@@ -138,6 +152,10 @@ class CameraCurve:
     self.phantom_frames = 0
     self.prev_set = None
     self.over = False                # (CAM_OVER) this curve was driven too fast: no taps, no end
+    self.end_frames = 0              # (CAM_END_CONFIRM)
+    self.end_done = False            # (B1) an end was cancelled in this curve slowdown: no new one until it is over
+    self.end_v0 = 0.0                # m/s: the speed when the end began
+    self.end_t0 = NO_CURVE           # m/s: the incoming curve target then
 
   def _never(self, i):
     if i.test_mode:
@@ -168,7 +186,7 @@ class CameraCurve:
     guards = model and i.lane_prob >= CAM_LANE_PROB and v >= CAM_MIN_SPEED
     never = self._never(i)
     if not i.curve_on:
-      self.ending, self.over = False, False
+      self.ending, self.over, self.end_done = False, False, False
     elif lat >= CAM_OVER:
       self.over = True
     # (b) the phantom release: kept for that map curve until it changes / goes
@@ -190,7 +208,9 @@ class CameraCurve:
       never = "too fast in this curve"
     if not guards or never or not i.curve_on:
       out.why = never or ("no model / lanes / speed" if not guards else "no curve")
-      self.ending = self.ending and not never and guards
+      if self.ending and i.curve_on:
+        self._cancel(out, never or "no model / lanes / speed", lat)
+      self.ending = False
       return self._done(out, i)
     in_curve = max(self.lat_hist) >= CAM_IN_CURVE_LAT if self.lat_hist else False
     pk_now = model_peak(i.model_x, i.model_k, v, 0.5, 2.0)
@@ -202,9 +222,22 @@ class CameraCurve:
     trq = sorted(self.trq_hist)[len(self.trq_hist) // 2] if self.trq_hist else 1.0
     n_rise = int(CAM_RISE_TIME / DT_CTRL)
     rising = len(self.lat_hist) > 1 and lat - self.lat_hist[max(len(self.lat_hist) - 1 - n_rise, 0)] > CAM_RISE
-    if (not self.ending and in_curve and pk_end is not None and pk_end < CAM_END_LAT and pk_now is not None and
-        pk_now < lim and lat < lim and trq < CAM_TORQUE_RESERVE):
+    if self.ending:
+      # (B1) checked again every frame
+      why_c = ("model peak" if pk_now is None or pk_now >= lim else
+               "curve ahead" if pk_end is None or pk_end >= CAM_END_LAT + CAM_END_HYST else
+               "lateral rising" if rising or lat >= lim else
+               "steering reserve" if trq >= CAM_TORQUE_RESERVE else
+               "target dropping" if i.target < min(self.end_t0, i.set_speed) - CAM_END_DROP else "")
+      if why_c:
+        self._cancel(out, why_c, lat)
+        self.ending = False
+    end_ok = (not self.ending and not self.end_done and in_curve and pk_end is not None and pk_end < CAM_END_LAT and
+              pk_now is not None and pk_now < lim and lat < lim and trq < CAM_TORQUE_RESERVE and not rising)
+    self.end_frames = self.end_frames + 1 if end_ok else 0
+    if end_ok and self.end_frames >= int(CAM_END_CONFIRM / DT_CTRL):
       self.ending = True
+      self.end_v0, self.end_t0 = v, i.target
       out.events.append(("camCurveEnd", {"lat": round(lat, 2), "model_peak_2_3s": round(pk_end, 2),
                                          "model_peak_0p5_2s": round(pk_now, 2), "vEgo_mph": round(v / MS_PER_MPH, 1),
                                          "set_mph": round(i.set_speed / MS_PER_MPH, 1), "lane_prob": round(i.lane_prob, 2),
@@ -212,6 +245,8 @@ class CameraCurve:
                                          "ti_only": i.ti_only}))
     if self.ending:
       out.ending = True
+      if not i.map_covered and not i.on_ramp:
+        out.end_goal = self.end_v0 + CAM_END_STEP      # (B1) nothing known beyond the model's horizon
       return self._done(out, i)
     # (c) the in-curve +1 tap
     v1 = v + MS_PER_MPH
@@ -239,6 +274,11 @@ class CameraCurve:
                                          "cap_mph": round(min(i.cap, NO_CURVE) / MS_PER_MPH, 1),
                                          "map_ahead_mph": round(min(i.map_ahead, NO_CURVE) / MS_PER_MPH, 1)}))
     return self._done(out, i)
+
+  def _cancel(self, out, why, lat):
+    self.end_done = True
+    out.end_cancel = True
+    out.events.append(("camCurveEndCancel", {"why": why, "lat": round(lat, 2)}))
 
   def _done(self, out, i):
     self.prev_set = i.set_speed

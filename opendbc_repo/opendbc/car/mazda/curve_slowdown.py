@@ -3138,7 +3138,7 @@ class CurveSlowdown:
     """(round Q, camera_curve.py) the live camera decides inside a curve: the phantom release, the +1 taps, the curve's
     end. Returns the curve inputs for the controller (changed or as they were) and whether the curve is ending."""
     from opendbc.car.mazda.camera_curve import CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT
-    from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, TEST as MAP_TEST
+    from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_PAUSED, TEST as MAP_TEST
     from opendbc.car.mazda.speed_limit_follow import TEST as LIMIT_TEST
     from opendbc.car.mazda.curve_target import map_curve_speed
     lg, mc, mo = self.logic, self.map_control, self.map_out
@@ -3178,8 +3178,15 @@ class CurveSlowdown:
       stop=bool(stop_active or lg.stop_episode or self.plan_stop_raw or getattr(plan, "redLight", False)),
       steer_override=bool(getattr(CS.out, "steeringPressed", False)),
       blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker), on_ramp=bool(mc is not None and mc.link_now),
-      blocked=bool(lg.blocked or CS.out.brakePressed), test_mode=bool(test))
+      blocked=bool(lg.blocked or CS.out.brakePressed), test_mode=bool(test),
+      target=float(curve_speed) if curve_active else CAM_NONE,
+      # (B1) the map knows the road beyond the model's horizon: matched to a road class, GPS trusted, Map Curves On
+      map_covered=bool(self.map_on_used and status != STATUS_PAUSED and int(getattr(plan, "mapRoadClass", 0) or 0) > 0 and
+                       int(getattr(plan, "mapGpsTrust", 4) or 0) < 2))
     out = self.cam_out = self.cam_curve.update(ci)
+    if out.end_cancel:
+      # (B1) the end cancelled: no restore of ours left in the way of the camera target taking the set down again
+      lg.restore_pending, lg.restoring = False, False
     if self.recorder is not None and out.events:
       import time
       for kind, data in out.events:
@@ -3199,6 +3206,10 @@ class CurveSlowdown:
         a, sp, fl, bu, tr, ra = self.curve_mix.update(False, CAM_NONE, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step,
                                                                                         MIN_SET_SPEED))
         return (a, sp, fl, bu, tr, ra, self.curve_mix.firm, self.curve_mix.no_accel, res[8], True)
+      if out.end_goal < CAM_NONE:
+        # (B1, CAM_END_STEP) nothing known beyond the model's horizon: the end raises (taps) only this far
+        goal = min(out.end_goal, driver_speed)
+        return (True, goal, 0.0, 0, True, True, False, False, False, True)
       return (False, CAM_NONE, 0.0, 0, False, False, False, False, True, True)
     if out.tap:
       self.cam_goal = (out.tap_goal, self.frame)

@@ -1,6 +1,7 @@
 """Round Q (drives 74 / 75): the logged scenarios as tests (synthetic geometry only)."""
 import dataclasses
 import importlib.util
+import math
 import os
 
 HERE = os.path.dirname(__file__)
@@ -248,7 +249,7 @@ def test_q3_the_curve_ending_from_the_model_ahead():
                                curve_on=True, map_in_curve=True))
     if o.ending:
       ends.append(f)
-  assert ends and 200 <= ends[0] <= 205, ends[:1]
+  assert ends and 200 + CC.CAM_END_CONFIRM / DT - 1 <= ends[0] <= 205 + CC.CAM_END_CONFIRM / DT, ends[:1]
   # never without a curve actually driven (the approach: the lateral still low)
   cc = CC.CameraCurve()
   xs, ks = _path(lambda x: 0.0)
@@ -435,3 +436,93 @@ def test_q4_a_lead_on_a_straight_path_in_our_lane_does_not_blind_the_camera_chec
   assert cam([0.0] * len(s), 2.0).blind(60.0) == "lead"                       # (the lead beside our lane's middle)
   assert cam([math.radians(x / 10) for x in s], 0.2).blind(60.0) == "lead"    # (the path curving)
   assert MC.BLIND_CODES["lead"] == 6
+
+
+# ---- review of round Q, B1: the curve's end checked every frame (rq_review/q3_closed.py, q3_end_sticky.py) ----
+
+def _road2(R1, gap, R2, len1=180.0, len2=200.0, x1=300.0):
+  a, b = x1, x1 + len1
+  c, d = b + gap, b + gap + len2
+
+  def k(x):
+    return 1 / R1 if a <= x < b else (-1 / R2 if c <= x < d else 0.0)
+  return k, c, d
+
+
+def _cam_target(k, x, amax=1.8, dec=0.5, hor=170.0):
+  best = 99.0
+  for dd in range(0, int(hor), 4):
+    kk = abs(k(x + dd))
+    if kk > 0:
+      best = min(best, math.sqrt(amax / kk + 2 * dec * max(dd - 5, 0)))
+  return best
+
+
+def _closed(R1, gap, R2, q=True, anchor=45):
+  """Closed loop: curve 1, a straight, curve 2 (unmapped); the camera target as the wrapper's, CameraCurve's end as the
+  wrapper carries it out (end_goal: taps to it; end_cancel: no restore left in the way)."""
+  k, c, d = _road2(R1, gap, R2)
+  car = TP.MaxCar(anchor, dash_offset_mph=0.0, lag=10, accel_fn=TP._acc, cruise_gain=0.19, step=MPH)
+  car.v_ego = anchor * MPH
+  lg, cc = TP.cs.CurveSlowdownLogic(False, 10), CC.CameraCurve()
+  x, peak2, v_c2, presses = 0.0, 0.0, None, 0
+  xs = [190 * (j / 32) ** 2 for j in range(33)]
+  for f in range(9000):
+    v = car.v_ego
+    tgt = _cam_target(k, x)
+    csc = tgt < car.set_speed - 0.01 or (lg.offset > 0 and tgt < anchor * MPH)
+    lat = k(x) * v * v
+    act, spd, fr, tr = csc, tgt, False, False
+    if q:
+      o = cc.update(CC.CamInputs(v_ego=v, set_speed=car.set_speed, lat=lat, model_x=xs, model_k=[k(x + xx) for xx in xs],
+                                 lane_prob=0.8, torque=min(abs(lat) / 2.3, 1.0),
+                                 curve_on=bool(csc and car.set_speed < anchor * MPH - 0.2), target=tgt))
+      if o.end_cancel:
+        lg.restore_pending, lg.restoring = False, False
+      if o.ending:
+        act, spd, fr, tr = (True, min(o.end_goal, anchor * MPH), False, True) if o.end_goal < 99 else (False, 99.0, True, False)
+    btn, _ = lg.update(TP._inp(set_speed=car.set_speed, v_ego=v, csc_active=act, csc_speed=spd if act else 0.0,
+                               fast_restore=fr, curve_track=tr, curve_raise=tr, btn_counter=(f // 10) % 16))
+    if btn is not None:
+      presses += 1
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    car.tick()
+    x += car.v_ego * DT
+    if c <= x < d:
+      peak2 = max(peak2, abs(k(x)) * car.v_ego ** 2)
+    if v_c2 is None and x >= c:
+      v_c2 = car.v_ego / MPH
+    if x > d + 100:
+      break
+  return v_c2, peak2, presses
+
+
+def test_review_b1_an_ending_curve_followed_by_a_tighter_one_is_no_faster_than_without_the_rule():
+  for R1, gap, R2 in ((130, 60, 90), (130, 60, 60), (130, 100, 70), (130, 120, 90)):
+    vb, pb, nb = _closed(R1, gap, R2, q=False)
+    vq, pq, nq = _closed(R1, gap, R2)
+    assert vq <= vb + 0.5 and pq <= pb + 0.1 and nq < 2 * nb, (R1, gap, R2, vb, vq, pb, pq, nb, nq)
+
+
+def test_review_b1_the_end_is_cancelled_when_the_next_curve_shows_up():
+  v = 35 * MPH
+  cc = CC.CameraCurve()
+  seen = []
+  for f in range(1200):
+    t = f * DT
+    if t < 2:
+      kap, lat, trq = (lambda x: 1.4 / (v * v)), 1.4, 0.5
+    elif t < 3:
+      kap, lat, trq = (lambda x: 1.4 / (v * v) if x < 1.5 * v else 0.0), 1.4, 0.5
+    elif t < 4:
+      kap, lat, trq = (lambda x: 0.0), 0.3, 0.5
+    else:
+      kap, lat, trq = (lambda x: -2.6 / (v * v)), min(0.3 + (t - 4) * 0.8, 3.2), 0.95
+    xs, ks = _path(kap)
+    o = cc.update(CC.CamInputs(v_ego=v, set_speed=30 * MPH, lat=lat, model_x=xs, model_k=ks, lane_prob=0.8, torque=trq,
+                               curve_on=True))
+    seen.append((t, o.ending, o.end_cancel, o.end_goal))
+  assert any(e for t, e, c, g in seen if 2.0 < t < 4.0)
+  assert any(c for t, e, c, g in seen if t >= 4.0) and not seen[-1][1]
+  # unmapped beyond the model's horizon: the end's raise at most CAM_END_STEP over its speed
+  assert all(g <= v + CC.CAM_END_STEP + 1e-6 for t, e, c, g in seen if e)
