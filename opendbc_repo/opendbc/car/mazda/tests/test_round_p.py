@@ -237,15 +237,16 @@ def test_73_a_curve_release_blip_of_0_2_s_under_the_anchor_keeps_the_boost_and_i
   ups = [h for h in lg.hold_log if h["direction"] == cs.SET_PLUS]
   assert ups and ups[0]["frame"] < 120, ups[:1]        # the boost's hold goes on right after the blip
   assert max(s for _, s, *_ in log) >= 89.5            # ... and the set to the cap
-  # a curve target under the target for MERGE_CSC_END or more still ends it (as before)
-  car, lg, log = _blip_run(range(53, 53 + int(cs.MERGE_CSC_END / DT) + 5))
+  # a curve target under the target for MERGE_CSC_END or more still ends it (as before; round Q: one that asks for no
+  # speeding up, under the car's speed + MERGE_CSC_NEAR)
+  car, lg, log = _blip_run(range(53, 53 + int(cs.MERGE_CSC_END / DT) + 5), csc_mph=36.0)
   assert lg.boost is None or "ended" in lg.boost
   assert max(s for _, s, *_ in log) <= 75 + 1e-6
   # (before round P: ended in the blip's first frame)
   old = cs.MERGE_CSC_END
   try:
     cs.MERGE_CSC_END = 0.0
-    car, lg, log = _blip_run(range(53, 73))
+    car, lg, log = _blip_run(range(53, 73), csc_mph=36.0)
   finally:
     cs.MERGE_CSC_END = old
   assert max(s for _, s, *_ in log) <= 75 + 1e-6

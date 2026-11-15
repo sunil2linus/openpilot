@@ -39,7 +39,7 @@ Design rules (each enforced by the logic itself, not by timing assumptions):
     and a back-off when the car ignores presses (give up after NO_EFFECT_TRIPS back-offs).
 """
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 DT_CTRL = 0.01                     # car controller runs at 100 Hz
 MS_PER_MPH = 0.44704
@@ -287,6 +287,12 @@ BOOST_DOWN_NO_BACKOFF = True
 # one sample and ended the boost in the frame it began (anchor 75 instead of the boost). A curve target ends the boost
 # only once on MERGE_CSC_END with its speed under the target - MERGE_BOOST_END.
 MERGE_CSC_END = 0.5           # s
+# Round Q (drive 75 t 1158.6-1159.1, the loop's end: the boosted anchor 90 lasted 0.5 s, then 75): the camera curve target
+# was rising out of the loop (67 -> 69 mph at 33 mph) and counted as "under the target - MERGE_BOOST_END" for MERGE_CSC_END.
+# A curve target ends or blocks the boost only when it is under the car's speed + MERGE_CSC_NEAR (it really asks for no
+# speeding up now); higher, while the boost is on, it is not a curve to the controller at all (no end, no ceiling for the way
+# up). A followed map curve (curve_track) always counts.
+MERGE_CSC_NEAR = 5 * MS_PER_MPH  # m/s
 MERGE_TAPER = True
 MERGE_TAPER_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
 MERGE_TAPER_OVER = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
@@ -1493,6 +1499,9 @@ class CurveSlowdownLogic:
     self.phase_lock = HOLD_PHASE_LOCK and i.btn_counter >= 0
     if self.disabled:
       return None, None
+    if (self.boost is not None and "ended" not in self.boost and i.csc_active and not i.curve_track and
+        i.csc_speed >= i.v_ego + MERGE_CSC_NEAR):
+      i = replace(i, csc_active=False)   # (MERGE_CSC_NEAR) a curve target far above the speed: no curve for the boost
     cruise_ok = i.cruise_enabled and i.set_speed > 0
     self.cruise_on_frames = self.cruise_on_frames + 1 if cruise_ok else 0
     if not cruise_ok:

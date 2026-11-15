@@ -109,3 +109,35 @@ def test_q1_his_gas_held_lets_the_reachable_profile_go():
   later = [w for w, xx in zip(r["why"], r["xs"], strict=True) if exit_x + 120 <= xx < exit_x + 300]
   assert "exit reach" not in later and "exit reach hold" not in later
 
+
+# ---- Q2: the merge boost at a loop's end (drive 75 t 1158.6-1159.1; drive 73's loop start) ----
+
+TP = _load("trp_round_q", os.path.join(HERE, "test_round_p.py"))
+
+
+def _loop_end(csc_fn, frames=1500):
+  def inp(f, car, lg):
+    v = csc_fn(f, car)
+    return {"csc_active": v is not None, "csc_speed": (v or 0.0) * MPH}
+  return TP._boost73(frames=frames, inp=inp)
+
+
+def test_q2_a_curve_target_rising_out_of_the_loop_keeps_the_boost():
+  # drive 75: the camera target 67 -> 69 mph at 33-34 mph for 1.5 s from the merge's adoption (was: ended after 0.5 s,
+  # anchor 75)
+  car, lg, log = _loop_end(lambda f, car: 67.0 + 2.0 * min(max(f - 50, 0) / 150.0, 1.0) if 53 <= f < 200 else None)
+  assert max(s for _, s, *_ in log) >= 89.5, max(s for _, s, *_ in log)
+  # drive 73's loop start (the 72.8 mph release ramp, 0.8 s): the same
+  car, lg, log = _loop_end(lambda f, car: 72.8 if 53 <= f < 133 else None)
+  assert max(s for _, s, *_ in log) >= 89.5
+
+
+def test_q2_a_real_tight_curve_still_ends_it():
+  # a curve asking for no more than the speed + 3 mph, for MERGE_CSC_END: ended, the anchor at the target
+  car, lg, log = _loop_end(lambda f, car: car.v_ego / MPH + 3.0 if 60 <= f < 400 else None)
+  assert lg.boost is None or "ended" in lg.boost
+  assert max(s for _, s, *_ in log) <= 75 + 1e-6
+  # a target far above the speed that comes down to it later (a curve ahead coming into view) ends it then
+  car, lg, log = _loop_end(lambda f, car: (72.0 if f < 300 else car.v_ego / MPH + 2.0) if 60 <= f < 600 else None)
+  assert lg.boost is None or "ended" in lg.boost
+
