@@ -529,6 +529,14 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_state": lambda: params.get_bool("MazdaSlowLowerLimit"),
       "set_state": lambda s: self._controller._on_toggle("MazdaSlowLowerLimit"),
     })
+    get_value, on_click = choice("MazdaCurveSpeedOffset", (tr_noop("Off"), tr_noop("+1 mph"), tr_noop("+2 mph"), tr_noop("+3 mph"),
+                                                           tr_noop("+4 mph"), tr_noop("+5 mph")), 0)
+    tiles.append({
+      "title": tr("Curve Speed Offset"),
+      "subtitle": tr("Adds this much to the speed our map plans for a curve. Limited where the steering is near its limit, and removed for a curve that proved too tight."),  # noqa: E501
+      "get_value": get_value,
+      "on_click": on_click,
+    })
     tiles.append({
       "title": tr("Camera Decides in Curves"),
       "subtitle": tr("Map curve speeds as a start: inside the curve the camera adds 1 mph when there is room, speeds up as it ends."),

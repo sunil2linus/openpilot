@@ -283,6 +283,15 @@ NAV_SIGNAL_FIRM = True
 # LKAS_KEEP floor keeps it from going under its own target instead.)
 TI_ONLY_LAT = 1.8               # m/s^2
 TI_ONLY_RAMP_SCALE = 2.2 / 2.6  # map_curves.PLAN_LAT / RAMP_LAT
+# Round S, Curve Speed Offset (map_curves.CURVE_OFFSET_*: the planner decides it per curve, with its lateral cap and the curve's
+# "no offset" mark, and publishes it as starpilotPlan.mapCurveSpeedOffset next to the unchanged radius). Here it is added to
+# the governing map curve's speed (road and ramp curves, status 1 / 2) where that speed is made: the radius is planned as the
+# one whose speed at this lateral is the curve's speed plus the offset (offset_radius), so the approach, the follower, the
+# hold, the Max Drop / LKAS_KEEP floors, CurveMix and the camera's caps (gov_plan, map_ahead) all see one number. Nothing
+# (as the setting 0) in Test, while TI-only (TI_ONLY_*), on a car without a Torque Interceptor (ti_plan), or with the car
+# side's own reading of the setting 0 (offset_ok). The exit plan's curves (mapExitCurve* / mapNavCurve*: planned on the map's
+# radius at RAMP_LAT, where the planner's cap leaves nothing) never get it. At most OFFSET_MAX (8 km/h, whatever arrives).
+OFFSET_MAX = 8 / 3.6            # m/s
 NAV_SIGNAL_NEAR = 200.0         # m
 # Round Q (drive 75, exit 48: his signal 370-300 m before the split): his signal toward the exit this far before the split
 # makes the tentative phase keep the exit's curve reachable for TENT_HARD_MAX (TENT_REACH). The firm follow from the split
@@ -557,6 +566,7 @@ class MapFields:
   exit_link_bend: float = 0.0
   exit_bend_valid: bool = False
   onramp_ahead: bool = False      # mapOnRampAhead: the ramp curve is an on-ramp's first curve, before the turn onto it
+  speed_offset: float = 0.0       # mapCurveSpeedOffset: m/s the planner granted the governing curve (OFFSET_*)
 
   @staticmethod
   def from_plan(plan):
@@ -572,7 +582,8 @@ class MapFields:
                      int(g("mapGpsTrust", 0)), float(g("slcSpeedLimit") or 0.0), int(g("mapExitShape", 0)),
                      float(g("mapExitCurveRadius")), float(g("mapExitCurveDistance")), float(g("mapExitCurveAdvisory")),
                      int(g("mapExitFork", 0)), float(g("mapExitStart")), float(g("mapExitHighwayBend")),
-                     float(g("mapExitLinkBend")), bool(g("mapExitBendValid", False)), bool(g("mapOnRampAhead", False)))
+                     float(g("mapExitLinkBend")), bool(g("mapExitBendValid", False)), bool(g("mapOnRampAhead", False)),
+                     float(g("mapCurveSpeedOffset") or 0.0))
 
 
 @dataclass
@@ -710,6 +721,13 @@ def short_split_speed(room, v_curve, hi):
   return lo
 
 
+def offset_radius(radius, offset, lat):
+  """(OFFSET_*) the radius whose speed at `lat` is `radius`'s plus `offset` m/s (map_curves.offset_radius)."""
+  if radius <= 0 or offset <= 0 or lat <= 0:
+    return radius
+  return ((lat * radius) ** 0.5 + offset) ** 2 / lat
+
+
 def reach_needed(v, v_curve, decel=CHIME_DECEL, dead=CHIME_DEAD, lead=MAP_LEAD_TIME):
   """m the cruise needs from v (m/s) to be at v_curve MAP_LEAD_TIME before a curve's entry at its strongest slowdown."""
   if v <= v_curve:
@@ -793,6 +811,8 @@ class MapCurveControl:
     self.onramp_now = False
     self.ti_only = False            # (TI_ONLY_*) the stock LKAS is blocked: every curve at TI_ONLY_LAT (the wrapper sets it)
     self.ti_plan = False            # a Torque Interceptor car: TI_ONLY_* apply (the wrapper sets it)
+    self.offset_ok = False          # (OFFSET_*) the car side's reading of the setting is not 0 (the wrapper sets it)
+    self.offset_now = 0.0           # m/s added to the governing map curve's speed this update (0 none)
 
   def _lat(self, radius, advisory=0.0, scaled=False):
     """m/s^2 a map curve of `radius` m is planned at (TI_ONLY_*): TI_ONLY_LAT (scaled for a ramp / exit curve's
@@ -803,6 +823,10 @@ class MapCurveControl:
     if self.ti_only:
       return ti
     return self.lat_accel
+
+  def with_offset(self, radius):
+    """(OFFSET_*) the governing map curve's published radius as this update planned it (its offset included)."""
+    return offset_radius(radius, self.offset_now, self.curve.lat_accel)
 
   @property
   def exit_rem(self):
@@ -1309,6 +1333,7 @@ class MapCurveControl:
     elif (f.road_class in LINK_CLASSES or f.on_ramp) and (f.ramp_to_highway or f.road_class in HIGHWAY_LINK_CLASSES or
                                                           self.road_before in HIGHWAY_CLASSES):
       self.link_hwy = True
+    self.offset_now = 0.0
     if f.mode == OFF or driver_speed <= 0:
       if self.ll_on:
         self.ll_on, self.lower_event = False, "cancel: cruise off"
@@ -1342,6 +1367,11 @@ class MapCurveControl:
     # takes the curve's speed when higher), not his set speed; a road curve as before
     ramp_st = f.status == STATUS_RAMP_CURVE
     self.curve.lat_accel = self._lat(radius, f.advisory, ramp_st)          # (TI_ONLY_*)
+    # (OFFSET_*) the planner's offset for this curve, planned as a radius at this lateral
+    off = f.speed_offset if (self.offset_ok and self.ti_plan and not self.ti_only and f.mode == ON and radius > 0 and
+                             f.status in (STATUS_CURVE, STATUS_RAMP_CURVE)) else 0.0
+    self.offset_now = min(max(off, 0.0), OFFSET_MAX) if off == off else 0.0
+    radius = offset_radius(radius, self.offset_now, self.curve.lat_accel)
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
                               lead_time=MAP_ROAD_LEAD_TIME if road_curve else (MAP_RAMP_LEAD_TIME if ramp_st else MAP_LEAD_TIME),
                               reaction_speed=v_ego if (ramp_st and v_ego > 0) else None)

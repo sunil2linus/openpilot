@@ -179,6 +179,7 @@ class CamInputs:
   gov_plan: float = NO_CURVE      # m/s: the governing map curve's plan (C6)
   hwy_ramp: bool = False          # (CAM_POST_APEX, F3) on an on-ramp to a highway
   ramp_left: object = None        # m to that ramp's end (None unknown): CAM_POST_RAMP_END
+  map_offset: float = 0.0         # m/s: the Curve Speed Offset in gov_plan (map_curve_control.OFFSET_*): counts against CAM_POST_APEX_OVER
 
 
 @dataclass
@@ -346,6 +347,8 @@ class CameraCurve:
     pk_far = model_peak(i.model_x, i.model_k, v1, 3.0, 4.0)     # (C6) what the model sees beyond its reliable 3 s
     goal = i.set_speed + i.step
     post_over = CAM_POST_APEX_OVER if post else 0.0
+    # (round S) the governing plan's Curve Speed Offset counts against its allowance: at most plan + max(offset, +3 mph)
+    plan_over = max(post_over - max(float(i.map_offset), 0.0), 0.0)
     set_steps = int(round(i.set_speed / i.step))
     why = ("not in the curve" if not (i.map_in_curve or lat >= CAM_PHANTOM_LAT) else
            "no prediction" if pred is None else
@@ -356,7 +359,7 @@ class CameraCurve:
            "cap" if goal > i.cap + 1e-3 else
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
            "camera curve ahead" if goal > i.cam_target + post_over + 1e-3 else
-           "map plan" if goal > i.gov_plan + post_over + 1e-3 else
+           "map plan" if goal > i.gov_plan + plan_over + 1e-3 else
            "wait" if self.frame - self.last_tap < int(CAM_TAP_DT / DT_CTRL) else "")
     out.why = why
     if not why:

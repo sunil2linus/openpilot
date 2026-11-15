@@ -2688,6 +2688,13 @@ class CurveSlowdown:
     except Exception:
       self.profile = None
     self.map_mode = map_mode
+    # (round S, map_curve_control.OFFSET_*) Curve Speed Offset: 0..5 (mph steps), read at the start of a drive as the others
+    try:
+      raw = params.get("MazdaCurveSpeedOffset", encoding="utf8")
+      n = 0 if raw is None or raw == "" else int(raw)
+      self.curve_offset_set = n if 0 <= n <= 5 else 0
+    except (TypeError, ValueError, AttributeError):
+      self.curve_offset_set = 0      # (an older params build without the key: off)
     self.map_control = None
     self.map_out = None
     self.map_on_used = False
@@ -2705,6 +2712,7 @@ class CurveSlowdown:
       self.map_control = MapCurveControl(self.lat_limit, self.decel_used, split_mode=split_mode,
                                          metric=bool(params.get_bool("IsMetric")), street_mode=street_mode)
       self.map_control.ti_plan = self.has_ti       # (TI_ONLY_*)
+      self.map_control.offset_ok = self.curve_offset_set > 0      # (map_curve_control.OFFSET_*)
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
     # (round Q, camera_curve.py) the camera-led curve handling: MazdaCameraCurveRaise (default on)
@@ -3515,8 +3523,9 @@ class CurveSlowdown:
     map_gov = bool(self.map_on_used and mo is not None and mo.active and mo.track)
     map_ahead = CAM_NONE
     if map_curve and dist > 10.0 and mc is not None:
-      map_ahead = map_curve_speed(radius, dist, mc.curve.lat_accel, float(getattr(plan, "mapCurveAdvisory", 0.0) or 0.0),
-                                  reaction_speed=v_ego)
+      # (map_curve_control.OFFSET_*) as the map control planned it this update
+      map_ahead = map_curve_speed(mc.with_offset(radius), dist, mc.curve.lat_accel,
+                                  float(getattr(plan, "mapCurveAdvisory", 0.0) or 0.0), reaction_speed=v_ego)
     caps = [c for c in ((self.limit_follow.cap_speed, self.limit_follow.ceiling_speed) if self.limit_follow else ()) if c > 0]
     if lg.boost is not None and "ended" not in lg.boost:
       caps.append(lg.anchor if lg.anchor is not None else lg.boost["target"])
@@ -3541,6 +3550,8 @@ class CurveSlowdown:
       target=float(curve_speed) if curve_active else CAM_NONE,
       cam_target=float(cam_speed0) if cam_active0 else CAM_NONE,
       gov_plan=float(mo.plan) if (map_gov and mo is not None and mo.plan < CAM_NONE) else CAM_NONE,
+      # (map_curve_control.OFFSET_*) the offset in that plan: the post-apex taps' allowance over it shrinks by as much
+      map_offset=float(mc.offset_now) if (map_gov and mc is not None) else 0.0,
       apex_d=(float(getattr(plan, "mapCurveApexDistance", 0.0) or 0.0)
               if (map_curve and bool(getattr(plan, "mapCurveApexValid", False))) else None),
       # (B1) the map knows the road beyond the model's horizon: matched to a road class, GPS trusted, Map Curves On
@@ -3599,7 +3610,8 @@ class CurveSlowdown:
     keep = max(self.cam_floor or 0.0, self.cam_goal[0] if self.cam_goal is not None else 0.0)
     # (S1) never above a map curve ahead's plan, nor the governing map curve's plan
     # (camera_curve.CAM_POST_APEX) past the apex and the lateral's peak: up to CAM_POST_APEX_OVER over the governing plan
-    over = CAM_POST_APEX_OVER if out.post_apex else 0.0
+    # (map_curve_control.OFFSET_*) the governing plan's offset counts against that allowance: plan + max(offset, +3)
+    over = max(CAM_POST_APEX_OVER - (mc.offset_now if (map_gov and mc is not None) else 0.0), 0.0) if out.post_apex else 0.0
     keep = min(keep, map_ahead, (mo.plan + over) if (map_gov and mo is not None and not out.phantom) else CAM_NONE)
     if keep > 0 and keep > float(curve_speed):
       # (c) the curve target kept at what the taps proved (a lower map / camera target no longer takes it back down)
@@ -4100,7 +4112,14 @@ class CurveSlowdown:
         "ramp_to_mph": float(plan.mapRampToSpeed) / MS_PER_MPH, "ramp_to_highway": bool(plan.mapRampToHighway),
         "nav_exit": int(plan.mapNavExit), "nav_exit_m": float(plan.mapNavExitDistance),
         "source": int(getattr(plan, "mapCurveSource", 0)), "gps_trust": int(getattr(plan, "mapGpsTrust", 0)),
-        "gps_acc_m": float(getattr(plan, "mapGpsAccuracy", 0.0)), **self._profile_summary()})
+        "gps_acc_m": float(getattr(plan, "mapGpsAccuracy", 0.0)),
+        # (round S, map_curve_control.OFFSET_*) Curve Speed Offset: the setting (mph steps), what the planner granted, what was
+        # applied here (0 TI-only / Test), the radius its cap was computed on and how (map_curves.OFS_*: 3 the curve's mark)
+        "offset_set": int(getattr(self, "curve_offset_set", 0)),
+        "offset_granted_mph": round(float(getattr(plan, "mapCurveSpeedOffset", 0.0) or 0.0) / MS_PER_MPH, 2),
+        "offset_applied_mph": round(float(self.map_control.offset_now) / MS_PER_MPH, 2),
+        "offset_cap_r_m": round(float(getattr(plan, "mapCurveOffsetCapRadius", 0.0) or 0.0), 1),
+        "offset_state": int(getattr(plan, "mapCurveOffsetState", 0) or 0), **self._profile_summary()})
       self.map_min_speed = i.v_ego
       self.map_vetoed, self.map_veto_radius = False, 0.0
       self.map_blind = ""            # (round Q) the camera check's last "blind" reason in the episode (mapCurveBlind)

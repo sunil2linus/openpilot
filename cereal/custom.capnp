@@ -319,6 +319,11 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveBlind @86 :UInt8;          # why the camera check could not judge the governing curve: 0 judged / none, 1 slow, 2 red, 3 signal, 4 far, 5 ystd, 6 lead
   mapCurveApexDistance @87 :Float32; # m to the governing curve's apex (its tightest point; negative: passed), with mapCurveApexValid
   mapCurveApexValid @88 :Bool;
+  # (round S, map_curves.CURVE_OFFSET_*) Curve Speed Offset for the governing curve: m/s granted on top of its planned speed
+  # (0 with the setting 0), how it was decided (map_curves.OFS_*), and the radius its lateral cap was computed on (m, 0 none)
+  mapCurveSpeedOffset @89 :Float32;
+  mapCurveOffsetState @90 :UInt8;
+  mapCurveOffsetCapRadius @91 :Float32;
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

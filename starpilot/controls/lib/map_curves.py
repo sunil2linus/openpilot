@@ -51,6 +51,53 @@ def ramp_radius(c):
   """The radius to plan curve record `c` with: a ramp curve's is scaled for RAMP_LAT (see above)."""
   r = float(c["r"])
   return r * RAMP_LAT / PLAN_LAT if c.get("ramp") else r
+
+
+# Round S, Curve Speed Offset (owner: "my car takes curves 4-5 mph above the curve speed with no issues"): the setting
+# MazdaCurveSpeedOffset (0..5 mph; in km/h 0, 2, 3, 5, 6, 8; read at the start of a drive) is added to the speed planned for
+# the governing MAP curve (road and ramp curves; not the camera's own target, not the exit plan's curve, not stops / limits).
+# It is published as its own field (starpilotPlan.mapCurveSpeedOffset, m/s granted) next to the unchanged radius, and the car
+# side adds it where the map curve's speed is made (map_curve_control: the approach, the hold, the follower, the floors, the
+# camera's caps all come from that one number), except TI-only (the stock LKAS blocked / the camera's fault) and Test.
+#   A (lateral cap): never above CURVE_OFFSET_LAT on the radius the plan is based on: a road curve's planning radius (the
+#     map's, or the curve memory's learned one), a ramp curve's map radius UNscaled (ramp_radius' RAMP_LAT is not stacked
+#     on), or, once the ramp memory has RAMP_MEMORY_MIN_PASSES agreeing clean passes, the tighter of its last two measured
+#     radii. A curve already planned at or above CURVE_OFFSET_LAT on that radius gets nothing (every ramp curve on its map
+#     radius: 2.6 > 2.3). Never above its yellow sign + ADVISORY_OVER either.
+#   B (proved too tight): a pass through the curve with the offset granted that ends with the steering at its limit (as the
+#     ramp memory: > PASS_SAT_BLIP at PASS_SATURATED), his steering or his brake in the curve, "Turn Exceeds Steering Limit",
+#     or the measured lateral (1 s average, + OFFSET_MEAS_MARGIN) at CURVE_OFFSET_MARK_LAT or more stores a "no offset" mark
+#     in that curve's memory record (its own way id and the direction of travel, as the ghost marks; the record lives on the
+#     device only). Kept until curve memory is cleared (a mark costs at most this setting on one curve one way).
+#   Nothing (as with the setting 0) with the GPS trust not OK, the direction of travel unknown, no curve memory, any ghost
+#   mark or camera veto on the curve, a memory speed cap (the steering maxed out there), an on-ramp's curve before the turn.
+CURVE_OFFSET_LAT = 2.3        # m/s^2
+CURVE_OFFSET_MAX = 5          # setting 0..5 (mph steps; km/h: CURVE_OFFSET_KPH)
+CURVE_OFFSET_KPH = (0, 2, 3, 5, 6, 8)
+CURVE_OFFSET_MARK_LAT = 2.6   # m/s^2, margin-corrected: a pass this hard removes the offset there
+OFFSET_MEAS_MARGIN = 0.15     # m/s^2: the wheel angle's lateral reads low in curves (camera_curve.CAM_MEAS_MARGIN)
+# starpilotPlan.mapCurveOffsetState: 0 off (setting 0, no curve), 1 granted (cap on the map's radius), 2 granted (cap on a
+# measured / learned radius), 3 none: the curve's "no offset" mark, 4 none: not eligible (GPS, ghost, veto, cap, direction),
+# 5 none: the lateral cap leaves nothing
+OFS_OFF, OFS_MAP, OFS_MEMORY, OFS_MARK, OFS_NOT, OFS_CAP = 0, 1, 2, 3, 4, 5
+
+
+def curve_offset_setting(raw, metric=False):
+  """m/s the setting MazdaCurveSpeedOffset asks for (0 for an unknown or bad value)."""
+  try:
+    n = int(raw) if raw not in (None, "", b"") else 0
+  except (TypeError, ValueError):
+    return 0.0
+  if not 0 <= n <= CURVE_OFFSET_MAX:
+    return 0.0
+  return CURVE_OFFSET_KPH[n] / 3.6 if metric else n * MPH
+
+
+def offset_radius(radius, offset, lat=PLAN_LAT):
+  """The radius whose speed at `lat` is `radius`'s plus `offset` m/s (radius itself with no offset)."""
+  if radius <= 0 or offset <= 0:
+    return radius
+  return (math.sqrt(lat * radius) + offset) ** 2 / lat
 # PLAN_DECEL: as the car side for road curves (curve_target.MAP_DECEL, the drive evidence is there): the slowdown is
 # planned firm and the car side commands the set speed below the plan so the stock cruise really slows that hard
 # (drive 50: the old gentle 0.25 plan started 380-395 m before West Utica's 30 mph curve). The car profile's learned
@@ -1194,6 +1241,42 @@ class CurveMemory:
     except (KeyError, TypeError, IndexError, ValueError):
       return None
 
+  def ramp_measured(self, c, direction=None):
+    """(CURVE_OFFSET_*) the tighter of the last two measured radii of ramp curve `c` when the ramp memory plans with them
+    (ramp_radius not None), else None."""
+    try:
+      if self.ramp_radius(c, direction) is None:
+        return None
+      e = self._find(*c["apex"], direction)
+      passes = [float(p[0]) for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 4 and
+                "full" in (p[3] or []) and "ramp" in (p[3] or []) and 0 < float(p[0]) < MEMORY_MAX_R]
+      return min(passes[-2:])
+    except (KeyError, TypeError, IndexError, ValueError, AttributeError):
+      return None
+
+  def no_offset(self, c, direction=None, way=0):
+    """(CURVE_OFFSET_*) the curve's "no offset" mark for `direction` on way `way` (0: any): its reason, or "" for none."""
+    try:
+      if direction is None:
+        return ""
+      e = self._find(*c["apex"], direction)
+      m = e.get("no_offset") if e is not None and e.get("dir") is not None else None
+      if not isinstance(m, list) or len(m) < 3:
+        return ""
+      return str(m[2]) if (not way or not m[1] or int(m[1]) == int(way)) else ""
+    except (KeyError, TypeError, ValueError, IndexError):
+      return ""
+
+  def add_no_offset(self, c, direction, way=0, reason="", t=None):
+    """(CURVE_OFFSET_*) a pass with the offset that proved the curve too tight: no offset there from now on (this direction
+    only; nothing without one). Kept until curve memory is cleared."""
+    if direction is None:
+      return
+    t = time.time() if t is None else t   # (wall time, as the passes)
+    e = self._entry(c, direction)
+    e["no_offset"] = [round(t, 1), int(way), str(reason)]
+    self.save()
+
   def add_ramp_pass(self, c, r, direction, t=None, v=None, flags=None):
     """A clean pass through ramp curve `c` (tagged "ramp", the record too); nothing without a direction."""
     if direction is None:
@@ -1583,6 +1666,8 @@ class MapCurves:
     self.watches = []            # navigation exits watched past the split (_watch_add), newest last
     self.onramp_keep = None      # [s left, curve, ramp start (lat, lon), m from the start to the curve] (ONRAMP_KEEP)
     self.nav_all = []            # navigation's first maneuvers (ONRAMP_NAV_ALL)
+    self.offset_set = 0.0        # (CURVE_OFFSET_*) m/s the setting asks for (the planner sets it at the start of a drive)
+    self._ofs = {}               # id(curve) -> this update's (granted m/s, state, cap radius m)
     self.reset()
 
   def reset(self):
@@ -1613,6 +1698,9 @@ class MapCurves:
     self.veto_status = 0         # starpilotPlan.mapCurveVeto
     self.veto_radius = 0.0
     self.source = 0              # starpilotPlan.mapCurveSource
+    self.offset = 0.0            # (CURVE_OFFSET_*) m/s granted for the governing curve (starpilotPlan.mapCurveSpeedOffset)
+    self.offset_state = OFS_OFF  # starpilotPlan.mapCurveOffsetState
+    self.offset_cap_r = 0.0      # m: the radius its lateral cap was computed on (0 none)
     self.paused = False          # GpsTrust paused: nothing planned from the map
     self.held = None             # (curve, distance) found but not acted on: the road match is not trusted
     self.trust_status = TRUST_OK # starpilotPlan.mapGpsTrust
@@ -1758,6 +1846,52 @@ class MapCurves:
       return ramp_radius(c)
     return learned * RAMP_LAT / PLAN_LAT
 
+  def _offset(self, c):
+    """(CURVE_OFFSET_*) (m/s granted, state, cap radius m) for curve `c` as the governing curve, cached per update."""
+    key = id(c)
+    hit = self._ofs.get(key)
+    if hit is None or hit[0] is not c:
+      hit = self._ofs[key] = (c, *self._offset_calc(c))
+    return hit[1:]
+
+  def _offset_calc(self, c):
+    if self.offset_set <= 0:
+      return 0.0, OFS_OFF, 0.0
+    try:
+      mem = self.memory
+      d = self.direction(c)
+      if mem is None or d is None or self.trust_status != TRUST_OK or not hasattr(mem, "no_offset"):
+        return 0.0, OFS_NOT, 0.0
+      key = (self.chain_id, c["s_a"])
+      if self.veto.is_vetoed(key) or self.veto.flips(key) > 0 or mem.ghost(c, d, way=curve_way(c)) > 0 or \
+         mem.speed_cap(c, d) is not None:
+        return 0.0, OFS_NOT, 0.0
+      if c.get("ramp"):
+        measured = mem.ramp_measured(c, d)
+        r_cap, state = (measured, OFS_MEMORY) if measured is not None else (float(c["r"]), OFS_MAP)
+      else:
+        learned = mem.radius(c, d)
+        r_cap, state = (learned, OFS_MEMORY) if learned is not None else (float(c["r"]), OFS_MAP)
+      if not (r_cap > 0 and math.isfinite(r_cap)):
+        return 0.0, OFS_NOT, 0.0
+      if mem.no_offset(c, d, way=curve_way(c)):
+        return 0.0, OFS_MARK, r_cap
+      adv = float(c.get("adv", 0.0) or 0.0)
+      v_base = curve_speed_limit(self._radius(c), adv)
+      room = math.sqrt(CURVE_OFFSET_LAT * r_cap) - v_base
+      if adv > 0:
+        room = min(room, adv + ADVISORY_OVER - v_base)
+      g = min(self.offset_set, room)
+      if g <= 1e-3:
+        return 0.0, OFS_CAP, r_cap
+      return g, state, r_cap
+    except (KeyError, TypeError, ValueError, AttributeError):
+      return 0.0, OFS_NOT, 0.0
+
+  def _plan_r(self, c):
+    """The radius the governing curve is chosen with: its planning radius with the offset granted on it (CURVE_OFFSET_*)."""
+    return offset_radius(self._radius(c), self._offset(c)[0])
+
   def _source(self, c):
     """Where the curve's radius comes from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap."""
     if self.memory is None:
@@ -1779,6 +1913,7 @@ class MapCurves:
     (allManeuvers, ONRAMP_NAV_ALL; the on-ramp ahead only)."""
     self.nav_all = list(nav_all or [])[:ONRAMP_NAV_ALL]
     self.reset()
+    self._ofs = {}
     self.veto.tick()
     if gps is not None:
       self.odo += max(float(gps.get("dt", 0.05)), 0.0) * max(float(gps.get("v_ego", 0.0)), 0.0)
@@ -1814,7 +1949,7 @@ class MapCurves:
       if cands:
         cands = self.veto.filter(self, cid, cands, camera, shaky)
       if cands:
-        c, d = min(cands, key=lambda cd: plan_speed(self._radius(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel,
+        c, d = min(cands, key=lambda cd: plan_speed(self._plan_r(cd[0]), cd[1], cd[0].get("adv", 0.0), decel=self.decel,
                                                     floor=0.0 if cd[0].get("ramp") else self.floor,
                                                     lead_time=PLAN_RAMP_LEAD_TIME if cd[0].get("ramp") else PLAN_ROAD_LEAD_TIME))
         if trust is not None and trust.low:
@@ -1825,6 +1960,7 @@ class MapCurves:
           self.advisory = float(c.get("adv", 0.0) or 0.0)
           self.status = STATUS_RAMP_CURVE if c.get("ramp") else STATUS_CURVE
           self.source = self._source(c)
+          self.offset, self.offset_state, self.offset_cap_r = self._offset(c)
       if self.veto.hidden is not None:
         self.veto_status = 1
         r_cam = self.veto.hidden[1]
@@ -1869,7 +2005,7 @@ class MapCurves:
       return
     v, c, dd = best[:3]
     if self.curve is not None:
-      cur = plan_speed(self.radius, self.distance, self.advisory, decel=self.decel,
+      cur = plan_speed(offset_radius(self.radius, self.offset), self.distance, self.advisory, decel=self.decel,
                        floor=0.0 if self.status == STATUS_RAMP_CURVE else self.floor,
                        lead_time=PLAN_RAMP_LEAD_TIME if self.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME)
       if cur <= v:
@@ -1877,6 +2013,7 @@ class MapCurves:
     self.curve, self.distance, self.radius = c, dd, self._ramp_r(c)
     self.advisory = float(c.get("adv", 0.0) or 0.0)
     self.status, self.source, self.onramp_ahead = STATUS_RAMP_CURVE, 0, True
+    self.offset, self.offset_state, self.offset_cap_r = 0.0, (OFS_NOT if self.offset_set > 0 else OFS_OFF), 0.0
 
   def _onramp_find(self, lat, lon, bearing, nav, signal):
     """_onramp_ahead's search: (plan speed, curve, m to it, the ramp's start, m from the start to the curve) or None."""
@@ -2166,6 +2303,8 @@ class MapCurvesPlanner:
     self.prev_slowing = False
     self.held_logged = set()
     self.gps_acc, self.gps_rel = 0.0, 0
+    self.offset_set = 0.0       # (CURVE_OFFSET_*) m/s, read with the mode
+    self.offset_events = []     # (CURVE_OFFSET_*) curveOffsetRemoved events for the feature log
 
   def _read_mode(self):
     try:
@@ -2183,8 +2322,14 @@ class MapCurvesPlanner:
       self.metric = bool(self.params.get_bool("IsMetric"))
     except Exception:
       self.metric = False
+    # (CURVE_OFFSET_*) Curve Speed Offset, as the car side reads it at the start of a drive
+    try:
+      self.offset_set = curve_offset_setting(self.params.get("MazdaCurveSpeedOffset", encoding="utf8"), self.metric)
+    except Exception:
+      self.offset_set = 0.0
     if self.mc is not None:
       self.mc.decel = self.decel
+      self.mc.offset_set = self.offset_set
 
   @staticmethod
   def _signal(sm):
@@ -2230,6 +2375,7 @@ class MapCurvesPlanner:
       # the speed comes back from a road curve's apex only with the camera curve slowdown on (it keeps the speed
       # for whatever is left of the curve, and the next curve keeps governing when it is close)
       self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory(), decel=self.decel)
+      self.mc.offset_set = getattr(self, "offset_set", 0.0)
       self.pass_curve, self.pass_samples = None, []
       self.matcher = RoadMatcher(self.mc.store)
     elif started:
@@ -2286,16 +2432,17 @@ class MapCurvesPlanner:
     road_lead = PLAN_RAMP_LEAD_TIME if mc.status == STATUS_RAMP_CURVE else PLAN_ROAD_LEAD_TIME
     # (PLAN_RAMP_LEAD_TIME) a ramp curve's reaction at the car's own speed
     react = max(v_ego, 0.0) if mc.status == STATUS_RAMP_CURVE else set_speed
+    r_ofs = offset_radius(mc.radius, getattr(mc, "offset", 0.0))      # (CURVE_OFFSET_*) the speed the car side plans the curve at
     self.prev_slowing = mc.curve is not None and set_speed > 0 and \
-      plan_speed(mc.radius, mc.distance, mc.advisory, react, decel=self.decel, floor=road_floor,
+      plan_speed(r_ofs, mc.distance, mc.advisory, react, decel=self.decel, floor=road_floor,
                  lead_time=road_lead) < set_speed - 2 * MPH
     # notices: once per curve that would need a slowdown, once per announced exit
     if mc.curve is not None and set_speed > 0:
       key = (mc.chain_id, mc.curve["s_a"])
       if key != self.announced_curve and \
-         plan_speed(mc.radius, mc.distance, mc.advisory, react, decel=self.decel, floor=road_floor,
+         plan_speed(r_ofs, mc.distance, mc.advisory, react, decel=self.decel, floor=road_floor,
                     lead_time=road_lead) < set_speed - 2 * MPH and \
-         curve_speed_limit(mc.radius, mc.advisory) < set_speed - 2 * MPH:
+         curve_speed_limit(r_ofs, mc.advisory) < set_speed - 2 * MPH:
         self.announced_curve = key
         self.notice = "curve"
     if mc.nav_exit != NAV_NONE:
@@ -2356,6 +2503,9 @@ class MapCurvesPlanner:
       for info in getattr(self, "pass_drops", []):
         rec.record("mapCurvePassDropped", now, info)
       self.pass_drops = []
+      for info in getattr(self, "offset_events", []):
+        rec.record("curveOffsetRemoved", now, info)
+      self.offset_events = []
       rec.tick(now)
     except Exception:
       pass
@@ -2396,9 +2546,17 @@ class MapCurvesPlanner:
         self.pass_exits, self.pass_exit_seen = [], None
         # the direction of travel the pass is remembered under: as MapCurves plans this curve now (direction(c))
         self.pass_dir = getattr(self.mc, "inside_dir", None)
+        self.pass_ofs, self.pass_alert = 0.0, False      # (CURVE_OFFSET_*)
+        self.pass_ofs_way = curve_way(inside)
       c = self.pass_curve
       if c is None:
         return
+      # (CURVE_OFFSET_*) the offset granted for this curve while it governed, and "Turn Exceeds Steering Limit" in it
+      gov = getattr(self.mc, "curve", None)
+      if gov is not None and self._same(gov, c) and getattr(self.mc, "offset", 0.0) > 0:
+        self.pass_ofs = max(getattr(self, "pass_ofs", 0.0), self.mc.offset)
+      if self._same(inside, c) and self._steer_alert(sm):
+        self.pass_alert = True
       if inside is c:
         if self.mc.inside_exit != self.pass_exit_seen:
           # a new GPS fix (the distance only changes with one): its estimate of the exit; the middle of them all, so
@@ -2430,6 +2588,53 @@ class MapCurvesPlanner:
           self.pass_stop_cut = False
     except Exception:
       self.pass_curve, self.pass_buf = None, []
+
+  @staticmethod
+  def _steer_alert(sm):
+    """(CURVE_OFFSET_*) "Turn Exceeds Steering Limit" (steerSaturated) is up now (never raises)."""
+    try:
+      if "steerSaturated/" in str(sm["selfdriveState"].alertType or ""):
+        return True
+    except Exception:
+      pass
+    try:
+      return any(str(getattr(e, "name", "")) == "steerSaturated" for e in sm["onroadEvents"])
+    except Exception:
+      return False
+
+  def _offset_verdict(self, samples):
+    """(CURVE_OFFSET_*) why the pass just ended proved its curve too tight for the offset ("" when it did not): the
+    steering at its limit, his steering, his brake, the steering alert, the measured lateral."""
+    if sum(1 for _, _, _, _, cmd in samples if cmd >= PASS_SATURATED) * PASS_DT > PASS_SAT_BLIP + 1e-9:
+      return "steering limit"
+    if any(drv for _, _, _, drv, _ in samples):
+      return "his steering"
+    if getattr(self, "pass_brake", False):
+      return "his brake"
+    if getattr(self, "pass_alert", False):
+      return "steer alert"
+    lats = [v * v * abs(k) for v, k, _, _, _ in samples]
+    n = max(int(round(PASS_FILTER / PASS_DT)), 1)
+    peak = max((sum(lats[j:j + n]) / n for j in range(len(lats) - n + 1)), default=max(lats, default=0.0))
+    if peak + OFFSET_MEAS_MARGIN >= CURVE_OFFSET_MARK_LAT:
+      return "lateral"
+    return ""
+
+  def _offset_pass(self, c, samples, direction):
+    """(CURVE_OFFSET_*) a pass with the offset granted: its "no offset" mark when it proved the curve too tight."""
+    g = getattr(self, "pass_ofs", 0.0)
+    if g <= 0 or not samples or not hasattr(self.mc.memory, "add_no_offset"):
+      return
+    why = self._offset_verdict(samples)
+    if not why or direction is None:
+      return
+    self.mc.memory.add_no_offset(c, direction, way=getattr(self, "pass_ofs_way", curve_way(c)), reason=why)
+    lats = [v * v * abs(k) for v, k, _, _, _ in samples]
+    self.offset_events = (getattr(self, "offset_events", []) + [{
+      "reason": why, "name": c.get("name", "") or "", "ramp": bool(c.get("ramp")), "map_r": float(c.get("r", 0.0) or 0.0),
+      "offset_mph": round(g / MPH, 2), "v_max_mph": round(max(v for v, *_ in samples) / MPH, 1),
+      "lat_peak": round(max(lats, default=0.0), 2),
+      "sat_s": round(sum(1 for *_, cmd in samples if cmd >= PASS_SATURATED) * PASS_DT, 2)}])[-20:]
 
   @staticmethod
   def _same(a, b):
@@ -2471,6 +2676,7 @@ class MapCurvesPlanner:
     if self.pass_blinker or self.pass_apex > PASS_APEX_NEAR:
       return
     direction = getattr(self, "pass_dir", None)
+    self._offset_pass(c, samples, direction)
     if c.get("ramp"):
       # (RAMP_MEMORY_*) the steering at its limit, his steering or his brake in the curve: back to the map's radius
       sat = sum(1 for _, _, _, _, cmd in samples if cmd >= PASS_SATURATED) * PASS_DT > PASS_SAT_BLIP + 1e-9
@@ -2564,8 +2770,16 @@ class MapCurvesPlanner:
     # the governing curve's speed as the car side takes it: a road curve never below the driver's Curve Max Drop floor
     # (drive 54, West Utica: the notice said 32 for a curve the car took to 35)
     if mc.curve is not None and mc.radius > 0:
-      plan.mapCurveTarget = float(max(curve_speed_limit(mc.radius, mc.advisory),
+      plan.mapCurveTarget = float(max(curve_speed_limit(offset_radius(mc.radius, getattr(mc, "offset", 0.0)), mc.advisory),
                                       0.0 if mc.status == STATUS_RAMP_CURVE else mc.floor))
+    try:
+      # (CURVE_OFFSET_*) the governing curve's granted offset (0 with the setting 0), how it was decided, its cap's radius
+      gov = mc.curve is not None
+      plan.mapCurveSpeedOffset = float(getattr(mc, "offset", 0.0) if gov else 0.0)
+      plan.mapCurveOffsetState = int(getattr(mc, "offset_state", OFS_OFF) if gov else OFS_OFF)
+      plan.mapCurveOffsetCapRadius = float(getattr(mc, "offset_cap_r", 0.0) if gov else 0.0)
+    except (AttributeError, ValueError):
+      pass                       # (an older cereal without the fields)
     plan.mapCurveName = (mc.curve or {}).get("name", "") or ""
     plan.mapOnRamp = bool(mc.on_ramp)
     plan.mapOnRampAhead = bool(getattr(mc, "onramp_ahead", False))

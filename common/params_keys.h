@@ -830,6 +830,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaSlowLowerLimit", {PERSISTENT, BOOL, "1", "1"}},           // on a street: slow (gently) for a lower posted limit steady 5 s (speed_limit_follow rule 9)
     {"MazdaBrakeAutoResume", {PERSISTENT, BOOL, "0", "0"}},          // brake cancelled the cruise: the gas brings it back (RES), mapped public roads only (auto_resume.py)
     {"MazdaCameraCurveRaise", {PERSISTENT, BOOL, "1", "1"}},         // in a curve the live camera decides: +1 taps with margin, SET+ at its end, a phantom map curve let go (camera_curve.py)
+    {"MazdaCurveSpeedOffset", {PERSISTENT, INT, "0", "0"}},         // map curves: 0..5 mph (0/2/3/5/6/8 km/h) added to the planned curve speed, capped at 2.3 m/s^2 (map_curves.CURVE_OFFSET_*)
     {"MazdaCurveMapRange", {PERSISTENT, INT, "2", "2"}},             // curve_mapd: build map folders within 30/50/100/200/300 mi (index) of the car
     {"MazdaCurveMapStates", {PERSISTENT, STRING, "", ""}},           // curve_mapd: states (MapsSelected tokens, CSV) built in full whatever the range
     {"MazdaStopWarningChime", {PERSISTENT, INT, "0", "0"}},
