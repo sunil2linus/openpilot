@@ -277,3 +277,139 @@ def test_r6_no_follow_for_a_slower_far_closing_or_other_lane_lead_nor_with_the_t
   c, rec = _lead_wrapper(tmp_path, monkeypatch)
   c.ti_only = True
   assert abs(_lead_run(c, 400) - 31.0) < 1e-6
+
+
+# ---------------- R1: the merge boost opened by the model at a loop's end ----------------
+
+def _loop_end(gate_at=400, model_from=100, lat=lambda f: 2.1, pk=lambda f: 0.5, frames=1500, extra=None, v0=31.0):
+  """The merge (75, boost +20) offered inside a loop, the set 31 at 31 mph; the turn gate ok only from gate_at (its pause
+  latched from the loop until then); the model's conditions (merge_model_open) from model_from; the loop's own camera
+  target at the car's speed meanwhile."""
+  car = TP.MaxCar(31, dash_offset_mph=0.0, lag=10, accel_fn=TP._acc, cruise_gain=0.19, step=MPH)
+  car.set_speed, car.v_ego = 31 * MPH, v0 * MPH
+  lg = cs.CurveSlowdownLogic(False)
+  log = []
+  for f in range(frames):
+    d = dict(set_speed=car.set_speed, v_ego=car.v_ego, btn_counter=(f // 10) % 16,
+             limit_raise=75 * MPH if lg.boost is None and lg.limit_raised is None else 0.0,
+             limit_boost=20 * MPH if lg.boost is None and lg.limit_raised is None else 0.0,
+             merge_turn_ok=f >= gate_at, merge_turn_pause=f < gate_at, merge_turning=f < gate_at,
+             csc_active=f < gate_at, csc_speed=v0 * MPH,
+             merge_model_open=f >= model_from, merge_lat=lat(f), merge_model_pk=pk(f))
+    if extra:
+      d.update(extra(f, car))
+    btn, _ = lg.update(TP._inp(**d))
+    if btn is not None:
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    log.append((f, car.set_speed / MPH, car.v_ego / MPH, btn, lg.last_action, lg.anchor))
+    car.tick()
+  return car, lg, log
+
+
+def _first_up(log):
+  return next((f for f, s, v, b, *_ in log if b == cs.SET_PLUS), None)
+
+
+def test_r1_the_model_opens_the_boost_before_the_turn_gate():
+  car, lg, log = _loop_end()
+  f_up = _first_up(log)
+  assert f_up is not None and 100 <= f_up < 160, f_up                      # (the gate only at 400: 3 s later)
+  assert max(s for f, s, *_ in log if f < 400) >= 45                        # the boost's SET+ hold goes on in the loop's end
+  old = cs.MERGE_MODEL_OPEN
+  try:
+    cs.MERGE_MODEL_OPEN = False
+    _, _, log0 = _loop_end()
+  finally:
+    cs.MERGE_MODEL_OPEN = old
+  assert _first_up(log0) >= 400                                             # (before round R: at the gate)
+
+
+def test_r1_a_second_bend_stops_it_and_takes_the_set_back():
+  # the lateral rises 0.2 over its value at the start (an S-curve): stop, the set back to max(the speed, the set at the
+  # start), the boost opens again on the turn gate
+  car, lg, log = _loop_end(lat=lambda f: 2.1 if f < 250 else 2.4, gate_at=900)
+  f_up = _first_up(log)
+  peak = max(s for f, s, *_ in log if f < 400)
+  assert f_up is not None and peak >= 35 - 1e-6
+  assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 250 <= f < 700)
+  assert max(s for f, s, *_ in log if 700 <= f < 900) <= round(max(v for f, s, v, *_ in log if 250 <= f < 300)) + 1.0
+  assert max(s for f, s, *_ in log if f >= 900) >= 75                       # up again once the gate is ok
+  # the model's 0.5-3 s peak rising over the start lateral + 0.2: the same
+  car, lg, log = _loop_end(pk=lambda f: 0.5 if f < 250 else 2.5, gate_at=900)
+  assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 250 <= f < 700)
+
+
+def test_r1_its_guards_red_light_a_slow_lead_a_tighter_curve_target():
+  for extra in (lambda f, car: dict(red_light=True),
+                lambda f, car: dict(radar_lead=True, lead_v=8.0),
+                lambda f, car: dict(csc_speed=24 * MPH)):                    # an unmapped tighter turn the camera sees
+    car, lg, log = _loop_end(extra=extra)
+    f_up = _first_up(log)
+    assert f_up is None or f_up >= 400, f_up
+
+
+def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0.9, link=True, plan=None, rend=60.0):
+  from types import SimpleNamespace as NS
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  m = c.sm.msgs["modelV2"]
+  xs = [190.0 * (j / 32) ** 2 for j in range(33)]
+  m.position = NS(x=xs, y=[0.0] * 33)
+  m.velocity = NS(x=[14.0] * 33, t=[0.0] * 33)
+  m.orientationRate = NS(z=[(2.0 / 14.0 ** 2 if x < 20 else kappa) * 14.0 for x in xs])
+  m.laneLineProbs = [0.5, lane, lane, 0.5]
+  c.sm.updated["modelV2"] = True
+  c.map_control.link_now = link
+  c.map_control.hwy_ramp_left = rend
+  p = c.sm.msgs["starpilotPlan"]
+  for k, v in (plan or {}).items():
+    setattr(p, k, v)
+  CS = W.car_state(31.0, 31.0)
+  CS.out.steeringAngleDeg, CS.out.steeringRateDeg = lat_deg, 0.0
+  out = None
+  for _ in range(60):
+    c.frame += 1
+    c.turn_gate.lat = 2.0
+    c.steer_cmds.append(0.6)
+    out = c._merge_model(CS, None, p, 14.0)
+  return c, out
+
+
+def test_r1_the_wrappers_model_view_and_its_guards(tmp_path, monkeypatch):
+  _, out = _merge_model_wrapper(tmp_path, monkeypatch)
+  assert out["merge_model_open"] and abs(out["merge_lat"] - 2.0) < 1e-6
+  _, out = _merge_model_wrapper(tmp_path, monkeypatch, kappa=1.5 / 14.0 ** 2)     # still turning 2.5 s ahead: no
+  assert not out["merge_model_open"]
+  _, out = _merge_model_wrapper(tmp_path, monkeypatch, lane=0.2)
+  assert not out["merge_model_open"]
+  _, out = _merge_model_wrapper(tmp_path, monkeypatch, link=False)
+  assert not out["merge_model_open"]
+  # a tight ramp curve just ahead: no; a map curve we are in (the planner has not let the loop go: the next one is hidden): no
+  near = dict(mapCurveStatus=2, mapCurveRadius=60.0, mapCurveDistance=30.0)
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, plan=near)[1]["merge_model_open"]
+  inside = dict(mapCurveStatus=2, mapCurveRadius=70.0, mapCurveDistance=0.0, mapCurveApexValid=True, mapCurveApexDistance=-40.0)
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, plan=inside)[1]["merge_model_open"]
+  # a gentle mapped curve far ahead (its plan above the speed + 5): yes
+  far = dict(mapCurveStatus=2, mapCurveRadius=400.0, mapCurveDistance=300.0)
+  assert _merge_model_wrapper(tmp_path, monkeypatch, plan=far)[1]["merge_model_open"]
+  # a mapped curve ahead whose plan is under the speed + 5: no
+  ahead = dict(mapCurveStatus=1, mapCurveRadius=60.0, mapCurveDistance=120.0)
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, plan=ahead)[1]["merge_model_open"]
+  # the ramp's end far (a long ramp left: a turn the map lacks may come) or unknown: no
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=300.0)[1]["merge_model_open"]
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=None)[1]["merge_model_open"]
+  # the stock LKAS blocked: no
+  c, out = _merge_model_wrapper(tmp_path, monkeypatch)
+  c.lkas_blocked = True
+  assert not c._merge_model(W.car_state(31.0, 31.0), None, c.sm.msgs["starpilotPlan"], 14.0)["merge_model_open"]
+
+
+def test_r1_the_ramps_end_distance_is_kept_when_the_ramp_flag_drops():
+  # (drive 76 t 521.5: the planner's ramp flag dropped with the end 50 m ahead) the map control counts it on by the speed
+  CTLm = TE.CTL
+  ctl = CTLm.MapCurveControl(2.2, CTLm.MAP_DECEL)
+  for _ in range(300):
+    ctl.update(TE.F(road_class=2, on_ramp=True, ramp_type=2, ramp_to_highway=True, ramp_end_distance=50.0), 31 * MPH, 0,
+               v_ego=14.0)
+  for _ in range(100):
+    ctl.update(TE.F(road_class=2, gps_trust=2), 31 * MPH, 0, v_ego=14.0)
+  assert ctl.hwy_ramp_left is not None and abs(ctl.hwy_ramp_left - (50.0 - 14.0)) < 1.0, ctl.hwy_ramp_left

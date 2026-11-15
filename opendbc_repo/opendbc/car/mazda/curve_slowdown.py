@@ -496,6 +496,50 @@ MERGE_TURN_UNWIND_LAT = MERGE_TURN_LAT   # m/s^2 (tightened from MERGE_TURN_PAUS
 MERGE_TURN_UNWIND_AHEAD = 100.0   # m
 MERGE_TURN_UNWIND_DECEL = -0.5    # m/s^2
 MERGE_TURN_ACCEL_TAU = 0.3        # s
+# Round R, R1 (owner: "raise to 90 three seconds before where we did; Mazda does not accelerate rapidly so it is safe"; drive
+# 76, the S Rochester Rd loop onto M-59: the boost started at t 523.0 with the lateral under MERGE_TURN_LAT; 3 s before it
+# the lateral was 2.19 with the wheel steady and the command 0.67; the cruise adds ~0.6 mph in the first second, so the
+# boost shifted 3 s earlier peaks at 2.20 / 1.72 / 1.16 on drives 76 / 75 / 6f, never above what was already there). The
+# model path's lateral 2.5 s ahead at the car's speed (its peak over MERGE_MODEL_WINDOW) at most MERGE_MODEL_LAT for
+# MERGE_MODEL_TIME held from t 520.0 / 1155.5 / 676.5 (76 / 75 / 6f, ~3 s before the gate).
+# MERGE_MODEL_OPEN: on a link to a highway with the merge raise waiting for the turn gate, the full boost starts when all
+# (the wrapper, SlowdownInputs.merge_model_open): that model view for MERGE_MODEL_TIME; |lateral| now at most
+# MERGE_MODEL_NOW_LAT and not rising (MERGE_MODEL_RISE over MERGE_MODEL_RISE_TIME), the wheel not winding up
+# (MERGE_TURN_RATE); the median |steer command| over 1 s under MERGE_EARLY_RESERVE; no ramp curve under MERGE_TURN_CURVE_R
+# within MERGE_TURN_CURVE_D, no other mapped curve ahead whose plan is under the car's speed + MERGE_MODEL_AHEAD, and no map
+# curve governing that we are in (MERGE_MODEL_MAP: the planner shows the next curve only once it lets the loop go); the stock
+# LKAS not blocked, no camera fault; the lane lines at CAM_LANE_PROB; the model valid and fresh; no planned stop; and in the
+# controller as for any merge start: no red light, stop, post-stop wait, slow / closing lead. A boost started this way is
+# not paused by MERGE_TURN_PAUSE_LAT (the loop's lateral is above it): it stops (MERGE_MODEL_STOP) only when the lateral rises
+# MERGE_MODEL_MARGIN above where it was at the start, the wheel winds up, or the model's 0.5-3 s peak at the car's speed (or its
+# peak from 2.25 s out to MERGE_MODEL_FAR) rises above the start lateral + MERGE_MODEL_MARGIN (an S-curve, a second bend, a
+# tighter turn coming into view; no model: as the turn gate). Then the set goes
+# back to max(the car's speed rounded, the set at the start) by the normal rules (SET- taps; the boost opens again on the
+# turn gate: the boosted anchor back). Once the turn gate is ok it is a normal boost.
+MERGE_MODEL_OPEN = True
+MERGE_MODEL_LAT = 1.1             # m/s^2
+MERGE_MODEL_AT = 2.5              # s ahead
+MERGE_MODEL_WINDOW = 0.25         # s either side of MERGE_MODEL_AT
+MERGE_MODEL_TIME = 0.3            # s
+MERGE_MODEL_NOW_LAT = 2.3         # m/s^2
+MERGE_MODEL_RISE = 0.05           # m/s^2 ...
+MERGE_MODEL_RISE_TIME = 0.3       # s ... over this: rising
+MERGE_MODEL_AHEAD = 5 * MS_PER_MPH
+MERGE_MODEL_MARGIN = 0.2          # m/s^2
+# ... and while the model opens the merge (its start, and the boost it opened until the turn gate is ok) a curve target that
+# asks for no slowing (at or above the car's speed - MERGE_MODEL_CSC, the speed when the boost began once it runs: the loop
+# being left, its camera target at the speed)
+# is no curve for the merge; a lower one (an unmapped tighter turn the camera sees ahead) still is. The ramp curve the map
+# says we are in (distance 0) blocks the start (MERGE_MODEL_MAP).
+MERGE_MODEL_CSC = 1 * MS_PER_MPH
+# ... and the model's view straight (MERGE_MODEL_LAT) not only 2.5 s ahead but out to MERGE_MODEL_FAR, as far as its path
+# reaches (wsim: an unmapped tighter turn 80-120 m after the loop, seen by the model, held the start back as the base does)
+MERGE_MODEL_FAR = 7.0             # s
+# ... and only with the ramp's end (the highway) known and at most MERGE_MODEL_REND ahead (map_curve_control.hwy_ramp_left, the
+# planner's mapRampEndDistance): a long ramp left (drive 75: 512 m) may hold a tighter turn the map lacks and the model cannot
+# see yet (wsim: an unmapped R30 / R40 turn 80-120 m after the loop came in 4-19 mph faster than with the turn gate); there
+# the turn gate decides, as before. (Drives 76 / 6f: 64 / 57 m left at the model's opening.)
+MERGE_MODEL_REND = 100.0          # m
 # No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
 HWY_ROAD_CLASSES = (1, 3)
 CAMERA_STOP_HWY_MAX_SPEED = 50 * MS_PER_MPH
@@ -594,6 +638,12 @@ class SlowdownInputs:
   merge_turn_ok: bool = True
   merge_turn_pause: bool = False
   merge_early: bool = False       # the wrapper's MERGE_EARLY conditions (the ramp's end near, the turn easing, reserve, LKAS ok)
+  # (MERGE_MODEL_OPEN) the wrapper's conditions; |lateral| now (m/s^2), the model's 0.5-3 s peak at the car's speed (-1
+  # unknown), the wheel winding up
+  merge_model_open: bool = False
+  merge_lat: float = 0.0
+  merge_model_pk: float = -1.0
+  merge_winding: bool = False
   red_light: bool = False         # starpilotPlan.redLight (raw): no merge start under it, its way up pauses
   # ... as the stop trigger sees it (its red_ok: not at highway speed on a highway, not on a ramp onto one): no SET+ back
   # up from one of our stop slowdowns under it (RESUME_RESTORE, at most RED_STOP_BLOCK_MAX from its onset)
@@ -1033,6 +1083,22 @@ class CurveSlowdownLogic:
       self.restore_pending = True
       b["ended"] = self.frame
       return
+    if "model" in b and "ended" not in b:
+      m = b["model"]
+      if m.get("hold") is not None:
+        if i.merge_turn_ok and not i.merge_turn_pause and not self.blocked:
+          # (MERGE_MODEL_OPEN) held back after a second bend: the turn gate is ok, the boost goes on as a normal one
+          self.anchor, self.anchor_ours = m["top"], True
+          del b["model"]
+      elif i.merge_turn_ok and not i.merge_turn_pause:
+        del b["model"]                 # (MERGE_MODEL_OPEN) the turn gate is ok now: a normal boost
+      elif self._model_stop(i) and not self.blocked:
+        # (MERGE_MODEL_OPEN) an S-curve / a second bend: the set back to max(the car's speed, the set at the start) (SET-
+        # taps), held there (the boost's way up paused) until the turn gate is ok
+        m["hold"] = self.frame
+        self.anchor = min(max(round(i.v_ego / self.step) * self.step, m["set0"]), tgt)
+        self.anchor_ours = True
+        self.restore_pending = True
     if "ended" not in b and self._merge_paused(i):
       b["frame"] += 1                  # (second review) MERGE_BOOST_TIME does not run out while the way up is paused
     # (review) only his SET+ makes the speed his; his SET- above the target lowers it, our restore takes it on down
@@ -1100,7 +1166,21 @@ class CurveSlowdownLogic:
     """The merge's way up pauses (the hold released, the set speed kept, never a SET-): the car turning (MergeTurnGate)
     or the stop-light detector on (a ramp meter, a light on the ramp: review of round k, S1), unless that flag looks
     stuck (MERGE_RED_STUCK: on continuously that long while moving faster than MERGE_RED_STUCK_SPEED, no stop planned)."""
+    b = self.boost
+    if b is not None and "model" in b and "ended" not in b:
+      # (MERGE_MODEL_OPEN) opened by the model: its own stop rule, not the turn gate's MERGE_TURN_PAUSE_LAT
+      return b["model"].get("hold") is not None or self._model_stop(i) or (MERGE_RED_PAUSE and self._merge_red(i))
     return i.merge_turn_pause or (MERGE_RED_PAUSE and self._merge_red(i))
+
+  def _model_stop(self, i):
+    """(MERGE_MODEL_OPEN) a boost the model opened stops: the lateral up MERGE_MODEL_MARGIN on its start, the wheel winding
+    up, the model's 0.5-3 s peak above the start lateral + MERGE_MODEL_MARGIN (no model: the turn gate's pause)."""
+    lat0 = self.boost["model"]["lat0"]
+    if i.merge_winding or i.merge_lat > lat0 + MERGE_MODEL_MARGIN:
+      return True
+    if i.merge_model_pk < 0:
+      return i.merge_turn_pause
+    return i.merge_model_pk > lat0 + MERGE_MODEL_MARGIN
 
   def _merge_red(self, i):
     """The stop-light detector holds a merge back (start and way up), unless the flag looks stuck (MERGE_RED_STUCK)."""
@@ -1593,6 +1673,13 @@ class CurveSlowdownLogic:
     if (self.boost is not None and "ended" not in self.boost and i.csc_active and not i.curve_track and
         i.csc_speed >= i.v_ego + MERGE_CSC_NEAR):
       i = replace(i, csc_active=False)   # (MERGE_CSC_NEAR) a curve target far above the speed: no curve for the boost
+    b0 = self.boost
+    model_now = ((b0 is None and i.merge_model_open and i.limit_boost > 0 and i.limit_raise > 0) or
+                 (b0 is not None and "model" in b0 and "ended" not in b0))
+    v_ref = i.v_ego if (b0 is None or "model" not in b0) else min(i.v_ego, b0["model"]["v0"])
+    if (MERGE_MODEL_OPEN and model_now and i.csc_active and not i.street_lower and
+        i.csc_speed >= v_ref - MERGE_MODEL_CSC):
+      i = replace(i, csc_active=False)   # (MERGE_MODEL_CSC) the loop being left: no curve for the merge
     cruise_ok = i.cruise_enabled and i.set_speed > 0
     self.cruise_on_frames = self.cruise_on_frames + 1 if cruise_ok else 0
     if not cruise_ok:
@@ -2019,7 +2106,8 @@ class CurveSlowdownLogic:
     # (MERGE_STOP_ROLLING_SPEED) a merge after a rolling stop episode: no post-stop wait
     rolling = merge and self.stop_min_v >= MERGE_STOP_ROLLING_SPEED and not self.stop_braked
     stop_wait = self.frame - self.stop_off_frame < _frames(RAISE_FAST_AFTER_STOP) and not rolling
-    merge_wait = merge and (not i.merge_turn_ok or self._merge_red(i) or stop_wait)
+    model_open = MERGE_MODEL_OPEN and merge and i.merge_model_open and not i.merge_turn_ok
+    merge_wait = merge and (not (i.merge_turn_ok or model_open) or self._merge_red(i) or stop_wait)
     street_wait = ONRAMP_NO_RAISE and i.onramp_pending and not merge
     if (i.limit_raise > 0 and reason is None and not self.blocked and not self.inflight and self.hold is None and
         not i.hold_restore and self.last_set_speed is not None and i.limit_raise > raise_ref + self.half_step and
@@ -2030,9 +2118,13 @@ class CurveSlowdownLogic:
       self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
       if i.limit_boost > 0 and not self._lead_blocks_boost(i) and i.boost_road_ok:
         self.boost = {"target": i.limit_raise, "frame": self.frame}
+        if model_open:
+          self.boost["model"] = {"lat0": i.merge_lat, "set0": i.set_speed, "v0": i.v_ego}    # (MERGE_MODEL_OPEN)
         top = self._set_top()
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
         self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
+        if "model" in self.boost:
+          self.boost["model"]["top"] = self.anchor
       # a raise goes up at once, with a SET+ hold when it is far (drive 61: merges 35 -> 70 and a street's 43 -> 48 by
       # slow single taps after an earlier stop episode); right after a stop episode's release taps first (review)
       if not stop_wait:
@@ -2532,6 +2624,10 @@ class CurveSlowdown:
     self.lead_track_frames = 0         # (LEAD_CURVE) radarState's lead tracked without a jump
     self.lead_prev_d = None
     self.lead_follow = None            # (LEAD_CURVE) the follow going on: dict of its inputs at its start
+    self.model_open_frames = 0         # (MERGE_MODEL_OPEN) frames the model's view 2.5 s ahead has been straight enough
+    from collections import deque as _dq
+    self.merge_lat_hist = _dq(maxlen=max(1, _frames(MERGE_MODEL_RISE_TIME)))
+    self.merge_model_now = False       # (logs)
     self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
     self.plan_stop_raw = False         # the model's planned stop this frame, before the road gating (M-b)
     self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
@@ -2950,6 +3046,7 @@ class CurveSlowdown:
       merge_taper=self._merge_taper(plan if self._alive('starpilotPlan') else None),
       merge_turn_ok=turn_ok, merge_turn_pause=turn_pause, merge_turning=bool(self.turn_gate.turning),
       merge_early=self._merge_early(CC, plan if self._alive('starpilotPlan') else None),
+      **self._merge_model(CS, CP, plan if self._alive('starpilotPlan') else None, v_ego),
       onramp_pending=bool(self._alive('starpilotPlan') and getattr(plan, "mapOnRampAhead", False) and
                           0 < float(getattr(plan, "mapCurveTarget", 0.0) or 0.0) < set_speed - lg.half_step),
       ramp_start=bool(self.limit_follow is not None and self.limit_mode == LIMIT_ON and self.limit_follow.ramp_start),
@@ -3595,6 +3692,70 @@ class CurveSlowdown:
     reserve = bool(cmds) and cmds[len(cmds) // 2] < MERGE_EARLY_RESERVE
     self.merge_early_now = bool(reserve and not near)
     return self.merge_early_now
+
+  def _model_view(self):
+    """(xs, kappas, lane prob) of the last modelV2 plan when fresh (CAM_MODEL_STALE), else None (camera_curve's view)."""
+    if self._alive('modelV2') and (self.sm.updated['modelV2'] or self.cam_model is None):
+      m = self.sm['modelV2']
+      xs, ks = model_kappas(list(m.position.x), list(m.orientationRate.z), list(m.velocity.x))
+      probs = list(getattr(m, "laneLineProbs", []) or [])
+      self.cam_model = (xs, ks, self.frame, min(probs[1], probs[2]) if len(probs) >= 3 else 0.0)
+    cm = self.cam_model
+    if cm is None or not self._alive('modelV2') or (self.frame - cm[2]) * DT_CTRL > CAM_MODEL_STALE or not cm[0]:
+      return None
+    return cm[0], cm[1], cm[3]
+
+  def _merge_model(self, CS, CP, plan, v_ego):
+    """(MERGE_MODEL_OPEN) the wrapper's inputs: dict(merge_model_open, merge_lat, merge_model_pk, merge_winding)."""
+    from opendbc.car.mazda.camera_curve import model_peak, CAM_LANE_PROB
+    angle = float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0)
+    rate = float(getattr(CS.out, "steeringRateDeg", 0.0) or 0.0)
+    lat = abs(self.turn_gate.lat)
+    winding = abs(rate) > MERGE_TURN_RATE and angle * rate > 0
+    rising = bool(self.merge_lat_hist) and lat > self.merge_lat_hist[0] + MERGE_MODEL_RISE
+    self.merge_lat_hist.append(lat)
+    v = max(v_ego, 0.0)
+    view = self._model_view() if MERGE_MODEL_OPEN else None
+    pk = model_peak(view[0], view[1], v, 0.5, 3.0) if view is not None and v > 1.0 else None
+    pk25 = None
+    if view is not None and v > 1.0:
+      # (MERGE_MODEL_FAR) from 2.5 s ahead out to as far as the model's path reaches, up to MERGE_MODEL_FAR
+      far_t = min(MERGE_MODEL_FAR, view[0][-1] / v)
+      pk25 = model_peak(view[0], view[1], v, MERGE_MODEL_AT - MERGE_MODEL_WINDOW,
+                        max(far_t, MERGE_MODEL_AT + MERGE_MODEL_WINDOW))
+    # (the stop rule watches the 0.5-3 s peak and that far window: a tighter turn coming into the model's view)
+    pk_stop = max(pk, pk25) if (pk is not None and pk25 is not None) else pk
+    out = dict(merge_model_open=False, merge_lat=lat, merge_model_pk=pk_stop if pk_stop is not None else -1.0,
+               merge_winding=winding)
+    mc = self.map_control
+    left = mc.hwy_ramp_left if mc is not None else None
+    if left is None and plan is not None and bool(getattr(plan, "mapOnRamp", False)) and bool(getattr(plan, "mapRampToHighway", False)):
+      left = float(getattr(plan, "mapRampEndDistance", 0.0) or 0.0) or None
+    ok = (MERGE_MODEL_OPEN and plan is not None and view is not None and pk25 is not None and view[2] >= CAM_LANE_PROB and
+          left is not None and 0.0 < left <= MERGE_MODEL_REND and
+          not (self.has_ti and self.lkas_blocked) and not self.ti_fault and not self.plan_stop_raw and
+          mc is not None and mc.link_now)
+    self.model_open_frames = self.model_open_frames + 1 if (ok and pk25 <= MERGE_MODEL_LAT) else 0
+    if not ok or self.model_open_frames < _frames(MERGE_MODEL_TIME):
+      self.merge_model_now = False
+      return out
+    status = int(getattr(plan, "mapCurveStatus", 0) or 0)
+    radius = float(getattr(plan, "mapCurveRadius", 0.0) or 0.0)
+    dist = float(getattr(plan, "mapCurveDistance", 0.0) or 0.0)
+    ramp_near = status == STATUS_RAMP_CURVE and 0 < radius < MERGE_TURN_CURVE_R and dist < MERGE_TURN_CURVE_D
+    # (MERGE_MODEL_MAP) the map governs no curve we are in (the planner lets a to-highway ramp's loop go RAMP_HWY_RELEASE
+    # before its end and then shows the next curve, if any: while it still shows the one we are in, the next is hidden)
+    in_map_curve = status in (STATUS_CURVE, STATUS_RAMP_CURVE) and radius > 0 and dist <= 0.5
+    ahead_low = in_map_curve
+    if status in (STATUS_CURVE, STATUS_RAMP_CURVE) and radius > 0 and dist > 0.5:
+      ahead_low = map_curve_speed(radius, dist, mc.curve.lat_accel, float(getattr(plan, "mapCurveAdvisory", 0.0) or 0.0),
+                                  reaction_speed=v) < v + MERGE_MODEL_AHEAD
+    cmds = sorted(self.steer_cmds)
+    reserve = bool(cmds) and cmds[len(cmds) // 2] < MERGE_EARLY_RESERVE
+    self.merge_model_now = bool(lat <= MERGE_MODEL_NOW_LAT and not rising and not winding and reserve and not ramp_near and
+                                not ahead_low)
+    out["merge_model_open"] = self.merge_model_now
+    return out
 
   def _merge_taper(self, plan):
     """(MERGE_TAPER) during the merge boost: the road matched as the highway, or the planner's ramp flag dropped."""
