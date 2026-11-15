@@ -289,7 +289,7 @@ class CameraCurve:
     if end_ok and self.end_frames >= int(CAM_END_CONFIRM / DT_CTRL):
       self.ending = True
       self.end_v0, self.end_t0 = v, i.target
-      out.events.append(("camCurveEnd", {"lat": round(lat, 2), "model_peak_2_3s": round(pk_end, 2),
+      out.events.append(("camCurveEnd", {"lat": round(lat, 2), "model_peak_2_4s": round(pk_end, 2),
                                          "model_peak_0p5_2s": round(pk_now, 2), "vEgo_mph": round(v / MS_PER_MPH, 1),
                                          "set_mph": round(i.set_speed / MS_PER_MPH, 1), "lane_prob": round(i.lane_prob, 2),
                                          "map_ahead_mph": round(min(i.map_ahead, NO_CURVE) / MS_PER_MPH, 1),
