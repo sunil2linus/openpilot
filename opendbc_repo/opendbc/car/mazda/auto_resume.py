@@ -51,8 +51,16 @@ AUTO_RESUME_MAX_ANGLE = 45.0     # deg: |wheel angle| under this for CALM_TIME t
 # (re-review, 6c t 1698.8: a Michigan-left U-turn, ~200 deg, on the same road name and class; RES 0.5 s after the wheel
 # straightened, he braked 2.4 s later for a business) after a big turn of the wheel wait this long, armed
 AUTO_RESUME_BIG_TURN = 90.0      # deg
-AUTO_RESUME_BIG_TURN_WAIT = 3.0  # s since |wheel angle| was last above AUTO_RESUME_BIG_TURN
-MAP_STABLE_TIME = 2.0            # s the road class and name unchanged before a send
+# Round Q (drives 74 / 75: sent once, refused ten times): 3 -> 2 s and 2 -> 1 s; the calm check (lateral, angle) stays
+AUTO_RESUME_BIG_TURN_WAIT = 2.0  # s since |wheel angle| was last above AUTO_RESUME_BIG_TURN
+MAP_STABLE_TIME = 1.0            # s the road class and name unchanged before a send
+# Round Q: the planner's road class 0 (unknown) for less than this, then the same class and name again, is not a road
+# change (a one-frame class 0 restarted MAP_STABLE_TIME); the map must still be good at the send itself
+MAP_BLIP = 1.5                   # s
+# Round Q: mapdOut is declared 20 Hz but arrives at 0.4-15 Hz, so SubMaster called it dead between messages and the road
+# name read "" (the name flapped, MAP_STABLE_TIME never completed: "road just changed"); the wrapper keeps the last name
+# this long by its own receive time
+ROAD_NAME_HOLD = 5.0             # s
 AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
 LEAD_NEAR = 50.0                 # m
 LEAD_MOVING = 3 * MS_PER_MPH     # m/s (1.34)
@@ -137,6 +145,7 @@ class AutoResumeLogic:
     self.big_turn_frame = -10_000    # frame |wheel angle| was last above AUTO_RESUME_BIG_TURN
     self.road = None                 # (class, name) last frame
     self.road_frame = -10_000        # frame it last changed
+    self.blip_frame = None           # (MAP_BLIP) the first frame of a class 0 blip on a known road
     self.last_wheel_btn = -10_000    # frame his RES / SET was last down
     self.lat = 0.0
     self.gas_frames = 0
@@ -210,8 +219,16 @@ class AutoResumeLogic:
     v = max(float(i.v_ego), 0.0)
     moving = v > MOVING_SPEED
     road = (int(i.road_class) if i.plan_alive else 0, str(i.road_name or ""))
-    if road != self.road:
-      self.road, self.road_frame = road, f
+    if road[0] == 0 and self.road is not None and self.road[0] != 0:
+      # (MAP_BLIP) class 0 on a known road: the road is kept for MAP_BLIP (the send still needs the map good)
+      if self.blip_frame is None:
+        self.blip_frame = f
+      if f - self.blip_frame >= _frames(MAP_BLIP):
+        self.road, self.road_frame, self.blip_frame = road, self.blip_frame, None
+    else:
+      if road != self.road:
+        self.road, self.road_frame = road, f
+      self.blip_frame = None
     if i.wheel_resume or i.wheel_set:
       self.last_wheel_btn = f
     self.new_wheel = i.btn_counter >= 0 and i.btn_counter != self.prev_counter
@@ -306,19 +323,18 @@ class AutoResumeLogic:
     if self.state == ARMED:
       if self.press is None and not self.press_spent and self.gas_frames >= _frames(GAS_HOLD):
         self.press_spent = True
+        self.press = f
         if not self.map_allowed(i):
-          self._event("autoResumeRefused", reason="map", disarmed=False, attempt=self.attempt, frames=self.total_sent,
-                      dist_m=round(self.dist, 1), road_class=int(i.road_class), gps_trust=int(i.gps_trust),
-                      plan_alive=bool(i.plan_alive))
-        else:
-          self.press = f
+          # (round Q) the map is a wait while his gas is held, not a spent press: a one-frame class 0 / trust 2 dropped
+          # it; the send itself still needs the map good (_send_blocker). Logged once per press.
+          self._event("autoResumeRefused", reason="map (waiting)", disarmed=False, attempt=self.attempt,
+                      frames=self.total_sent, dist_m=round(self.dist, 1), road_class=int(i.road_class),
+                      gps_trust=int(i.gps_trust), plan_alive=bool(i.plan_alive))
       if self.press is not None:
         if i.brake_pressed:
           self._drop_press("brake")
         elif f - self.last_gas > _frames(GAS_RECENT):
-          self._drop_press("gas released")
-        elif not self.map_allowed(i):
-          self._drop_press("map")
+          self._drop_press("map" if not self.map_ok(i) else "gas released")
         else:
           self.wait_why = self._send_blocker(i)
           if self.wait_why == "":
@@ -469,6 +485,7 @@ class AutoResume:
     except Exception:
       self.recorder = None
     self.ratio = float(getattr(CP, "steerRatio", 0.0) or 15.5)
+    self.road_name, self.road_name_frame = "", -10_000   # (ROAD_NAME_HOLD) mapdOut's last name, by our receive time
     self.wheelbase = float(getattr(CP, "wheelbase", 0.0) or 2.7)
     self.frame = 0
 
@@ -517,9 +534,11 @@ class AutoResume:
     busy = self.slowdown_busy(slowdown)
     lead = self.sm['radarState'].leadOne if self._alive('radarState') else None
     try:
-      road_name = str(self.sm['mapdOut'].roadName or "") if self._alive('mapdOut') else ""
+      if self.sm.updated['mapdOut'] and self.sm.recv_frame['mapdOut'] > 0:
+        self.road_name, self.road_name_frame = str(self.sm['mapdOut'].roadName or ""), self.frame
     except (KeyError, AttributeError):
-      road_name = ""
+      pass
+    road_name = self.road_name if self.frame - self.road_name_frame <= _frames(ROAD_NAME_HOLD) else ""
     gear = getattr(out, "gearShifter", None)
     i = AutoResumeInputs(
       cruise_enabled=bool(out.cruiseState.enabled), cruise_available=bool(out.cruiseState.available),

@@ -116,8 +116,8 @@ def test_stop_sign_with_a_turn_waits_for_the_wheel():
   # the wheel unwinds (not winding up: |angle| falling) and is straight; the gas still down
   s.step(int(0.4 * F), steering_angle=0.0, v_ego=16 * MPH)
   assert s.sent == []                          # not calm CALM_TIME yet
-  s.step(int(2.5 * F))
-  assert s.sent == [] and s.lg.wait_why == "after a big turn"   # (a 300 deg turn: AUTO_RESUME_BIG_TURN_WAIT)
+  s.step(int(1.5 * F))
+  assert s.sent == [] and s.lg.wait_why == "after a big turn"   # (a 300 deg turn: AUTO_RESUME_BIG_TURN_WAIT, 2 s)
   s.step(int(0.2 * F))
   assert s.sent and s.sent[0][1] == RES
   assert s.lg.state == ar.DONE
@@ -161,14 +161,14 @@ def test_parking_lot_then_a_public_road_within_the_distance():
   # into a parking lot: no road on the map
   s.step(6 * F, road_class=0)
   s.step(F, gas_pressed=True)
-  assert s.sent == [] and s.lg.state == ar.ARMED and s.kinds("autoResumeRefused")[-1]["reason"] == "map"
-  # the same press held on: still not used
+  assert s.sent == [] and s.lg.state == ar.ARMED and s.kinds("autoResumeRefused")[-1]["reason"] == "map (waiting)"
+  # the same press held on: never sent there (round Q: the map is a wait while his gas is held, the send needs it good)
   s.step(2 * F)
-  assert s.sent == []
+  assert s.sent == [] and s.lg.wait_why == "map"
   # back on a residential street (still < 800 m), gas again
-  s.step(F, gas_pressed=False, road_class=12)
-  s.step(int(0.9 * F), gas_pressed=True, v_ego=22 * MPH)
-  assert s.sent == [] and s.lg.wait_why == "road just changed"     # the road only 1.9 s old
+  s.step(int(0.5 * F), gas_pressed=False, road_class=12)
+  s.step(int(0.4 * F), gas_pressed=True, v_ego=22 * MPH)
+  assert s.sent == [] and s.lg.wait_why == "road just changed"     # the road only 0.9 s old (MAP_STABLE_TIME 1 s)
   s.step(int(0.5 * F))
   assert s.sent and s.sent[0][1] == RES and s.lg.state == ar.DONE
 
@@ -187,23 +187,33 @@ def test_the_map_must_be_good_at_the_send_and_the_road_settled():
   s.brake_cancel(v_after_mph=30)
   s.step(3 * F, road_class=0)
   s.step(F, gas_pressed=True)
-  assert s.sent == [] and s.kinds("autoResumeRefused")[-1]["reason"] == "map"
-  # a press made on the road, the map lost before the frame (turning into a driveway): dropped
+  assert s.sent == [] and s.kinds("autoResumeRefused")[-1]["reason"] == "map (waiting)"
+  s.step(3 * F)
+  assert s.sent == []
+  # a press made on the road, the map lost before the frame (turning into a driveway): never sent while it is lost
   s = Sim(set_mph=45, v_mph=45, road_class=5)
   s.brake_cancel(v_after_mph=30)
   s.step(int(0.4 * F), gas_pressed=True, steering_angle=200.0)
   assert s.lg.press is not None
-  s.step(F, road_class=0, steering_angle=0.0)
-  assert s.sent == [] and s.lg.press is None and s.kinds("autoResumeRefused")[-1]["reason"] == "map"
-  # the class (or mapd's name) changed less than 2 s before: wait for it to settle
+  s.step(3 * F, road_class=0, steering_angle=0.0)
+  assert s.sent == [] and s.lg.wait_why == "map"
+  # the class (or mapd's name) changed less than MAP_STABLE_TIME (1 s) before: wait for it to settle
   for kw in (dict(road_class=7), dict(road_name="Other Rd")):
     s = Sim(set_mph=45, v_mph=45, road_class=5)
     s.brake_cancel(v_after_mph=30)
     s.step(F)
-    s.step(int(1.5 * F), gas_pressed=True, **kw)
+    s.step(int(0.8 * F), gas_pressed=True, **kw)
     assert s.sent == [] and s.lg.wait_why == "road just changed", kw
     s.step(F)
     assert s.sent, kw
+  # (round Q) a class 0 blip under MAP_BLIP on the same road is no road change: sent once the map is good again
+  s = Sim(set_mph=45, v_mph=45, road_class=5)
+  s.brake_cancel(v_after_mph=30)
+  s.step(3 * F)
+  s.step(int(0.5 * F), gas_pressed=True, road_class=0)
+  assert s.sent == [] and s.lg.wait_why == "map"
+  s.step(int(0.5 * F), gas_pressed=True, road_class=5)
+  assert s.sent
   # standing still on a good road never counts against it
   s = Sim(set_mph=45, v_mph=45)
   s.brake_cancel(v_after_mph=0)
@@ -225,7 +235,7 @@ def test_the_wheel_angle_must_be_small():
   assert s.sent
 
 
-def test_a_big_turn_of_the_wheel_waits_three_seconds():
+def test_a_big_turn_of_the_wheel_waits_two_seconds():
   # (re-review, 6c t 1698.8) a U-turn on the same road: 200 deg, then straight, the gas held throughout
   def run(angle, turn_s=2.0):
     s = Sim(set_mph=53, v_mph=53)
@@ -237,23 +247,23 @@ def test_a_big_turn_of_the_wheel_waits_three_seconds():
     return s, t_below
   s, t0 = run(200.0)
   assert s.sent and abs((s.sent[0][0] - t0) / F - ar.AUTO_RESUME_BIG_TURN_WAIT) <= 0.15, (s.sent[0][0] - t0) / F
-  # a 90+ deg junction turn: the same 3 s wait
+  # a 90+ deg junction turn: the same 2 s wait
   s, t0 = run(100.0)
   assert s.sent and (s.sent[0][0] - t0) / F >= ar.AUTO_RESUME_BIG_TURN_WAIT - 0.01
   # a 30 deg lane-position correction: only the 0.5 s calm (it never was over 45 deg: no wait at all)
   s, t0 = run(30.0)
   assert s.sent and (s.sent[0][0] - t0) / F < 0.2
-  # the wait is time, not samples: 3 s whatever the wheel does under 90 deg meanwhile
+  # the wait is time, not samples: 2 s whatever the wheel does under 90 deg meanwhile
   s = Sim(set_mph=53, v_mph=53)
   s.brake_cancel(v_after_mph=15)
   s.step(F)
   s.step(F, gas_pressed=True, steering_angle=-120.0, v_ego=12 * MPH)
   t0 = s.frame
   s.step(int(1.0 * F), steering_angle=60.0)
-  s.step(int(1.5 * F), steering_angle=0.0, v_ego=18 * MPH)
+  s.step(int(0.8 * F), steering_angle=0.0, v_ego=18 * MPH)
   assert s.sent == [] and s.lg.wait_why == "after a big turn"
   s.step(F)
-  assert s.sent and (s.sent[0][0] - t0) / F >= 3.0 - 0.01
+  assert s.sent and (s.sent[0][0] - t0) / F >= 2.0 - 0.01
 
 
 def test_creep_guard_needs_a_moving_lead_under_10_mph():
@@ -527,7 +537,8 @@ def test_wrapper_reads_the_plan_and_selfdrive_state_and_builds_the_frame(tmp_pat
   sm.msgs["starpilotPlan"].mapRoadClass = 5
   run(1, gas=False)
   out = run(3 * F, gas=True)               # (the road settled MAP_STABLE_TIME first)
-  assert out and out[0][0] == "frame" and out[0][2] == Buttons.RESUME and w.logic.state == ar.SENDING
+  # (round Q: the press made while the map was lost waited for it; sent once the road settled, no answer here: given up)
+  assert out and out[0][0] == "frame" and out[0][2] == Buttons.RESUME and w.logic.state in (ar.SENDING, ar.GAVE_UP)
   # sent on the cycle a new wheel frame came, with its counter (create_button_cmd adds 1: CTR = wheel + 1)
   assert all(f % 10 == 0 and counter == (f // 10) % 16 for _, counter, _, f in out)
   if w.recorder is not None:
