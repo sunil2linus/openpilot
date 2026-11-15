@@ -3202,6 +3202,8 @@ class CurveSlowdown:
       blocked=bool(lg.blocked or CS.out.brakePressed), test_mode=bool(test),
       target=float(curve_speed) if curve_active else CAM_NONE,
       cam_target=float(cam_speed0) if cam_active0 else CAM_NONE,
+      apex_d=(float(getattr(plan, "mapCurveApexDistance", 0.0) or 0.0)
+              if (map_curve and bool(getattr(plan, "mapCurveApexValid", False))) else None),
       # (B1) the map knows the road beyond the model's horizon: matched to a road class, GPS trusted, Map Curves On
       map_covered=bool(self.map_on_used and status != STATUS_PAUSED and int(getattr(plan, "mapRoadClass", 0) or 0) > 0 and
                        int(getattr(plan, "mapGpsTrust", 4) or 0) < 2))

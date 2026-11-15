@@ -2521,6 +2521,13 @@ class MapCurvesPlanner:
       plan.mapCurveDistance = float(mc.distance)
       plan.mapCurveRadius = float(mc.radius)
     plan.mapCurveAdvisory = float(mc.advisory)
+    try:
+      # (review of round Q, R2 / R3) the governing curve's apex: the car side's phantom release and curve end judge by it
+      g = mc.geom.get(id(mc.curve)) if mc.curve is not None else None
+      plan.mapCurveApexValid = g is not None
+      plan.mapCurveApexDistance = float(g[0]) if g is not None else 0.0
+    except (AttributeError, ValueError):
+      pass                       # (an older cereal without the fields)
     # the governing curve's speed as the car side takes it: a road curve never below the driver's Curve Max Drop floor
     # (drive 54, West Utica: the notice said 32 for a curve the car took to 35)
     if mc.curve is not None and mc.radius > 0:

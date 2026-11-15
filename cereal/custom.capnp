@@ -317,6 +317,8 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapNavManeuverTurn @84 :Bool;      # that maneuver is a turn (turn, end of road, roundabout)
   mapOnRampAhead @85 :Bool;          # the ramp curve (status 2) is an on-ramp's first curve, before the turn onto it (navigation or signal)
   mapCurveBlind @86 :UInt8;          # why the camera check could not judge the governing curve: 0 judged / none, 1 slow, 2 red, 3 signal, 4 far, 5 ystd, 6 lead
+  mapCurveApexDistance @87 :Float32; # m to the governing curve's apex (its tightest point; negative: passed), with mapCurveApexValid
+  mapCurveApexValid @88 :Bool;
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

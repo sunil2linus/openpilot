@@ -263,12 +263,20 @@ def test_q3_phantom_release_on_a_straight_road_past_the_map_curves_start():
   xs, ks = _path(lambda x: 0.0)
   cc = CC.CameraCurve()
   outs = [cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=0.2, model_x=xs, model_k=ks, lane_prob=0.8,
-                                 curve_on=True, map_in_curve=True, map_curve_id=(1, 142))) for _ in range(80)]
+                                 curve_on=True, map_in_curve=True, map_curve_id=(1, 142), apex_d=18.0)) for _ in range(80)]
   assert not outs[30].phantom and outs[-1].phantom
+  # (re-review R2) never with its apex unknown, on a ramp, or with the model curved at an apex further ahead
+  for kw in (dict(apex_d=None), dict(apex_d=18.0, on_ramp=True), dict(apex_d=60.0, model_k=[0.0 if x < 50 else 1.6 / (v * v)
+                                                                                                for x in xs])):
+    cc2 = CC.CameraCurve()
+    args = dict(v_ego=v, set_speed=36 * MPH, lat=0.2, model_x=xs, model_k=ks, lane_prob=0.8, curve_on=True,
+                map_in_curve=True, map_curve_id=(1, 142))
+    args.update(kw)
+    assert not any(cc2.update(CC.CamInputs(**args)).phantom for _ in range(200)), kw
   assert [k for o in outs for k, _ in o.events if k == "camPhantomRelease"] == ["camPhantomRelease"]
   # another map curve: not released
   o = cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=0.2, model_x=xs, model_k=ks, lane_prob=0.8, curve_on=True,
-                             map_in_curve=True, map_curve_id=(1, 90)))
+                             map_in_curve=True, map_curve_id=(1, 90), apex_d=18.0))
   assert not o.phantom
   # a real curve (the lateral up): never
   cc = CC.CameraCurve()
@@ -762,4 +770,23 @@ def test_rereview_r1_a_mapped_ramp_loop_then_an_unmapped_tighter_turn(tmp_path, 
                view=view)
   # R200 then R60 160 m on, unmapped, not a ramp (was +5.7 mph)
   _no_faster(tmp_path, monkeypatch, [(300, 480, 200, 1), (640, 840, 60, -1)], (640, 840), anchor=55, view=190.0)
+
+
+def test_rereview_r2_a_gentle_lead_in_does_not_release_the_tight_part_ahead(tmp_path, monkeypatch):
+  # (test_dbg5: R250 lead-in 200 m, then R60, mapped as one R60 curve: was 44.9 mph / 6.7 m/s^2 into it, base 25.1 / 2.1)
+  for ramp in (True, False):
+    _no_faster(tmp_path, monkeypatch, [(300, 500, 250, 1), (500, 580, 60, 1)], (500, 580), mapped=[(300, 580, 60, 540)],
+               ramp=ramp, anchor=55, view=70.0)
+
+
+def test_rereview_r2_rochester_rd_two_bends_on_a_straight_path_still_release(tmp_path, monkeypatch):
+  # (drive 75 t 698-716: two bends ~36 m apart mapped as one R142 curve, the real path straight): released, no slowdown
+  # (the approach is unchanged, rule a: the release stops the SET- once past the start and lets the restore run)
+  segs = [(300, 700, 100000.0, 1)]
+  tb, pb, _ = _wsim(tmp_path, monkeypatch, segs, mapped=[(300, 336, 142, 318)], anchor=45, view=120.0, camera=False)
+  tq, pq, ph = _wsim(tmp_path, monkeypatch, segs, mapped=[(300, 336, 142, 318)], anchor=45, view=120.0)
+  low_b, low_q = (min(t[1] for t in tr if 250 <= t[0] < 700) for tr in (tb, tq))
+  set_b, set_q = (min(t[2] for t in tr if 250 <= t[0] < 700) for tr in (tb, tq))
+  print("rochester base low", low_b, "set", set_b, pb, "| Q low", low_q, "set", set_q, pq)
+  assert ph and low_q >= low_b and set_q >= set_b, (ph, low_b, low_q, set_b, set_q)
 

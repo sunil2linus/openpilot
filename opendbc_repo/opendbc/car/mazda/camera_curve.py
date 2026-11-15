@@ -76,6 +76,12 @@ CAM_END_STEP = 10 * MS_PER_MPH  # m/s
 # Re-review of round Q, R1: the end may not start, and is cancelled, while any incoming target (the camera's, the map's,
 # a map curve ahead's plan) is under the car's speed or the set + one step (the camera saw curve 2 at 30 mph with the car at
 # 55: the end ran SET+ to his speed). CAM_END_STEP bounds every end, ramps included; curve_on going off ends it as a cancel.
+# R2: the phantom release only with the map curve's apex known (starpilotPlan.mapCurveApexDistance): ahead within
+# CAM_APEX_SEE m and CAM_APEX_TIME s with the model straight through it, or passed with the lateral under CAM_PHANTOM_LAT all
+# the way; never on a link / ramp.
+CAM_APEX_SEE = 110.0            # m (map_curves.VETO_SEE_MAX)
+CAM_APEX_TIME = 2.0             # s
+CAM_APEX_PAD = 20.0             # m past the apex the model must be straight too
 CAM_END_CONFIRM = 0.5           # s the end's conditions hold before it acts (one model frame of "straight" is not an end)
 CAM_OVER = 3.3                  # m/s^2 (the loops of drives 6f / 73 / 75 peaked 2.8-3.1, the turnaround 3.6)
 CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the farthest distance asked for
@@ -135,6 +141,7 @@ class CamInputs:
   test_mode: bool = False         # a Test mode governs: never press
   target: float = NO_CURVE        # m/s: the incoming curve target (camera or map) this frame (B1)
   map_covered: bool = False       # map curve data covers the road beyond the model's horizon (B1)
+  apex_d: object = None           # m to the governing map curve's apex (negative: passed), None unknown (R2 / R3)
   cam_target: float = NO_CURVE    # m/s: the camera curve target alone (its plan sees past the 3 s window: R1)
 
 
@@ -204,11 +211,17 @@ class CameraCurve:
     # (b) the phantom release: kept for that map curve until it changes / goes
     if self.phantom_id is not None and self.phantom_id != i.map_curve_id:
       self.phantom_id = None
-    pk_set = model_peak(i.model_x, i.model_k, max(i.set_speed, v), 0.5, 2.0) if model else None
-    straight = (guards and i.map_in_curve and lat < CAM_PHANTOM_LAT and pk_set is not None and pk_set < CAM_PHANTOM_LAT and
-                not i.cam_fault)
+    vq = max(i.set_speed, v)
     if i.map_curve_id != getattr(self, "count_id", None):
-      self.count_id, self.phantom_frames = i.map_curve_id, 0      # (another map curve: counted from its own start)
+      self.count_id, self.phantom_frames, self.ph_lat = i.map_curve_id, 0, 0.0   # (another map curve: its own count)
+    if i.map_in_curve:
+      self.ph_lat = max(self.ph_lat, lat)
+    pk_set = None
+    if model and i.apex_d is not None and 0.0 <= i.apex_d <= min(CAM_APEX_SEE, CAM_APEX_TIME * vq) and vq > 0:
+      pk_set = model_peak(i.model_x, i.model_k, vq, 0.0, (i.apex_d + CAM_APEX_PAD) / vq)   # (R2) straight through the apex
+    passed = i.apex_d is not None and i.apex_d < 0.0 and self.ph_lat < CAM_PHANTOM_LAT
+    straight = (guards and i.map_in_curve and not i.on_ramp and lat < CAM_PHANTOM_LAT and not i.cam_fault and
+                ((pk_set is not None and pk_set < CAM_PHANTOM_LAT) or passed))
     self.phantom_frames = self.phantom_frames + 1 if straight else 0
     if (self.phantom_id is None and i.map_curve_id and self.phantom_frames >= int(CAM_PHANTOM_TIME / DT_CTRL)):
       self.phantom_id = i.map_curve_id
