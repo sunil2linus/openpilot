@@ -77,7 +77,8 @@ CAM_RISE_TIME = 1.0             # s
 # the speed it began at; the rest by the normal restore.
 CAM_END_HYST = 0.3              # m/s^2
 CAM_END_DROP = 1 * MS_PER_MPH   # m/s
-CAM_END_STEP = 10 * MS_PER_MPH  # m/s
+CAM_END_STEP = 10 * MS_PER_MPH  # m/s: with the map covering the road beyond the model's view and no curve on it
+CAM_END_STEP_BLIND = 5 * MS_PER_MPH  # m/s: else (C5)
 # Re-review of round Q, R1: the end may not start, and is cancelled, while any incoming target (the camera's, the map's,
 # a map curve ahead's plan) is under the car's speed or the set + one step (the camera saw curve 2 at 30 mph with the car at
 # 55: the end ran SET+ to his speed). CAM_END_STEP bounds every end, ramps included; curve_on going off ends it as a cancel.
@@ -291,7 +292,8 @@ class CameraCurve:
                                          "ti_only": i.ti_only}))
     if self.ending:
       out.ending = True
-      out.end_goal = min(self.end_v0 + CAM_END_STEP, i.map_ahead)   # (R1 b) every end, ramps included
+      step = CAM_END_STEP if (i.map_covered and i.map_ahead >= NO_CURVE) else CAM_END_STEP_BLIND     # (C5)
+      out.end_goal = min(self.end_v0 + step, i.map_ahead)   # (R1 b) every end, ramps included
       return self._done(out, i)
     # (c) the in-curve +1 tap
     v1 = v + MS_PER_MPH

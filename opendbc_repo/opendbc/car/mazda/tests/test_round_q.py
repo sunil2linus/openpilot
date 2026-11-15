@@ -568,7 +568,7 @@ def test_review_b1_the_end_is_cancelled_when_the_next_curve_shows_up():
   assert any(e for t, e, c, g in seen if 2.0 < t < 4.0)
   assert any(c for t, e, c, g in seen if t >= 4.0) and not seen[-1][1]
   # unmapped beyond the model's horizon: the end's raise at most CAM_END_STEP over its speed
-  assert all(g <= v + CC.CAM_END_STEP + 1e-6 for t, e, c, g in seen if e)
+  assert all(g <= v + CC.CAM_END_STEP_BLIND + 1e-6 for t, e, c, g in seen if e)     # (C5: nothing mapped ahead)
 
 
 # ---- review of round Q, B2: navigation rerouted to a later exit (rq_review/q1two.py, q1two_b.py) ----
