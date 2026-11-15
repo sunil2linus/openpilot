@@ -440,6 +440,13 @@ LEAD_CURVE_LAT = 2.5           # m/s^2
 LEAD_CURVE_MAP_D = 150.0       # m
 LEAD_CURVE_VIEW = (0.0, 4.0)   # s ahead at the car's speed
 LEAD_CURVE_IN = 5.0            # m: the lead counts once it is this close to the map curve's start or past it (or we turn)
+# Round R, R8 (speed_limit_follow.NOGPS_FALLBACK): "no usable position" for rule 8's no-GPS fallback: the planner runs Map
+# Curves (mapCurveMode > 0) and either has had no fix at all (mapCurveStatus "no data" with mapGpsAccuracy 0: the planner gets
+# no GPS position) or its accuracy is worse than NOGPS_ACC_MAX, and nothing is matched (mapRoadClass 0). "GPS fine, the street
+# not in our map" (a parking lot, a subdivision street: a real accuracy, road class 0) is never it, nor a fix lost later (its
+# last accuracy is kept: no raise, the safe side). The fallback's raise also waits for no red light / planned stop / slow or
+# closing lead (NOGPS guards, besides the controller's).
+NOGPS_ACC_MAX = 50.0          # m
 LKAS_KEEP = True
 LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
 # Re-review of round P, N3 (rp_review2/keep_tight.py: a floor on the approach made the car enter a 30.4 mph curve at 33.5
@@ -2990,7 +2997,8 @@ class CurveSlowdown:
                        pending=bool(cruise_enabled and lg.anchor is not None and set_speed < lg.anchor - lg.half_step),
                        ours=bool(lg.anchor is not None and getattr(lg, "anchor_ours", False)),
                        stop_active=bool(self.trigger.active) and self.stop_mode == ON,
-                       red_light=bool(plan_alive and getattr(plan, "redLight", False)))
+                       red_light=bool(plan_alive and getattr(plan, "redLight", False)),
+                       no_gps=self._no_gps(plan, plan_alive))
       # rules 8 / 9 only act with Speed Limit Follow and Map Curves both On (second review: Map Curves in Test left the
       # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
       self.limit_follow.street_active = self._street_active(plan)
@@ -3041,7 +3049,7 @@ class CurveSlowdown:
       stop_clear_ahead=bool(self.trigger.clear_ahead) and self.stop_mode == ON,
       stop_pulling_away=bool(self.trigger.pulling_away) and self.stop_mode == ON,
       stop_slower_ahead=bool(self.trigger.slower_after_red) and self.stop_mode == ON,
-      limit_raise=self.limit_want if self.limit_mode == LIMIT_ON else 0.0,
+      limit_raise=(self.limit_want if self.limit_mode == LIMIT_ON and not self._nogps_wait(stop_inputs, lead, v_ego) else 0.0),
       limit_boost=self._merge_boost(),
       boost_road_ok=self._boost_road_ok(plan if self._alive('starpilotPlan') else None),
       merge_taper=self._merge_taper(plan if self._alive('starpilotPlan') else None),
@@ -3538,6 +3546,23 @@ class CurveSlowdown:
                            signals=False)
     self.lead_follow = {"target": target} if on else None
     return target if on else curve_speed
+
+  def _no_gps(self, plan, plan_alive):
+    """(NOGPS_ACC_MAX) no usable position at all, told apart from "GPS fine, the road not in our map"."""
+    if not plan_alive or int(getattr(plan, "mapCurveMode", 0) or 0) <= 0 or int(getattr(plan, "mapRoadClass", 0) or 0):
+      return False
+    acc = float(getattr(plan, "mapGpsAccuracy", 0.0) or 0.0)
+    no_fix = int(getattr(plan, "mapCurveStatus", 0) or 0) == 3 and acc <= 0.0       # (map_curves.STATUS_NO_DATA)
+    return bool(no_fix or acc > NOGPS_ACC_MAX)
+
+  def _nogps_wait(self, si, lead, v_ego):
+    """(NOGPS_ACC_MAX) the no-GPS fallback's raise waits: a red light, a planned stop, a slow or closing radar lead."""
+    lf = self.limit_follow
+    o = lf.offer if lf is not None else None
+    if o is None or o.source != "no GPS":
+      return False
+    slow = bool(self.trigger.radar_stable and float(lead.vLead) < v_ego - MERGE_LEAD_CLOSING)
+    return bool(si.red_light or self.plan_stop_raw or slow)
 
   def _merge_turn(self, CS, CP, v_ego, plan):
     """The ramp start's turn gate (MergeTurnGate): (a merge may start, a merge going up pauses)."""

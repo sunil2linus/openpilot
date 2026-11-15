@@ -265,6 +265,17 @@ ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "
 # the limit itself steady this long with GPS trust 0 on every frame of it (drive 55, t 627: his RES at a junction while the
 # cross road's 35 had been reported 3 s; it went after 4 s)
 ENGAGE_LIMIT_STEADY = 5.0    # s
+# Round R, R8 (drive 76 t 77-93, onto W Utica Rd from a subdivision: he engaged at 19 with no GPS fix yet; rule 8 waits for a
+# street matched with GPS trust 0, and its 43 fallback only ever lowers, so nothing happened; he held SET+ to 48 by hand).
+# Owner: "if there is no GPS our fallback speed was 43". When the cruise comes on (his SET / RES or our auto resume) with NO
+# usable position (LimitInputs.no_gps, the wrapper: the planner running Map Curves with no fix yet, or its accuracy worse
+# than curve_slowdown.NOGPS_ACC_MAX; never "GPS fine but the street not in our map": road class 0 on a parking lot / a 25
+# mph subdivision street stays as it is) and nothing matched (road class 0): rule 8 offers the fallback (43, up only, never
+# under his set), as a "match" offer the controller adopts with its usual guards (and the wrapper's NOGPS_* ones); the
+# match stays open (NOGPS_MATCH_WINDOW): once a street is matched with GPS trust 0 and his SET has not been touched since,
+# rule 8 decides again from his speed then (our 43: up or down to the street's limit + the offset).
+NOGPS_FALLBACK = True
+NOGPS_MATCH_WINDOW = 120.0   # s
 # Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
 LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
 # Round Q (drive 74 t 1104-1142: a 35 road, the set restored 30 -> 43 -> 51 -> 53): "the candidate's GPS trust" was the worst
@@ -368,6 +379,7 @@ class LimitInputs:
   ours: bool = False
   stop_active: bool = False # a stop reason (stopped car, stop ahead, red light head start) is on (rule 6's raise waits)
   red_light: bool = False   # the stop-light detector sees a red light (rule 6's raise waits)
+  no_gps: bool = False      # (NOGPS_FALLBACK) no usable position at all (no fix yet / far too poor), not "a road not mapped"
 
 
 @dataclass
@@ -469,6 +481,7 @@ class SpeedLimitFollower:
     self.lowered = None            # the last finished slowdown for a lower limit (LOWER_UNDO_TIME)
     self.lower_skip = None         # the limit a slowdown ended for by his decision: not again for it
     self.engage_frame = None       # cruise came on (rule 8 not decided yet)
+    self.nogps_open = None         # (NOGPS_FALLBACK) frame rule 8 took the fallback with no GPS: decided again once matched
     self.trust0_frames = 0         # consecutive frames with GPS trust 0
     self.unknown_frames = 0        # consecutive frames with no posted limit reported
     self.cand_name = ""            # the road name when the candidate limit first appeared ...
@@ -777,6 +790,12 @@ class SpeedLimitFollower:
     if not self.street_active:
       self.engage_frame = None
       return
+    no = self.nogps_open
+    if no is not None and self.engage_frame is None:
+      if self.frame - no > _frames(NOGPS_MATCH_WINDOW) or self.driver_set_frame > no + _frames(ENGAGE_SET_QUIET):
+        self.nogps_open = None           # (too late, or his own SET since: his)
+      elif not i.no_gps and self._street() and i.gps_trust <= LIMIT_FIRM_TRUST_MAX:
+        self.nogps_open, self.engage_frame = None, self.frame   # (NOGPS_FALLBACK) matched now: rule 8 decides again
     if self.engage_frame is not None:
       self._engage(i, d, reported)
     elif self.slow_lower:
@@ -789,6 +808,15 @@ class SpeedLimitFollower:
       self.engage_frame = None         # (too late, or his own SET since: his)
       return
     steady = _frames(ENGAGE_ROAD_STEADY)
+    if (NOGPS_FALLBACK and i.no_gps and not i.road_class and self.nogps_open is None and
+        self.frame - self.engage_frame <= _frames(ENGAGE_SET_QUIET) + 1):
+      # (NOGPS_FALLBACK) no usable position at the engagement: the fallback, up only, the match kept open
+      self.nogps_open, self.engage_frame = self.frame, None
+      tgt = max(self.fallback, self.street_floor)
+      if d < tgt - 0.5:
+        self.offer = Offer(None, tgt, "no GPS", self.frame, "match", d, tgt=tgt)
+        self._log("speedLimitMatch", "start: cruise on, up (no GPS: the fallback)", None, tgt, d, "none: no GPS")
+      return
     if not self._street() or self.frame - self.road_since < steady or self.trust0_frames < steady:
       return
     nav = self.nav

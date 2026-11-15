@@ -495,3 +495,61 @@ def test_r7_the_planner_publishes_a_ramp_curve_s_apex_once_inside_it():
   after = [g for fr, g in seen if fr > 0.75]
   assert before and all(g is not None and g > 0 for g in before), seen       # ahead, closing in
   assert after and all(g is not None and g < 0 for g in after), seen         # passed (the loop turns the bearing round)
+
+
+# ---------------- R8: engaged with no GPS at all: the 43 fallback ----------------
+
+_LI0 = SS.slf.LimitInputs
+
+
+def _nogps_run(monkeypatch, set_mph, no_gps_until=3000, street_from=3000, limit=45, gps_bad=True, frames=6000, driver=None):
+  """Cruise on at frame ENGAGE (his SET at set_mph); no position (no_gps) until no_gps_until, nothing matched (road class 0)
+  until street_from, then a street with `limit` (gps_bad False: GPS fine all along, the road simply not in our map)."""
+  orig = _LI0
+  st = {"f": 0}
+
+  def li(*a, **k):
+    return orig(*a, no_gps=bool(gps_bad and st["f"] < no_gps_until), **k)
+  monkeypatch.setattr(SS.slf, "LimitInputs", li)
+
+  def road(f):
+    st["f"] = f
+    return 7 if f >= street_from else 0
+  # (drive 76: he drove on the gas from 23 to 33 mph after his SET at 19)
+  return SS.street_sim(frames, lambda f: limit if f >= street_from else 0, set_mph, v_mph=24, road=road, driver=driver,
+                       gas=lambda f: 33 * MPH if SS.ENGAGE <= f < SS.ENGAGE + 600 else None, **SS._engage())
+
+
+def test_r8_no_gps_at_the_engagement_raises_to_43_then_the_streets_rules_take_over(monkeypatch):
+  r = _nogps_run(monkeypatch, 19)
+  at = r["sets"][2900]
+  assert abs(at - 43) < 0.6, at                                         # the fallback, before any road was matched
+  assert any("no GPS" in x for x in SS._reasons(r))
+  assert abs(r["sets"][-1] - 50) < 0.6, r["sets"][-1]                   # the 45 street matched: + 5 (Street Speed)
+  # a 25 street matched later: down to 30 (the 43 was ours)
+  r = _nogps_run(monkeypatch, 19, limit=25)
+  assert abs(r["sets"][2900] - 43) < 0.6 and abs(r["sets"][-1] - 30) < 0.6, (r["sets"][2900], r["sets"][-1])
+
+
+def test_r8_never_with_gps_fine_on_an_unmapped_street_nor_over_his_higher_set_nor_after_his_set(monkeypatch):
+  r = _nogps_run(monkeypatch, 19, gps_bad=False, street_from=10 ** 6)
+  assert r["presses"] == [] and abs(r["sets"][-1] - 19) < 0.6           # a 25 mph subdivision street: his 19 stays
+  r = _nogps_run(monkeypatch, 50, street_from=10 ** 6)
+  assert not SS._plus(r) and not SS._minus(r)                           # his own higher set: never lowered by this
+  # his SET+ after the fallback: his; the street matched later does not decide rule 8 again (rules 1 / 2 as always)
+  r = _nogps_run(monkeypatch, 19, driver=lambda f: cs.SET_PLUS if f == 2000 else None)
+  assert sum(1 for x in SS._reasons(r) if x.startswith("start: cruise on")) == 1, SS._reasons(r)
+  assert not SS._minus(r, 3000)
+
+
+def test_r8_the_wrapper_tells_no_gps_from_a_road_not_in_the_map(tmp_path, monkeypatch):
+  from types import SimpleNamespace as NS
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  P = lambda **k: NS(**{**dict(mapCurveMode=2, mapRoadClass=0, mapCurveStatus=0, mapGpsAccuracy=0.0), **k})  # noqa: E731
+  assert c._no_gps(P(mapCurveStatus=3), True)                          # no fix yet: the planner has no position
+  assert c._no_gps(P(mapGpsAccuracy=150.0), True)                      # a fix far too poor
+  assert not c._no_gps(P(mapGpsAccuracy=6.0), True)                    # GPS fine, the road not in our map
+  assert not c._no_gps(P(mapCurveStatus=3, mapGpsAccuracy=6.0), True)  # outside the curve files with a good fix
+  assert not c._no_gps(P(mapCurveStatus=3, mapRoadClass=7), True)
+  assert not c._no_gps(P(mapCurveStatus=3, mapCurveMode=0), True)      # Map Curves off: nothing known, no raise
+  assert not c._no_gps(P(mapCurveStatus=3), False)
