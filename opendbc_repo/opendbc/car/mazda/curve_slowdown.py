@@ -419,6 +419,26 @@ ENGAGE_AUTO_CLEAN_HOLDS = 3
 # works). It acts only near it (LKAS_KEEP_MARGIN, re-review N3: then its one bounded SET+ raise). While the LKAS is blocked (LKAS_BLOCK, kept
 # TI_ONLY_HYST after it clears) every curve is planned TI-only instead (map_curve_control.TI_ONLY_LAT,
 # curve_target.CurveTarget.ti_lat) and not floored. Stop slowdowns are unaffected.
+# Round R, R6 (owner: "for on-ramps, off-ramps or curves when there is a lead car, don't apply our slowdown at all"; but in 5 of
+# 10 curves of drives 6f-76 that began with a radar lead the stock radar lost it inside the curve, and with the set at the
+# anchor the car then sped up 0.5-0.8 m/s^2 in the loop): the bounded version. With a stable lead (radarState's lead tracked
+# LEAD_CURVE_TRACKED, the time gap at most LEAD_CURVE_GAP, in our path within LEAD_CURVE_Y of the model path, not closing at
+# MERGE_LEAD_CLOSING or more) on any curve / ramp: the curve target becomes min(his speed, max(the curve target, min(the
+# lead's speed + LEAD_CURVE_OVER, the speed at LEAD_CURVE_LAT on the governing radius))): we follow the lead up to ~7 %
+# above our own plan (2.2 -> 2.5 m/s^2), never more, and never a SET+ for it (it only holds SET- back). The lead lost /
+# away / out of the path: the curve target again (the normal SET- / hold). Not with the stock LKAS blocked, the camera's
+# fault or TI-only planning. The governing radius: the map curve's (when it governs or is within LEAD_CURVE_MAP_D) and the
+# camera model's tightest within LEAD_CURVE_VIEW s, the smaller; none known: no lead follow; only once the lead is in the
+# curve itself (LEAD_CURVE_IN; its approach speed says nothing about the curve). Events: leadCurveFollow.
+LEAD_CURVE = True
+LEAD_CURVE_TRACKED = 3.0       # s
+LEAD_CURVE_GAP = 2.5           # s
+LEAD_CURVE_Y = 1.5             # m
+LEAD_CURVE_OVER = 2 * MS_PER_MPH
+LEAD_CURVE_LAT = 2.5           # m/s^2
+LEAD_CURVE_MAP_D = 150.0       # m
+LEAD_CURVE_VIEW = (0.0, 4.0)   # s ahead at the car's speed
+LEAD_CURVE_IN = 5.0            # m: the lead counts once it is this close to the map curve's start or past it (or we turn)
 LKAS_KEEP = True
 LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
 # Re-review of round P, N3 (rp_review2/keep_tight.py: a floor on the approach made the car enter a 30.4 mph curve at 33.5
@@ -2509,6 +2529,9 @@ class CurveSlowdown:
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
     self.auto_resumed = False          # (ENGAGE_AUTO) set by carcontroller: the cruise came on by our auto resume's RES
+    self.lead_track_frames = 0         # (LEAD_CURVE) radarState's lead tracked without a jump
+    self.lead_prev_d = None
+    self.lead_follow = None            # (LEAD_CURVE) the follow going on: dict of its inputs at its start
     self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
     self.plan_stop_raw = False         # the model's planned stop this frame, before the road gating (M-b)
     self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
@@ -2835,6 +2858,14 @@ class CurveSlowdown:
           stop_active, cam_active0, cam_speed0)
       except Exception:
         self.cam_floor, self.cam_goal = None, None
+
+    try:
+      curve_speed = self._lead_curve(plan, plan_alive, v_ego, driver_speed, lead, lead_y_path, curve_active, curve_speed,
+                                     curve_floor)
+      if self.lead_follow is not None:
+        curve_raise = False            # (LEAD_CURVE) never a SET+ for the lead: it only holds SET- back
+    except Exception:
+      self.lead_follow = None
 
     # Posted limit (speed_limit_follow.py; Test: logged only). The driver's speed is the anchor itself, else the set
     # speed: set_speed + offset above mixes this frame's set speed with last frame's offset, a one-step blip on every
@@ -3346,6 +3377,67 @@ class CurveSlowdown:
       a, sp, fl, bu, tr, ra, hold, na, fr = res
       return (True, max(sp, keep), min(fl, keep) if fl > 0 else fl, bu, True, True, False, na, fr, False)
     return res + (False,)
+
+  def _lead_curve(self, plan, plan_alive, v_ego, driver_speed, lead, lead_y_path, curve_active, curve_speed, curve_floor):
+    """(LEAD_CURVE) the curve target with a stable lead in our path (m/s): raised toward the lead's speed, bounded by the
+    speed at LEAD_CURVE_LAT on the governing radius and his speed; else curve_speed as it was."""
+    alive = self._alive('radarState')
+    d = float(lead.dRel) if alive and lead.status else None
+    if d is not None and (self.lead_prev_d is None or abs(d - self.lead_prev_d) < 5.0):
+      self.lead_track_frames += 1
+    else:
+      self.lead_track_frames = 0
+    self.lead_prev_d = d
+    v_lead = float(lead.vLead) if d is not None else -1.0
+    stable = (d is not None and self.lead_track_frames >= _frames(LEAD_CURVE_TRACKED) and v_ego > 1.0 and
+              d / max(v_ego, 1.0) <= LEAD_CURVE_GAP and abs(lead_y_path) <= LEAD_CURVE_Y and
+              v_ego - v_lead < MERGE_LEAD_CLOSING and v_lead > 0)
+    ok_steer = not (self.ti_only or self.ti_fault or (self.has_ti and self.lkas_blocked))
+    radius = None
+    if curve_active and stable and ok_steer and driver_speed > 0 and LEAD_CURVE:
+      status = int(getattr(plan, "mapCurveStatus", 0) or 0) if plan_alive else 0
+      r_map = float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) if plan_alive else 0.0
+      d_map = float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) if plan_alive else 0.0
+      rs = []
+      map_known = status in (1, 2) and r_map > 0 and d_map <= LEAD_CURVE_MAP_D
+      if map_known:
+        rs.append(r_map)
+      # the lead's speed counts once it is in the curve itself (its approach speed says nothing about the curve)
+      lead_in = (map_known and d >= d_map - LEAD_CURVE_IN) or abs(self.turn_gate.lat) >= MERGE_TURN_LAT
+      if not lead_in:
+        rs = None
+      cm = self.cam_model
+      if rs is not None and cm is not None and cm[0] and (self.frame - cm[2]) * DT_CTRL <= 0.3:
+        lo, hi = LEAD_CURVE_VIEW[0] * v_ego, max(LEAD_CURVE_VIEW[1] * v_ego, 30.0)
+        k = max((abs(kk) for x, kk in zip(cm[0], cm[1], strict=False) if lo <= x <= hi and math.isfinite(kk)), default=0.0)
+        if k > 1e-4:
+          rs.append(1.0 / k)
+      radius = min(rs) if rs else None
+    target = curve_speed
+    if radius is not None:
+      cap = math.sqrt(LEAD_CURVE_LAT * radius)
+      step = self.logic.step
+      lead_t = math.floor(min(v_lead + LEAD_CURVE_OVER, cap) / step + 1e-3) * step   # (whole steps: the set never over it)
+      # the curve's own plan speed (not a follower's undershoot under it): a lead slower than our plan changes nothing
+      mo = self.map_out
+      owns = [mo.curve_speed] if (self.map_on_used and mo is not None and mo.active and mo.curve_speed < 100.0) else []
+      if self.curve_enabled and self.curve_target.active:
+        owns.append(self.curve_target.speed)
+      plan_v = min(owns) if owns else curve_speed
+      if lead_t > plan_v + 0.05:
+        # the curve's command moved up by the lead's margin over our plan (a follower's approach under its plan keeps its
+        # shape: the car still arrives at the new speed, not above it), never above it
+        target = min(driver_speed, max(curve_speed, min(lead_t, curve_speed + (lead_t - plan_v))))
+    on = radius is not None and target > curve_speed + 1e-3
+    if self.recorder is not None and on != (self.lead_follow is not None):
+      data = {"vEgo_mph": round(v_ego / MS_PER_MPH, 1), "curve_mph": round(min(curve_speed, 100.0) / MS_PER_MPH, 1),
+              "target_mph": round(min(target, 100.0) / MS_PER_MPH, 1), "lead_mph": round(v_lead / MS_PER_MPH, 1),
+              "lead_d": round(d or 0.0, 1), "lead_y_path": round(lead_y_path, 2), "radius_m": round(radius or 0.0, 1),
+              "driver_mph": round(driver_speed / MS_PER_MPH, 1), "stable": stable, "lkas_ok": ok_steer}
+      self.recorder.record("leadCurveFollow", time.monotonic(), dict(data, edge="start" if on else "end"), min_gap=0.0,
+                           signals=False)
+    self.lead_follow = {"target": target} if on else None
+    return target if on else curve_speed
 
   def _merge_turn(self, CS, CP, v_ego, plan):
     """The ramp start's turn gate (MergeTurnGate): (a merge may start, a merge going up pauses)."""

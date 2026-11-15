@@ -227,3 +227,53 @@ def test_r5_the_streets_limit_unknown_takes_the_43_fallback_and_never_a_raise():
   # the set already under the street's target (his 45 on the highway, a 55 street): left as it was
   r, exit_x = _exit_no_curve(ramp_to=55, set_mph=50)
   assert not TE._plus(r, exit_x, 10 ** 6) and r["sets"][-1] <= 50 + 1e-6
+
+
+# ---------------- R6: a stable lead in a curve: follow it, bounded ----------------
+
+W = _load("wcp_round_r", "test_car_profile_wrapper.py")
+
+
+def _lead_wrapper(tmp_path, monkeypatch):
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  rec = []
+  c.recorder = type("R", (), {"record": lambda self, kind, t, data, **kw: rec.append((kind, data))})()
+  plan = c.sm.msgs["starpilotPlan"]
+  plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = 1, 90.0, 0.0
+  return c, rec
+
+
+def _lead_run(c, frames, v_ego=30 * MPH, lead_v=32 * MPH, lead_d=20.0, curve=31.0, driver=45.0, lat=1.5, y=0.0):
+  lead = c.sm.msgs["radarState"].leadOne
+  out = None
+  for _ in range(frames):
+    c.frame += 1
+    lead.status, lead.dRel, lead.vLead = lead_d is not None, lead_d or 0.0, lead_v
+    c.turn_gate.lat = lat
+    out = c._lead_curve(c.sm.msgs["starpilotPlan"], True, v_ego, driver * MPH, lead, y, True, curve * MPH, 0.0)
+  return out / MPH
+
+
+def test_r6_a_stable_lead_in_the_curve_is_followed_up_to_the_lateral_bound(tmp_path, monkeypatch):
+  c, rec = _lead_wrapper(tmp_path, monkeypatch)
+  assert abs(_lead_run(c, 200) - 31.0) < 1e-6                     # not tracked LEAD_CURVE_TRACKED yet
+  t = _lead_run(c, 200)
+  bound = (2.5 * 90.0) ** 0.5 / MPH                                 # 33.6 mph at LEAD_CURVE_LAT on R90
+  assert t <= bound and abs(t - 33.0) < 1e-6, t                     # min(lead + 2, bound) in whole mph
+  assert [k for k, _ in rec] == ["leadCurveFollow"] and rec[0][1]["edge"] == "start"
+  # a faster lead: still the bound; his own speed under it: his speed
+  assert abs(_lead_run(c, 10, lead_v=40 * MPH) - 33.0) < 1e-6
+  assert abs(_lead_run(c, 10, lead_v=40 * MPH, driver=32.0) - 32.0) < 1e-6
+  # lost: the curve target again at once, the end logged
+  assert abs(_lead_run(c, 1, lead_d=None) - 31.0) < 1e-6 and rec[-1][1]["edge"] == "end"
+
+
+def test_r6_no_follow_for_a_slower_far_closing_or_other_lane_lead_nor_with_the_ti_alone(tmp_path, monkeypatch):
+  for kw in (dict(lead_v=29 * MPH), dict(lead_d=80.0), dict(lead_v=20 * MPH), dict(y=2.5), dict(lat=0.2, lead_d=20.0)):
+    c, rec = _lead_wrapper(tmp_path, monkeypatch)
+    if "lat" in kw:
+      c.sm.msgs["starpilotPlan"].mapCurveDistance = 60.0           # the lead not in the curve yet, nor we
+    assert abs(_lead_run(c, 400, **kw) - 31.0) < 1e-6, kw
+  c, rec = _lead_wrapper(tmp_path, monkeypatch)
+  c.ti_only = True
+  assert abs(_lead_run(c, 400) - 31.0) < 1e-6
