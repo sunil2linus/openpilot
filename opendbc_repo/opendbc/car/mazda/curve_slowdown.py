@@ -547,7 +547,8 @@ MERGE_MODEL_REND = 100.0          # m
 # the set back with one SET- hold to the car's speed rounded + MERGE_MODEL_BACK (never above where it is), held there until
 # the turn gate is ok. (wsim, a 40 m view: an unmapped R40 / R60 turn 50-80 m after the loop, see the commit for the worst
 # case; mapped later curves as the base.)
-MERGE_MODEL_OPEN_T = 3.5          # s
+MERGE_MODEL_OPEN_T = 5.0          # s (re-review G1-C: 3.5 -> 5, what a long view sees counts; it also pauses a running one)
+MERGE_MODEL_LOOP_SLACK = 0.1      # m/s^2 (re-review G1-A, merge_csc_loop)
 MERGE_MODEL_STEP = (15 * MS_PER_MPH, 24 * MS_PER_KPH)
 MERGE_MODEL_BACK = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
 # No camera-only stop start on a highway (mapRoadClass motorway / trunk-highway) above this speed (see CurveSlowdown.update)
@@ -655,6 +656,12 @@ class SlowdownInputs:
   merge_model_pk: float = -1.0
   merge_winding: bool = False
   merge_lane_ok: bool = True      # (MERGE_MODEL_OPEN, F4) the camera's lane lines at CAM_LANE_PROB
+  # (G1, re-review G1-C) the model's peak from 2.25 s out to min(its path / the speed, MERGE_MODEL_OPEN_T) (-1 unknown): at
+  # MERGE_MODEL_LAT or more a boost the model opened pauses
+  merge_model_far: float = -1.0
+  # (re-review G1-A) the camera's curve target is the loop being left: the model straight from 2.25 s out and nothing
+  # tighter from 0.5 s on than the car's lateral now / the first 0.5 s (its tightest point now or behind)
+  merge_csc_loop: bool = False
   red_light: bool = False         # starpilotPlan.redLight (raw): no merge start under it, its way up pauses
   # ... as the stop trigger sees it (its red_ok: not at highway speed on a highway, not on a ramp onto one): no SET+ back
   # up from one of our stop slowdowns under it (RESUME_RESTORE, at most RED_STOP_BLOCK_MAX from its onset)
@@ -765,6 +772,7 @@ class CurveSlowdownLogic:
   def __init__(self, is_metric: bool, max_drop_mph: float = DEFAULT_MAX_DROP_MPH):
     self.step = MS_PER_KPH if is_metric else MS_PER_MPH
     self.half_step = self.step / 2
+    self.csc_raw = (False, 0.0, False)   # (re-review G1-A) the camera's curve target as it came (active, m/s, followed)
     self.max_drop_steps = int(round(max_drop_mph * 1.609344)) if is_metric else int(round(max_drop_mph))
     self.max_lower_presses = self.max_drop_steps + EXTRA_LOWER_PRESSES
     self.frame = 0
@@ -1097,9 +1105,11 @@ class CurveSlowdownLogic:
       return
     if "model" in b and "ended" not in b:
       m = b["model"]
-      if i.merge_turn_ok and not i.merge_turn_pause:
-        # (MERGE_MODEL_OPEN) the turn gate is ok now: a normal boost; (G1) up to its full top (held back after a second
-        # bend, or bounded at the speed + MERGE_MODEL_STEP: the full boost goes on, with a hold)
+      held_back = self._model_held_back(i)
+      if i.merge_turn_ok and not i.merge_turn_pause and not held_back:
+        # (MERGE_MODEL_OPEN) the turn gate is ok now and (re-review G1-A/B) the normal start's checks too (no curve target
+        # but the loop's, no slow / closing lead, no red light, no stop, the road): a normal boost; (G1) up to its full top
+        # (held back after a second bend, or bounded at the speed + MERGE_MODEL_STEP: the full boost goes on, with a hold)
         if not self.blocked and "taper" not in b:
           self.anchor, self.anchor_ours = m["top"], True
           self.raise_fast = True
@@ -1110,7 +1120,7 @@ class CurveSlowdownLogic:
         m["up_done"] = True
         self.anchor = min(self.anchor if self.anchor is not None else self.last_set_speed, self.last_set_speed)
         self.anchor_ours = True
-      if "model" in b and m.get("hold") is None and self._model_stop(i) and not self.blocked:
+      if "model" in b and m.get("hold") is None and (self._model_stop(i) or held_back) and not self.blocked:
         # (MERGE_MODEL_OPEN) an S-curve / a second bend: (G1) the set back with one SET- hold to the car's speed rounded +
         # MERGE_MODEL_BACK (never up: at most where it is, at least the set at the start), held there (the boost's way
         # up paused) until the turn gate is ok
@@ -1128,8 +1138,12 @@ class CurveSlowdownLogic:
     self.boost_csc_frames = self.boost_csc_frames + 1 if low_curve else 0
     csc_end = low_curve and self.boost_csc_frames >= _frames(MERGE_CSC_END)      # (MERGE_CSC_END)
     if "ended" not in b:
-      if (i.v_ego >= tgt - MERGE_BOOST_END or not cruise_ok or self.blocked or i.stop_active or csc_end or
-          self._lead_blocks_boost(i) or i.brake_pressed or not i.boost_road_ok or
+      # (re-review G1-A/B) a boost the model opened, before the turn gate: a curve target ahead / a slow lead pause it (back
+      # to the speed + MERGE_MODEL_BACK, _model_held_back), they do not end it: the full boost comes once they are gone and
+      # the gate is ok, as the base's start then
+      in_model = "model" in b
+      if (i.v_ego >= tgt - MERGE_BOOST_END or not cruise_ok or self.blocked or i.stop_active or (csc_end and not in_model) or
+          (self._lead_blocks_boost(i) and not in_model) or i.brake_pressed or not i.boost_road_ok or
           self.frame - b["frame"] > _frames(MERGE_BOOST_TIME)):
         if his:
           self.boost = None            # his own buttons: the speed is his
@@ -1202,12 +1216,26 @@ class CurveSlowdownLogic:
       return b["model"].get("hold") is not None or self._model_stop(i) or (MERGE_RED_PAUSE and self._merge_red(i))
     return i.merge_turn_pause or (MERGE_RED_PAUSE and self._merge_red(i))
 
+  def _model_held_back(self, i):
+    """(re-review G1-A/B) what holds a boost the model opened back (its pause, and no full boost at the turn gate): the
+    normal merge start's checks. A curve target counts unless it is the loop being left (merge_csc_loop, at or above the
+    car's speed - MERGE_MODEL_CSC); a slow / closing lead, the red light, a stop, the road no longer the link's."""
+    act, spd, track = self.csc_raw
+    # (the camera's target counts as the base start sees it: active at the driver's speed before the boost, drv0, not
+    # only at the bounded set the car has now)
+    seen = act or spd < self.boost["model"].get("drv0", 0.0)
+    curve = seen and (track or not i.merge_csc_loop or spd < i.v_ego - MERGE_MODEL_CSC)
+    return (curve or self._lead_blocks_boost(i) or self._merge_red(i) or i.stop_active or i.hold_restore or
+            not i.boost_road_ok)
+
   def _model_stop(self, i):
     """(MERGE_MODEL_OPEN) a boost the model opened stops: the lateral up MERGE_MODEL_MARGIN on its start, the wheel winding
     up, the model's 0.5-3 s peak above the start lateral + MERGE_MODEL_MARGIN (no model: the turn gate's pause)."""
     lat0 = self.boost["model"]["lat0"]
     if i.merge_winding or i.merge_lat > lat0 + MERGE_MODEL_MARGIN or not i.merge_lane_ok:
       return True
+    if i.merge_model_far >= MERGE_MODEL_LAT:
+      return True                      # (re-review G1-C) a turn the model sees out to MERGE_MODEL_OPEN_T
     if i.merge_model_pk < 0:
       return i.merge_turn_pause
     return i.merge_model_pk > lat0 + MERGE_MODEL_MARGIN
@@ -1700,15 +1728,18 @@ class CurveSlowdownLogic:
     self.phase_lock = HOLD_PHASE_LOCK and i.btn_counter >= 0
     if self.disabled:
       return None, None
+    # (re-review G1-A) the camera's curve target as it came (the boost's start checks at the turn gate see it whole)
+    self.csc_raw = (i.csc_active, i.csc_speed, i.curve_track)
     if (self.boost is not None and "ended" not in self.boost and i.csc_active and not i.curve_track and
         i.csc_speed >= i.v_ego + MERGE_CSC_NEAR):
       i = replace(i, csc_active=False)   # (MERGE_CSC_NEAR) a curve target far above the speed: no curve for the boost
     b0 = self.boost
-    model_now = ((b0 is None and i.merge_model_open and i.limit_boost > 0 and i.limit_raise > 0) or
+    # (MERGE_MODEL_CSC) only for the model's own opening (the turn gate not ok yet) and the boost it opened before the gate,
+    # and only the loop being left (merge_csc_loop: never a curve ahead), at the car's speed now
+    model_now = ((b0 is None and i.merge_model_open and i.limit_boost > 0 and i.limit_raise > 0 and not i.merge_turn_ok) or
                  (b0 is not None and "model" in b0 and "ended" not in b0))
-    v_ref = i.v_ego if (b0 is None or "model" not in b0) else min(i.v_ego, b0["model"]["v0"])
-    if (MERGE_MODEL_OPEN and model_now and i.csc_active and not i.street_lower and
-        i.csc_speed >= v_ref - MERGE_MODEL_CSC):
+    if (MERGE_MODEL_OPEN and model_now and i.csc_active and not i.street_lower and not i.curve_track and i.merge_csc_loop and
+        i.csc_speed >= i.v_ego - MERGE_MODEL_CSC):
       i = replace(i, csc_active=False)   # (MERGE_MODEL_CSC) the loop being left: no curve for the merge
     cruise_ok = i.cruise_enabled and i.set_speed > 0
     self.cruise_on_frames = self.cruise_on_frames + 1 if cruise_ok else 0
@@ -2151,7 +2182,8 @@ class CurveSlowdownLogic:
       if i.limit_boost > 0 and not self._lead_blocks_boost(i) and i.boost_road_ok:
         self.boost = {"target": i.limit_raise, "frame": self.frame}
         if model_open:
-          self.boost["model"] = {"lat0": i.merge_lat, "set0": i.set_speed, "v0": i.v_ego}    # (MERGE_MODEL_OPEN)
+          self.boost["model"] = {"lat0": i.merge_lat, "set0": i.set_speed, "v0": i.v_ego,     # (MERGE_MODEL_OPEN)
+                                 "drv0": self.limit_adopted[0]}
         top = self._set_top()
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
         self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
@@ -2192,7 +2224,9 @@ class CurveSlowdownLogic:
           return SET_PLUS, off
       return None, None
     if (self.boost is not None and "ended" not in self.boost and self._merge_paused(i) and
-        self.anchor is not None and self.offset > 0):
+        self.anchor is not None and self.offset > 0 and not ("model" in self.boost and reason is not None)):
+      # (re-review G1-A) a boost the model opened, paused for a curve ahead: the curve's own slowdown goes on (the base's
+      # boost would not have started; a normal boost ends on MERGE_CSC_END)
       return None, None                # (MERGE_TURN_PAUSE, MERGE_RED_PAUSE) the merge's way up waits
 
     want_lower = False
@@ -2446,6 +2480,9 @@ class CurveSlowdownLogic:
       self.anchor_ours = False
     if hold:
       self.hold_wait_frame = None
+    if (button == SET_PLUS and not hold and self.boost is not None and "model" in self.boost and
+        "ended" not in self.boost):
+      return None, None                # (re-review G1-C) the bounded raise is one SET+ hold, never taps
     if hold and self.phase_lock and not self.new_wheel:
       self._start_hold(button)        # its first frame goes out with the next wheel frame
       off = None
@@ -2462,7 +2499,10 @@ class CurveSlowdownLogic:
     if hold and self.hold_kind == "boost_up" and self.boost is not None and "model" in self.boost:
       self.boost["model"]["up_held"] = True      # (G1) the bounded raise: one SET+ hold, then no taps after it
     if button == SET_MINUS and want_lower:
-      if reason == "curve":
+      bm = self.boost["model"] if (self.boost is not None and "model" in self.boost) else None
+      if reason == "curve" and bm is not None and set_speed > bm["set0"] + self.half_step:
+        pass                           # (re-review G1-A) undoing the raise the model opened: not the curve's own budget
+      elif reason == "curve":
         self.lower_presses += 1
       else:
         self.stop_presses += 1
@@ -3779,7 +3819,8 @@ class CurveSlowdown:
     if not ((mc0 is not None and mc0.link_now) or (b is not None and "model" in b)):
       self.model_open_frames, self.merge_model_now = 0, False
       self.merge_model_later = self.merge_model_was_in = False     # (G1) off the link: forgotten
-      return dict(merge_model_open=False, merge_lat=lat, merge_model_pk=-1.0, merge_winding=winding, merge_lane_ok=True)
+      return dict(merge_model_open=False, merge_lat=lat, merge_model_pk=-1.0, merge_winding=winding, merge_lane_ok=True,
+                  merge_model_far=-1.0, merge_csc_loop=False)
     view = self._model_view() if MERGE_MODEL_OPEN else None
     pk = model_peak(view[0], view[1], v, 0.5, 3.0) if view is not None and v > 1.0 else None
     pk25 = None
@@ -3795,8 +3836,16 @@ class CurveSlowdown:
                            max(min(view[0][-1] / v, MERGE_MODEL_OPEN_T), MERGE_MODEL_AT + MERGE_MODEL_WINDOW))
     # (the stop rule watches the 0.5-3 s peak and that far window: a tighter turn coming into the model's view)
     pk_stop = max(pk, pk25) if (pk is not None and pk25 is not None) else pk
+    # (re-review G1-A) the camera's curve target is the loop being left: straight from 2.25 s out (pk_open) and nothing
+    # tighter from 0.5 s to 2.25 s than the first 0.5 s or the car's lateral now
+    loop = False
+    if pk_open is not None and pk_open < MERGE_MODEL_LAT:
+      pk_near = model_peak(view[0], view[1], v, 0.0, 0.5)
+      pk_mid = model_peak(view[0], view[1], v, 0.5, MERGE_MODEL_AT - MERGE_MODEL_WINDOW)
+      loop = pk_mid is not None and pk_mid <= max(pk_near or 0.0, lat) + MERGE_MODEL_LOOP_SLACK
     out = dict(merge_model_open=False, merge_lat=lat, merge_model_pk=pk_stop if pk_stop is not None else -1.0,
-               merge_winding=winding, merge_lane_ok=bool(view is not None and view[2] >= CAM_LANE_PROB))
+               merge_winding=winding, merge_lane_ok=bool(view is not None and view[2] >= CAM_LANE_PROB),
+               merge_model_far=pk_open if pk_open is not None else -1.0, merge_csc_loop=loop)
     mc = self.map_control
     if MERGE_MODEL_OPEN and plan is not None and mc is not None and mc.link_now:
       # (G1) for the rest of this link, once the map showed a curve ahead whose own speed is under the bounded raise (the

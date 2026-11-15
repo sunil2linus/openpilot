@@ -302,8 +302,8 @@ def _loop_end(gate_at=400, model_from=100, lat=lambda f: 2.1, pk=lambda f: 0.5, 
              limit_raise=75 * MPH if lg.boost is None and lg.limit_raised is None else 0.0,
              limit_boost=20 * MPH if lg.boost is None and lg.limit_raised is None else 0.0,
              merge_turn_ok=f >= gate_at, merge_turn_pause=f < gate_at, merge_turning=f < gate_at,
-             csc_active=f < gate_at, csc_speed=v0 * MPH,
-             merge_model_open=f >= model_from, merge_lat=lat(f), merge_model_pk=pk(f))
+             csc_active=f < gate_at, csc_speed=car.v_ego,
+             merge_model_open=f >= model_from, merge_lat=lat(f), merge_model_pk=pk(f), merge_csc_loop=True)
     if extra:
       d.update(extra(f, car))
     btn, _ = lg.update(TP._inp(**d))
@@ -418,11 +418,13 @@ def test_r1_the_wrappers_model_view_and_its_guards(tmp_path, monkeypatch):
   assert not c._merge_model(W.car_state(31.0, 31.0), None, c.sm.msgs["starpilotPlan"], 14.0)["merge_model_open"]
 
 
-def test_g1_the_models_view_to_open_reaches_3_5_s_or_its_paths_end(tmp_path, monkeypatch):
-  # 14 m/s: a turn (1.5 m/s^2) 3.2 s ahead (45 m) holds it back, one 4.5 s ahead (63 m, past MERGE_MODEL_OPEN_T) does not
+def test_g1_the_models_view_to_open_reaches_5_s_or_its_paths_end(tmp_path, monkeypatch):
+  # 14 m/s: a turn (1.5 m/s^2) 3.2 s ahead (45 m) or (re-review G1-C) 4.5 s ahead (63 m) holds it back, one 6 s ahead (84 m,
+  # past MERGE_MODEL_OPEN_T 5 s) does not
   turn = 1.5 / 14.0 ** 2
   assert not _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 42 < x < 50 else 0.0)[1]["merge_model_open"]
-  assert _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 60 < x < 70 else 0.0)[1]["merge_model_open"]
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 60 < x < 70 else 0.0)[1]["merge_model_open"]
+  assert _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 80 < x < 95 else 0.0)[1]["merge_model_open"]
   # a 40 m path (2.9 s): straight to its end opens (no horizon rule: G1); a turn at its end does not
   assert _merge_model_wrapper(tmp_path, monkeypatch, path=40.0, rend=60.0)[1]["merge_model_open"]
   assert not _merge_model_wrapper(tmp_path, monkeypatch, path=40.0, rend=60.0,
@@ -458,6 +460,47 @@ def test_g1_the_model_opened_boost_is_bounded_and_its_stop_takes_one_set_minus_h
   assert abs(s_end - (round(v_stop) + 2)) <= 1.0 + 1e-6, (s_end, v_stop)
   assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if 350 <= f < 1000)
   assert max(s for f, s, *_ in log if f >= 1000) > s_end + 5
+
+
+def test_g1_rereview_the_gate_runs_the_normal_start_checks_and_a_lead_or_a_curve_ahead_pauses_it():
+  # (G1-B) a slow lead appears after the opening: the pause (back to the speed + 2), and no full boost at the gate while it
+  # is there (the base's never starts in front of it); the full boost once it is gone
+  def lead(f, car):
+    return dict(radar_lead=300 <= f < 1100, lead_v=car.v_ego - 6 * MPH)
+  car, lg, log = _loop_end(gate_at=700, frames=2000, extra=lead)
+  assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 300 <= f < 700)
+  assert max(s for f, s, *_ in log if 700 <= f < 1100) <= round(log[300][2]) + 2 + 1e-6
+  assert max(s for f, s, *_ in log if f >= 1100) >= 60
+  # (G1-A) a camera curve target ahead (not the loop's: merge_csc_loop off) under his speed before the boost (45) at the
+  # gate: paused, no full boost until it is gone
+
+  def ahead(f, car):
+    return dict(csc_active=300 <= f < 1100, csc_speed=37 * MPH, merge_csc_loop=f < 300)
+  car, lg, log = _loop_end(gate_at=700, frames=2000, extra=ahead)
+  assert max(s for f, s, *_ in log if 700 <= f < 1100) <= 46 + 1e-6
+  assert max(s for f, s, *_ in log if f >= 1100) >= 60
+  # ... even when the camera's target is not active at the bounded set: it counts under his speed before the boost (31 here)
+
+  def quiet(f, car):
+    return dict(csc_active=False, csc_speed=30 * MPH if 300 <= f < 1100 else 100.0, merge_csc_loop=f < 300)
+  car, lg, log = _loop_end(gate_at=700, frames=2000, extra=quiet)
+  assert max(s for f, s, *_ in log if 700 <= f < 1100) <= 46 + 1e-6
+  # (G1-C) a turn the model sees out to 5 s (merge_model_far >= 1.1) while it runs: the pause
+
+  def far(f, car):
+    return dict(merge_model_far=1.5 if f >= 300 else 0.2)
+  car, lg, log = _loop_end(gate_at=900, frames=1200, extra=far)
+  assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 300 <= f < 900)
+
+
+def test_g1_rereview_a_normal_start_at_the_gate_sees_the_camera_curve_as_the_base():
+  # the model's conditions still on as the turn gate opens, a camera curve target active: no start (base), nothing dropped
+  for loop in (False, True):
+    car, lg, log = _loop_end(gate_at=0, model_from=0, frames=600,
+                             extra=lambda f, car, loop=loop: dict(csc_active=True, csc_speed=car.v_ego, merge_csc_loop=loop,
+                                                                  merge_turn_ok=True, merge_turn_pause=False))
+    assert lg.boost is None or "model" not in lg.boost
+    assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log), log[:3]
 
 
 def test_r1_the_ramps_end_distance_is_kept_when_the_ramp_flag_drops():
