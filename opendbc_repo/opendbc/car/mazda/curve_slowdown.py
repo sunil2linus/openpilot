@@ -511,7 +511,7 @@ MERGE_TURN_ACCEL_TAU = 0.3        # s
 # tighter turn coming into view; no model: as the turn gate). Then the set goes
 # back to max(the car's speed rounded, the set at the start) by the normal rules (SET- taps; the boost opens again on the
 # turn gate: the boosted anchor back). Once the turn gate is ok it is a normal boost.
-MERGE_MODEL_OPEN = True
+MERGE_MODEL_OPEN = False  # off: the review found a full boost past a tracked lead with a curve ahead; the reviewed state is OFF
 MERGE_MODEL_LAT = 1.1             # m/s^2
 MERGE_MODEL_AT = 2.5              # s ahead
 MERGE_MODEL_WINDOW = 0.25         # s either side of MERGE_MODEL_AT

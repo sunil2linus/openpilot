@@ -2,6 +2,8 @@
 import importlib.util
 import os
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 
 
@@ -318,6 +320,17 @@ def _first_up(log):
   return next((f for f, s, v, b, *_ in log if b == cs.SET_PLUS), None)
 
 
+@pytest.fixture(autouse=True)
+def _model_open_on_for_its_own_tests(request, monkeypatch):
+  # MERGE_MODEL_OPEN ships OFF (the review: a full boost past a tracked lead with a curve ahead); its tests switch it on
+  if request.node.name.startswith(("test_r1_", "test_g1_")):
+    monkeypatch.setattr(cs, "MERGE_MODEL_OPEN", True)
+
+
+def test_the_model_opening_ships_switched_off():
+  assert cs.MERGE_MODEL_OPEN is False
+
+
 def test_r1_the_model_opens_the_boost_before_the_turn_gate():
   car, lg, log = _loop_end()
   f_up = _first_up(log)
@@ -362,6 +375,8 @@ def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0
                          kfn=None, path=190.0, was_in=False):
   from types import SimpleNamespace as NS
   c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  import sys
+  monkeypatch.setattr(sys.modules[type(c).__module__], "MERGE_MODEL_OPEN", True)   # (ships off) the wrapper's own module
   m = c.sm.msgs["modelV2"]
   xs = [path * (j / 32) ** 2 for j in range(33)]
   m.position = NS(x=xs, y=[0.0] * 33)
