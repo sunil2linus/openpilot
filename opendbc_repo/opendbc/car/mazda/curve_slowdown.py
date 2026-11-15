@@ -956,7 +956,7 @@ class CurveSlowdownLogic:
         self.last_set_speed is not None and self.last_set_speed > tgt + self.half_step and not self.blocked):
       # (MERGE_LEAD_GONE_REOPEN) the lead gone in a turn with the boosted set speed above the target: down at once
       self.boost_reopen = {"target": tgt, "frame": b["frame"]}
-      self.anchor = tgt
+      self.anchor, self.anchor_ours = tgt, True  # (re-review R4) the boost's own target: ours
       self.restore_pending = True
       b["ended"] = self.frame
       return
@@ -977,7 +977,7 @@ class CurveSlowdownLogic:
         # (the anchor is forgotten once the set speed got to the boosted speed: that is still ours to take back)
         top = self.anchor if self.anchor is not None else (self.last_set_speed or 0.0)
         if top > tgt + self.half_step:
-          self.anchor = tgt
+          self.anchor, self.anchor_ours = tgt, True  # (re-review R4) the boost's own target: ours
         self.restore_pending = True
         b["ended"] = self.frame
       elif MERGE_TAPER and "taper" not in b and not his and (i.v_ego >= tgt - self._metric_pick(MERGE_TAPER_GAP) or
@@ -987,7 +987,7 @@ class CurveSlowdownLogic:
         top = self.anchor if self.anchor is not None else (self.last_set_speed or 0.0)
         b["taper"] = self.frame
         if top > over + self.half_step:
-          self.anchor = over
+          self.anchor, self.anchor_ours = over, True  # (re-review R4) the boost's own target: ours
           self.restore_pending = True
       return
     if his or (self.anchor is not None and abs(self.anchor - tgt) > self.half_step):
@@ -999,7 +999,7 @@ class CurveSlowdownLogic:
     if cruise_ok and self.anchor is None and self.last_set_speed is not None:
       # (review: forgotten after openpilot was off PAUSE_ABANDON, the car not answering, his cancel) still ours to take
       # back to the target
-      self.anchor = tgt
+      self.anchor, self.anchor_ours = tgt, True  # (re-review R4) the boost's own target: ours
       self.restore_pending = True
     if self.last_set_speed is not None and abs(self.last_set_speed - b.get("set", -1.0)) > self.half_step:
       b["set"], b["moved"] = self.last_set_speed, self.frame      # (a press of ours landed)

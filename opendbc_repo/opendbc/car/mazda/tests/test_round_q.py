@@ -882,3 +882,20 @@ def test_rereview_c7_the_planner_publishes_the_governing_curves_apex():
   plan = N()
   mp.publish(plan)
   assert not plan.mapCurveApexValid
+
+
+def test_rereview_r4_the_boosts_own_target_as_the_anchor_is_ours():
+  class Quiet:
+    def __getattr__(self, k):
+      return 0.0
+  logic = cs.CurveSlowdownLogic(False, 10)
+  # forgotten (openpilot off, his cancel): the boost's target taken back on as the anchor is ours (the limit cap may lower it)
+  logic.boost = {"target": 20.0, "frame": 0, "ended": 0}
+  logic.anchor, logic.anchor_ours, logic.last_set_speed = None, False, 25.0
+  logic._boost_update(Quiet(), True)
+  assert logic.anchor == 20.0 and logic.anchor_ours and logic.restore_pending
+  # his SET+ reaching the anchor: nothing of ours left
+  logic.restoring, logic.inflight = False, []
+  logic.anchor, logic.anchor_ours, logic.last_set_speed, logic.boost = 20.0, True, 20.0, None
+  logic._driver_change(cs.SET_PLUS, 1)
+  assert logic.anchor is None and not logic.anchor_ours
