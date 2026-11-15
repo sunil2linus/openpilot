@@ -808,3 +808,18 @@ def test_rereview_r5_ghost_marks_by_the_curves_own_way_and_old_records_do_not_ra
   mem.add_ghost(c, way=MC.curve_way(c))
   # looked up by the curve's own way whatever way the car was matched to when the pass began (a later way of the chain)
   assert MC.curve_way(c) == 42 and mem.ghost(c, way=MC.curve_way(c)) == 2
+
+
+def test_rereview_c2_the_too_fast_latch_ends_cam_over_hold_after_the_lateral_is_back(tmp_path):
+  # a loop whose entry peaked 2.8 (margin in): no taps then, taps in its gentler middle CAM_OVER_HOLD later
+  v = 30 * MPH
+  cc = CC.CameraCurve()
+  taps = []
+  for f in range(1200):
+    lat = 2.8 if f < 150 else 1.2
+    xs, ks = _path(lambda x, lat=lat: lat / (v * v))
+    o = cc.update(CC.CamInputs(v_ego=v, set_speed=28 * MPH, lat=lat, model_x=xs, model_k=ks, lane_prob=0.8, torque=0.4,
+                               curve_on=True, map_in_curve=True))
+    if o.tap:
+      taps.append(f)
+  assert taps and taps[0] >= 150 + CC.CAM_OVER_HOLD / DT - 1, taps[:1]

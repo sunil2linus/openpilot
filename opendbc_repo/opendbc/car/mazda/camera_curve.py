@@ -86,7 +86,10 @@ CAM_APEX_SEE = 110.0            # m (map_curves.VETO_SEE_MAX)
 CAM_APEX_TIME = 2.0             # s
 CAM_APEX_PAD = 20.0             # m past the apex the model must be straight too
 CAM_END_CONFIRM = 0.5           # s the end's conditions hold before it acts (one model frame of "straight" is not an end)
-CAM_OVER = 3.3                  # m/s^2 (the loops of drives 6f / 73 / 75 peaked 2.8-3.1, the turnaround 3.6)
+# (C2) 2.5 on the margin-corrected lateral; the latch ends CAM_OVER_HOLD after the lateral is back under the limit (a loop's
+# entry peaked ~2.8, its gentler middle may still get taps: drive 75, taps geometrically fine from ~1152)
+CAM_OVER = 2.5                  # m/s^2
+CAM_OVER_HOLD = 4.0             # s
 CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the farthest distance asked for
 
 NO_CURVE = 1000.0
@@ -172,6 +175,7 @@ class CameraCurve:
     self.phantom_frames = 0
     self.prev_set = None
     self.over = False                # (CAM_OVER) this curve was driven too fast: no taps, no end
+    self.over_clear = 0              # (C2) frames back under the limit since
     self.end_frames = 0              # (CAM_END_CONFIRM)
     self.end_done = False            # (B1) an end was cancelled in this curve slowdown: no new one until it is over
     self.end_v0 = 0.0                # m/s: the speed when the end began
@@ -211,7 +215,11 @@ class CameraCurve:
         self._cancel(out, "curve off", lat)     # (R1 c) as a cancel: no restore of ours left behind
       self.ending, self.over, self.end_done = False, False, False
     elif lat >= CAM_OVER:
-      self.over = True
+      self.over, self.over_clear = True, 0
+    elif self.over:
+      self.over_clear = self.over_clear + 1 if lat < lim else 0
+      if self.over_clear >= int(CAM_OVER_HOLD / DT_CTRL):
+        self.over = False                     # (C2) CAM_OVER_HOLD back under the limit
     # (b) the phantom release: kept for that map curve until it changes / goes
     if self.phantom_id is not None and self.phantom_id != i.map_curve_id:
       self.phantom_id = None
