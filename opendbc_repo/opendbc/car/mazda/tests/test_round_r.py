@@ -48,3 +48,28 @@ def test_r4_no_margin_on_a_street_target_and_curves_keep_theirs():
   # the street target never goes under itself: at 47.989 nothing more
   assert first_press(47.989, 48.0, street_lower=True, curve_track=True) is None
 
+
+# ---------------- R2: the merge taper only by the speed ----------------
+
+TP = _load("trp_round_r", "test_round_p.py")
+
+
+def test_r2_the_highway_match_right_after_the_loop_does_not_taper_at_34_mph():
+  # drive 76 t 525.6: the motorway matched with the car at ~34 mph, 41 under the target 75 (before: the anchor 89 -> 80)
+  car, lg, log = TP._boost73(inp=lambda f, car, lg: {"merge_taper": f >= 60})
+  f65 = next(f for f, s, v, *_ in log if v >= 65)
+  assert max(s for f, s, *_ in log if f < f65) >= 90 - 1e-6           # the full boost until 10 mph under the target
+  assert all(a is None or a >= 90 * MPH - 1e-6 for f, s, v, b, act, a, _ in log if 100 <= f < f65 - 50)
+  assert abs(car.set_speed / MPH - 75) < 1e-6
+
+
+def test_r2_a_boost_ended_by_its_time_behind_a_moving_lead_goes_to_the_target():
+  # a long ramp behind a car at 57 mph (it does not block the boost: moving, not closing): MERGE_BOOST_TIME ends it with
+  # the car 18 mph under the target; the set comes down to the target 75 (not left high, not left low)
+  def inp(f, car, lg):
+    car.v_ego = min(car.v_ego, 57 * MPH)
+    return {"radar_lead": True, "lead_v": 57 * MPH}
+  car, lg, log = TP._boost73(frames=6000, inp=inp)
+  ends = [f for f, s, v, b, *_ in log if b == cs.SET_MINUS]
+  assert ends and ends[0] >= int(cs.MERGE_BOOST_TIME / 0.01), ends[:3]
+  assert abs(car.set_speed / MPH - 75) < 1e-6 and min(s for f, s, *_ in log if f >= ends[0]) >= 75 - 1e-6

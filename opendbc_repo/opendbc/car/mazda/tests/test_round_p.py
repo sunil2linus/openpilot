@@ -155,7 +155,8 @@ def test_73_the_taper_holds_90_to_80_from_65_mph_then_75_from_73_and_no_set_plus
 
 
 def test_the_taper_also_when_the_highway_is_matched_or_the_ramp_flag_drops():
-  # the ramp flag drops at 55 mph (the planner's merge_taper): the taper at once, the set never under 80 before the end
+  # round R, R2 (drive 76 t 525.6): the ramp flag dropping / the highway matched (the planner's merge_taper) no longer
+  # tapers: the same as without it (the taper only by the speed, MERGE_TAPER_GAP)
   state = {}
 
   def inp(f, car, lg):
@@ -163,12 +164,19 @@ def test_the_taper_also_when_the_highway_is_matched_or_the_ramp_flag_drops():
       state["f"] = f
     return {"merge_taper": "f" in state}
   car, lg, log = _boost73(inp=inp)
-  f55 = state["f"]
-  f73 = next(f for f, s, v, *_ in log if v >= 73)
-  assert next(f for f, s, v, b, *_ in log if f >= f55 and b == cs.SET_MINUS) - f55 <= 60
-  assert all(s >= 80 - 1e-6 for f, s, *_ in log if f55 <= f < f73)
-  assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if f >= f55 + 5)
+  _, _, log0 = _boost73()
+  assert [x[:5] for x in log] == [x[:5] for x in log0]
   assert abs(car.set_speed / MPH - 75) < 1e-6
+  # (before round R: the taper at 55 mph, the set 80 from there)
+  old = cs.MERGE_TAPER_ROAD
+  try:
+    cs.MERGE_TAPER_ROAD = True
+    state.clear()
+    _, _, log1 = _boost73(inp=inp)
+  finally:
+    cs.MERGE_TAPER_ROAD = old
+  f55 = state["f"]
+  assert next(f for f, s, v, b, *_ in log1 if f >= f55 and b == cs.SET_MINUS) - f55 <= 60
 
 
 def test_the_wrapper_tapers_on_the_highway_match_or_when_the_ramp_flag_drops():
@@ -927,13 +935,12 @@ def test_review_m1_no_early_raise_while_the_wheel_winds_up():
 
 
 def test_review_a_taper_with_the_set_still_low_raises_to_the_target_plus_5():
-  # the highway matched 1.5 s into the boost (a short ramp), the set still ~45: up to 80, then no SET+ (rp_review taper)
+  # the highway matched 1.5 s into the boost (a short ramp), the set still ~45: (round R, R2) no taper for that any more,
+  # the boost runs as without it, then down to the target
   car, lg, log = _boost73(frames=4000, inp=lambda f, car, lg: {"merge_taper": f >= 150})
-  t70 = next((f for f, s, v, *_ in log if v >= 70), None)
   _, _, log0 = _boost73(frames=4000)
-  t70_0 = next(f for f, s, v, *_ in log0 if v >= 70)
-  assert t70 is not None and t70 <= t70_0 + 150, (t70, t70_0)       # (was: the set left at 45, 70 mph far later)
-  assert max(s for _, s, *_ in log) <= 80 + 1e-6 and abs(car.set_speed / MPH - 75) < 1e-6
+  assert [x[:5] for x in log] == [x[:5] for x in log0]
+  assert abs(car.set_speed / MPH - 75) < 1e-6
 
 
 def test_rereview_n1_res_while_passing_never_takes_the_set_above_his_anchor():

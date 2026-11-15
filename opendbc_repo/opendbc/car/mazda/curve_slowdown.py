@@ -304,6 +304,12 @@ MERGE_CSC_END = 0.5           # s
 # up). A followed map curve (curve_track) always counts.
 MERGE_CSC_NEAR = 5 * MS_PER_MPH  # m/s
 MERGE_TAPER = True
+# Round R, R2 (drive 76 t 525.6: the road matched as the motorway right after the loop took the anchor 89 -> 80 at 33.8 mph,
+# 41 mph under the target; the Dequindre ramp t 279: the ramp flag dropped at 52.5 mph): the taper only by the speed (the
+# car within MERGE_TAPER_GAP of the target). The road match / ramp flag (SlowdownInputs.merge_taper) is still an input,
+# it no longer tapers. (Checked: a boost ended by MERGE_BOOST_TIME on a long ramp behind a moving lead takes
+# the set down to the target, not lower: test_round_r.)
+MERGE_TAPER_ROAD = False
 MERGE_TAPER_GAP = (10 * MS_PER_MPH, 16 * MS_PER_KPH)
 MERGE_TAPER_OVER = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 MERGE_HIGH_OVER = 10 * MS_PER_MPH
@@ -987,7 +993,7 @@ class CurveSlowdownLogic:
         self.restore_pending = True
         b["ended"] = self.frame
       elif MERGE_TAPER and "taper" not in b and not his and (i.v_ego >= tgt - self._metric_pick(MERGE_TAPER_GAP) or
-                                                             i.merge_taper):
+                                                             (MERGE_TAPER_ROAD and i.merge_taper)):
         # (MERGE_TAPER) one bounded SET- hold to the target + MERGE_TAPER_OVER, then no more SET+
         over = tgt + self._metric_pick(MERGE_TAPER_OVER)
         top = self.anchor if self.anchor is not None else (self.last_set_speed or 0.0)
