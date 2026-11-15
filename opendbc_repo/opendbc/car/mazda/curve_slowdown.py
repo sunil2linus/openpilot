@@ -934,6 +934,15 @@ class CurveSlowdownLogic:
     self.restoring = False
     self.engage = {"frame": self.frame, "goal": self.anchor, "fixed": True}
 
+  def ramp_handover(self, goal):
+    """(map_curve_control.EXIT_RAMP_HANDOVER) an exit ended on its ramp with the highway's set: his speed is the street's
+    target `goal` (m/s, under the set), an anchor of ours; the restore takes the set down to it (SET- taps)."""
+    self.anchor = goal
+    self.anchor_ours = True
+    self.engage = None
+    self.restoring = False
+    self.restore_pending = True
+
   def _keep_floor(self, i, driver_speed):
     """(LKAS_KEEP) m/s, the floor now: min(lkas_keep, his speed) rounded down to a whole step; 0 none."""
     if not LKAS_KEEP or i.lkas_keep <= 0:
@@ -2318,6 +2327,16 @@ def exit_handover(lg, set_speed, target, stopped_recently):
   return target if (stopped_recently or low) and target > set_speed + lg.half_step else 0.0
 
 
+def exit_ramp_handover(lg, mo, set_speed):
+  """(map_curve_control.EXIT_RAMP_HANDOVER) an exit plan ended on its ramp with our lowering under the set: the street's
+  target (MapOutput.ramp_handover) becomes his speed when it is under the set (lowered to it by SET- taps). True: done."""
+  t = getattr(mo, "ramp_handover", 0.0)
+  if t <= 0 or set_speed <= t + lg.half_step:
+    return False
+  lg.ramp_handover(t)
+  return True
+
+
 def adopt_forgets(lg, mo, set_speed):
   """map_curve_control's adopt (the set speed becomes his) forgets the controller's anchor: a restore pending above it,
   or (third review, drive 54 t 745.2) an anchor one step under the street speed just reached (our last press landing in
@@ -2774,7 +2793,9 @@ class CurveSlowdown:
         # far above it says otherwise (EXIT_HANDOVER)
         goal = exit_handover(lg, set_speed if cruise_enabled else 0.0, self.map_control.handover_target(),
                              self.frame - self.exit_stop_frame <= _frames(EXIT_HANDOVER_STOP))
-        if goal > 0:
+        if exit_ramp_handover(lg, mo, set_speed if cruise_enabled else 0.0):
+          pass                                 # (map_curve_control.EXIT_RAMP_HANDOVER) down to the street's target
+        elif goal > 0:
           lg.handover(goal)
         else:
           lg._forget()

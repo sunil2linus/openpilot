@@ -118,6 +118,15 @@ LOWER_GAP = 2.4                 # m/s
 LOWER_HOLD_ABOVE = 5 * MPH      # m/s
 LOWER_HOLD_MIN = 10 * MPH       # m/s
 EXIT_STREET_DONE = 0.6 * MPH    # m/s: the set speed this close to the target: it is his speed
+# Round R, R5 (drive 76 t 737, the exit to Dobry Dr: the plan ended "on the ramp, no curve" and its adopt made our set 61 his
+# speed; the road unmatched 26 s; the car went 40 -> 55 mph on the ramp toward a red light, his hard brake at 755, his RES
+# later brought back 58 toward stopped cars). An exit plan that ends on its ramp (EXIT_RAMP_HANDOVER_WHYS) does not make the
+# highway's set his: MapOutput.ramp_handover is the exit's street target (the street matched, this exit's street cap, the
+# limit the planner announced for this exit's street within EXIT_TO_SEEN_TIME, else STREET_FALLBACK); the wrapper lowers
+# the set to it (SET- taps, an anchor of ours), never raises it with this.
+EXIT_RAMP_HANDOVER = True
+EXIT_RAMP_HANDOVER_WHYS = ("on the ramp, no curve", "confirmed, no link match")
+EXIT_TO_SEEN_TIME = 60.0        # s
 ADOPT_LANDED_FRAMES = 2         # the street speed reached: adopted this frame and the next (_street_end)
 HWY_RESET = 1.0                 # s matched to a highway: the exit sequence starts over
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
@@ -586,6 +595,9 @@ class MapOutput:
   # m/s: the street speed just reached and adopted (0 none): the wrapper also forgets a set speed above the anchor at it
   # (our last press landing in the adopt frame re-anchored one step under it: drive 54, t 745.2, 43 -> 42)
   adopt_target: float = 0.0
+  # (round R, R5: EXIT_RAMP_HANDOVER) the adopt is an exit plan ending on its ramp ("on the ramp, no curve" / "confirmed,
+  # no link match"): the set there is still the highway's; m/s the street target to hand over to (> 0)
+  ramp_handover: float = 0.0
 
 
 class ExitPlan:
@@ -739,6 +751,9 @@ class MapCurveControl:
     self.restore_frames = 0         # fast restore asked for this many frames more (RESTORE_PULSE)
     self.adopt_frames = 0           # the set speed becomes his for this many frames more (an exit never resolved)
     self.adopt_target = 0.0         # m/s: _street_end's target while its adopt lasts
+    self.adopt_ramp = False         # (EXIT_RAMP_HANDOVER) the adopt is an exit plan ending on its ramp
+    self.exit_to_seen = (0.0, -10_000)   # (m/s the exit's street limit + the offset as the planner announced it, frame)
+    self.frame = 0
     self.hwy_limit = (0.0, 0.0)     # the highway's steady posted limit (m/s) and the odometer where it became steady
     self.lim_new, self.lim_s = 0.0, 0.0
     self.chime_count = 0            # "Exit curve - brake" chimes so far (the wrapper raises the alert on a change)
@@ -801,6 +816,7 @@ class MapCurveControl:
     """restore: the speed back at once (fast restore); adopt: the set speed now becomes his (nothing restored: the exit
     was never resolved, it may be the ramp)."""
     self.adopt_frames = 10 if adopt else 0
+    self.adopt_ramp = bool(adopt and why in EXIT_RAMP_HANDOVER_WHYS)
     p = self.plan
     if p is not None:
       p.why = why
@@ -1261,6 +1277,9 @@ class MapCurveControl:
     street target: _exit_street). limit_lower: speed_limit_follow's street speed (m/s, 0 none: _limit_lower);
     limit_lower_gas: his gas held ends it (a lower limit's, rule 9; not rule 8's match)."""
     out = MapOutput()
+    self.frame += 1
+    if f.ramp_type == RAMP_EXIT and not f.ramp_to_highway and f.ramp_to_speed > 0:
+      self.exit_to_seen = (f.ramp_to_speed + self.street_add, self.frame)   # (EXIT_RAMP_HANDOVER)
     if a_ego is None:
       self.a_f = None
     else:
@@ -1459,6 +1478,8 @@ class MapCurveControl:
     out.why = why
     out.street = street
     out.adopt_target = self.adopt_target if self.adopt_frames > 0 else 0.0
+    if EXIT_RAMP_HANDOVER and self.adopt_frames > 0 and self.adopt_ramp:
+      out.ramp_handover = self.ramp_handover_target()
     out.chime = self.chime_count != getattr(self, "_chimes_out", 0)
     self._chimes_out = self.chime_count
     return out
@@ -1498,6 +1519,17 @@ class MapCurveControl:
       self.xs_since, self.xs_done = 0.0, False      # the exit's street: its target applies (_exit_street)
       if self.plan is not None:
         self._end("on a street")
+
+  def ramp_handover_target(self):
+    """(EXIT_RAMP_HANDOVER) m/s: the exit's street target (the street matched, this exit's street cap, or the limit the
+    planner announced for this exit's street within EXIT_TO_SEEN_TIME), else STREET_FALLBACK."""
+    t = self.handover_target()
+    if t > 0:
+      return t
+    v, fr = self.exit_to_seen
+    if v > 0 and self.frame - fr <= int(EXIT_TO_SEEN_TIME / DT_CTRL):
+      return v
+    return self.street_fallback
 
   def handover_target(self):
     """m/s: the street target an exit hands over to when its slowdown ends by adoption (round P, the wrapper's

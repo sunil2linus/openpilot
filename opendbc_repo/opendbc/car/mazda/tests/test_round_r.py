@@ -162,3 +162,68 @@ def test_r3_the_guards_stay_red_light_a_slow_car_ahead_a_curve_and_the_hold_marg
   car, lg, log, reach = _res_after_our_stop(clean=0)
   holds = [f for f, s, v, b, a in log if a == "hold"]
   assert holds and abs(log[max(holds) + 160][1] - 45) < 0.6, log[max(holds) + 160][1]
+
+
+# ---------------- R5: an exit that ends on its ramp with no curve does not keep the highway's set ----------------
+
+TE = _load("tep_round_r", "test_exit_plan.py")
+
+
+def _exit_no_curve(ramp_to=45, set_mph=75, frames=12000, lead=40):
+  """Navigation's exit with no curve on its ramp, the link matched with GPS trust 2 (unmatched) after it, the car behind
+  a car at 40 mph that leaves 400 m past the exit point (drive 76 t 700-755, exit to Dobry Dr; synthetic)."""
+  exit_x = 1500.0
+  F, cs_ = TE.F, TE.cs
+
+  def fields(x):
+    hwy = dict(road_class=1, limit=70 * MPH, gps_trust=0)
+    if x < exit_x - 700:
+      return F(**hwy)
+    if x < exit_x - 40:
+      return F(nav_exit=1, nav_exit_distance=exit_x - x, nav_exit_side=1, exit_shape=1, exit_start=exit_x - x,
+               ramp_type=1, ramp_to_speed=ramp_to * MPH, **hwy)
+    if x < exit_x + 60:
+      return F(exit_shape=0, **{**hwy, "gps_trust": 2})
+    return F(exit_shape=2, road_class=2, gps_trust=2)
+  real = cs_.adopt_forgets
+
+  def wrapper_adopt(lg, mo, set_speed):            # (the wrapper's adopt: curve_slowdown.CurveSlowdown.update)
+    if not real(lg, mo, set_speed):
+      return False
+    return not cs_.exit_ramp_handover(lg, mo, set_speed)
+  cs_.adopt_forgets = wrapper_adopt
+  try:
+    r = TE.drive_exit(fields, frames, set_mph, v_mph=62, lane=lambda x: 1 if x < exit_x else None,
+                      signal=lambda x: 1 if exit_x - 300 <= x < exit_x - 250 else 0,
+                      lead=lambda x: lead * MPH if x < exit_x + 400 else None)
+  finally:
+    cs_.adopt_forgets = real
+  return r, exit_x
+
+
+def test_r5_the_exit_ending_on_its_ramp_hands_over_to_the_streets_target():
+  r, exit_x = _exit_no_curve()
+  assert (r["ctl"].last_plan.why == "on the ramp, no curve"), r["ctl"].last_plan.why
+  end = next(k for k, xx in enumerate(r["xs"]) if xx >= exit_x)
+  assert r["sets"][end] >= 59                                          # (the exit's own lowering left ~60)
+  assert abs(r["sets"][-1] - 50) < 0.6, r["sets"][-1]                  # the announced 45 street + 5, by SET- taps
+  assert not TE._plus(r, exit_x, 10 ** 6)
+  assert r["logic"].anchor_ours or r["logic"].anchor is None
+  # the car does not speed up toward the old set once the car ahead is gone: at most the street's target
+  assert max(r["vs"][end:]) <= 50.5, max(r["vs"][end:])
+  # (before round R: the 60 kept as his speed)
+  old = TE.CTL.EXIT_RAMP_HANDOVER
+  try:
+    TE.CTL.EXIT_RAMP_HANDOVER = False
+    r0, _ = _exit_no_curve()
+  finally:
+    TE.CTL.EXIT_RAMP_HANDOVER = old
+  assert r0["sets"][-1] >= 59 and max(r0["vs"][end:]) > 55
+
+
+def test_r5_the_streets_limit_unknown_takes_the_43_fallback_and_never_a_raise():
+  r, exit_x = _exit_no_curve(ramp_to=0)
+  assert abs(r["sets"][-1] - 43) < 0.6, r["sets"][-1]
+  # the set already under the street's target (his 45 on the highway, a 55 street): left as it was
+  r, exit_x = _exit_no_curve(ramp_to=55, set_mph=50)
+  assert not TE._plus(r, exit_x, 10 ** 6) and r["sets"][-1] <= 50 + 1e-6
