@@ -79,11 +79,11 @@ try:
   from opendbc.car.mazda.curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP,
                                               END_GAP, MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET,
                                               MAP_START_GAP, MAP_LEAD_TIME, MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME,
-                                              MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
+                                              MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME, MAP_SETTLE)
 except ImportError:          # offline tests load this file directly
   from curve_target import (MapCurveTarget, MapCurveFollower, map_curve_target, NO_CURVE, START_GAP, END_GAP,
                             MAP_LATERAL_ACCEL, MAP_DECEL, MAP_FOLLOW_BUDGET, MAP_START_GAP, MAP_LEAD_TIME,
-                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME)
+                            MAP_ROAD_UNDERSHOOT, MAP_ROAD_LEAD_TIME, MAP_ROAD_ACCEL_TAU, MAP_RAMP_LEAD_TIME, MAP_SETTLE)
 
 MPH = 0.44704
 KPH = 1 / 3.6
@@ -273,6 +273,12 @@ NAV_SIGNAL_FIRM = True
 TI_ONLY_LAT = 1.8               # m/s^2
 TI_ONLY_RAMP_SCALE = 2.2 / 2.6  # map_curves.PLAN_LAT / RAMP_LAT
 NAV_SIGNAL_NEAR = 200.0         # m
+# Round Q (drive 75, exit 48: his signal 370-300 m before the split): his signal toward the exit this far before the split
+# makes the tentative phase keep the exit's curve reachable for TENT_HARD_MAX (TENT_REACH). The firm follow from the split
+# keeps NAV_SIGNAL_NEAR (widened, it broke the false exit bounds of the review of round P: test_exit_plan's "link" 34 m /
+# nothing 6 m stream with his signal 280 m out ratcheted 67 -> 30 mph on the highway, and drive 54 exit 2's set went back up
+# on the real ramp after the firm start's TENT_MAX)
+NAV_SIGNAL_REACH = 400.0        # m
 # the firm slowdown after the confirmation as planned for the short ramp's split speed: it takes ~2 s to build up (the
 # SET- hold, the cruise's answer) to its ~0.95-1.0 (drive 53 replay: 0.94 m/s^2 on average from the confirmation to E2's
 # curve), so a little under CHIME_DECEL
@@ -316,6 +322,29 @@ GAS_QUIET_LINK = 40.0           # m
 # navigation no longer announcing the exit (a cancel, a reroute to another exit) farther than this before its exit point:
 # its route does not take it (nav_near off). Closer, it is the usual clearing at the split (drive 53: 46 m and 9 m before)
 NAV_NEAR_CLEAR = 80.0           # m
+# Round Q (drive 75, exit 48, t 1227-1240: the plan ended "rerouted" twice, 400 m and 300 m before the split, and his
+# signal toward the exit went with it; the plan made again 180 m before the split had no signal, the exit stayed
+# tentative and the car came to the 35 mph curve at 52 mph). Navigation's maneuverDistance comes ~1 Hz, sometimes 2 s
+# apart (62 m at 31 m/s) and is not counted down between; the plan re-took its exit point from the stale value every frame
+# and the map's link start (mapExitStart, fresh) pulled it back by moving start_off, so the next fresh value was one
+# update's travel off: past NAV_SAME_MIN at 2 s. Now a repeated (stale) distance moves nothing, the map's link start
+# agreeing within NAV_SAME_MIN is the same exit, and a plan that ended "rerouted" / "navigation dropped it" is taken on again
+# with what it knew (his signal, the lane evidence) when navigation announces the same exit point again (NAV_REVIVE).
+NAV_REVIVE = ("rerouted", "navigation dropped it")
+# Round Q (exit 48): while the exit is not resolved past the split (tentative) and its curve needs a much lower speed, the
+# car is kept on a speed profile from which the curve's speed is still reached with at most TENT_REACH_DECEL after the
+# cruise's dead time (CHIME_DEAD), MAP_LEAD_TIME before its entry (the cruise's strongest is ~0.9-1.0 and takes ~2 s to
+# build up, SHORT_PLAN_DECEL): a firm follow starts once the car's speed is within TENT_REACH_START of that profile. It is let
+# go at once by any "highway" evidence (the shapes, the trusted road match, the model path), his gas held
+# (GAS_OVERTURN_*), or the time bounds: TENT_HARD_MAX after the split with navigation's route taking it and his signal toward
+# it (or navigation moving on at the split), else TENT_MAX_QUIET. Its cost when he stays on with nothing answering is
+# what those seconds of a firm slowdown take (test_round_q's false exit table).
+TENT_REACH = True
+TENT_REACH_DECEL = 0.7          # m/s^2
+TENT_REACH_START = 1 * MPH      # m/s
+# ... and never more than this under the speed at the split until confirmed (the no-answer false exit, GPS trust 2 and no
+# shapes past the split, went 48.6 -> 32.1 mph on the highway without it)
+TENT_REACH_DIP = 12 * MPH       # m/s
 
 # ---- the camera's view of our lane (LaneView) ----
 # modelV2 lane lines 0-3 (left-left, left, right, right-right; y positive to the right, MODEL_LEFT) and
@@ -595,11 +624,21 @@ class ExitPlan:
     self.link_odo = None          # the control's odometer at the shapes' last "link" answer (GAS_QUIET_LINK)
     self.gas_past = False         # his gas held (GAS_OVERTURN_*) past the split with no "link" answer since
     self.nav_miss_s = 0.0         # s navigation has not announced it near it (NAV_NEAR_CLEAR)
+    self.nav_d = None             # navigation's last distance taken (a repeat of it is stale: nothing moves)
+    self.nav_passed = False       # navigation stopped announcing it within NAV_CLOSE of the split (weak: he took it)
+    self.reach_on = False         # (TENT_REACH) the firm follow toward the reachable profile is on
+    self.reach_off = ""           # ... why it was let go (logs)
+    self.revived = 0              # taken on again after "rerouted" (NAV_REVIVE)
+    self.past = False             # the car has been past the exit point (it is not moved ahead of the car again)
     self.update_nav(odo, f)
 
   def update_nav(self, odo, f):
-    self.exit_at = odo + f.nav_exit_distance + self.start_off
-    if f.nav_exit_distance + self.start_off <= DECIDE_NEAR:
+    if f.nav_exit_distance != self.nav_d:
+      # (NAV_REVIVE) only a new distance from navigation moves the exit point; a repeated one is stale
+      at = odo + f.nav_exit_distance + self.start_off
+      self.exit_at = min(at, self.exit_at) if getattr(self, "past", False) else at
+      self.nav_d = f.nav_exit_distance
+    if self.exit_at - odo <= DECIDE_NEAR:
       self.nav_near = True
     if f.nav_exit_side:
       self.side = f.nav_exit_side
@@ -611,10 +650,14 @@ class ExitPlan:
 
   def same(self, odo, f):
     d = f.nav_exit_distance
+    if d == self.nav_d:
+      return True                 # (NAV_REVIVE) the same stale value: nothing new
+    if f.exit_start > 0 and abs(odo + f.exit_start - self.exit_at) <= NAV_SAME_MIN:
+      return True                 # the map's link start of navigation's exit agrees: the same exit
     return abs(odo + d + self.start_off - self.exit_at) <= max(NAV_SAME_MIN, NAV_SAME_SHARE * d)
 
 
-HOLD_WHYS = ("exit hold", "exit lost", "exit wait")
+HOLD_WHYS = ("exit hold", "exit lost", "exit wait", "exit reach hold")
 
 
 def exit_room_needed(v, v_curve, confirm=CHIME_CONFIRM, tent=TENT_DECEL, decel=CHIME_DECEL, dead=CHIME_DEAD,
@@ -677,6 +720,7 @@ class MapCurveControl:
     self.nav = MapCurveTarget(lat_accel, decel)
     self.nav_follower = MapCurveFollower(firm=True)
     self.split_follower = MapCurveFollower(max_decel=SPLIT_MAX_DECEL, undershoot=SPLIT_UNDERSHOOT, lead_time=0.0)
+    self.reach_follower = MapCurveFollower(firm=True)   # (TENT_REACH)
     self.split_active = False
     self.lane = LaneView()          # fed by the wrapper from modelV2
     self.model = ModelPath()        # the same (model_path_heading)
@@ -685,6 +729,7 @@ class MapCurveControl:
     self.plan = None                # ExitPlan
     self.last_plan = None           # the plan that ended last (logs; its exit is never taken on again)
     self.done_at = None             # m of the odometer: the exit point of a plan that ended (no re-adoption)
+    self.revivable = []             # plans that ended "rerouted" / "navigation dropped it", newest last (NAV_REVIVE)
     self.restore_frames = 0         # fast restore asked for this many frames more (RESTORE_PULSE)
     self.adopt_frames = 0           # the set speed becomes his for this many frames more (an exit never resolved)
     self.adopt_target = 0.0         # m/s: _street_end's target while its adopt lasts
@@ -754,10 +799,13 @@ class MapCurveControl:
     if p is not None:
       p.why = why
       self.last_plan, self.done_at = p, p.exit_at
+      if why in NAV_REVIVE:
+        self.revivable = (self.revivable + [p])[-3:]     # (NAV_REVIVE)
     self.plan = None
     self.split_active = False
     self.split_follower.reset()
     self.nav_follower.reset()
+    self.reach_follower.reset()
     self.nav.active = False
     if restore:
       self.restore_frames = int(RESTORE_PULSE / DT_CTRL)
@@ -783,12 +831,26 @@ class MapCurveControl:
         p.nav_near = False
     elif p is not None:
       p.nav_miss_s = 0.0
+    if p is not None and not announced and p.nav_near and p.exit_at - self.odo <= NAV_CLOSE:
+      p.nav_passed = True                           # (moving on at the split: not a cancel; weak evidence he took it)
     if announced:
       if p is not None and p.same(self.odo, f):
         p.update_nav(self.odo, f)
       elif p is not None and not p.confirmed and p.exit_at - self.odo > NAV_CLOSE:
         self._end("rerouted")                       # another exit far from this one's split: navigation changed its route
         p = None
+      lp = None if p is not None or f.road_class in LINK_CLASSES else next((
+        q for q in reversed(self.revivable) if q.exit_at - self.odo > 0 and (
+          abs(self.odo + f.nav_exit_distance + q.start_off - q.exit_at) <=
+          max(NAV_SAME_MIN, NAV_SAME_SHARE * f.nav_exit_distance) or
+          (f.exit_start > 0 and abs(self.odo + f.exit_start - q.exit_at) <= NAV_SAME_MIN))), None)
+      if lp is not None:
+        # (NAV_REVIVE) navigation is back on the exit it left: the same plan, with his signal and the lane evidence
+        self.revivable.remove(lp)
+        p = self.plan = lp
+        p.why, p.grace, p.revived, p.nav_d = "", 0.0, p.revived + 1, None
+        self.done_at = None
+        p.update_nav(self.odo, f)
       if p is None and f.road_class not in LINK_CLASSES and not (
           self.done_at is not None and abs(self.odo + f.nav_exit_distance - self.done_at) <= NAV_SAME_MIN):
         p = self.plan = ExitPlan(self.odo, f)
@@ -800,7 +862,10 @@ class MapCurveControl:
     if p is not None:
       # where the map's link starts is the split (navigation's exit point may be tens of m off it): taken while it is
       # ahead and agrees with navigation's within NAV_SAME_MIN x 2
-      if (not p.confirmed and f.exit_start > 0 and abs(self.odo + f.exit_start - p.exit_at) <= 2 * NAV_SAME_MIN):
+      # (round Q: once the car is past it, never moved ahead again: the planner's link start lags its GPS fixes, and a
+      # stale one put the split back ahead of the car 25 m past it, "exit split" again in the middle of the firm follow)
+      if (not p.confirmed and f.exit_start > 0 and abs(self.odo + f.exit_start - p.exit_at) <= 2 * NAV_SAME_MIN and
+          not (p.past and self.odo + f.exit_start > p.exit_at)):
         p.start_off += self.odo + f.exit_start - p.exit_at
         p.exit_at = self.odo + f.exit_start
       # the highway's own limit (review: the first one seen was taken at once, and a ramp's 45 showing up before the
@@ -834,6 +899,7 @@ class MapCurveControl:
     if p is None:
       return none
     rem = p.exit_at - self.odo
+    p.past = p.past or rem <= 0
     side = p.side
     # the shape check (the planner's): "link" only on consecutive answers (review: "no answer" frames between them kept
     # the count, a coin-flip heading gave "link" on the highway), "highway" past the exit point; the last answer given
@@ -1047,6 +1113,25 @@ class MapCurveControl:
         p.tent_v0 = v_ego
       cmd, sp, v_c, why, fol, firm = self._ramp_command(f, p, driver_speed, v_ego, on_link)
       sig_near = p.signal_odo is not None and p.exit_at - p.signal_odo <= NAV_SIGNAL_NEAR
+      # (TENT_REACH) the curve's speed kept reachable while nothing says "highway" and his gas is not held
+      hwy_seen = p.hwy_s > 0.0 or p.hwy_match_s > 0.0 or m_hwy > 0.0
+      # (his signal toward it NAV_SIGNAL_REACH before the split with navigation's route taking it; the camera's edge lane
+      # alone never: it is also the ordinary right lane, test_exit_plan's missed exits)
+      sig_reach = p.signal_odo is not None and p.exit_at - p.signal_odo <= NAV_SIGNAL_REACH
+      reach = self._reach(f, p, v_ego, "highway" if hwy_seen else "his gas" if gas_firm else
+                          "time" if p.tent_s > TENT_HARD_MAX else "" if (p.nav_near and p.signalled and sig_reach) else
+                          "no signal")
+      reach_firm = True
+      if reach < NO_CURVE:
+        floor = p.tent_v0 - TENT_REACH_DIP
+        # (at its floor: taps, so a hold's overrun does not land far under it)
+        reach_firm = reach > floor + TENT_GAP
+        reach = max(reach, floor)
+      # (at its floor not followed: the set speed comes back up to it as for any target, so the firm start's low set
+      # speed is not kept under it)
+      reach_fol = self.reach_follower if reach_firm else None
+      reach_why = "exit reach" if reach_firm else "exit reach hold"
+
       # (review of round P, B2) a "link" answer past the split (the shapes, the model path, the road match) carries the firm
       # follow on; without one it lasts TENT_MAX, then the tentative rules (TENT_DIP_MAX included); the model path saying
       # "highway" ends it at once
@@ -1073,11 +1158,37 @@ class MapCurveControl:
           cmd = min(max(cmd, v_ego, dip_floor), driver_speed)
           if (on_link or f.on_ramp) and p.last_cmd is not None:
             cmd = min(cmd, p.last_cmd)
+          if reach < cmd:
+            return self._cmd(p, reach, reach, self.reach_follower.v_curve, reach_why, reach_fol, reach_firm)
           return self._cmd(p, cmd, cmd, cmd, "exit wait", None)
+        if reach < cmd:
+          # (TENT_REACH) below the tentative bounds (TENT_GAP, TENT_DIP_MAX): the curve must stay reachable
+          return self._cmd(p, reach, reach, self.reach_follower.v_curve, reach_why, reach_fol, reach_firm)
         return self._cmd(p, cmd, sp, v_c, "exit tentative", fol)
+      if reach < NO_CURVE:
+        return self._cmd(p, reach, reach, self.reach_follower.v_curve, reach_why, reach_fol, reach_firm)
     if p.hold is not None and p.slowing:
       return self._cmd(p, p.hold, p.hold, p.hold, "exit hold", None)
     return none
+
+  def _reach(self, f, p, v_ego, off):
+    """(TENT_REACH) m/s: the firm follow's command that keeps the exit's curve reachable at TENT_REACH_DECEL, NO_CURVE
+    while the car is not near that profile (or `off`: why it is let go, for good on this plan)."""
+    r, d, adv = self._curve_now(f, p)
+    if not TENT_REACH or off or r <= 0 or v_ego <= 0 or p.reach_off:
+      if p.reach_on and off:
+        p.reach_off = off
+      p.reach_on = False
+      self.reach_follower.reset()
+      return NO_CURVE
+    v_c = map_curve_target(r, self._lat(r, adv, True), adv)
+    room = d - v_ego * CHIME_DEAD - v_c * MAP_LEAD_TIME
+    bound = (v_c * v_c + 2 * TENT_REACH_DECEL * max(room, 0.0)) ** 0.5
+    if not p.reach_on:
+      p.reach_on = v_ego > v_c + MAP_SETTLE and v_ego >= bound - TENT_REACH_START
+      if not p.reach_on:
+        return NO_CURVE
+    return self.reach_follower.update(v_ego, v_c, max(d, 0.0), max(bound, v_c))
 
   @staticmethod
   def _gentle(v, rem):

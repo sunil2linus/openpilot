@@ -428,9 +428,13 @@ def test_drive_53_e1_a_short_ramp_lowers_the_split_speed_and_the_slowdown_starts
   # from the split, before the shapes confirm the ramp (106 m on): the tentative slowdown (A), the set speed at most
   # TENT_GAP below the speed
   conf = next(xx for s, xx in zip(r["state"], r["xs"], strict=True) if s == "confirmed")
-  assert exit_x + 125 <= conf <= exit_x + 140, conf - exit_x     # (no model path: the shapes alone, 1.5 s)
+  # (no model path: the shapes alone, 1.5 s; round Q: his signal 300-250 m out keeps the curve reachable past the split,
+  # TENT_REACH, the car a little slower there, so the same 1.5 s end a few m sooner)
+  assert exit_x + 118 <= conf <= exit_x + 140, conf - exit_x
   tent = _minus(r, exit_x, conf)
-  assert tent and all(p[5] - p[4] <= CTL.TENT_GAP / MPH + 1.01 for p in tent), tent
+  # (round Q: his signal 300-250 m out, TENT_REACH: the curve 270 m on kept reachable, at most TENT_REACH_DIP under the speed
+  # at the split instead of TENT_GAP under the speed)
+  assert tent and all(p[4] >= v_split - CTL.TENT_REACH_DIP / MPH - 1.01 for p in tent), tent
   v_entry = _at(r, curve_x)
   assert V_C95 - 1.0 <= v_entry <= V_C95 + 2.5, v_entry        # at about the curve's speed, nobody braking
   assert min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if curve_x <= xx < curve_x + 127) >= V_C95 - 1.5
@@ -1147,7 +1151,9 @@ def test_final_review_the_tentative_slowdown_is_bounded_whatever_carries_it_on()
     v0 = _at(r, ex)
     tent = [xx for st, xx in zip(r["state"], r["xs"], strict=True) if st == "tentative"]
     low = min(_past(r, ex))
-    assert low >= v0 - CTL.TENT_DIP_MAX / MPH - 2.5, (model, v0, low)      # (the speed's cap, the cruise's lag after it)
+    # (the speed's cap, the cruise's lag after it; round Q: his signal 280 m out keeps the 85 m curve 500 m on reachable,
+    # TENT_REACH, at most TENT_REACH_DIP under the speed at the split until confirmed)
+    assert low >= v0 - CTL.TENT_REACH_DIP / MPH - 2.5, (model, v0, low)
     p = r["ctl"].last_plan
     assert "confirmed" not in r["state"] and p.why == "missed", p.why
     # (tentative: the plan's state past the split until the missed exit, its slowing TENT_HARD_MAX at most)
