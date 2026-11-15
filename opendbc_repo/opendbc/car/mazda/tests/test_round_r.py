@@ -649,3 +649,23 @@ def test_r8_f2_no_raise_in_a_subdivision_or_a_lot_only_at_a_roads_speed(tmp_path
   # a usable fix with no road matched (outside the curve files): nothing
   out, presses = _nogps_wrapper(tmp_path, monkeypatch, 19, frames=6000, gas_until=3500, gas_v=40, acc_m=5.0)
   assert not [p for p in presses if p[1] == cs.SET_PLUS]
+
+
+def test_r3_f7_no_fast_hold_with_a_short_model_path_or_a_lead_we_close_on(tmp_path, monkeypatch):
+  # the guard off: taps only (no hold of the raise), never faster than before round R's taps
+  car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(auto_hold_ok=f < 0))
+  assert not [f for f, s, v, b, a in log if a == "hold"]
+  _, _, log0, reach0 = _res_after_our_stop(auto=False)
+  assert reach is None or reach0 is None or reach >= reach0 - 200
+  # coming on during the hold: it stops there (taps from then)
+  car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(auto_hold_ok=f < 250))
+  assert not [f for f, s, v, b, a in log if a == "hold" and f >= 260]
+  # the wrapper: the model's path under v x 4 s, or a lead within 80 m we close on (even one the cruise does not track)
+  from types import SimpleNamespace as NS
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  v = 15.0
+  assert c._auto_hold_ok(190.0, NS(status=False, dRel=0.0, vLead=0.0), v)
+  assert not c._auto_hold_ok(50.0, NS(status=False, dRel=0.0, vLead=0.0), v)
+  assert not c._auto_hold_ok(190.0, NS(status=True, dRel=70.0, vLead=0.0), v)
+  assert c._auto_hold_ok(190.0, NS(status=True, dRel=70.0, vLead=18.0), v)        # pulling away
+  assert c._auto_hold_ok(190.0, NS(status=True, dRel=120.0, vLead=0.0), v)

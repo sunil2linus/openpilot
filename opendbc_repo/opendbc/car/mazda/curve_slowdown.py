@@ -405,6 +405,13 @@ ENGAGE_RAISE_MAX = 20.0       # s
 # only the last 1-4 mph are taps. His own RES: as before.
 ENGAGE_AUTO = True
 ENGAGE_AUTO_CLEAN_HOLDS = 3
+# Review of round R, F7 (60-100 m past the stop the car was 2.6 mph faster than the base's if a stopped car there is not yet
+# tracked): its SET+ hold only while the model's path reaches the car's speed x ENGAGE_AUTO_PATH_TIME (raw: the quantity the
+# stop-light detector's planned stop is built from, without its filters) and radarState shows no lead within
+# ENGAGE_AUTO_LEAD_D that we close on (any lead, also one the cruise does not track); else taps, as before round R
+# (SlowdownInputs.auto_hold_ok, the wrapper)
+ENGAGE_AUTO_PATH_TIME = 4.0   # s
+ENGAGE_AUTO_LEAD_D = 80.0     # m
 # Round P (drive 73 t 1296.2, the South Blvd exit with stopped cars on the ramp): the exit's end by adoption (map_curve_control
 # adopt, adopt_forgets) took the 26 its slowdown and the queue left as his speed though the street cap was 48 (he held SET+
 # 26 -> 50 himself at 1330). After a stop (our stop episode, the trigger or a standstill within EXIT_HANDOVER_STOP) or with the
@@ -684,6 +691,7 @@ class SlowdownInputs:
   lkas_keep: float = 0.0
   # (ENGAGE_AUTO) the cruise came back on by our auto resume's RES (auto_resume.AutoResume.own_engaged)
   auto_resumed: bool = False
+  auto_hold_ok: bool = True       # (ENGAGE_AUTO_PATH_TIME / _LEAD_D, F7) its SET+ hold may go
 
 
 def steer_lateral_accel(v, angle_deg, wheelbase, ratio=MERGE_TURN_RATIO, slip=MERGE_TURN_SLIP):
@@ -2053,6 +2061,8 @@ class CurveSlowdownLogic:
       turn_pause = d == SET_PLUS and self._merge_paused(i) and self.boost is not None and "ended" not in self.boost
       # (ENGAGE_AUTO) the raise after our auto resume's RES: its SET+ hold goes on under his gas
       gas_cut = i.gas_pressed and not (d == SET_PLUS and self.hold_kind == "restore" and self._engage_auto())
+      if d == SET_PLUS and self.hold_kind == "restore" and self._engage_auto() and not i.auto_hold_ok:
+        reason_gone = True               # (F7) a short model path or a lead we close on: taps from here
       if (reason_gone or gas_cut or i.other_button_active or no_effect or turn_pause or
           self.frame - self.hold.frame >= _frames(hold_max) or crosses):
         if target_rose and kind == "stop":
@@ -2393,6 +2403,8 @@ class CurveSlowdownLogic:
         # (review of round P, S2) and only with the goal at or above the car's speed: a jump could never land above it
         hold = hold and (not faster or v_hi <= bound_steps or (self._engage_go() and not may_jump and
                                                                 int(round(self.engage["goal"] / self.step)) >= v_hi))
+        if self._engage_auto() and not i.auto_hold_ok:
+          hold = False                   # (F7) taps only
         if hold:
           self.hold_bound = bound_steps * self.step
           self.hold_margin = True
@@ -3091,6 +3103,7 @@ class CurveSlowdown:
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
       auto_resumed=bool(getattr(self, "auto_resumed", False)),
+      auto_hold_ok=self._auto_hold_ok(model_length, lead, v_ego),
     )
     if self.ramp_handover is not None:
       pa = self._alive('starpilotPlan')
@@ -3519,6 +3532,17 @@ class CurveSlowdown:
       a, sp, fl, bu, tr, ra, hold, na, fr = res
       return (True, max(sp, keep), min(fl, keep) if fl > 0 else fl, bu, True, True, False, na, fr, False)
     return res + (False,)
+
+  def _auto_hold_ok(self, model_length, lead, v_ego):
+    """(ENGAGE_AUTO_PATH_TIME / _LEAD_D, F7) the model's path long enough and no lead near that we close on."""
+    if not self._alive('modelV2') or model_length < max(v_ego, 0.0) * ENGAGE_AUTO_PATH_TIME:
+      return False
+    try:
+      if self._alive('radarState') and lead.status and float(lead.dRel) < ENGAGE_AUTO_LEAD_D and float(lead.vLead) < v_ego:
+        return False
+    except (AttributeError, TypeError, ValueError):
+      return False
+    return True
 
   def _no_gps(self, plan, plan_alive):
     """(NOGPS_ACC_MAX) no usable position at all, told apart from "GPS fine, the road not in our map"."""
