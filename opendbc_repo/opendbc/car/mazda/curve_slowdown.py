@@ -1064,6 +1064,7 @@ class CurveSlowdownLogic:
     before it, so it is put right."""
     if self.anchor is None and self.prev_set_speed is not None:
       self.anchor = self.prev_set_speed
+      self.anchor_ours = False          # (re-review R4) his speed before our first press
     self.last_ours_frame = self.frame
     self.no_effect = 0
     self.no_effect_trips = 0
@@ -1081,6 +1082,7 @@ class CurveSlowdownLogic:
       # (review) his SET- while the merge boost is up or coming down: the target (or lower) stays his speed, the rest
       # comes down by our restore
       self.anchor = min(self.last_set_speed, b["target"])
+      self.anchor_ours = True          # (re-review R4) the boost target, ours
       b.setdefault("ended", self.frame)
       self.restore_pending = True
       self.blocked = False
@@ -1091,6 +1093,7 @@ class CurveSlowdownLogic:
     elif self.anchor is not None and self.last_set_speed >= self.anchor - self.half_step:
       ours_down = any(p.direction == SET_MINUS for p in self.inflight)
       self.anchor = self.last_set_speed if ours_down else None
+      self.anchor_ours = False          # (re-review R4) his speed before our SET-
       action = "reached_anchor"
     else:
       action = "kept" if self.anchor is not None else "none"
@@ -1689,6 +1692,7 @@ class CurveSlowdownLogic:
       if not raised["touched"] and not owned:
         self.limit_undone = (self.anchor if self.anchor is not None else self.last_set_speed, before, "undo")
         self.anchor = before
+        self.anchor_ours = False          # (re-review R4) rule 4 undo: his speed before our raise
         self.undo_cap = None
         if boosted:
           self.boost = {"target": before, "frame": self.frame, "ended": self.frame, "undo": True}
@@ -1721,6 +1725,7 @@ class CurveSlowdownLogic:
     if self.offset == 0 and not self.inflight:
       self.flicker = False
       self.anchor = None             # back at the driver's speed: nothing left to restore
+      self.anchor_ours = False          # (re-review R4) nothing left
     # (provisional: only while it is below the driver's speed; it never lowers the anchor, rule 3's cap does that)
     self.limit_ceiling = (i.limit_ceiling if (i.limit_ceiling > 0 and self.anchor is not None and
                                               i.limit_ceiling < self.anchor - self.half_step) else None)
