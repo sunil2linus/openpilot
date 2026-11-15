@@ -559,3 +559,36 @@ def test_review_b2_a_reroute_to_a_later_exit_carries_nothing_over():
   assert abs(v_curve - 64.3) <= 2.0, v_curve
   _, low = _two_exits(decline=False, sig_a=True, stay_b=True)
   assert abs(low - 68.9) <= 2.0, low
+
+
+def test_review_s1_what_the_taps_reached_never_stays_above_a_target_that_dropped(tmp_path, monkeypatch):
+  # (rq_review/test_rq_keep.py) taps 33 -> 36, then the governing target asks 28: the controller gets 28, not 36
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace as N
+  W = _load("tcpw_round_q_s1", os.path.join(HERE, "test_car_profile_wrapper.py"))
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  v = 35 * MPH
+  xs = [190.0 * (k / 32) ** 2 for k in range(33)]
+  m = c.sm.msgs["modelV2"]
+  m.position, m.velocity = N(x=xs, y=[0.0] * 33), N(x=[v] * 33, t=[0.0] * 33)
+  m.orientationRate = N(z=[1.2 / v] * 33)
+  m.laneLineProbs = [0.5, 0.9, 0.9, 0.5]
+  c.sm.updated["modelV2"] = True
+  cs_ = W.car_state(35, 33)
+  cs_.out.steeringAngleDeg = 1.2 * 18.9 * 2.7 * (1 + 0.001 * v * v) / (v * v) * 57.29578
+  c.logic.anchor = 45 * MPH
+  plan = c.sm.msgs["starpilotPlan"]
+  setv = 33 * MPH
+  for _ in range(150):
+    c.frame += 1
+    c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, setv, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
+                    False, False, False, False, False, True, 33 * MPH)
+    if c.cam_goal is not None:
+      setv = c.cam_goal[0]
+  assert c.cam_floor is not None and c.cam_floor / MPH > 34.5
+  for _ in range(50):
+    c.frame += 1
+    r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, setv, 45 * MPH, True, 28 * MPH, 0.0, 0, True,
+                        False, False, False, False, False, True, 28 * MPH)
+  assert r[0] and r[1] / MPH < 30, r[1] / MPH

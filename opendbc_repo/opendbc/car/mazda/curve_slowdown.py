@@ -3212,14 +3212,23 @@ class CurveSlowdown:
         return (True, goal, 0.0, 0, True, True, False, False, False, True)
       return (False, CAM_NONE, 0.0, 0, False, False, False, False, True, True)
     if out.tap:
+      if self.cam_floor is None and self.cam_goal is None:
+        self.cam_tref = float(curve_speed)        # (S1) the incoming target when the taps began
       self.cam_goal = (out.tap_goal, self.frame)
+    if (self.cam_floor is not None or self.cam_goal is not None) and \
+       float(curve_speed) < getattr(self, "cam_tref", CAM_NONE) - lg.step - 1e-3:
+      # (S1) the incoming target dropped more than a tap under where it was when the taps began: it governs again
+      self.cam_floor, self.cam_goal = None, None
+      return res + (False,)
     if self.cam_goal is not None and (set_speed >= self.cam_goal[0] - lg.half_step or
                                       (self.frame - self.cam_goal[1]) * DT_CTRL > 3 * CAM_TAP_DT):
       if set_speed >= self.cam_goal[0] - lg.half_step:
         self.cam_floor = max(self.cam_floor or 0.0, self.cam_goal[0])
       self.cam_goal = None
     keep = max(self.cam_floor or 0.0, self.cam_goal[0] if self.cam_goal is not None else 0.0)
-    if keep > 0:
+    # (S1) never above a map curve ahead's plan, nor the governing map curve's plan
+    keep = min(keep, map_ahead, mo.plan if (map_gov and mo is not None and not out.phantom) else CAM_NONE)
+    if keep > 0 and keep > float(curve_speed):
       # (c) the curve target kept at what the taps proved (a lower map / camera target no longer takes it back down)
       a, sp, fl, bu, tr, ra, hold, na, fr = res
       return (True, max(sp, keep), min(fl, keep) if fl > 0 else fl, bu, True, True, False, na, fr, False)
