@@ -3716,6 +3716,12 @@ class CurveSlowdown:
     rising = bool(self.merge_lat_hist) and lat > self.merge_lat_hist[0] + MERGE_MODEL_RISE
     self.merge_lat_hist.append(lat)
     v = max(v_ego, 0.0)
+    # (review of round R, F6) the model's peaks only on a link or while a boost the model opened runs (+0.09 ms a frame else)
+    b = self.logic.boost
+    mc0 = self.map_control
+    if not ((mc0 is not None and mc0.link_now) or (b is not None and "model" in b)):
+      self.model_open_frames, self.merge_model_now = 0, False
+      return dict(merge_model_open=False, merge_lat=lat, merge_model_pk=-1.0, merge_winding=winding, merge_lane_ok=True)
     view = self._model_view() if MERGE_MODEL_OPEN else None
     pk = model_peak(view[0], view[1], v, 0.5, 3.0) if view is not None and v > 1.0 else None
     pk25 = None
