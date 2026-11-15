@@ -2387,7 +2387,8 @@ class CurveSlowdown:
     self.cam_curve = None
     try:
       raw = params.get("MazdaCameraCurveRaise", encoding="utf8")
-      if raw is None or raw == "" or raw in ("1", b"1", True):
+      # (review of round Q, M3) Torque Interceptor cars only (its limits are the TI's); others as before round Q
+      if self.has_ti and (raw is None or raw == "" or raw in ("1", b"1", True)):
         from opendbc.car.mazda.camera_curve import CameraCurve
         self.cam_curve = CameraCurve()
     except Exception:

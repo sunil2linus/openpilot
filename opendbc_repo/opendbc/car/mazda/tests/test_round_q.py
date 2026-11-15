@@ -662,3 +662,11 @@ def test_review_m2_a_non_finite_model_point_is_no_model_not_a_straight_road():
   ks[10] = float("nan")
   assert CC.model_peak(xs, ks, 20.0, 0.0, 9.0) is None
   assert CC.model_kappas([0.0, 5.0], [0.0, float("inf")], [10.0, 10.0]) == ([], [])
+
+
+def test_review_m3_the_camera_curve_rules_only_on_a_torque_interceptor_car(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  W = _load("tcpw_round_q_m3", os.path.join(HERE, "test_car_profile_wrapper.py"))
+  assert W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch).cam_curve is not None
+  assert W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch, ti=False).cam_curve is None
