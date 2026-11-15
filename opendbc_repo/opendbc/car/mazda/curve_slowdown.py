@@ -490,6 +490,12 @@ RESTORE_IN_CURVE_HOLD = True
 # the in-curve restore hold (RESTORE_IN_CURVE_HOLD) out.
 CAP_CURVE_MARGIN = 3 * MS_PER_MPH        # m/s (curve_target.MAP_ROAD_UNDERSHOOT)
 UP_STEP_TOL = 0.05                       # steps (see up_ok)
+# Round R, R4 (drive 76 t 1857-1897, W Utica Rd: rule 8's match on engage, target 48; the set went 49.989 -> 48.989 and
+# stuck for 35 s): the dash's set speed reads 0.011 mph under each whole mph, so "one more step down" (set - target over a
+# step) came out at 0.989 and was no step, and map_curve_control._street_end (|set - target| <= 0.6 mph) never finished.
+# A street speed / lower limit's target (street_lower) is counted in whole dash steps and gets no CURVE_MARGIN: it lands on
+# the target.
+STREET_EXACT = True
 SET_MINUS = "SET_MINUS"
 SET_PLUS = "SET_PLUS"
 
@@ -1830,7 +1836,8 @@ class CurveSlowdownLogic:
         floor = max(i.curve_floor, MIN_SET_SPEED)
       else:
         floor = max(driver_speed - self.max_drop_steps * self.step, MIN_SET_SPEED)
-      curve_t = i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN)
+      # (STREET_EXACT) a street speed / lower limit's target lands on it: no margin
+      curve_t = i.csc_speed + (0.0 if (i.curve_track or (STREET_EXACT and i.street_lower)) else CURVE_MARGIN)
       if CURVE_NO_ACCEL and i.curve_no_accel and not i.curve_track:
         curve_t = min(curve_t, i.v_ego + self.half_step)    # never a set speed that speeds the car up in the curve
       # (LKAS_KEEP, LKAS_KEEP_MARGIN) only once the car is down near the floor in this curve
@@ -1993,6 +2000,9 @@ class CurveSlowdownLogic:
     if reason is not None and not self.blocked:
       # How many more steps down this wants (re-lowering while restoring needs 2 steps).
       room = int((set_speed - target + 1e-3) // self.step)
+      if STREET_EXACT and reason == "curve" and i.street_lower:
+        # (STREET_EXACT) counted in the dash's whole steps: the set reads 48.989 for 49, so 48.989 -> 48 is a step
+        room = int(round(set_speed / self.step)) - int(math.ceil(target / self.step - UP_STEP_TOL))
       if reason == "curve":
         budget_ok = self.lower_presses < max(self.max_lower_presses, i.curve_budget)
         if not budget_ok and i.curve_budget > self.max_lower_presses:
