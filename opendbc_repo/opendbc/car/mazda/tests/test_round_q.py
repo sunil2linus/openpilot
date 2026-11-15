@@ -790,3 +790,9 @@ def test_rereview_r2_rochester_rd_two_bends_on_a_straight_path_still_release(tmp
   print("rochester base low", low_b, "set", set_b, pb, "| Q low", low_q, "set", set_q, pq)
   assert ph and low_q >= low_b and set_q >= set_b, (ph, low_b, low_q, set_b, set_q)
 
+
+def test_rereview_r3_a_compound_curve_keeps_the_map_follow_until_its_apex(tmp_path, monkeypatch):
+  # (test_v2_s2: R90, near straight 60 m, R60 mapped as one R60 curve: was +9.8 mph / +1.96 m/s^2, presses 62 -> 123)
+  for ramp in (True, False):
+    segs = [(300, 380, 90, 1), (380, 440, 1500, 1), (440, 530, 60, 1)]
+    _no_faster(tmp_path, monkeypatch, segs, (440, 530), mapped=[(300, 530, 60, 485)], ramp=ramp, anchor=55, view=70.0)

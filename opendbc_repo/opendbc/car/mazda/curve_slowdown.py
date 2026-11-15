@@ -3225,8 +3225,11 @@ class CurveSlowdown:
     if out.ending:
       # (d) the camera's target let go; a map curve still asking for less keeps governing (its plan caps the restore)
       self.cam_floor, self.cam_goal = None, None
-      if map_gov and not out.phantom and dist > 10.0:
-        # a map curve ahead (not the one we are in) governs: it keeps its follow, its plan caps the raise
+      apex_passed = (map_curve and bool(getattr(plan, "mapCurveApexValid", False)) and
+                     float(getattr(plan, "mapCurveApexDistance", 0.0) or 0.0) < 0.0)
+      if map_gov and not out.phantom and (dist > 10.0 or not apex_passed):
+        # a map curve ahead, or the one we are in with its apex still ahead (re-review R3: the map's apex is more reliable
+        # than its end; a compound curve's tight part comes after a near-straight), keeps its follow
         a, sp, fl, bu, tr, ra = self.curve_mix.update(False, CAM_NONE, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step,
                                                                                         MIN_SET_SPEED))
         return (a, sp, fl, bu, tr, ra, self.curve_mix.firm, self.curve_mix.no_accel, res[8], True)
