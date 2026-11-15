@@ -796,3 +796,15 @@ def test_rereview_r3_a_compound_curve_keeps_the_map_follow_until_its_apex(tmp_pa
   for ramp in (True, False):
     segs = [(300, 380, 90, 1), (380, 440, 1500, 1), (440, 530, 60, 1)]
     _no_faster(tmp_path, monkeypatch, segs, (440, 530), mapped=[(300, 530, 60, 485)], ramp=ramp, anchor=55, view=70.0)
+
+
+def test_rereview_r5_ghost_marks_by_the_curves_own_way_and_old_records_do_not_raise(tmp_path):
+  mem = MC.CurveMemory(str(tmp_path / "m.json"))
+  c = {"apex": (10.0, 10.0), "r": 142.0, "s_a": 0.0, "turn": 40.0, "name": "Main Road", "ways": [42, 43]}
+  e = mem._entry(c)
+  e["ghost"] = 2                                              # (an older build's integer)
+  assert mem.ghost(c) == 0
+  mem.add_ghost(c, way=MC.curve_way(c))
+  mem.add_ghost(c, way=MC.curve_way(c))
+  # looked up by the curve's own way whatever way the car was matched to when the pass began (a later way of the chain)
+  assert MC.curve_way(c) == 42 and mem.ghost(c, way=MC.curve_way(c)) == 2

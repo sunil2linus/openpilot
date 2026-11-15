@@ -403,6 +403,13 @@ def tiles_around(lat, lon):
   return [tile_name(lat + dla * 0.25, lon + dlo * 0.25) for dla in (-1, 0, 1) for dlo in (-1, 0, 1)]
 
 
+def curve_way(c):
+  """(re-review of round Q, R5) the way a curve's ghost marks are kept under: its own (first) way id, so a curve on a later
+  way of the chain finds the marks its passes left (not the way matched when the pass began)."""
+  ws = c.get("ways") or []
+  return int(ws[0]) if ws else 0
+
+
 def dist_m(a_lat, a_lon, b_lat, b_lon):
   x = math.radians(b_lon - a_lon) * EARTH_R * math.cos(math.radians((a_lat + b_lat) / 2))
   y = math.radians(b_lat - a_lat) * EARTH_R
@@ -1291,13 +1298,14 @@ class CurveMemory:
     """(PASS_GHOST_*) a pass that did not turn through `c` with the GPS trusted on way `way`: one more ghost mark."""
     t = time.time() if t is None else t   # (wall time: marks are compared across drives)
     e = self._entry(c, direction)
-    marks = [m for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2]
+    g = e.get("ghost")
+    marks = [m for m in (g if isinstance(g, list) else []) if isinstance(m, list) and len(m) == 2]   # (R5: an old int)
     e["ghost"] = (marks + [[round(t, 1), int(way)]])[-4:]
     self.save()
 
   def clear_ghost(self, c, direction=None):
     e = self._find(*c["apex"], direction) if "apex" in c else None
-    if e is not None and e.get("ghost"):
+    if e is not None and "ghost" in e:
       e.pop("ghost", None)
       self.save()
 
@@ -1307,7 +1315,8 @@ class CurveMemory:
     if e is None:
       return 0
     t = time.time() if t is None else t
-    return sum(1 for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2 and
+    g = e.get("ghost")
+    return sum(1 for m in (g if isinstance(g, list) else []) if isinstance(m, list) and len(m) == 2 and
                t - m[0] <= PASS_GHOST_DAYS * 86400.0 and (not way or not m[1] or int(m[1]) == int(way)))
 
   def note_veto(self, c, direction=None):
@@ -1656,7 +1665,7 @@ class MapCurves:
       if later_way and self._against_oneway(c, increasing):
         continue                  # (round Q) a later way of the chain driven against its one-way direction: not our road
       if (self.memory is not None and not c.get("ramp") and hasattr(self.memory, "ghost") and
-          self.memory.ghost(c, curve_direction(c, increasing), way=getattr(self, "cur_way", 0)) >= PASS_GHOST_COUNT):
+          self.memory.ghost(c, curve_direction(c, increasing), way=curve_way(c)) >= PASS_GHOST_COUNT):
         continue                  # (PASS_GHOST_*) driven straight past it twice with the GPS trusted: not a curve
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
@@ -2457,7 +2466,7 @@ class MapCurvesPlanner:
       if reason == "turn" and getattr(self, "pass_trust0", False) and driven < PASS_GHOST_SHARE * turn_c and \
          not c.get("ramp") and int(c.get("cls", 0) or 0) not in LINK_CLASSES and hasattr(self.mc.memory, "add_ghost") and \
          not self._other_way_near(c, getattr(self, "pass_way", 0)):
-        self.mc.memory.add_ghost(c, direction, way=getattr(self, "pass_way", 0))      # (PASS_GHOST_*)
+        self.mc.memory.add_ghost(c, direction, way=curve_way(c))      # (PASS_GHOST_*)
       return
     if turn_c >= PASS_TURN_MIN and hasattr(self.mc.memory, "clear_ghost"):
       self.mc.memory.clear_ghost(c, direction)          # (it really turned through it)
