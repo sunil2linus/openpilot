@@ -350,10 +350,13 @@ def test_q5_one_second_of_gps_trust_2_no_longer_disqualifies_the_lower_limit():
   steps = [(12, dict(limit=45, d=50)), (1.0, dict(limit=35, d=50, trust=2)), (10, dict(limit=35, d=50))]
   f = _sl_run(steps)
   assert f.lower is not None and f.lower.kind == "lower" and abs(f.lower.tgt - 40) < 0.6, f.lower
-  # (still: trust 2 within the last LIMIT_TRUST_RECENT of its steady time keeps it waiting)
+  # (review S4: its steady time starts over at the last trust > 0 frame: 4.5 s clean after the blip is not yet 5 s)
   f = _sl_run([(12, dict(limit=45, d=50)), (3.5, dict(limit=35, d=50)), (0.5, dict(limit=35, d=50, trust=2)),
-               (2.0, dict(limit=35, d=50))])
+               (4.5, dict(limit=35, d=50))])
   assert f.lower is None
+  f = _sl_run([(12, dict(limit=45, d=50)), (3.5, dict(limit=35, d=50)), (0.5, dict(limit=35, d=50, trust=2)),
+               (5.2, dict(limit=35, d=50))])
+  assert f.lower is not None and f.lower.kind == "lower"
 
 
 def test_q5_a_stale_navigation_limit_after_a_road_change_does_not_block_slowing():

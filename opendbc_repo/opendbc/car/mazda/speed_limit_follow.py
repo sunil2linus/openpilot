@@ -268,8 +268,9 @@ ENGAGE_LIMIT_STEADY = 5.0    # s
 # Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
 LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
 # Round Q (drive 74 t 1104-1142: a 35 road, the set restored 30 -> 43 -> 51 -> 53): "the candidate's GPS trust" was the worst
-# value seen since the limit first appeared, so one second of trust 2 disqualified the 35 for good. For the ways down (rule
-# 9, rule 3's cap, rule 4's undo) it is now the worst of the last LIMIT_TRUST_RECENT (candidate_trust_recent); a raise (the
+# value seen since the limit first appeared, so one second of trust 2 disqualified the 35 for good. Rule 9's steady time now
+# counts from the candidate's last frame with trust > 0 (review S4: a whole steady time of clean trust); rule 3's cap and
+# rule 4's undo use the worst of the last LIMIT_TRUST_RECENT (candidate_trust_recent); a raise (the
 # rises, a first limit, the match on engage) keeps the worst since it appeared (test_speed_limit_follow: a trust 1 moment
 # while a 60 was reported keeps it from raising 45 -> 60; a raise on a wrong road's limit is the costly mistake)
 LIMIT_TRUST_RECENT = 3.0     # s
@@ -413,7 +414,8 @@ class SpeedLimitFollower:
     self.candidate = None
     self.candidate_frames = 0
     self.candidate_trust = 0       # the highest GPS trust value (map sources) while the candidate has been reported
-    self.candidate_trust_recent = 0  # ... in its last LIMIT_TRUST_RECENT (the ways down)
+    self.candidate_trust_recent = 0  # ... in its last LIMIT_TRUST_RECENT (rule 3's cap, rule 4's undo)
+    self.cand_clean_frames = 0     # (rule 9) frames since the candidate's last frame with GPS trust > 0 (or its start)
     self.cand_trusts = deque()     # (frame, trust) of its frames with trust > 0, the last LIMIT_TRUST_RECENT
     self.nav_seen = (None, -10_000)  # (navigation's limit, the frame it last changed): a stale route step (round Q)
     self.name_change_frame = -10_000  # the frame the steady road name last changed
@@ -725,6 +727,7 @@ class SpeedLimitFollower:
     """(LIMIT_TRUST_RECENT) candidate_trust_recent: the worst GPS trust of the candidate's last LIMIT_TRUST_RECENT."""
     if trust > 0:
       self.cand_trusts.append((self.frame, trust))
+    self.cand_clean_frames = 0 if (trust > 0 or self.candidate_frames == 0) else self.cand_clean_frames + 1
     while self.cand_trusts and self.frame - self.cand_trusts[0][0] >= _frames(LIMIT_TRUST_RECENT):
       self.cand_trusts.popleft()
     self.candidate_trust_recent = max((t for _, t in self.cand_trusts), default=0)
@@ -840,7 +843,7 @@ class SpeedLimitFollower:
   def _slow_lower(self, i, d, reported):
     """Rule 9: a lower limit steady LOWER_STEADY (navigation agreeing: LOWER_NAV_STEADY) with GPS trust 0 throughout."""
     c = self.candidate
-    if (c is None or reported != c or c == self.lower_skip or not self._street() or self.candidate_trust_recent > 0 or
+    if (c is None or reported != c or c == self.lower_skip or not self._street() or self.cand_clean_frames <= 0 or
         self.cand_turn or self.name_cand):
       return
     if self.cand_name != self.name and self.turn_frame < self.frame - self.candidate_frames - _frames(TURN_EARLY):
@@ -856,7 +859,8 @@ class SpeedLimitFollower:
     need = (LOWER_NAV_BIG_STEADY if big else LOWER_NAV_STEADY) if agree else (LOWER_BIG_STEADY if big else LOWER_STEADY)
     if not agree and self.frame - self.turn_frame < _frames(LOWER_NEW_ROAD_TIME):
       need = max(need, LOWER_NEW_ROAD_STEADY)
-    if min(self.candidate_frames, self.cruise_frames) < _frames(need):
+    # (review of round Q, S4) the steady time counts from the candidate's last frame with GPS trust > 0
+    if min(self.candidate_frames, self.cruise_frames, self.cand_clean_frames) < _frames(need):
       return
     limit, sources = c, ("map+nav" if agree else "map")
     if nav is not None and not agree:

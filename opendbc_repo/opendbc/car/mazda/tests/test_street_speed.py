@@ -221,12 +221,10 @@ def test_a_junction_flap_is_ignored_and_a_big_drop_needs_8_s():
   # a drop of more than 20 mph (50 -> 25): 8 s
   r = street_sim(9000, lambda f: 50 if f < 500 else 25, 55)
   assert 500 + 800 <= _minus(r)[0][0] <= 500 + 900, _minus(r)[0][0]
-  # GPS trust 1 for a moment in the last LIMIT_TRUST_RECENT of its steady time: not yet (round Q: a moment earlier in it
-  # no longer disqualifies it for good, drive 74 t 1104-1142)
-  r = street_sim(5000, lambda f: 45 if f < 500 else 25, 50, trust=lambda f: 1 if f == 900 else 0)
-  assert not _minus(r, 0, 900 + int(slf.LIMIT_TRUST_RECENT / DT)), _minus(r)[:1]
+  # GPS trust 1 for a moment in it: its steady time starts over there (round Q, review S4: a whole steady time of clean
+  # trust; it no longer disqualifies the limit for good, drive 74 t 1104-1142)
   r = street_sim(5000, lambda f: 45 if f < 500 else 25, 50, trust=lambda f: 1 if f == 600 else 0)
-  assert _minus(r) and _minus(r)[0][0] >= 500 + 500 - 1, _minus(r)[:1]
+  assert _minus(r) and 600 + 500 - 1 <= _minus(r)[0][0] <= 600 + 600, _minus(r)[:1]
   # the name changed since it appeared, not by a turn (a flap still going): not
   r = street_sim(5000, lambda f: 45 if f < 500 else 25, 50, name=lambda f: "B Road" if f >= 550 else "A Road")
   assert _minus(r, 0, 1100) == []
