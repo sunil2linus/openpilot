@@ -458,6 +458,19 @@ def find_curves(chain, ways_by_id, ramp=None):
 # the same name, are the jog onto a carriageway, not curves: dropped
 SPLIT_PAIR_GAP = 60.0      # m between the first's exit and the second's entry
 SPLIT_NET_DEG = 8.0        # deg
+# (review of round Q, S5) ... each bend at most SPLIT_BEND_MAX and the road moved sideways at most SPLIT_OFFSET_MAX (the
+# Rochester Rd case: ~23-26 deg, ~9 m): a real S-bend (70 / 65 deg) is kept
+SPLIT_BEND_MAX = 30.0      # deg
+SPLIT_OFFSET_MAX = 12.0    # m
+
+
+def _sideways(c1, c2):
+  """m: how far the road after c2's exit lies beside the line through c1's entry along its heading."""
+  (la1, lo1), (la2, lo2) = c1["a"], c2["b"]
+  dy = (la2 - la1) * 111195.0
+  dx = (lo2 - lo1) * 111195.0 * math.cos(math.radians(la1))
+  h = math.radians(c1["a_hdg"])
+  return abs(dx * math.cos(h) - dy * math.sin(h))
 
 
 def split_doublets(curves, ways_by_id):
@@ -466,6 +479,8 @@ def split_doublets(curves, ways_by_id):
   for k in range(len(curves) - 1):
     c1, c2 = curves[k], curves[k + 1]
     if c1["dir"] == c2["dir"] or c2["s_a"] - c1["s_b"] > SPLIT_PAIR_GAP or abs(c1["turn"] - c2["turn"]) >= SPLIT_NET_DEG:
+      continue
+    if max(c1["turn"], c2["turn"]) > SPLIT_BEND_MAX or _sideways(c1, c2) > SPLIT_OFFSET_MAX:
       continue
     wl = [ways_by_id[w] for w in sorted(set(c1["ways"]) | set(c2["ways"])) if w in ways_by_id]
     names = {(w.name or w.ref) for w in wl if (w.name or w.ref)}

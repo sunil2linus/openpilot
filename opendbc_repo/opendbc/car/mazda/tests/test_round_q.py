@@ -396,10 +396,15 @@ def test_q4_the_builder_drops_the_jog_where_a_road_splits_into_its_one_way_sides
   ways = {1: N(name="Main Road", ref="", oneway=False), 2: N(name="Main Road", ref="", oneway=True),
           3: N(name="Other Road", ref="", oneway=True)}
 
-  def cv(s_a, s_b, d, turn, wset):
-    return {"s_a": s_a, "s_b": s_b, "dir": d, "turn": turn, "ways": wset}
+  def cv(s_a, s_b, d, turn, wset, off=9.0):
+    # (synthetic: heading north, the jog's exit `off` m to the side, ~100 m on)
+    return {"s_a": s_a, "s_b": s_b, "dir": d, "turn": turn, "ways": wset, "a": (0.0, 0.0), "a_hdg": 0.0,
+            "b": (100.0 / 111195.0, off / 111195.0)}
   jog = [cv(0, 30, "L", 22.0, [1, 2]), cv(70, 100, "R", 18.0, [2])]
   assert BCM.split_doublets(jog, ways) == []
+  # (review S5) a real S-bend of the same shape kept: bends of 70 / 65 deg, or the road 20 m to the side
+  assert len(BCM.split_doublets([cv(0, 30, "L", 70.0, [1, 2]), cv(70, 100, "R", 65.0, [2])], ways)) == 2
+  assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1, 2]), cv(70, 100, "R", 18.0, [2], off=20.0)], ways)) == 2
   # a real S-bend (same name, both two-way), one far apart, one not cancelling, another road: kept
   assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1]), cv(70, 100, "R", 18.0, [1])], ways)) == 2
   assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1, 2]), cv(120, 150, "R", 18.0, [2])], ways)) == 2
