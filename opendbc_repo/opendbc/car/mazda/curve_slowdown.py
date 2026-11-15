@@ -3478,7 +3478,9 @@ class CurveSlowdown:
               if (map_curve and bool(getattr(plan, "mapCurveApexValid", False))) else None),
       # (B1) the map knows the road beyond the model's horizon: matched to a road class, GPS trusted, Map Curves On
       map_covered=bool(self.map_on_used and status != STATUS_PAUSED and int(getattr(plan, "mapRoadClass", 0) or 0) > 0 and
-                       int(getattr(plan, "mapGpsTrust", 4) or 0) < 2))
+                       int(getattr(plan, "mapGpsTrust", 4) or 0) < 2),
+      # (camera_curve.CAM_POST_APEX, F3) an on-ramp to a highway
+      hwy_ramp=bool(plan_alive and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False)))
     out = self.cam_out = self.cam_curve.update(ci)
     if out.end_cancel:
       # (B1) the end cancelled: no restore of ours left in the way of the camera target taking the set down again

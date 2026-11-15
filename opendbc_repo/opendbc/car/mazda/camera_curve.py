@@ -104,6 +104,11 @@ CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the 
 # peaks, as rule (c)), with the median |torque| under CAM_POST_TORQUE (and the saturation share as always), up to
 # CAM_POST_APEX_OVER over the governing map plan and the camera's own target (C6 relaxed only here); every other rule (c)
 # / (e) guard stays. What the taps reached is kept on the same terms (keep). Not with the TI alone (CAM_LAT_TI then).
+# Review of round R, F3 (a ramp that does not lead to a highway: the planner keeps its loop to its very end, and the +3 mph
+# carried out of the loop into a curve 50 m after it, 31.9 mph / 5.09 m/s^2 against the base's 28.2 / 3.98): only on an
+# on-ramp to a highway (CamInputs.hwy_ramp), the owner's case. There the planner lets the loop go RAMP_HWY_RELEASE (120 m)
+# before its end: the apex is then unknown, so no taps and no relaxed keep in the loop's last 120 m (the set back under
+# the normal limits).
 CAM_POST_APEX = True
 CAM_LAT_POST_APEX = 2.3         # m/s^2
 CAM_POST_APEX_OVER = 3 * MS_PER_MPH
@@ -169,6 +174,7 @@ class CamInputs:
   apex_d: object = None           # m to the governing map curve's apex (negative: passed), None unknown (R2 / R3)
   cam_target: float = NO_CURVE    # m/s: the camera curve target alone (its plan sees past the 3 s window: R1)
   gov_plan: float = NO_CURVE      # m/s: the governing map curve's plan (C6)
+  hwy_ramp: bool = False          # (CAM_POST_APEX, F3) on an on-ramp to a highway
 
 
 @dataclass
@@ -236,7 +242,7 @@ class CameraCurve:
       self.below_peak = self.below_peak + 1 if lat <= self.lat_peak - CAM_POST_PEAK_DROP else 0
     else:
       self.lat_peak, self.below_peak = 0.0, 0
-    post = bool(CAM_POST_APEX and not i.ti_only and i.apex_d is not None and i.apex_d < 0.0 and
+    post = bool(CAM_POST_APEX and i.hwy_ramp and not i.ti_only and i.apex_d is not None and i.apex_d < 0.0 and
                 self.below_peak >= int(CAM_POST_PEAK_TIME / DT_CTRL))
     lim_up = CAM_LAT_POST_APEX if post else lim
     model = bool(i.model_x) and bool(i.model_k)

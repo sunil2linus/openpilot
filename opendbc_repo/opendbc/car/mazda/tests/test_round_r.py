@@ -491,7 +491,7 @@ def _loop_cam(seconds=6.0, v_mph=30.5, set_mph=30.0, lat=2.0, apex=-30.0, torque
     tight = f < 200
     args = dict(v_ego=v, set_speed=set_v, lat=peak_first if tight else lat, model_x=xs, model_k=ks, lane_prob=0.8,
                 torque=1.0 if tight else torque, curve_on=True, map_in_curve=True, map_curve_id=(2, 72), on_ramp=True,
-                apex_d=(20.0 if tight else apex), gov_plan=set_mph * MPH, cam_target=set_mph * MPH)
+                apex_d=(20.0 if tight else apex), gov_plan=set_mph * MPH, cam_target=set_mph * MPH, hwy_ramp=True)
     args.update(kw)
     o = cc.update(CCm.CamInputs(**args))
     if o.tap:
@@ -508,7 +508,8 @@ def test_r7_past_the_apex_and_the_peak_taps_up_to_3_mph_over_the_plan():
 
 
 def test_r7_no_taps_before_the_apex_unknown_apex_too_little_reserve_or_the_ti_alone():
-  for kw in (dict(apex=15.0), dict(apex=None), dict(torque=0.9), dict(lat=2.3), dict(ti_only=True)):
+  # (F3) a ramp that does not lead to a highway: never
+  for kw in (dict(apex=15.0), dict(apex=None), dict(torque=0.9), dict(lat=2.3), dict(ti_only=True), dict(hwy_ramp=False)):
     taps, s = _loop_cam(**kw)
     assert not taps, kw
   # the lateral not past its peak (the loop's second part as tight as the first): none
