@@ -1289,7 +1289,7 @@ class CurveMemory:
 
   def add_ghost(self, c, direction=None, way=0, t=None):
     """(PASS_GHOST_*) a pass that did not turn through `c` with the GPS trusted on way `way`: one more ghost mark."""
-    t = time.time() if t is None else t   # noqa: TID251  wall time: marks are compared across drives
+    t = time.time() if t is None else t   # (wall time: marks are compared across drives)
     e = self._entry(c, direction)
     marks = [m for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2]
     e["ghost"] = (marks + [[round(t, 1), int(way)]])[-4:]
@@ -1306,7 +1306,7 @@ class CurveMemory:
     e = self._find(*c["apex"], direction) if "apex" in c else None
     if e is None:
       return 0
-    t = time.time() if t is None else t   # noqa: TID251
+    t = time.time() if t is None else t
     return sum(1 for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2 and
                t - m[0] <= PASS_GHOST_DAYS * 86400.0 and (not way or not m[1] or int(m[1]) == int(way)))
 

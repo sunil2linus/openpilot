@@ -364,8 +364,8 @@ class LimitInputs:
   # a restore of the controller's is pending (the set speed under its anchor): driver_speed is not the set speed he
   # chose (rule 9's undo never brings such a speed back above the limit)
   pending: bool = False
-  ours: bool = False        # (review of round Q, S3) the anchor was made by us (an exit handover, the ENGAGE goal, a merge,
-                            # our limit raise), not his own speed
+  # (review of round Q, S3) the anchor was made by us (an exit handover, the ENGAGE goal, a merge, our limit raise)
+  ours: bool = False
   stop_active: bool = False # a stop reason (stopped car, stop ahead, red light head start) is on (rule 6's raise waits)
   red_light: bool = False   # the stop-light detector sees a red light (rule 6's raise waits)
 
