@@ -311,3 +311,54 @@ def test_q3_the_wrapper_raises_the_curve_target_by_its_taps_and_logs_them(tmp_pa
                       False, False, False, False, False, True, 33 * MPH)
   assert abs(r[1] - 33 * MPH) < 1e-6 and not r[4]
 
+
+# ---- Q5: a known lower limit caps every raise of ours (drive 74 t 1104-1142, t 532) ----
+
+SLF = _load("slf_round_q", os.path.join(HERE, "..", "speed_limit_follow.py"))
+
+
+def _sli(limit, d, trust=0, pending=False, name="Rochester Road", nav=0.0, turned=False):
+  return SLF.LimitInputs(limit=limit * MPH, source="Map Data", gps_trust=trust, driver_speed=d * MPH, cruise_enabled=True,
+                         road_class=7, road_name=name, pending=pending, nav_limit=nav * MPH, v_ego=d * MPH, turned=turned,
+                         nav_dist=1000.0)
+
+
+def _sl_run(steps, f=None):
+  f = f or SLF.SpeedLimitFollower(False)
+  for n, kw in steps:
+    for _ in range(int(n / DT)):
+      f.update(_sli(**kw))
+  return f
+
+
+def test_q5_a_pending_restore_is_capped_at_a_lower_limit_in_any_band():
+  # drive 74: our exit handover's 53 on a 45 road (out of its band), the set lowered to 30 for the turnaround; the 35 road
+  f = _sl_run([(12, dict(limit=45, d=53)), (12, dict(limit=35, d=53, pending=True))])
+  assert abs(f.cap_speed / MPH - 40) < 1e-6, f.cap_speed / MPH       # 35 + the Street Speed offset (+5)
+  assert f.cap is not None and not f.cap.band
+  # nothing pending (his own 53): no cap; rule 9 may slow him as before (MazdaSlowLowerLimit)
+  f = _sl_run([(12, dict(limit=45, d=53)), (12, dict(limit=35, d=53))])
+  assert f.cap_speed == 0.0
+
+
+def test_q5_one_second_of_gps_trust_2_no_longer_disqualifies_the_lower_limit():
+  # (his 50 on the 45 road: at the street's target already, nothing for rule 8)
+  steps = [(12, dict(limit=45, d=50)), (1.0, dict(limit=35, d=50, trust=2)), (10, dict(limit=35, d=50))]
+  f = _sl_run(steps)
+  assert f.lower is not None and f.lower.kind == "lower" and abs(f.lower.tgt - 40) < 0.6, f.lower
+  # (still: trust 2 within the last LIMIT_TRUST_RECENT of its steady time keeps it waiting)
+  f = _sl_run([(12, dict(limit=45, d=50)), (3.5, dict(limit=35, d=50)), (0.5, dict(limit=35, d=50, trust=2)),
+               (2.0, dict(limit=35, d=50))])
+  assert f.lower is None
+
+
+def test_q5_a_stale_navigation_limit_after_a_road_change_does_not_block_slowing():
+  # drive 74 t 532: navigation's 50 from the route step before the turn, the map's 45 on the new road: 53 was kept
+  def steps(nav_after):
+    return [(12, dict(limit=50, d=55, nav=50.0, name="Old Road")), (1, dict(limit=50, d=55, nav=50.0, name="New Road", turned=True)),
+            (5, dict(limit=50, d=55, nav=50.0, name="New Road")), (20, dict(limit=45, d=55, nav=nav_after, name="New Road"))]
+  f = _sl_run(steps(50.0))
+  assert f.lower is not None and abs(f.lower.tgt - 50) < 0.6, f.lower       # 45 + 5 (was: max(nav 50, map 45) + 5 = 55)
+  # navigation's limit changed after the road change: it still counts (the higher of the two, as before)
+  f = _sl_run(steps(48.0))
+  assert f.lower is not None and abs(f.lower.tgt - 53) < 0.6, f.lower

@@ -131,6 +131,7 @@ MazdaSpeedLimitFollow: 0 off, 1 test (logs what it would do), 2 on.
 
 No openpilot dependencies, so it can be unit tested.
 """
+from collections import deque
 from dataclasses import dataclass
 
 DT_CTRL = 0.01
@@ -266,6 +267,14 @@ ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "
 ENGAGE_LIMIT_STEADY = 5.0    # s
 # Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
 LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
+# Round Q (drive 74 t 1104-1142: a 35 road, the set restored 30 -> 43 -> 51 -> 53): "the candidate's GPS trust" was the worst
+# value seen since the limit first appeared, so one second of trust 2 disqualified the 35 for good. For the ways down (rule
+# 9, rule 3's cap, rule 4's undo) it is now the worst of the last LIMIT_TRUST_RECENT (candidate_trust_recent); a raise (the
+# rises, a first limit, the match on engage) keeps the worst since it appeared (test_speed_limit_follow: a trust 1 moment
+# while a 60 was reported keeps it from raising 45 -> 60; a raise on a wrong road's limit is the costly mistake)
+LIMIT_TRUST_RECENT = 3.0     # s
+# ... and a steady lower limit (+ the offset) caps every pending restore / raise of ours in any band (rule 3 skipped it
+# silently with his speed out of the old limit's band, the 53 an exit handover of ours had made on a 45 road), logged
 LOWER_BIG_DROP = (20, 32)    # mph / km/h
 LOWER_BIG_STEADY = 8.0       # s
 LOWER_NAV_STEADY = 2.5       # s with navigation's limit agreeing
@@ -402,6 +411,10 @@ class SpeedLimitFollower:
     self.candidate = None
     self.candidate_frames = 0
     self.candidate_trust = 0       # the highest GPS trust value (map sources) while the candidate has been reported
+    self.candidate_trust_recent = 0  # ... in its last LIMIT_TRUST_RECENT (the ways down)
+    self.cand_trusts = deque()     # (frame, trust) of its frames with trust > 0, the last LIMIT_TRUST_RECENT
+    self.nav_seen = (None, -10_000)  # (navigation's limit, the frame it last changed): a stale route step (round Q)
+    self.name_change_frame = -10_000  # the frame the steady road name last changed
     self.seen = {}                 # {limit (steps): last frame reported}, for rule 2's quiet time
     self.matched = None            # the last stable limit the driver's speed was at (steps, rule 1's band) ...
     self.matched_seen = -10_000    # ... and when
@@ -550,8 +563,10 @@ class SpeedLimitFollower:
       self.candidate_trust = max(self.candidate_trust, trust)
     else:
       self.candidate, self.candidate_frames, self.candidate_trust = reported, 0, trust
+      self.cand_trusts.clear()
       self.cand_name = self.name
       self.cand_turn = bool(i.nav_turn and 0 < i.nav_dist <= NAV_TURN_NEAR)
+    self._cand_trust(trust)
     if self.candidate is not None and self.candidate != self.stable and self.candidate_frames >= _frames(self._stable_time()):
       self._new_limit(i, d)
     if self.rise is not None:
@@ -572,6 +587,8 @@ class SpeedLimitFollower:
       # (review of merge-f: the retry kept the old trust 2 in candidate_trust and never raised) with a fresh steady time
       if self.exit_retry == reported or self.candidate_trust > LIMIT_FIRM_TRUST_MAX:
         self.candidate_frames, self.candidate_trust = 0, trust
+        self.cand_trusts.clear()
+        self._cand_trust(trust)
       self.turn_check, self.exit_retry = False, None
       self._exit_limit(reported, None, d, i, self.frame)
     self._provisional(reported, d, i)
@@ -681,7 +698,8 @@ class SpeedLimitFollower:
     if self.name_frames < _frames(TURN_NAME_STEADY_STRAIGHT if straight else TURN_NAME_STEADY):
       return                         # (navigation says straight on through here: a short name change is a flap)
     old, self.name, self.name_cand = self.name, n, ""
-    # the heading turned at any time since the new name appeared (mapd's name comes seconds after the turn: drive 55,
+    if old and old != n:
+      self.name_change_frame = self.frame    # the heading turned at any time since the new name appeared (mapd's name comes seconds after the turn: drive 55,
     # Mound Road, 45 deg at 624.8, the name steady at 635.6 with the 10 s window just past)
     turned = self.frame - self.turned_frame < self.name_frames      # (name_frames counts its first frame)
     if old and turned:
@@ -701,6 +719,14 @@ class SpeedLimitFollower:
                                                       "driver_before_mph": (d or 0) * self.step / MS_PER_MPH,
                                                       "sources": sources}}))
 
+  def _cand_trust(self, trust):
+    """(LIMIT_TRUST_RECENT) candidate_trust_recent: the worst GPS trust of the candidate's last LIMIT_TRUST_RECENT."""
+    if trust > 0:
+      self.cand_trusts.append((self.frame, trust))
+    while self.cand_trusts and self.frame - self.cand_trusts[0][0] >= _frames(LIMIT_TRUST_RECENT):
+      self.cand_trusts.popleft()
+    self.candidate_trust_recent = max((t for _, t in self.cand_trusts), default=0)
+
   def _nav_limit(self, i):
     """Navigation's limit (steps) when usable (fresh: the planner's; not junk under NAV_LIMIT_MIN), else None."""
     if i.nav_limit <= 0:
@@ -714,6 +740,8 @@ class SpeedLimitFollower:
   def _street_speed(self, i, d, reported):
     """Rules 8 and 9 (no limit follow on a highway, a link or an unknown road)."""
     self.nav = self._nav_limit(i)
+    if self.nav != self.nav_seen[0]:
+      self.nav_seen = (self.nav, self.frame)
     self.trust0_frames = self.trust0_frames + 1 if i.gps_trust <= LIMIT_FIRM_TRUST_MAX else 0
     self.unknown_frames = self.unknown_frames + 1 if reported is None else 0
     if d is None:
@@ -810,7 +838,7 @@ class SpeedLimitFollower:
   def _slow_lower(self, i, d, reported):
     """Rule 9: a lower limit steady LOWER_STEADY (navigation agreeing: LOWER_NAV_STEADY) with GPS trust 0 throughout."""
     c = self.candidate
-    if (c is None or reported != c or c == self.lower_skip or not self._street() or self.candidate_trust > 0 or
+    if (c is None or reported != c or c == self.lower_skip or not self._street() or self.candidate_trust_recent > 0 or
         self.cand_turn or self.name_cand):
       return
     if self.cand_name != self.name and self.turn_frame < self.frame - self.candidate_frames - _frames(TURN_EARLY):
@@ -819,6 +847,8 @@ class SpeedLimitFollower:
     if old is None or c >= old:
       return
     nav = self.nav
+    if nav is not None and self.nav_seen[1] < self.name_change_frame and nav != c:
+      nav = None                       # (round Q, drive 74 t 532: navigation's step from before the road changed: stale)
     agree = nav is not None and abs(nav - c) <= self.nav_agree
     big = old - c > self.big_drop
     need = (LOWER_NAV_BIG_STEADY if big else LOWER_NAV_STEADY) if agree else (LOWER_BIG_STEADY if big else LOWER_STEADY)
@@ -1027,8 +1057,8 @@ class SpeedLimitFollower:
       # any lower one). The controller decides how (rule 4 in the module docstring); no rule 3 cap from our own raised
       # speed. GPS trust 0 on every frame of its steady time (review: a street's 45 for 3 s with trust 2 a few s after
       # a merge took the set 70 -> 45 on the highway, 25 SET-).
-      if self.candidate_trust > LIMIT_FIRM_TRUST_MAX:
-        self._not_followed(r.new, new, i.source, f"undo: GPS trust {self.candidate_trust} (an undo needs 0)")
+      if self.candidate_trust_recent > LIMIT_FIRM_TRUST_MAX:
+        self._not_followed(r.new, new, i.source, f"undo: GPS trust {self.candidate_trust_recent} (an undo needs 0)")
         return
       self.raised = self.merge_watch = None
       self.undo_frame = self.frame
@@ -1055,13 +1085,15 @@ class SpeedLimitFollower:
       if d is not None and abs(d - new - self._add()) < 0.5:
         return                                         # already at the new limit
       self.rise = (old, new, start)                    # rule 1, decided once steady (_steady_rise)
-    elif d is None or self._in_band(d, old):
-      why = self._plausible(old, new, i.source, i.gps_trust)
+    elif d is None or self._in_band(d, old) or (i.pending and d > new + self._add() + 0.5):
+      why = self._plausible(old, new, i.source, max(i.gps_trust, self.candidate_trust_recent))
       if why:
         self._not_followed(old, new, i.source, f"lower limit: {why}")
       else:
         # (cruise off: decided with the driver's speed on the first frame it is back; until then nothing to cap)
+        # (round Q: a pending restore of ours is capped in any band, LIMIT_TRUST_RECENT)
         self.cap = Offer(old, new, i.source, self.frame, "cap", d, tgt=new + self._add())
+        self.cap.band = d is None or self._in_band(d, old)     # (logged with the cap: speedLimitCap's in_band)
     # (a lower limit with the driver's speed outside the band: his own speed, nothing to do)
 
   def _exit_limit(self, new, old, d, i, start):

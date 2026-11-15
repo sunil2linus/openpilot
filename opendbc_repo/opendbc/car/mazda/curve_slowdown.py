@@ -3632,6 +3632,7 @@ class CurveSlowdown:
         if capped is not None:
           self.recorder.record("speedLimitCap", time.monotonic(), {
             "mode": "on" if self.limit_mode == 2 else "test", "old_mph": c.old * unit, "new_mph": c.new * unit,
+            "in_band": bool(getattr(c, "band", True)),
             "source": c.source, "driver_mph_before": capped[0] / MS_PER_MPH, "set_mph": i.set_speed / MS_PER_MPH,
             "set_mph_with_in_flight": set_after / MS_PER_MPH,
             "restore_to_mph": max(capped[1], set_after) / MS_PER_MPH, "vEgo_mph": i.v_ego / MS_PER_MPH,
