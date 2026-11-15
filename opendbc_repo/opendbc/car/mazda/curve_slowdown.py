@@ -392,6 +392,18 @@ RED_NO_RESTORE_UP = True
 ENGAGE_RAISE = True
 ENGAGE_BELOW = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
 ENGAGE_RAISE_MAX = 20.0       # s
+# Round R, R3 (drive 76 t 1123 / 1212 / 1310 / 1422 / 1614: our auto resume's RES with the set at the 19-25 our stop / red
+# light lowering left, his 53 above it: 11-14 s to 53 by taps on his gas, the post-stop wait, a hold to ~8 under it, taps).
+# When the RES was our auto resume's (SlowdownInputs.auto_resumed) and the set is under the anchor by our own stop lowering
+# (stop_episode, the anchor above the set): no RAISE_FAST_AFTER_STOP wait (he is on the gas, the light is green), every
+# other ENGAGE_RAISE guard kept (red light, stop on / planned, a slow / closing car ahead, a curve under the goal); the goal
+# also bounded by the street / limit target (engage_goal); SET+ at once: the jump on his gas when the jump rules allow,
+# else a SET+ hold, which (only here) also goes on under his gas; the hold goes to the highest multiple of the quantum at
+# or under the goal (no overrun margin) when this drive's phase-locked holds have all measured nothing landing after the
+# release (at least ENGAGE_AUTO_CLEAN_HOLDS of them; the driver's own holds do not count: he releases at any time), so
+# only the last 1-4 mph are taps. His own RES: as before.
+ENGAGE_AUTO = True
+ENGAGE_AUTO_CLEAN_HOLDS = 3
 # Round P (drive 73 t 1296.2, the South Blvd exit with stopped cars on the ramp): the exit's end by adoption (map_curve_control
 # adopt, adopt_forgets) took the 26 its slowdown and the queue left as his speed though the street cap was 48 (he held SET+
 # 26 -> 50 himself at 1330). After a stop (our stop episode, the trigger or a standstill within EXIT_HANDOVER_STOP) or with the
@@ -600,6 +612,8 @@ class SlowdownInputs:
   engage_goal: float = 0.0
   # m/s, 0 none (LKAS_KEEP): curve targets are never under this (nor his speed); stop targets are not floored
   lkas_keep: float = 0.0
+  # (ENGAGE_AUTO) the cruise came back on by our auto resume's RES (auto_resume.AutoResume.own_engaged)
+  auto_resumed: bool = False
 
 
 def steer_lateral_accel(v, angle_deg, wheelbase, ratio=MERGE_TURN_RATIO, slip=MERGE_TURN_SLIP):
@@ -771,7 +785,8 @@ class CurveSlowdownLogic:
     self.boost_reopen = None         # {"target", "frame"}: a boost ended for a lead gone in a turn (MERGE_LEAD_GONE_REOPEN)
     self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
     self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
-    self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"]}
+    self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"][, "auto"]}
+    self.lock_clean = 0              # phase-locked holds measured with nothing landing after the release (ENGAGE_AUTO)
     self.keep_on = False             # the LKAS_KEEP floor acts in this curve (LKAS_KEEP_MARGIN)
     self.keep_held = None            # ... at the lowest floor seen while on (m/s)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
@@ -888,7 +903,15 @@ class CurveSlowdownLogic:
       goal = max(goal, lift)
     if goal <= set_v + self.half_step:
       return None
-    return {"frame": self.frame, "goal": min(goal, self._set_top())}
+    e = {"frame": self.frame, "goal": min(goal, self._set_top())}
+    if ENGAGE_AUTO and getattr(i, "auto_resumed", False) and self.stop_episode:
+      # (ENGAGE_AUTO) our auto resume's RES at the set our stop lowering left: also never above the street / limit target
+      e["auto"] = True
+      if i.engage_goal > 0:
+        e["goal"] = max(min(e["goal"], i.engage_goal), set_v)
+        if e["goal"] <= set_v + self.half_step:
+          return None
+    return e
 
   def _engage_clear(self, i, red_block):
     """(ENGAGE_RAISE) nothing asks for slowing: no stop on or planned, no red light, no slower / stopped car ahead, no curve
@@ -897,7 +920,7 @@ class CurveSlowdownLogic:
     lead_ok = not i.stop_slower_ahead and (i.stop_clear_ahead or i.stop_pulling_away)
     curve_low = (i.csc_active and not i.street_lower and
                  i.csc_speed + (0.0 if i.curve_track else CURVE_MARGIN) < self.engage["goal"] - self.half_step)
-    waited = self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP)
+    waited = self.frame - self.stop_off_frame >= _frames(RAISE_FAST_AFTER_STOP) or bool(self.engage.get("auto"))
     return not (i.stop_active or i.hold_restore or red_block or i.red_stop or curve_low) and lead_ok and waited
 
   def handover(self, goal):
@@ -916,6 +939,15 @@ class CurveSlowdownLogic:
     if not LKAS_KEEP or i.lkas_keep <= 0:
       return 0.0
     return math.floor(min(i.lkas_keep, driver_speed) / self.step + 1e-3) * self.step
+
+  def _engage_auto(self):
+    """(ENGAGE_AUTO) the raise after our auto resume's RES is going."""
+    return self.engage is not None and bool(self.engage.get("go")) and bool(self.engage.get("auto"))
+
+  def _holds_clean(self):
+    """(ENGAGE_AUTO) this drive's phase-locked holds of ours all measured with nothing landing after the release."""
+    return (self.phase_lock and self.lock_measured and self.lock_overrun[SET_MINUS] == 0 and
+            self.lock_clean >= ENGAGE_AUTO_CLEAN_HOLDS)
 
   def _engage_go(self):
     return self.engage is not None and bool(self.engage.get("go"))
@@ -1164,6 +1196,7 @@ class CurveSlowdownLogic:
       up = quanta_after + 1 if not self.lock_measured else max(self.lock_overrun[SET_PLUS], quanta_after + 1)
       self.lock_overrun[SET_PLUS] = up
       self.lock_measured = True
+      self.lock_clean = self.lock_clean + 1 if quanta_after == 0 else -1_000_000   # (ENGAGE_AUTO: one overrun, never)
     if p.landed > q:
       # A real staircase was seen: the overrun after a release is learned as the worst seen, never
       # below one quantum (the release always comes just after a landing, so at most the next one
@@ -1618,6 +1651,8 @@ class CurveSlowdownLogic:
         # (ENGAGE_RAISE) his speed for this road, then the fast restore at once (the goal as things are now: a lower
         # limit's cap, rule 3 / 4, still bounds it; EXIT_HANDOVER's is fixed)
         g = {"goal": e["goal"]} if e.get("fixed") else self._engage_goal(i)
+        if g is not None and e.get("auto") and i.engage_goal > 0:
+          g["goal"] = min(g["goal"], max(i.engage_goal, i.set_speed))   # (ENGAGE_AUTO) as at the RES
         cap = self._cap()
         goal = None if g is None else (g["goal"] if cap is None else min(g["goal"], max(cap, i.set_speed)))
         if goal is None or goal <= i.set_speed + self.half_step:
@@ -1900,7 +1935,9 @@ class CurveSlowdownLogic:
       no_effect = self.hold.landed == 0 and self.frame - self.hold.frame >= _frames(HOLD_NO_EFFECT_SECONDS)
       hold_max = MERGE_UP_HOLD_MAX if self.hold_kind == "boost_up" else HOLD_MAX_SECONDS
       turn_pause = d == SET_PLUS and self._merge_paused(i) and self.boost is not None and "ended" not in self.boost
-      if (reason_gone or i.gas_pressed or i.other_button_active or no_effect or turn_pause or
+      # (ENGAGE_AUTO) the raise after our auto resume's RES: its SET+ hold goes on under his gas
+      gas_cut = i.gas_pressed and not (d == SET_PLUS and self.hold_kind == "restore" and self._engage_auto())
+      if (reason_gone or gas_cut or i.other_button_active or no_effect or turn_pause or
           self.frame - self.hold.frame >= _frames(hold_max) or crosses):
         if target_rose and kind == "stop":
           self.holds_this_episode = max(0, self.holds_this_episode - 1)   # the floor hold stays available
@@ -2222,6 +2259,8 @@ class CurveSlowdownLogic:
           driver_steps = min(driver_steps, int(math.floor(target / self.step + 1e-3)))
         set_steps = int(round(set_speed / self.step))
         margin = self._up_overrun() * q                      # what may still land after the release
+        if self._engage_auto() and self._holds_clean():
+          margin = 0                                         # (ENGAGE_AUTO) measured: nothing lands after a release
         bound_steps = ((driver_steps - margin) // q) * q     # a multiple of the quantum, that far below
         first = ((set_steps + 1 + q) // q) * q               # where the hold's first jump lands (after its tap)
         hold = first <= bound_steps and bound_steps - set_steps >= RESTORE_HOLD_MIN_GAIN * q
@@ -2450,6 +2489,7 @@ class CurveSlowdown:
     self.frame = 0
     self.driver_other_frame = -10_000  # the last frame his CANCEL / RES was down (update)
     self.turn_gate = MergeTurnGate()   # the ramp start's turn gate (MERGE_TURN_*)
+    self.auto_resumed = False          # (ENGAGE_AUTO) set by carcontroller: the cruise came on by our auto resume's RES
     self.stop_road = None              # (road name, follower frame) when the controller's stop episode began (S4)
     self.plan_stop_raw = False         # the model's planned stop this frame, before the road gating (M-b)
     self.unattributed_high_last = -1_000_000  # logic frame of the last such chime (UNATTRIBUTED_HIGH_GAP)
@@ -2869,6 +2909,7 @@ class CurveSlowdown:
       limit_cap=limit_cap if self.limit_mode == LIMIT_ON else 0.0,
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
+      auto_resumed=bool(getattr(self, "auto_resumed", False)),
     )
     button, offset = self.logic.update(inputs)
     # (CURVE_ON_HOLD) a map curve target that drops still counts a while (a HELD flicker before the ramp's link)

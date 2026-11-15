@@ -73,3 +73,92 @@ def test_r2_a_boost_ended_by_its_time_behind_a_moving_lead_goes_to_the_target():
   ends = [f for f, s, v, b, *_ in log if b == cs.SET_MINUS]
   assert ends and ends[0] >= int(cs.MERGE_BOOST_TIME / 0.01), ends[:3]
   assert abs(car.set_speed / MPH - 75) < 1e-6 and min(s for f, s, *_ in log if f >= ends[0]) >= 75 - 1e-6
+
+
+# ---------------- R3: the fast raise after our auto resume's RES ----------------
+
+TCS = _load("tcs_round_r", "test_curve_slowdown.py")
+
+
+def _acc(g):
+  return 0.39 if g < 5 else (0.50 if g < 10 else (0.71 if g < 20 else 0.82))
+
+
+def _res_after_our_stop(auto=True, gas_s=2.5, set0=19, anchor=53, goal=53, clean=25, stop_episode=True, extra=None,
+                        frames=2000, lose=None):
+  """Stopped at a light at the set our stop lowering left (set0 under his anchor), his brake, then the RES (ours when
+  `auto`) at 10 mph on his gas, held gas_s; the car's speed follows his foot (+2 m/s^2), then the cruise."""
+  car = TCS.Car(set0, dash_offset_mph=0.0, lag=10, accel_fn=_acc, cruise_gain=0.19, step=MPH, lose=lose)
+  car.set_speed, car.v_ego = (set0 - 0.005) * MPH, 10 * MPH
+  lg = cs.CurveSlowdownLogic(False)
+  lg.anchor, lg.last_set_speed, lg.stop_episode, lg.cruise_gap = anchor * MPH, car.set_speed, stop_episode, True
+  lg.lock_measured, lg.lock_overrun, lg.lock_clean = True, {cs.SET_MINUS: 0, cs.SET_PLUS: 1}, clean
+  log, reach = [], None
+  for f in range(frames):
+    gas = f < gas_s * 100
+    if gas:
+      car.gas_frame = car.frame
+    d = dict(enabled=True, cruise_enabled=True, set_speed=car.set_speed, v_ego=car.v_ego, gas_pressed=gas, brake_pressed=False,
+             standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0, other_button_active=f < 100,
+             btn_counter=(f // 10) % 16, stop_clear_ahead=True, stop_pulling_away=True, engage_goal=goal * MPH,
+             auto_resumed=auto and f == 0)
+    if extra:
+      d.update(extra(f, car))
+    btn, _ = lg.update(cs.SlowdownInputs(**d))
+    if btn is not None:
+      car.hold_frame(btn) if lg.last_action == "hold" else car.press(btn)
+    log.append((f, car.set_speed / MPH, car.v_ego / MPH, btn, lg.last_action))
+    v0 = car.v_ego
+    car.tick()
+    if gas:
+      car.v_ego = v0 + 2.0 * 0.01
+    if reach is None and car.set_speed >= (goal - 0.6) * MPH:
+      reach = f
+  return car, lg, log, reach
+
+
+def test_r3_our_auto_resume_raises_at_once_with_a_hold_under_his_gas_to_the_goal():
+  car, lg, log, reach = _res_after_our_stop()
+  assert reach is not None and reach <= 700, reach                      # (drive 76: 11-14 s; here <= 7 s)
+  holds = [f for f, s, v, b, a in log if a == "hold"]
+  assert holds and holds[0] < 250, holds[:3]                            # a SET+ hold under his gas (he is on it 2.5 s)
+  assert max(s for _, s, *_ in log) <= 53 + 1e-6                        # never above the goal
+  # the hold to 50 (no overrun margin: this drive's holds are clean), the last 3 mph by taps
+  end = max(holds)
+  assert abs(log[end + 160][1] - 50) < 0.6, log[end + 160][1]
+
+
+def test_r3_his_own_res_is_unchanged_and_none_without_our_lowering():
+  # his RES (not our auto resume's): exactly as before round R (the logic with ENGAGE_AUTO off)
+  _, _, log1, r1 = _res_after_our_stop(auto=False)
+  old = cs.ENGAGE_AUTO
+  try:
+    cs.ENGAGE_AUTO = False
+    _, _, log0, r0 = _res_after_our_stop(auto=True)
+  finally:
+    cs.ENGAGE_AUTO = old
+  assert [x[:4] for x in log1] == [x[:4] for x in log0] and r1 == r0
+  assert r0 is None or r0 > 700
+  # the set at his brake his own (no lowering of ours: no stop episode): no ENGAGE_AUTO raise
+  _, lg, log, _ = _res_after_our_stop(stop_episode=False)
+  assert lg.engage is None or not lg.engage.get("auto")
+  # the street's target under his anchor: the goal is the lower one
+  car, lg, log, reach = _res_after_our_stop(goal=48)
+  assert max(s for _, s, *_ in log) <= 48 + 1e-6 and reach is not None
+
+
+def test_r3_the_guards_stay_red_light_a_slow_car_ahead_a_curve_and_the_hold_margin_unless_measured():
+  # the stop-light detector on: nothing up while it is (RED_STOP_BLOCK_MAX), then the raise
+  car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(red_stop=f < 300, red_light=f < 300))
+  assert not any(b == cs.SET_PLUS for f, s, v, b, a in log if f < 300)
+  assert reach is not None
+  # a slower car ahead (the stop trigger's clear / pulling away off): no raise of this kind
+  car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(stop_clear_ahead=False, stop_pulling_away=False))
+  assert not any(a == "hold" for *_, a in log)
+  # a curve target under the goal: no raise to the goal
+  car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(csc_active=True, csc_speed=30 * MPH, curve_floor=25 * MPH))
+  assert max(s for _, s, *_ in log) <= 31 + 1e-6
+  # this drive's holds not measured clean: the hold keeps its quantum of margin (stops at 45), the rest by taps
+  car, lg, log, reach = _res_after_our_stop(clean=0)
+  holds = [f for f, s, v, b, a in log if a == "hold"]
+  assert holds and abs(log[max(holds) + 160][1] - 45) < 0.6, log[max(holds) + 160][1]

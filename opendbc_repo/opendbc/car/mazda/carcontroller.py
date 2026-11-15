@@ -117,6 +117,8 @@ class CarController(CarControllerBase):
         try:
           # (auto resume) never both sending: ours going or just gone holds the slowdown's presses back
           ours = self.auto_resume is not None and self.auto_resume.busy
+          # (curve_slowdown.ENGAGE_AUTO) the cruise came on by our auto resume's RES
+          self.curve_slowdown.auto_resumed = bool(self.auto_resume is not None and self.auto_resume.own_engaged)
           other_button_active = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume or ours)
           can_sends.extend(self.curve_slowdown.update(CC, CS, self.packer, self.CP, other_button_active))
         except Exception:

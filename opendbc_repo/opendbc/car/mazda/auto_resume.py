@@ -203,6 +203,11 @@ class AutoResumeLogic:
             self.frame - (self.own_engage_frame - 1) < _frames(OWN_ENGAGE_TIME))   # (as from his RES's last wheel frame,
     # the one before the cruise comes on: curve_slowdown's DRIVER_QUIET then ends on the same frame)
 
+  @property
+  def own_engaged(self):
+    """(curve_slowdown.ENGAGE_AUTO) the cruise came on by our RES within OWN_ENGAGE_TIME (the frame it rose included)."""
+    return self.state == DONE and self.frame - self.own_engage_frame < _frames(OWN_ENGAGE_TIME)
+
   def _event(self, kind, **data):
     if len(self.events) < 20:
       self.events.append((kind, data))
@@ -521,6 +526,10 @@ class AutoResume:
   @property
   def busy(self):
     return self.logic.busy
+
+  @property
+  def own_engaged(self):
+    return self.logic.own_engaged
 
   @staticmethod
   def slowdown_busy(slowdown):
