@@ -663,6 +663,7 @@ class CurveSlowdownLogic:
     # A restore only brings the actual set speed back to it, never above (drive 2026-11-03: the driver brought the
     # speed back himself and the old step count added its steps on top). `offset` is derived from it.
     self.anchor = None
+    self.anchor_ours = False
     self.prev_set_speed = None       # the set speed before the last observed change
     self.driver_events = []          # driver set speed changes while we managed it (for the per-event log)
     self.driver_log_frame = -10_000  # frame of the last one (DRIVER_LOG_GAP)
@@ -884,6 +885,7 @@ class CurveSlowdownLogic:
       self._forget()
       return
     self.anchor = min(self.anchor, goal)
+    self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
     self.restoring = False
     self.engage = {"frame": self.frame, "goal": self.anchor, "fixed": True}
 
@@ -932,6 +934,7 @@ class CurveSlowdownLogic:
         top = self._set_top()
         self.boost = {"target": ro["target"], "frame": ro["frame"]}
         self.anchor = max(min(ro["target"] + i.limit_boost, top), ro["target"])
+        self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
         self.boost_reopen = None
     b = self.boost
     if b is None:
@@ -1027,6 +1030,7 @@ class CurveSlowdownLogic:
   def _forget(self):
     """Leave the set speed where it is and stop managing it (it becomes the driver's speed)."""
     self.anchor = None
+    self.anchor_ours = False
     self.limit_cap = None
     self.undo_cap = None
     self.restoring = False
@@ -1524,6 +1528,7 @@ class CurveSlowdownLogic:
     # The driver's own SET+/SET- taps (rising edge). Our own frames are never read back here:
     # pandad reports transmitted frames on bus + 128 and the bus-0 parser ignores those.
     if i.driver_button in (SET_MINUS, SET_PLUS):
+      self.anchor_ours = False         # (review of round Q, S3) his SET: the speed is his
       if i.driver_button != self.prev_driver_button:
         self.driver_taps.append((i.driver_button, self.frame))
         self.blocked = True
@@ -1595,6 +1600,7 @@ class CurveSlowdownLogic:
         else:
           e["go"], e["goal"] = True, goal
           self.anchor = goal
+          self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
           self.restore_pending = self.raise_fast = True
           self.resume_restore_frame = None
     if (RAMP_START_FORGET and i.ramp_start and cruise_ok and self.cruise_gap and self.boost is None and
@@ -1927,10 +1933,12 @@ class CurveSlowdownLogic:
       self.limit_adopted = (self.anchor if self.anchor is not None else i.set_speed, i.limit_raise)
       self.limit_raised = {"frame": self.frame, "before": self.limit_adopted[0], "new": i.limit_raise, "touched": False}
       self.anchor = i.limit_raise
+      self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
       if i.limit_boost > 0 and not self._lead_blocks_boost(i) and i.boost_road_ok:
         self.boost = {"target": i.limit_raise, "frame": self.frame}
         top = self._set_top()
         self.anchor = max(min(i.limit_raise + i.limit_boost, top), i.limit_raise)
+        self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
       # a raise goes up at once, with a SET+ hold when it is far (drive 61: merges 35 -> 70 and a street's 43 -> 48 by
       # slow single taps after an earlier stop episode); right after a stop episode's release taps first (review)
       if not stop_wait:
@@ -1955,6 +1963,7 @@ class CurveSlowdownLogic:
           self.frame - self.last_send_frame > BUTTON_GAP_FRAMES and
           self.frame - max(self.last_driver_edge.values()) >= _frames(LIMIT_DRIVER_QUIET)):
         self.anchor = early_top          # (his speed for now: the merge's adoption takes it on from here)
+        self.anchor_ours = True              # (review of round Q, S3) an anchor of ours
         off = self._send(SET_PLUS)
         if off is not None:
           self.last_action = "early"
@@ -2202,6 +2211,7 @@ class CurveSlowdownLogic:
       self.stop_episode = True
     if button == SET_MINUS and self.anchor is None:
       self.anchor = i.set_speed      # the driver's speed, before our first press moves it
+      self.anchor_ours = False
     if hold:
       self.hold_wait_frame = None
     if hold and self.phase_lock and not self.new_wheel:
@@ -2757,6 +2767,7 @@ class CurveSlowdown:
                        nav_turn=bool(plan_alive and getattr(plan, "mapNavManeuverTurn", False)),
                        turned=self._heading_turned(CS, CP, v_ego),
                        pending=bool(cruise_enabled and lg.anchor is not None and set_speed < lg.anchor - lg.half_step),
+                       ours=bool(lg.anchor is not None and getattr(lg, "anchor_ours", False)),
                        stop_active=bool(self.trigger.active) and self.stop_mode == ON,
                        red_light=bool(plan_alive and getattr(plan, "redLight", False)))
       # rules 8 / 9 only act with Speed Limit Follow and Map Curves both On (second review: Map Curves in Test left the

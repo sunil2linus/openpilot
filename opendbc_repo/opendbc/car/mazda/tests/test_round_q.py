@@ -318,10 +318,10 @@ def test_q3_the_wrapper_raises_the_curve_target_by_its_taps_and_logs_them(tmp_pa
 SLF = _load("slf_round_q", os.path.join(HERE, "..", "speed_limit_follow.py"))
 
 
-def _sli(limit, d, trust=0, pending=False, name="Rochester Road", nav=0.0, turned=False):
+def _sli(limit, d, trust=0, pending=False, name="Rochester Road", nav=0.0, turned=False, ours=False, rc=7):
   return SLF.LimitInputs(limit=limit * MPH, source="Map Data", gps_trust=trust, driver_speed=d * MPH, cruise_enabled=True,
-                         road_class=7, road_name=name, pending=pending, nav_limit=nav * MPH, v_ego=d * MPH, turned=turned,
-                         nav_dist=1000.0)
+                         road_class=rc, road_name=name, pending=pending, nav_limit=nav * MPH, v_ego=d * MPH, turned=turned,
+                         nav_dist=1000.0, ours=ours)
 
 
 def _sl_run(steps, f=None):
@@ -334,9 +334,12 @@ def _sl_run(steps, f=None):
 
 def test_q5_a_pending_restore_is_capped_at_a_lower_limit_in_any_band():
   # drive 74: our exit handover's 53 on a 45 road (out of its band), the set lowered to 30 for the turnaround; the 35 road
-  f = _sl_run([(12, dict(limit=45, d=53)), (12, dict(limit=35, d=53, pending=True))])
+  f = _sl_run([(12, dict(limit=45, d=53, ours=True)), (12, dict(limit=35, d=53, pending=True, ours=True))])
   assert abs(f.cap_speed / MPH - 40) < 1e-6, f.cap_speed / MPH       # 35 + the Street Speed offset (+5)
   assert f.cap is not None and not f.cap.band
+  # (review S3, rq_review/q5.py) his own 80 on a 70 highway, a curve restore pending, a 55 steady: not capped (his speed)
+  f = _sl_run([(12, dict(limit=70, d=80, rc=1, name="I-75")), (12, dict(limit=55, d=80, pending=True, rc=1, name="I-75"))])
+  assert f.cap_speed == 0.0, f.cap_speed / MPH
   # nothing pending (his own 53): no cap; rule 9 may slow him as before (MazdaSlowLowerLimit)
   f = _sl_run([(12, dict(limit=45, d=53)), (12, dict(limit=35, d=53))])
   assert f.cap_speed == 0.0

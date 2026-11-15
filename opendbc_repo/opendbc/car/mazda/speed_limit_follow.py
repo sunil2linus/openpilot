@@ -363,6 +363,8 @@ class LimitInputs:
   # a restore of the controller's is pending (the set speed under its anchor): driver_speed is not the set speed he
   # chose (rule 9's undo never brings such a speed back above the limit)
   pending: bool = False
+  ours: bool = False        # (review of round Q, S3) the anchor was made by us (an exit handover, the ENGAGE goal, a merge,
+                            # our limit raise), not his own speed
   stop_active: bool = False # a stop reason (stopped car, stop ahead, red light head start) is on (rule 6's raise waits)
   red_light: bool = False   # the stop-light detector sees a red light (rule 6's raise waits)
 
@@ -1085,13 +1087,14 @@ class SpeedLimitFollower:
       if d is not None and abs(d - new - self._add()) < 0.5:
         return                                         # already at the new limit
       self.rise = (old, new, start)                    # rule 1, decided once steady (_steady_rise)
-    elif d is None or self._in_band(d, old) or (i.pending and d > new + self._add() + 0.5):
+    elif d is None or self._in_band(d, old) or (i.pending and i.ours and d > new + self._add() + 0.5):
       why = self._plausible(old, new, i.source, max(i.gps_trust, self.candidate_trust_recent))
       if why:
         self._not_followed(old, new, i.source, f"lower limit: {why}")
       else:
         # (cruise off: decided with the driver's speed on the first frame it is back; until then nothing to cap)
-        # (round Q: a pending restore of ours is capped in any band, LIMIT_TRUST_RECENT)
+        # (round Q: a pending restore to an anchor of ours is capped in any band, LIMIT_TRUST_RECENT; his own speed
+        # above the band is his, review S3)
         self.cap = Offer(old, new, i.source, self.frame, "cap", d, tgt=new + self._add())
         self.cap.band = d is None or self._in_band(d, old)     # (logged with the cap: speedLimitCap's in_band)
     # (a lower limit with the driver's speed outside the band: his own speed, nothing to do)
