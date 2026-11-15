@@ -362,3 +362,76 @@ def test_q5_a_stale_navigation_limit_after_a_road_change_does_not_block_slowing(
   # navigation's limit changed after the road change: it still counts (the higher of the two, as before)
   f = _sl_run(steps(48.0))
   assert f.lower is not None and abs(f.lower.tgt - 53) < 0.6, f.lower
+
+
+# ---- Q4: the phantom curve where a road splits into its two one-way sides (synthetic geometry) ----
+
+TMC = _load("tmc_round_q", os.path.join(HERE, "test_map_curves.py"))
+MC = TMC.MC
+ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", ".."))
+BCM = _load("bcm_round_q", os.path.join(ROOT, "tools", "curve_map", "build_curve_map.py"))
+
+
+def test_q4_a_later_way_is_never_followed_against_its_one_way_direction():
+  from types import SimpleNamespace as N
+  from array import array
+  mcs = MC.MapCurves(MC.MapCurveStore(__import__("tempfile").mkdtemp(), background=False))
+  mcs.store = N(grid=[N(way=array("q", [1, 2]), oneway=array("b", [1, 0]))])     # (the store's RoadIndex list)
+  c = {"oneway": True, "wdir": [[1, 1]]}
+  assert mcs._against_oneway(c, increasing=False)            # b -> a on a way one-way a -> b
+  assert not mcs._against_oneway(c, increasing=True)
+  assert not mcs._against_oneway({"oneway": True, "wdir": [[2, 1]]}, increasing=False)   # (the two-way way)
+  assert not mcs._against_oneway({"oneway": False, "wdir": [[1, 1]]}, increasing=False)
+
+
+def test_q4_the_builder_drops_the_jog_where_a_road_splits_into_its_one_way_sides():
+  from types import SimpleNamespace as N
+  ways = {1: N(name="Main Road", ref="", oneway=False), 2: N(name="Main Road", ref="", oneway=True),
+          3: N(name="Other Road", ref="", oneway=True)}
+
+  def cv(s_a, s_b, d, turn, wset):
+    return {"s_a": s_a, "s_b": s_b, "dir": d, "turn": turn, "ways": wset}
+  jog = [cv(0, 30, "L", 22.0, [1, 2]), cv(70, 100, "R", 18.0, [2])]
+  assert BCM.split_doublets(jog, ways) == []
+  # a real S-bend (same name, both two-way), one far apart, one not cancelling, another road: kept
+  assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1]), cv(70, 100, "R", 18.0, [1])], ways)) == 2
+  assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1, 2]), cv(120, 150, "R", 18.0, [2])], ways)) == 2
+  assert len(BCM.split_doublets([cv(0, 30, "L", 40.0, [1, 2]), cv(70, 100, "R", 18.0, [2])], ways)) == 2
+  assert len(BCM.split_doublets([cv(0, 30, "L", 22.0, [1, 3]), cv(70, 100, "R", 18.0, [3])], ways)) == 2
+
+
+def test_q4_two_trusted_straight_passes_make_a_ghost_and_a_real_pass_clears_it(tmp_path):
+  class P:
+    def get(self, key, encoding=None):
+      return None
+  mem = MC.CurveMemory(str(tmp_path / "mem.json"))
+  c = {"apex": (10.0, 10.0), "r": 142.0, "s_a": 0.0, "turn": 40.0, "name": "Main Road"}
+
+  def run(samples, trust0=True, blinker=False):
+    mp = MC.MapCurvesPlanner(P(), P())
+    mp.mc = MC.MapCurves(MC.MapCurveStore(__import__("tempfile").mkdtemp(), background=False), memory=mem)
+    mp.pass_curve, mp.pass_samples = c, samples
+    mp.pass_blinker, mp.pass_apex, mp.pass_exit, mp.pass_vetoed, mp.pass_shaky = blinker, 5.0, 16.0, False, False
+    mp.pass_trust0 = trust0
+    mp._finish_pass()
+  straight = TMC._pass(0, seconds=6.0)
+  run(straight, trust0=False)
+  assert mem.ghost(c) == 0                                    # (GPS trust not 0 throughout: no mark)
+  run(straight, blinker=True)
+  assert mem.ghost(c) == 0                                    # (his signal: no mark)
+  run(straight)
+  run(straight)
+  assert mem.ghost(c) == MC.PASS_GHOST_COUNT
+  import math
+  run(TMC._pass(142, seconds=math.radians(40) * 142 / 18.0))  # it really turned through it
+  assert mem.ghost(c) == 0
+
+
+def test_q4_a_lead_on_a_straight_path_in_our_lane_does_not_blind_the_camera_check():
+  import math
+  s = [float(x) for x in range(0, 200, 10)]
+  cam = lambda psi, y: MC.CameraView(s, psi, [0.1] * len(s), lead_d=40.0, lead_y=y, v_ego=15.0)  # noqa: E731
+  assert cam([0.0] * len(s), 0.2).blind(60.0) is None
+  assert cam([0.0] * len(s), 2.0).blind(60.0) == "lead"                       # (the lead beside our lane's middle)
+  assert cam([math.radians(x / 10) for x in s], 0.2).blind(60.0) == "lead"    # (the path curving)
+  assert MC.BLIND_CODES["lead"] == 6

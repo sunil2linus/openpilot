@@ -167,6 +167,12 @@ TIMER_EPS = 1e-6                # s: timers summed from dt steps reach their lim
 NEAREST_SEARCH = 220.0          # m: the nearest road is measured this far (logs: how far off the GPS is)
 PASS_TURN_SHARE = 0.5      # a pass that turned less than this share of the curve's turn did not drive the curve
 PASS_TURN_MIN = 10.0       # deg: ... checked for curves that turn at least this much
+# Round Q: a pass dropped as "turn" (a parallel road) with GPS trust 0 throughout, within PASS_APEX_NEAR of the apex, no
+# signal, that turned under PASS_GHOST_SHARE of the map's turn marks the curve a "ghost" (the road split into its one-way
+# sides: Rochester Rd construction); after PASS_GHOST_COUNT such passes the curve is ignored. A pass that really turns
+# through it clears the mark.
+PASS_GHOST_SHARE = 0.25
+PASS_GHOST_COUNT = 2
 # The pass is the car's own driving from PASS_PRE before the curve's start to PASS_POST past its end, placed by the
 # distance the car travelled (not by the moments it counted as inside the curve). Drive 44, Dobry Drive (map 131 m,
 # 64 m long, 20 deg): "inside" starts once the start is NEAR behind and ends NEAR before the end, on a GPS position
@@ -990,6 +996,12 @@ VETO_MAX_FLIPS = 2         # after this many take-backs a curve is never ignored
 VETO_FORGET = 40           # planner frames a curve may be missing (road match flicker) before its check starts over
 VETO_CHORD = 30.0          # m: heading change over +-this along the path (the curve builder's HALF_WINDOW)
 VETO_PAD = 20.0            # m added around the curve's span
+# Round Q (Rochester Rd construction, drives 74 t 950-965 / 75 t 698-716): a lead nearer than the apex + VETO_PAD made the
+# camera "blind", so the phantom curve was never vetoed. With the model's path straight through the zone (its heading
+# within VETO_LEAD_STRAIGHT_DEG) and the lead in our lane's middle (|yRel| < VETO_LEAD_Y) the camera still judges
+VETO_LEAD_STRAIGHT_DEG = 2.0
+VETO_LEAD_Y = 0.8          # m
+BLIND_CODES = {"slow": 1, "red": 2, "signal": 3, "far": 4, "ystd": 5, "lead": 6}   # starpilotPlan.mapCurveBlind
 VETO_STEP = 5.0            # m between curvature samples
 VETO_SEE_MAX = 110.0       # m: the camera judges a curve only when its apex + VETO_PAD is this close ...
 VETO_PATH_MARGIN = 10.0    # ... and this far inside the end of the model's path
@@ -1270,6 +1282,23 @@ class CurveMemory:
     e["passes"] = (passes + [new])[-MEMORY_KEEP:]
     self.save()
 
+  def add_ghost(self, c, direction=None):
+    """(PASS_GHOST_*) a pass that did not turn through `c` with the GPS trusted: one more ghost mark."""
+    e = self._entry(c, direction)
+    e["ghost"] = int(e.get("ghost", 0)) + 1
+    self.save()
+
+  def clear_ghost(self, c, direction=None):
+    e = self._find(*c["apex"], direction) if "apex" in c else None
+    if e is not None and e.get("ghost"):
+      e.pop("ghost", None)
+      self.save()
+
+  def ghost(self, c, direction=None):
+    """(PASS_GHOST_*) the curve's ghost marks (0 none)."""
+    e = self._find(*c["apex"], direction) if "apex" in c else None
+    return int(e.get("ghost", 0)) if e is not None else 0
+
   def note_veto(self, c, direction=None):
     """The camera check ignored curve `c` driven in `direction` (counted for the record only, never read)."""
     e = self._entry(c, direction)
@@ -1306,10 +1335,11 @@ class CameraView:
   per path point s (m along the path), psi (heading, rad, relative to the car) and ystd (m, sideways uncertainty);
   red (model confidence red), lane_change, blinker, lead_d (m to the lead, None without one), v_ego (m/s)."""
 
-  def __init__(self, s, psi, ystd, red=False, lane_change=False, blinker=False, lead_d=None, v_ego=0.0):
+  def __init__(self, s, psi, ystd, red=False, lane_change=False, blinker=False, lead_d=None, v_ego=0.0, lead_y=None):
     self.s, self.psi, self.ystd = list(s), list(psi), list(ystd)
     self.red, self.lane_change, self.blinker = bool(red), bool(lane_change), bool(blinker)
     self.lead_d, self.v_ego = lead_d, float(v_ego)
+    self.lead_y = lead_y              # m, the lead's lateral offset (radarState yRel), None without one
 
   @property
   def end(self):
@@ -1352,7 +1382,12 @@ class CameraView:
     if self._at(self.ystd, s_apex) > VETO_YSTD_MAX:
       return "ystd"
     if self.lead_d is not None and self.lead_d < s_apex + VETO_PAD:
-      return "lead"
+      # (round Q, Rochester Rd construction: a lead on the straight road kept the phantom curve from being vetoed) the
+      # path straight through the zone and the lead in our lane's middle: the camera still sees the road
+      psis = [p for x, p in zip(self.s, self.psi, strict=False) if x <= s_apex + VETO_PAD]
+      straight = bool(psis) and max(psis) - min(psis) < math.radians(VETO_LEAD_STRAIGHT_DEG)
+      if not (straight and self.lead_y is not None and abs(self.lead_y) < VETO_LEAD_Y):
+        return "lead"
     return None
 
 
@@ -1382,8 +1417,9 @@ def camera_view(sm):
     cs = sm["carState"]
     lead = sm["radarState"].leadOne
     lead_d = float(lead.dRel) if lead.status else None
+    lead_y = float(lead.yRel) if (lead.status and getattr(lead, "yRel", None) is not None) else None
     return CameraView(s, psi, ystd, red=_raw(md.confidence) == 0, lane_change=_raw(md.meta.laneChangeState) != 0,
-                      blinker=bool(cs.leftBlinker or cs.rightBlinker), lead_d=lead_d, v_ego=float(cs.vEgo))
+                      blinker=bool(cs.leftBlinker or cs.rightBlinker), lead_d=lead_d, v_ego=float(cs.vEgo), lead_y=lead_y)
   except Exception:
     return None
 
@@ -1411,6 +1447,7 @@ class CurveVeto:
 
   def tick(self):
     self.frame += 1
+    self.blind_why = ""       # (round Q) why the camera could not judge the governing curve this frame (mapCurveBlind)
     self.hidden = None
     for key in [k for k, st in self.state.items() if self.frame - st["seen"] > VETO_FORGET]:
       del self.state[key]
@@ -1466,7 +1503,10 @@ class CurveVeto:
       return
     d_apex, d_exit = g
     s_apex = max(d_apex, 0.0)               # behind the apex: what is left of the curve
-    if camera.blind(s_apex) is not None:
+    why = camera.blind(s_apex)
+    if c is getattr(mc, "next_curve", None) or d_entry <= 0.0:
+      self.blind_why = why or ""
+    if why is not None:
       return
     r_eff = mc._radius(c)
     s_exit = d_exit if d_entry <= 0.0 else d_entry + float(c.get("len", 0.0))
@@ -1602,6 +1642,11 @@ class MapCurves:
         ap_ok, ap_d = ahead(lat, lon, bearing, *c["apex"])
         self.geom[id(c)] = (ap_d if ap_ok else -ap_d, d_exit)
       later_way = (s_entry > s1) if increasing else (s_entry < s0)
+      if later_way and self._against_oneway(c, increasing):
+        continue                  # (round Q) a later way of the chain driven against its one-way direction: not our road
+      if (self.memory is not None and not c.get("ramp") and hasattr(self.memory, "ghost") and
+          self.memory.ghost(c, curve_direction(c, increasing)) >= PASS_GHOST_COUNT):
+        continue                  # (PASS_GHOST_*) driven straight past it twice with the GPS trusted: not a curve
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
           out.append((c, d_entry))
@@ -1623,6 +1668,22 @@ class MapCurves:
         if self.odo_ok and c.get("ramp"):
           self.entered[c["s_a"]] = self.odo
     return out
+
+  def _against_oneway(self, c, increasing):
+    """(round Q) curve `c` lies on a one-way way that travel along the chain (increasing: a -> b) would take against
+    its direction (its node order, 'wdir' fwd 1 when a -> b follows it)."""
+    if not c.get("oneway"):
+      return False
+    g = getattr(self.store, "grid", None)
+    idx = [ri for ri in (g if isinstance(g, (list, tuple)) else [g]) if hasattr(ri, "way") and hasattr(ri, "oneway")]
+    if not idx:
+      return False                # (no shapes loaded here: nothing known about the ways' directions)
+    key = tuple(id(ri) for ri in idx)
+    ow = getattr(self, "_ow_ways", None)
+    if ow is None or ow[0] != key:
+      ow = (key, {int(ri.way[k]) for ri in idx for k in range(len(ri.way)) if ri.oneway[k]})
+      self._ow_ways = ow
+    return any(int(w) in ow[1] and bool(fwd) != bool(increasing) for w, fwd in c.get("wdir", []))
 
   def direction(self, c):
     """Our direction of travel through curve `c` on the matched road (curve_direction), for the curve memory: the same
@@ -2285,6 +2346,7 @@ class MapCurvesPlanner:
           self._end_pass(self._pass_end())    # in the next curve already: this pass ends where that one starts
         self.pass_curve, self.pass_x_exit, self.pass_x_next = inside, float("inf"), float("inf")
         self.pass_apex, self.pass_exit, self.pass_vetoed, self.pass_shaky = float("inf"), float("inf"), False, False
+        self.pass_trust0 = True
         self.pass_exits, self.pass_exit_seen = [], None
         # the direction of travel the pass is remembered under: as MapCurves plans this curve now (direction(c))
         self.pass_dir = getattr(self.mc, "inside_dir", None)
@@ -2309,6 +2371,7 @@ class MapCurvesPlanner:
         self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *c["apex"]))
       self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, c["s_a"]))
       self.pass_shaky |= bool(self.trust.shaky)
+      self.pass_trust0 = getattr(self, "pass_trust0", True) and int(getattr(self.mc, "trust_status", 1) or 0) == 0
       if not self._same(inside, c) and x >= self._pass_end():
         self._end_pass(self._pass_end())
       elif PASS_STOP_CUT and not self._same(inside, c) and self.pass_x_exit <= x and stopping:
@@ -2378,7 +2441,12 @@ class MapCurvesPlanner:
     if reason is not None:
       self.pass_drops = getattr(self, "pass_drops", []) + [{"reason": reason, "name": c.get("name", "") or "",
                                                              "map_turn": turn_c, "driven_turn": round(driven, 1)}]
+      if reason == "turn" and getattr(self, "pass_trust0", False) and driven < PASS_GHOST_SHARE * turn_c and \
+         not c.get("ramp") and hasattr(self.mc.memory, "add_ghost"):
+        self.mc.memory.add_ghost(c, direction)          # (PASS_GHOST_*)
       return
+    if turn_c >= PASS_TURN_MIN and hasattr(self.mc.memory, "clear_ghost"):
+      self.mc.memory.clear_ghost(c, direction)          # (it really turned through it)
     v_sat = curve_pass_saturation(samples)
     if v_sat is not None:
       self.mc.memory.add_saturated_pass(c, v_sat, direction=direction)
@@ -2440,6 +2508,10 @@ class MapCurvesPlanner:
       plan.mapRampEndDistance = float(mc.ramp_end_dist)
     plan.mapRoadClass = int(getattr(self, "road_class", 0))
     plan.mapCurveVeto = int(mc.veto_status)
+    try:
+      plan.mapCurveBlind = BLIND_CODES.get(getattr(mc.veto, "blind_why", ""), 0)
+    except (AttributeError, ValueError):
+      pass                       # (an older cereal without the field)
     plan.mapCurveVetoRadius = float(mc.veto_radius)
     plan.mapCurveSource = int(mc.source)
     plan.mapGpsTrust = int(mc.trust_status)

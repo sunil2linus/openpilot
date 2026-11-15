@@ -450,7 +450,28 @@ def find_curves(chain, ways_by_id, ramp=None):
                        "end_dist": round(end_dist, 1), "len": ramp["len"]}
         curves.append(c)
     i = j + 1
-  return curves
+  return split_doublets(curves, ways_by_id)
+
+
+# Round Q (Rochester Rd construction, drives 74 / 75: a road splitting into its two one-way sides): two opposite bends
+# within SPLIT_PAIR_GAP whose heading changes cancel (net under SPLIT_NET_DEG), where a one-way way meets a two-way way of
+# the same name, are the jog onto a carriageway, not curves: dropped
+SPLIT_PAIR_GAP = 60.0      # m between the first's exit and the second's entry
+SPLIT_NET_DEG = 8.0        # deg
+
+
+def split_doublets(curves, ways_by_id):
+  """curves of one chain (along it) without the split jogs (SPLIT_*)."""
+  drop = set()
+  for k in range(len(curves) - 1):
+    c1, c2 = curves[k], curves[k + 1]
+    if c1["dir"] == c2["dir"] or c2["s_a"] - c1["s_b"] > SPLIT_PAIR_GAP or abs(c1["turn"] - c2["turn"]) >= SPLIT_NET_DEG:
+      continue
+    wl = [ways_by_id[w] for w in sorted(set(c1["ways"]) | set(c2["ways"])) if w in ways_by_id]
+    names = {(w.name or w.ref) for w in wl if (w.name or w.ref)}
+    if len(names) == 1 and any(w.oneway for w in wl) and any(not w.oneway for w in wl):
+      drop.update((k, k + 1))
+  return [c for k, c in enumerate(curves) if k not in drop]
 
 
 # ---------------- ramps ----------------

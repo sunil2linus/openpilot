@@ -3574,6 +3574,7 @@ class CurveSlowdown:
         "gps_acc_m": float(getattr(plan, "mapGpsAccuracy", 0.0)), **self._profile_summary()})
       self.map_min_speed = i.v_ego
       self.map_vetoed, self.map_veto_radius = False, 0.0
+      self.map_blind = ""            # (round Q) the camera check's last "blind" reason in the episode (mapCurveBlind)
       self.map_min_set = i.set_speed
       self.map_brake = False
     if self.map_event is not None:
@@ -3582,12 +3583,16 @@ class CurveSlowdown:
       self.map_brake |= i.brake_pressed
       if int(getattr(plan, "mapCurveVeto", 0)) == 1:
         self.map_vetoed, self.map_veto_radius = True, float(getattr(plan, "mapCurveVetoRadius", 0.0))
+      blind = int(getattr(plan, "mapCurveBlind", 0) or 0)
+      if blind:
+        self.map_blind = ("slow", "red", "signal", "far", "ystd", "lead")[blind - 1] if blind <= 6 else str(blind)
       done = not mo.active and (self.map_mode == 1 or (lg.offset == 0 and not lg.inflight))
       if done:
         self.recorder.close(self.map_event, t, {"min_speed_mph": self.map_min_speed / MS_PER_MPH,
                                                 "min_set_mph": self.map_min_set / MS_PER_MPH, "driver_braked": self.map_brake,
                                                 "set_mph_after": i.set_speed / MS_PER_MPH, "last_why": mo.why,
-                                                "vetoed": self.map_vetoed, "veto_radius_m": self.map_veto_radius})
+                                                "vetoed": self.map_vetoed, "veto_radius_m": self.map_veto_radius,
+                                                "camera_blind": getattr(self, "map_blind", "")})
         self.map_event = None
 
   # ---- per-event logs (never raises into the car controller: called inside try/except) ----
