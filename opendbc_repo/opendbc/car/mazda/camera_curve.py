@@ -87,6 +87,7 @@ CAM_END_STEP = 10 * MS_PER_MPH  # m/s
 CAM_APEX_SEE = 110.0            # m (map_curves.VETO_SEE_MAX)
 CAM_APEX_TIME = 2.0             # s
 CAM_APEX_PAD = 20.0             # m past the apex the model must be straight too
+CAM_END_FAR = 4.0               # s: the end's window, 2 s .. this (C4)
 CAM_END_CONFIRM = 0.5           # s the end's conditions hold before it acts (one model frame of "straight" is not an end)
 # (C2) 2.5 on the margin-corrected lateral; the latch ends CAM_OVER_HOLD after the lateral is back under the limit (a loop's
 # entry peaked ~2.8, its gentler middle may still get taps: drive 75, taps geometrically fine from ~1152)
@@ -257,7 +258,8 @@ class CameraCurve:
     pk_cur = model_peak(i.model_x, i.model_k, v, 0.5, 3.0)
     out.keep = pk_cur is not None and pk_cur < lim and lat < lim and not tightening
     # (d) the curve ending
-    pk_end = model_peak(i.model_x, i.model_k, v, 2.0, 3.0)
+    # (C4) 2-4 s (was 2-3 s): between two bends the 2-3 s peak got as low as 0.99; at true ends the 2-4 s peak still fell
+    pk_end = model_peak(i.model_x, i.model_k, v, 2.0, CAM_END_FAR)
     trq = sorted(self.trq_hist)[len(self.trq_hist) // 2] if self.trq_hist else 1.0
     sat = (sum(1 for q in self.trq_hist if q >= CAM_TORQUE_SAT) / len(self.trq_hist)) if self.trq_hist else 1.0
     no_reserve = trq >= CAM_TORQUE_RESERVE or sat > CAM_TORQUE_SAT_SHARE      # (C3)
