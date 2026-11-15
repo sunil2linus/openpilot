@@ -2,6 +2,7 @@
 navigation is the base, a gentle slowdown to the exit speed at the split only in an exit lane, the ramp confirmed by
 the map's shapes, the full (firm) slowdown only after that, a missed exit restored at once, his decisions, the early
 brake chime, forks after the split. Closed loop on the measured cruise as test_map_curves.drive_53 runs it."""
+import dataclasses
 import importlib.util
 import json
 import math
@@ -376,6 +377,9 @@ def exit_fields(exit_x, curve_x, r=95.0, ann=800.0, clear=46.0, limit=70.0, link
   trust_from = exit_x - clear if trust_from is None else trust_from
 
   def fields(x):
+    return dataclasses.replace(_fields(x), exit_start=exit_x - x) if exit_x - x > 0 and x >= exit_x - ann else _fields(x)
+
+  def _fields(x):     # (review of round Q, B2: the planner gives mapExitStart, the watched exit's link start, as here)
     hwy = dict(road_class=1, limit=limit * MPH, gps_trust=2 if x >= trust_from and x < exit_x + ramp_at else 0)
     if exit_x - 300 <= x < exit_x + ramp_at:
       # the roads ahead from the map: the highway straight on, the link 5 deg off it (drive 53's)

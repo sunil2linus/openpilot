@@ -526,3 +526,36 @@ def test_review_b1_the_end_is_cancelled_when_the_next_curve_shows_up():
   assert any(c for t, e, c, g in seen if t >= 4.0) and not seen[-1][1]
   # unmapped beyond the model's horizon: the end's raise at most CAM_END_STEP over its speed
   assert all(g <= v + CC.CAM_END_STEP + 1e-6 for t, e, c, g in seen if e)
+
+
+# ---- review of round Q, B2: navigation rerouted to a later exit (rq_review/q1two.py, q1two_b.py) ----
+
+def _two_exits(decline=True, sig_a=False, stay_b=False):
+  """Exits A (2000) and B (2800): navigation takes A until 240 m before it, then B; the map's link start is A's (the nearest
+  watched exit) until A is passed. B taken (or stayed past) with the camera's edge lane only."""
+  A, B = 2000.0, 2800.0
+  fb = TE.exit_fields(B, B + 262, r=60.0, ann=1400.0, clear=10.0, link_at=150, ramp_at=190, curve_held=100.0)
+  fs = TE.exit_fields(B, B + 262, r=60.0, ann=1400.0, clear=10.0, stay=True, shape=True, stay_from=40.0)
+
+  def fields(x):
+    f = fs(x) if (stay_b and x >= B - 10) else fb(x)
+    if x < A - 240:
+      f = dataclasses.replace(f, nav_exit=1, nav_exit_distance=A - x, nav_curve_radius=113.0, nav_curve_distance=A + 262 - x,
+                              nav_exit_side=1, exit_curve_radius=113.0, exit_curve_distance=A + 262 - x)
+    f = dataclasses.replace(f, exit_start=(A - x) if x < A + 60 else (B - x))
+    if A - 300 <= x < A + 150:
+      f = dataclasses.replace(f, gps_trust=0, exit_shape=1)
+    return f
+  sig = (lambda x: -1 if A - 290 <= x < A - 270 else 0) if decline else ((lambda x: 1 if A - 370 <= x < A - 300 else 0)
+                                                                        if sig_a else None)
+  r = TE.drive_exit(fields, 14000, 75, v_mph=70, signal=sig, lane=lambda x: 1 if B - 300 <= x < B + 60 else None)
+  low_b = min(v for v, xx in zip(r["vs"], r["xs"], strict=True) if xx >= B - 400)
+  return TE._at(r, B + 262), low_b
+
+
+def test_review_b2_a_reroute_to_a_later_exit_carries_nothing_over():
+  # (base f360ec650: declined A, takes B: 64.3 mph at B's curve; signalled A, stays past B: 68.9 low; Q had 74.7 / 39.9)
+  v_curve, _ = _two_exits(decline=True)
+  assert abs(v_curve - 64.3) <= 2.0, v_curve
+  _, low = _two_exits(decline=False, sig_a=True, stay_b=True)
+  assert abs(low - 68.9) <= 2.0, low

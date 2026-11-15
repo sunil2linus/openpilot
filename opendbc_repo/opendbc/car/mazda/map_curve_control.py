@@ -331,6 +331,11 @@ NAV_NEAR_CLEAR = 80.0           # m
 # agreeing within NAV_SAME_MIN is the same exit, and a plan that ended "rerouted" / "navigation dropped it" is taken on again
 # with what it knew (his signal, the lane evidence) when navigation announces the same exit point again (NAV_REVIVE).
 NAV_REVIVE = ("rerouted", "navigation dropped it")
+# Review of round Q, B2 (rq_review/q1two.py: navigation rerouted from exit A to a later exit B while A was ahead; the map's
+# link start, the nearest watched exit's, still agreed with A, so same() held and A's signal / decline / lane evidence went
+# to B): the map's link start makes it the same exit only with navigation's own (fresh) distance agreeing within
+# NAV_UPDATE_TRAVEL of travel; a moved exit point is another exit (a fresh plan, nothing carried), in the revive lookup too
+NAV_UPDATE_TRAVEL = 2.5         # s
 # Round Q (exit 48): while the exit is not resolved past the split (tentative) and its curve needs a much lower speed, the
 # car is kept on a speed profile from which the curve's speed is still reached with at most TENT_REACH_DECEL after the
 # cruise's dead time (CHIME_DEAD), MAP_LEAD_TIME before its entry (the cruise's strongest is ~0.9-1.0 and takes ~2 s to
@@ -648,13 +653,15 @@ class ExitPlan:
       self.curve = (0.0, 0.0, 0.0)                # (review: re-identified as an exit without curves: not the old one's)
     self.grace = 0.0
 
-  def same(self, odo, f):
+  def same(self, odo, f, v=0.0):
     d = f.nav_exit_distance
     if d == self.nav_d:
       return True                 # (NAV_REVIVE) the same stale value: nothing new
-    if f.exit_start > 0 and abs(odo + f.exit_start - self.exit_at) <= NAV_SAME_MIN:
-      return True                 # the map's link start of navigation's exit agrees: the same exit
-    return abs(odo + d + self.start_off - self.exit_at) <= max(NAV_SAME_MIN, NAV_SAME_SHARE * d)
+    err = abs(odo + d + self.start_off - self.exit_at)
+    if f.exit_start > 0 and abs(odo + f.exit_start - self.exit_at) <= NAV_SAME_MIN and \
+       err <= max(NAV_SAME_MIN, v * NAV_UPDATE_TRAVEL):
+      return True                 # the map's link start agrees and so does navigation (B2)
+    return err <= max(NAV_SAME_MIN, NAV_SAME_SHARE * d)
 
 
 HOLD_WHYS = ("exit hold", "exit lost", "exit wait", "exit reach hold")
@@ -820,11 +827,11 @@ class MapCurveControl:
       return 0.0
     return p.limit + SPLIT_OFFSETS[self.split_mode] * self.unit
 
-  def _nav_plan(self, f, on_link, signal):
+  def _nav_plan(self, f, on_link, signal, v=0.0):
     """Adopt / follow / drop the plan from navigation's exit."""
     p = self.plan
     announced = f.nav_exit in NAV_PLAN_EXITS and f.nav_exit_distance > 0 and not on_link
-    if p is not None and p.nav_near and p.exit_at - self.odo > NAV_NEAR_CLEAR and not (announced and p.same(self.odo, f)):
+    if p is not None and p.nav_near and p.exit_at - self.odo > NAV_NEAR_CLEAR and not (announced and p.same(self.odo, f, v)):
       # (NAV_NEAR_CLEAR) cancelled, or another exit, for NAV_GRACE (a one-frame drop is not): not navigation's route
       p.nav_miss_s += DT_CTRL
       if p.nav_miss_s >= NAV_GRACE - 1e-6:
@@ -834,7 +841,7 @@ class MapCurveControl:
     if p is not None and not announced and p.nav_near and p.exit_at - self.odo <= NAV_CLOSE:
       p.nav_passed = True                           # (moving on at the split: not a cancel; weak evidence he took it)
     if announced:
-      if p is not None and p.same(self.odo, f):
+      if p is not None and p.same(self.odo, f, v):
         p.update_nav(self.odo, f)
       elif p is not None and not p.confirmed and p.exit_at - self.odo > NAV_CLOSE:
         self._end("rerouted")                       # another exit far from this one's split: navigation changed its route
@@ -842,8 +849,7 @@ class MapCurveControl:
       lp = None if p is not None or f.road_class in LINK_CLASSES else next((
         q for q in reversed(self.revivable) if q.exit_at - self.odo > 0 and (
           abs(self.odo + f.nav_exit_distance + q.start_off - q.exit_at) <=
-          max(NAV_SAME_MIN, NAV_SAME_SHARE * f.nav_exit_distance) or
-          (f.exit_start > 0 and abs(self.odo + f.exit_start - q.exit_at) <= NAV_SAME_MIN))), None)
+          max(NAV_SAME_MIN, NAV_SAME_SHARE * f.nav_exit_distance))), None)    # (B2: navigation's own distance)
       if lp is not None:
         # (NAV_REVIVE) navigation is back on the exit it left: the same plan, with his signal and the lane evidence
         self.revivable.remove(lp)
@@ -894,7 +900,7 @@ class MapCurveControl:
 
   def _exit(self, f, driver_speed, v_ego, on_link, signal, gas):
     """The plan's command: (speed, plan, curve speed, why, follower or None, firm). NO_CURVE when it asks for nothing."""
-    p = self._nav_plan(f, on_link, signal)
+    p = self._nav_plan(f, on_link, signal, v_ego)
     none = (NO_CURVE, NO_CURVE, NO_CURVE, "", None, False)
     if p is None:
       return none
