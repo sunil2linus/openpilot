@@ -839,3 +839,46 @@ def test_rereview_c6_no_tap_above_the_governing_map_plan_or_into_the_models_3_to
   far = 1.65 / (v * v)       # (1.75 at v+1: the 0.5-3 s window at v+1 ends at 3 (v+1), before it)
   taps, _, outs = _cam_run(3.0, kappa=lambda x: far if 3.2 * v <= x <= 4.0 * v else 1.2 / (v * v))
   assert not taps and outs[-1].why == "lateral"
+
+
+def test_rereview_c7_no_phantom_release_once_the_curve_was_driven_and_none_without_the_apex():
+  v = 40 * MPH
+  xs, ks = _path(lambda x: 0.0)
+
+  def run(lat_fn, apex_fn, frames=300):
+    cc = CC.CameraCurve()
+    return [cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=lat_fn(f), model_x=xs, model_k=ks, lane_prob=0.8,
+                                   curve_on=True, map_in_curve=True, map_curve_id=(1, 142), apex_d=apex_fn(f)))
+            for f in range(frames)]
+  # a first bend at 1.3 m/s^2, then a straight with the model straight to the apex ahead: a real curve, not a phantom
+  assert not any(o.phantom for o in run(lambda f: 1.3 if f < 100 else 0.2, lambda f: 18.0))
+  # nor once its apex is passed
+  assert not any(o.phantom for o in run(lambda f: 1.3 if f < 100 else 0.2, lambda f: 30.0 - 0.18 * f))
+  # passed with the lateral low all the way: released (and its event carries no model peak)
+  outs = run(lambda f: 0.2, lambda f: -5.0)
+  assert outs[-1].phantom
+  assert [d["model_peak_to_apex"] for o in outs for k, d in o.events if k == "camPhantomRelease"] == [None]
+  # the apex unknown (the planner did not publish it, or a build without the field): never
+  assert not any(o.phantom for o in run(lambda f: 0.2, lambda f: None))
+
+
+def test_rereview_c7_the_planner_publishes_the_governing_curves_apex():
+  from types import SimpleNamespace as N
+  mp = MC.MapCurvesPlanner(None, None)
+  mp.mode = 2
+  m, rm, trust, _, _ = TMC._with_trust(TMC.G.curve_road(r=115, turn=40))
+  mp.mc = m
+  seen = []
+  for y in (-200, -120, -60):
+    TMC._drive(m, rm, trust, 0, y, 0.0, 3)
+    plan = N()
+    mp.publish(plan)
+    seen.append((plan.mapCurveStatus, plan.mapCurveApexValid, plan.mapCurveApexDistance))
+  assert all(s == MC.STATUS_CURVE and ok for s, ok, _ in seen), seen
+  d = [a for _, _, a in seen]
+  assert d[0] > d[1] > d[2] > 60 and abs((d[0] - d[1]) - 80) < 5, d    # the apex lies past the curve's start, nearing
+  # no governing curve: not valid (the car side then never releases on it)
+  mp.mc.curve = None
+  plan = N()
+  mp.publish(plan)
+  assert not plan.mapCurveApexValid

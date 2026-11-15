@@ -15,7 +15,7 @@ The live data:
 
 Rules (all need the camera's lane lines (probability >= CAM_LANE_PROB), the speed >= CAM_MIN_SPEED, a fresh model):
   (a) The approach is unchanged: the target is the lower of the map's and the camera's, as before.
-  (b) Phantom release: past a map curve's start with the measured |lateral| under CAM_PHANTOM_LAT and the model's peak
+  (b) Phantom release: past a map curve's start with the measured |lateral| under CAM_PHANTOM_LAT (ever since that start) and the model's peak
       over 0.5-2 s at the current set speed under it too, for CAM_PHANTOM_TIME: no more SET- for that map curve; the
       normal restore applies (drive 75 t ~700, Rochester Rd construction: 45 -> 35 mph on a straight road).
   (c) In-curve +1 tap (at most every CAM_TAP_DT) when all: the larger of the measured lateral scaled to the speed + 1 mph
@@ -83,8 +83,8 @@ CAM_END_STEP_BLIND = 5 * MS_PER_MPH  # m/s: else (C5)
 # a map curve ahead's plan) is under the car's speed or the set + one step (the camera saw curve 2 at 30 mph with the car at
 # 55: the end ran SET+ to his speed). CAM_END_STEP bounds every end, ramps included; curve_on going off ends it as a cancel.
 # R2: the phantom release only with the map curve's apex known (starpilotPlan.mapCurveApexDistance): ahead within
-# CAM_APEX_SEE m and CAM_APEX_TIME s with the model straight through it, or passed with the lateral under CAM_PHANTOM_LAT all
-# the way; never on a link / ramp.
+# CAM_APEX_SEE m and CAM_APEX_TIME s with the model straight through it, or passed; either way (C7) only with the lateral
+# under CAM_PHANTOM_LAT all the way since the map curve's start; never on a link / ramp. Apex unknown: no release.
 CAM_APEX_SEE = 110.0            # m (map_curves.VETO_SEE_MAX)
 CAM_APEX_TIME = 2.0             # s
 CAM_APEX_PAD = 20.0             # m past the apex the model must be straight too
@@ -236,13 +236,16 @@ class CameraCurve:
     pk_set = None
     if model and i.apex_d is not None and 0.0 <= i.apex_d <= min(CAM_APEX_SEE, CAM_APEX_TIME * vq) and vq > 0:
       pk_set = model_peak(i.model_x, i.model_k, vq, 0.0, (i.apex_d + CAM_APEX_PAD) / vq)   # (R2) straight through the apex
-    passed = i.apex_d is not None and i.apex_d < 0.0 and self.ph_lat < CAM_PHANTOM_LAT
+    passed = i.apex_d is not None and i.apex_d < 0.0
+    # (C7) both ways only with the lateral never at CAM_PHANTOM_LAT since this map curve's start (a curve being driven is
+    # no phantom, whatever the model shows of the road on to its apex)
     straight = (guards and i.map_in_curve and not i.on_ramp and lat < CAM_PHANTOM_LAT and not i.cam_fault and
-                ((pk_set is not None and pk_set < CAM_PHANTOM_LAT) or passed))
+                self.ph_lat < CAM_PHANTOM_LAT and ((pk_set is not None and pk_set < CAM_PHANTOM_LAT) or passed))
     self.phantom_frames = self.phantom_frames + 1 if straight else 0
     if (self.phantom_id is None and i.map_curve_id and self.phantom_frames >= int(CAM_PHANTOM_TIME / DT_CTRL)):
       self.phantom_id = i.map_curve_id
-      out.events.append(("camPhantomRelease", {"lat": round(lat, 2), "model_peak_0p5_2s": round(pk_set, 2),
+      out.events.append(("camPhantomRelease", {"lat": round(lat, 2),
+                                               "model_peak_to_apex": round(pk_set, 2) if pk_set is not None else None,
                                                "vEgo_mph": round(v / MS_PER_MPH, 1), "set_mph": round(i.set_speed / MS_PER_MPH, 1),
                                                "map_curve": str(i.map_curve_id), "lane_prob": round(i.lane_prob, 2)}))
     out.phantom = self.phantom_id is not None
