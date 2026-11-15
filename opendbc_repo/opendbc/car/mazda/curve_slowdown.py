@@ -2786,8 +2786,11 @@ class CurveSlowdown:
       self.limit_follow.street_active = self._street_active(plan)
       self.limit_want = self.limit_follow.update(li)
     turn_ok, turn_pause = self._merge_turn(CS, CP, v_ego, plan if self._alive('starpilotPlan') else None)
-    if cam_end and self.map_control is not None and self.map_control.link_now:
-      turn_ok = True                 # (camera_curve rule d) on a link: one more "ok" beside MergeTurnGate
+    if (cam_end and self.map_control is not None and self.map_control.link_now and self._alive('starpilotPlan') and
+        int(getattr(plan, "mapCurveStatus", 0) or 0) != 2 and float(getattr(plan, "mapRampEndDistance", 0.0) or 0.0) > 0):
+      # (camera_curve rule d) on a link one more "ok" beside MergeTurnGate, only with the ramp's mapped curves all behind
+      # the car and its end known (re-review R1 b); else the camera end gives its CAM_END_STEP only
+      turn_ok = True
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
     limit_ceiling = self.limit_follow.ceiling_speed if self.limit_follow is not None else 0.0
@@ -3198,6 +3201,7 @@ class CurveSlowdown:
       blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker), on_ramp=bool(mc is not None and mc.link_now),
       blocked=bool(lg.blocked or CS.out.brakePressed), test_mode=bool(test),
       target=float(curve_speed) if curve_active else CAM_NONE,
+      cam_target=float(cam_speed0) if cam_active0 else CAM_NONE,
       # (B1) the map knows the road beyond the model's horizon: matched to a road class, GPS trusted, Map Curves On
       map_covered=bool(self.map_on_used and status != STATUS_PAUSED and int(getattr(plan, "mapRoadClass", 0) or 0) > 0 and
                        int(getattr(plan, "mapGpsTrust", 4) or 0) < 2))

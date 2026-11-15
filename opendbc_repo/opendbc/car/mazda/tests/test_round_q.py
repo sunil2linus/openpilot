@@ -302,14 +302,14 @@ def test_q3_the_wrapper_raises_the_curve_target_by_its_taps_and_logs_them(tmp_pa
   for _ in range(120):
     c.frame += 1
     r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 33 * MPH, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
-                        False, False, False, False, False, True, 33 * MPH)
+                        False, False, False, False, False, True, 45 * MPH)
     got.append(r)
   assert any(r[1] >= 34 * MPH - 1e-3 and r[4] and r[5] for r in got), got[-1]
   assert "camCurveTap" in records
   # his steering: nothing raised, the target as it came
   cs_.out.steeringPressed = True
   r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 33 * MPH, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
-                      False, False, False, False, False, True, 33 * MPH)
+                      False, False, False, False, False, True, 45 * MPH)
   assert abs(r[1] - 33 * MPH) < 1e-6 and not r[4]
 
 
@@ -615,14 +615,14 @@ def test_review_s1_what_the_taps_reached_never_stays_above_a_target_that_dropped
   for _ in range(150):
     c.frame += 1
     c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, setv, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
-                    False, False, False, False, False, True, 33 * MPH)
+                    False, False, False, False, False, True, 45 * MPH)
     if c.cam_goal is not None:
       setv = c.cam_goal[0]
   assert c.cam_floor is not None and c.cam_floor / MPH > 34.5
   for _ in range(50):
     c.frame += 1
     r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, setv, 45 * MPH, True, 28 * MPH, 0.0, 0, True,
-                        False, False, False, False, False, True, 28 * MPH)
+                        False, False, False, False, False, True, 45 * MPH)
   assert r[0] and r[1] / MPH < 30, r[1] / MPH
 
 
@@ -642,6 +642,7 @@ def test_review_s2_the_curve_end_also_lets_go_of_a_followed_map_curve(tmp_path, 
   c.logic.anchor = 45 * MPH
   plan = c.sm.msgs["starpilotPlan"]
   plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance, plan.mapRoadClass, plan.mapGpsTrust = 1, 90.0, 0.0, 7, 0
+  plan.mapCurveApexValid, plan.mapCurveApexDistance = True, -20.0   # (re-review R3: its apex passed)
   c.map_on_used = True
   c.map_out = N(active=True, track=True, plan=30 * MPH, speed=30 * MPH, floor=0.0, budget=40, settled=True, firm=False,
                 link=False)
@@ -651,10 +652,11 @@ def test_review_s2_the_curve_end_also_lets_go_of_a_followed_map_curve(tmp_path, 
     # in the curve 2 s, then the model sees the road straighten 1.5 s ahead
     m.orientationRate = N(z=[1.4 / v if (f < 200 or x < 1.5 * v) else 0.0 for x in xs])
     c.sm.updated["modelV2"] = True
-    out.append(c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 30 * MPH, 45 * MPH, True, 30 * MPH, 0.0, 40,
-                               True, True, False, False, False, False, True, 32 * MPH))
+    out.append(c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 30 * MPH, 45 * MPH, True, 36 * MPH, 0.0, 40,
+                               True, True, False, False, False, False, True, 45 * MPH))
   ends = [r for r in out if r[9]]
-  assert ends and not ends[-1][0] and ends[-1][8], ends[-1:]        # the map curve's hold let go, SET+ holds
+  # the map curve's hold let go: the end's raise (taps) toward the speed + CAM_END_STEP (re-review R1 b), here his 45
+  assert ends and ends[-1][0] and ends[-1][1] >= 44.9 * MPH and ends[-1][4] and ends[-1][5], ends[-1:]
 
 
 def test_review_m2_a_non_finite_model_point_is_no_model_not_a_straight_road():
@@ -670,3 +672,94 @@ def test_review_m3_the_camera_curve_rules_only_on_a_torque_interceptor_car(tmp_p
   W = _load("tcpw_round_q_m3", os.path.join(HERE, "test_car_profile_wrapper.py"))
   assert W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch).cam_curve is not None
   assert W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch, ti=False).cam_curve is None
+
+
+# ---- re-review of round Q, R1-R3: closed loop through the real CurveSlowdown.update (rq_review/v2/wsim.py's harness) ----
+
+def _wsim(tmp_path, monkeypatch, segs, mapped=(), ramp=False, anchor=50, view=70.0, camera=True):
+  """segs: (start, end, R, sign); mapped: (start, end, R, apex) the map knows (status 1, or 2 on a ramp), its apex published
+  (mapCurveApex*). The model sees curvature `view` m ahead. camera False: CameraCurve off (round P's behaviour)."""
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace as N
+  from opendbc.car.mazda import mazdacan
+  from opendbc.car.mazda.values import Buttons
+  sent = []
+  monkeypatch.setattr(mazdacan, "create_button_cmd", lambda packer, CP, ctr, btn: sent.append(btn) or ("btn", btn))
+  W = _load("tcpw_round_q_w", os.path.join(HERE, "test_car_profile_wrapper.py"))
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  if not camera:
+    c.cam_curve = None
+
+  def k(x):
+    for a, b, R, sg in segs:
+      if a <= x < b:
+        return sg / R
+    return 0.0
+  acc = lambda g: 0.33 if g < 5 else (0.51 if g < 10 else (0.75 if g < 15 else 0.91))  # noqa: E731
+  car = TP.T.Car(anchor, dash_offset_mph=0.0, lag=10, accel_fn=acc, cruise_gain=0.19, step=MPH)
+  car.v_ego = anchor * MPH
+  plan, m = c.sm.msgs["starpilotPlan"], c.sm.msgs["modelV2"]
+  m.laneLineProbs, m.meta = [0.5, 0.9, 0.9, 0.5], N(laneChangeState=0)
+  xs = [190.0 * (j / 32) ** 2 for j in range(33)]
+  CP = N(wheelbase=2.7, steerRatio=15.5, carFingerprint="MAZDA_CX5")
+  cc = N(enabled=True, cruiseControl=N(cancel=False, resume=False), latActive=True, actuators=N(torque=0.0))
+  x, trace, presses, phantom = 0.0, [], 0, False
+  x_end = max(b for _, b, _, _ in segs) + 60
+  for f in range(20000):
+    v = car.v_ego
+    plan.mapCurveMode, plan.mapRoadClass, plan.mapGpsTrust, plan.mapOnRamp = 2, (2 if ramp else 5), 0, ramp
+    st, R, d, apex = 0, 0.0, 0.0, None
+    for a, b, Rm, ap in mapped:
+      if x < b and a - x < 400:
+        st, R, d, apex = (2 if ramp else 1), Rm, max(a - x, 0.0), ap - x
+        break
+    plan.mapCurveStatus, plan.mapCurveRadius, plan.mapCurveDistance = st, R, d
+    plan.mapCurveApexValid, plan.mapCurveApexDistance = apex is not None, apex or 0.0
+    upd = f % 5 == 0
+    if upd:
+      m.position = N(x=xs, y=[0.0] * 33)
+      m.velocity = N(x=[max(v, 1.0)] * 33, t=[0.0] * 33)
+      m.orientationRate = N(z=[(k(x + xx) if xx <= view else 0.0) * max(v, 1.0) for xx in xs])
+    c.sm.updated["modelV2"] = c.sm.updated["starpilotPlan"] = upd
+    lat = k(x) * v * v
+    cc.actuators.torque = min(abs(lat) / 2.3, 1.0)
+    CS = W.car_state(v / MPH, car.set_speed / MPH)
+    CS.out.steeringAngleDeg = math.degrees(k(x) * 18.9 * 2.7 * (1 + 0.001 * v * v))
+    CS.out.steeringRateDeg = 0.0
+    CS.crz_btns_counter = (f // 10) % 16
+    nb = len(sent)
+    c.update(cc, CS, None, CP, False)
+    if len(sent) > nb:
+      btn = TP.cs.SET_MINUS if sent[-1] == Buttons.SET_MINUS else TP.cs.SET_PLUS
+      presses += 1
+      car.hold_frame(btn) if c.logic.last_action == "hold" else car.press(btn)
+    phantom |= bool(c.cam_out is not None and c.cam_out.phantom) if camera and c.cam_curve is not None else False
+    trace.append((x, v / MPH, car.set_speed / MPH, abs(lat)))
+    car.tick()
+    x += car.v_ego * DT
+    if x > x_end:
+      break
+  return trace, presses, phantom
+
+
+def _entry(trace, a, b):
+  return next(t[1] for t in trace if t[0] >= a), max((t[3] for t in trace if a <= t[0] < b), default=0.0)
+
+
+def _no_faster(tmp_path, monkeypatch, segs, c2, **kw):
+  tb, pb, _ = _wsim(tmp_path, monkeypatch, segs, camera=False, **kw)
+  tq, pq, _ = _wsim(tmp_path, monkeypatch, segs, **kw)
+  (vb, lb), (vq, lq) = _entry(tb, *c2), _entry(tq, *c2)
+  assert vq <= vb + 1.0 and lq <= lb + 0.2 and pq <= 1.3 * pb + 1, (segs, kw, vb, vq, lb, lq, pb, pq)
+
+
+def test_rereview_r1_a_mapped_ramp_loop_then_an_unmapped_tighter_turn(tmp_path, monkeypatch):
+  # (test_v2_ramp: was +8.7 mph / +3.4 m/s^2, presses 51 -> 88)
+  for gap, R2, view in ((80, 30, 190.0), (120, 40, 120.0)):
+    segs = [(300, 550, 60, 1), (550 + gap, 650 + gap, R2, 1)]
+    _no_faster(tmp_path, monkeypatch, segs, (550 + gap, 650 + gap), mapped=[(300, 550, 60, 425)], ramp=True, anchor=45,
+               view=view)
+  # R200 then R60 160 m on, unmapped, not a ramp (was +5.7 mph)
+  _no_faster(tmp_path, monkeypatch, [(300, 480, 200, 1), (640, 840, 60, -1)], (640, 840), anchor=55, view=190.0)
+

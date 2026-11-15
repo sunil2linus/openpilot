@@ -73,6 +73,9 @@ CAM_RISE_TIME = 1.0             # s
 CAM_END_HYST = 0.3              # m/s^2
 CAM_END_DROP = 1 * MS_PER_MPH   # m/s
 CAM_END_STEP = 10 * MS_PER_MPH  # m/s
+# Re-review of round Q, R1: the end may not start, and is cancelled, while any incoming target (the camera's, the map's,
+# a map curve ahead's plan) is under the car's speed or the set + one step (the camera saw curve 2 at 30 mph with the car at
+# 55: the end ran SET+ to his speed). CAM_END_STEP bounds every end, ramps included; curve_on going off ends it as a cancel.
 CAM_END_CONFIRM = 0.5           # s the end's conditions hold before it acts (one model frame of "straight" is not an end)
 CAM_OVER = 3.3                  # m/s^2 (the loops of drives 6f / 73 / 75 peaked 2.8-3.1, the turnaround 3.6)
 CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the farthest distance asked for
@@ -132,6 +135,7 @@ class CamInputs:
   test_mode: bool = False         # a Test mode governs: never press
   target: float = NO_CURVE        # m/s: the incoming curve target (camera or map) this frame (B1)
   map_covered: bool = False       # map curve data covers the road beyond the model's horizon (B1)
+  cam_target: float = NO_CURVE    # m/s: the camera curve target alone (its plan sees past the 3 s window: R1)
 
 
 @dataclass
@@ -192,6 +196,8 @@ class CameraCurve:
     guards = model and i.lane_prob >= CAM_LANE_PROB and v >= CAM_MIN_SPEED
     never = self._never(i)
     if not i.curve_on:
+      if self.ending:
+        self._cancel(out, "curve off", lat)     # (R1 c) as a cancel: no restore of ours left behind
       self.ending, self.over, self.end_done = False, False, False
     elif lat >= CAM_OVER:
       self.over = True
@@ -228,9 +234,11 @@ class CameraCurve:
     trq = sorted(self.trq_hist)[len(self.trq_hist) // 2] if self.trq_hist else 1.0
     n_rise = int(CAM_RISE_TIME / DT_CTRL)
     rising = len(self.lat_hist) > 1 and lat - self.lat_hist[max(len(self.lat_hist) - 1 - n_rise, 0)] > CAM_RISE
+    low_target = i.target < max(v, i.set_speed + i.step) - 1e-3 or i.map_ahead < v     # (R1 a)
     if self.ending:
       # (B1) checked again every frame
-      why_c = ("model peak" if pk_now is None or pk_now >= lim else
+      why_c = ("target under the speed" if low_target else
+               "model peak" if pk_now is None or pk_now >= lim else
                "curve ahead" if pk_end is None or pk_end >= CAM_END_LAT + CAM_END_HYST else
                "lateral rising" if rising or lat >= lim else
                "steering reserve" if trq >= CAM_TORQUE_RESERVE else
@@ -238,7 +246,8 @@ class CameraCurve:
       if why_c:
         self._cancel(out, why_c, lat)
         self.ending = False
-    end_ok = (not self.ending and not self.end_done and in_curve and pk_end is not None and pk_end < CAM_END_LAT and
+    end_ok = (not self.ending and not self.end_done and not low_target and in_curve and pk_end is not None and
+              pk_end < CAM_END_LAT and
               pk_now is not None and pk_now < lim and lat < lim and trq < CAM_TORQUE_RESERVE and not rising)
     self.end_frames = self.end_frames + 1 if end_ok else 0
     if end_ok and self.end_frames >= int(CAM_END_CONFIRM / DT_CTRL):
@@ -251,8 +260,7 @@ class CameraCurve:
                                          "ti_only": i.ti_only}))
     if self.ending:
       out.ending = True
-      if not i.map_covered and not i.on_ramp:
-        out.end_goal = self.end_v0 + CAM_END_STEP      # (B1) nothing known beyond the model's horizon
+      out.end_goal = min(self.end_v0 + CAM_END_STEP, i.map_ahead)   # (R1 b) every end, ramps included
       return self._done(out, i)
     # (c) the in-curve +1 tap
     v1 = v + MS_PER_MPH
@@ -268,6 +276,7 @@ class CameraCurve:
            "steering reserve" if trq >= CAM_TORQUE_RESERVE else
            "cap" if goal > i.cap + 1e-3 else
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
+           "camera curve ahead" if goal > i.cam_target + 1e-3 else
            "wait" if self.frame - self.last_tap < int(CAM_TAP_DT / DT_CTRL) else "")
     out.why = why
     if not why:
