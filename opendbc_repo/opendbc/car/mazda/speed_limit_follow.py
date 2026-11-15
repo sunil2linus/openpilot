@@ -282,6 +282,8 @@ NOGPS_MATCH_WINDOW = 120.0   # s
 # with no street matched drops it (the normal rules then).
 NOGPS_MIN_SPEED = (35, 56)   # mph / km/h
 NOGPS_MIN_TIME = 3.0         # s
+# Re-review of round R (F2 minor): ... and it expires NOGPS_OFFER_MAX after the engagement (not taken by then: his speed)
+NOGPS_OFFER_MAX = 120.0      # s
 # Rule 9, slow for a lower limit (MazdaSlowLowerLimit)
 LOWER_STEADY = 5.0           # s steady, GPS trust 0 on every frame (a junction's cross road: drive 55 had a 4 s 35)
 # Round Q (drive 74 t 1104-1142: a 35 road, the set restored 30 -> 43 -> 51 -> 53): "the candidate's GPS trust" was the worst
@@ -1288,6 +1290,10 @@ class SpeedLimitFollower:
       # (NOGPS_MIN_SPEED) no expiry; offered only at a road's speed; a usable fix with nothing matched: the normal rules
       if not self.nogps_now and self.engage_frame is None:
         self.offer = None
+        return 0.0
+      if self.frame - o.frame > _frames(NOGPS_OFFER_MAX):
+        self.offer = None
+        self._not_followed(o.old, o.new, o.source, "no GPS: not taken in time")
         return 0.0
       if self.nogps_fast_frames < _frames(NOGPS_MIN_TIME):
         return 0.0 if d is None or abs(d - o.driver) < 0.5 else self._his(o, d)

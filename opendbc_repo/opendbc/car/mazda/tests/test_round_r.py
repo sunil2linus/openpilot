@@ -740,6 +740,15 @@ def test_r8_f2_no_raise_in_a_subdivision_or_a_lot_only_at_a_roads_speed(tmp_path
   assert not [p for p in presses if p[1] == cs.SET_PLUS]
 
 
+def test_r8_rereview_the_no_gps_offer_expires_120_s_after_the_engagement(tmp_path, monkeypatch):
+  # his gas to a road's speed only 125 s after the engagement: nothing of ours (his speed by then)
+  gf = 12500
+  out, presses = _nogps_wrapper(tmp_path, monkeypatch, 19, frames=gf + 3000, gas_until=2000 + gf + 1500, gas_v=40,
+                                gas_from=gf)
+  assert not [p for p in presses if p[1] == cs.SET_PLUS], presses[:3]
+  assert SS.slf.NOGPS_OFFER_MAX == 120.0
+
+
 def test_r7_rereview_no_taps_within_120_m_of_the_ramps_end_whatever_the_planner_does():
   taps, s = _loop_cam(ramp_left=100.0)
   assert not taps
