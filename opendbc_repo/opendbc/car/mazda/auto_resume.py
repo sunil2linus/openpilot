@@ -61,6 +61,10 @@ MAP_BLIP = 1.5                   # s
 # name read "" (the name flapped, MAP_STABLE_TIME never completed: "road just changed"); the wrapper keeps the last name
 # this long by its own receive time
 ROAD_NAME_HOLD = 5.0             # s
+# Review of round Q, M6: the held name is no proof of the same public road (into a parking lot, a flicker back to a public
+# class for < 1 s): a send needs the class good continuously for MAP_STABLE_TIME now, and the name fresh (received within
+# ROAD_NAME_FRESH) or the same as at his brake
+ROAD_NAME_FRESH = 1.5            # s
 AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
 LEAD_NEAR = 50.0                 # m
 LEAD_MOVING = 3 * MS_PER_MPH     # m/s (1.34)
@@ -117,6 +121,7 @@ class AutoResumeInputs:
   plan_alive: bool = False        # starpilotPlan
   road_class: int = 0             # starpilotPlan.mapRoadClass
   road_name: str = ""             # mapdOut.roadName ("" unknown)
+  road_name_age: float = 0.0      # s since that name was received (M6)
   lead_status: bool = False       # radarState.leadOne (as stopped_car_slowdown reads it)
   lead_d: float = 0.0             # m
   lead_v: float = 0.0             # m/s
@@ -146,6 +151,8 @@ class AutoResumeLogic:
     self.road = None                 # (class, name) last frame
     self.road_frame = -10_000        # frame it last changed
     self.blip_frame = None           # (MAP_BLIP) the first frame of a class 0 blip on a known road
+    self.good_frames = 0             # (M6) consecutive frames with a public road class
+    self.brake_name = ""             # (M6) the road name when his brake turned the cruise off
     self.last_wheel_btn = -10_000    # frame his RES / SET was last down
     self.lat = 0.0
     self.gas_frames = 0
@@ -219,6 +226,7 @@ class AutoResumeLogic:
     v = max(float(i.v_ego), 0.0)
     moving = v > MOVING_SPEED
     road = (int(i.road_class) if i.plan_alive else 0, str(i.road_name or ""))
+    self.good_frames = self.good_frames + 1 if (i.plan_alive and int(i.road_class) in PUBLIC_ROAD_CLASSES) else 0
     if road[0] == 0 and self.road is not None and self.road[0] != 0:
       # (MAP_BLIP) class 0 on a known road: the road is kept for MAP_BLIP (the send still needs the map good)
       if self.blip_frame is None:
@@ -356,8 +364,10 @@ class AutoResumeLogic:
       return "gas"
     if not self.map_ok(i):
       return "map"
-    if not self.road_stable():
+    if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME):
       return "road just changed"
+    if not (i.road_name_age <= ROAD_NAME_FRESH or i.road_name == self.brake_name):
+      return "road name not fresh"
     if not self.creep_ok(i):
       return "slow, no moving lead"
     if not i.can_valid:
@@ -444,6 +454,7 @@ class AutoResumeLogic:
       return
     self.state = ARMED
     self.armed_frame = f
+    self.brake_name = str(i.road_name or "")
     self.press_spent = i.gas_pressed     # (a gas already down at the brake is not his press)
     self._event("autoResumeArmed", set_mph=i.set_speed / MS_PER_MPH, vEgo_mph=v / MS_PER_MPH,
                 map_ok=self.map_ok(i), road_class=int(i.road_class), gps_trust=int(i.gps_trust))
@@ -538,7 +549,8 @@ class AutoResume:
         self.road_name, self.road_name_frame = str(self.sm['mapdOut'].roadName or ""), self.frame
     except (KeyError, AttributeError):
       pass
-    road_name = self.road_name if self.frame - self.road_name_frame <= _frames(ROAD_NAME_HOLD) else ""
+    road_age = (self.frame - self.road_name_frame) * DT_CTRL
+    road_name = self.road_name if road_age <= ROAD_NAME_HOLD else ""
     gear = getattr(out, "gearShifter", None)
     i = AutoResumeInputs(
       cruise_enabled=bool(out.cruiseState.enabled), cruise_available=bool(out.cruiseState.available),
@@ -551,6 +563,7 @@ class AutoResume:
       set_allowed=bool(getattr(CS, "crz_set_allowed", False)), not_allowed=bool(getattr(CS, "crz_not_allowed", False)),
       op_cancel=bool(CC.cruiseControl.cancel), cancel_sent=bool(cancel_sent), other_button_active=bool(CC.cruiseControl.resume),
       plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0, road_name=road_name,
+      road_name_age=road_age,
       lead_status=bool(lead is not None and lead.status), lead_d=float(lead.dRel) if lead is not None else 0.0,
       lead_v=float(lead.vLead) if lead is not None else 0.0, can_valid=bool(getattr(out, "canValid", False)),
       gps_trust=self._trust(plan) if plan_alive else 4, engageable=engageable,

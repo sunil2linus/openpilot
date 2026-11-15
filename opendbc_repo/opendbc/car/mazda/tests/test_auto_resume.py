@@ -213,6 +213,8 @@ def test_the_map_must_be_good_at_the_send_and_the_road_settled():
   s.step(int(0.5 * F), gas_pressed=True, road_class=0)
   assert s.sent == [] and s.lg.wait_why == "map"
   s.step(int(0.5 * F), gas_pressed=True, road_class=5)
+  assert s.sent == []                       # (review M6: the class good MAP_STABLE_TIME continuously first)
+  s.step(int(0.7 * F), gas_pressed=True, road_class=5)
   assert s.sent
   # standing still on a good road never counts against it
   s = Sim(set_mph=45, v_mph=45)
@@ -612,3 +614,26 @@ def test_crz_info_never_makes_can_invalid_and_a_stale_value_is_not_allowed():
   for k in range(1, 200):
     cp.update([(t + k * 10_000_000, [])])
   assert cp.can_valid
+
+
+def test_review_m6_into_a_parking_lot_a_flicker_back_to_a_public_class_never_sends():
+  # (review of round Q, M6) a public road, his brake, into a lot (class 0) with his gas held, the class flickers back
+  # to a public one for 0.5 s: no send (the class must be good MAP_STABLE_TIME continuously)
+  s = Sim(set_mph=30, v_mph=30, road_class=7)
+  s.brake_cancel(v_after_mph=12)
+  s.step(int(1.0 * F), road_class=0, gas_pressed=True)
+  s.step(int(0.5 * F), road_class=7, gas_pressed=True)
+  s.step(int(2.0 * F), road_class=0, gas_pressed=True)
+  assert s.sent == []
+  # the same flicker shorter than MAP_BLIP inside the lot: none either
+  s = Sim(set_mph=30, v_mph=30, road_class=7)
+  s.brake_cancel(v_after_mph=12)
+  s.step(int(3.0 * F), road_class=0, gas_pressed=True)
+  s.step(int(0.8 * F), road_class=7, gas_pressed=True)
+  s.step(int(1.0 * F), road_class=0, gas_pressed=True)
+  assert s.sent == []
+  # a name received long ago and another than at his brake: not the same public road for sure
+  s = Sim(set_mph=30, v_mph=30, road_class=7, road_name="Main St")
+  s.brake_cancel(v_after_mph=25)
+  s.step(int(2.0 * F), gas_pressed=True, road_name="Lot Rd", road_name_age=3.0)
+  assert s.sent == [] and s.lg.wait_why == "road name not fresh"
