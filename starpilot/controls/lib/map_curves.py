@@ -173,6 +173,11 @@ PASS_TURN_MIN = 10.0       # deg: ... checked for curves that turn at least this
 # through it clears the mark.
 PASS_GHOST_SHARE = 0.25
 PASS_GHOST_COUNT = 2
+# (review of round Q, M1) a mark is kept with the matched way id and the direction; only marks of the last PASS_GHOST_DAYS
+# count (a road rebuilt back to its curve forgets them); never on ramps / links, never with a way of another id (a fork, a
+# parallel road) within PASS_GHOST_ZONE of the apex
+PASS_GHOST_DAYS = 60.0
+PASS_GHOST_ZONE = 30.0     # m
 # The pass is the car's own driving from PASS_PRE before the curve's start to PASS_POST past its end, placed by the
 # distance the car travelled (not by the moments it counted as inside the curve). Drive 44, Dobry Drive (map 131 m,
 # 64 m long, 20 deg): "inside" starts once the start is NEAR behind and ends NEAR before the end, on a GPS position
@@ -1282,10 +1287,12 @@ class CurveMemory:
     e["passes"] = (passes + [new])[-MEMORY_KEEP:]
     self.save()
 
-  def add_ghost(self, c, direction=None):
-    """(PASS_GHOST_*) a pass that did not turn through `c` with the GPS trusted: one more ghost mark."""
+  def add_ghost(self, c, direction=None, way=0, t=None):
+    """(PASS_GHOST_*) a pass that did not turn through `c` with the GPS trusted on way `way`: one more ghost mark."""
+    t = time.time() if t is None else t   # noqa: TID251  wall time: marks are compared across drives
     e = self._entry(c, direction)
-    e["ghost"] = int(e.get("ghost", 0)) + 1
+    marks = [m for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2]
+    e["ghost"] = (marks + [[round(t, 1), int(way)]])[-4:]
     self.save()
 
   def clear_ghost(self, c, direction=None):
@@ -1294,10 +1301,14 @@ class CurveMemory:
       e.pop("ghost", None)
       self.save()
 
-  def ghost(self, c, direction=None):
-    """(PASS_GHOST_*) the curve's ghost marks (0 none)."""
+  def ghost(self, c, direction=None, way=0, t=None):
+    """(PASS_GHOST_*) the curve's ghost marks on way `way` (0: any) of the last PASS_GHOST_DAYS (0 none)."""
     e = self._find(*c["apex"], direction) if "apex" in c else None
-    return int(e.get("ghost", 0)) if e is not None else 0
+    if e is None:
+      return 0
+    t = time.time() if t is None else t   # noqa: TID251
+    return sum(1 for m in (e.get("ghost") or []) if isinstance(m, list) and len(m) == 2 and
+               t - m[0] <= PASS_GHOST_DAYS * 86400.0 and (not way or not m[1] or int(m[1]) == int(way)))
 
   def note_veto(self, c, direction=None):
     """The camera check ignored curve `c` driven in `direction` (counted for the record only, never read)."""
@@ -1645,7 +1656,7 @@ class MapCurves:
       if later_way and self._against_oneway(c, increasing):
         continue                  # (round Q) a later way of the chain driven against its one-way direction: not our road
       if (self.memory is not None and not c.get("ramp") and hasattr(self.memory, "ghost") and
-          self.memory.ghost(c, curve_direction(c, increasing)) >= PASS_GHOST_COUNT):
+          self.memory.ghost(c, curve_direction(c, increasing), way=getattr(self, "cur_way", 0)) >= PASS_GHOST_COUNT):
         continue                  # (PASS_GHOST_*) driven straight past it twice with the GPS trusted: not a curve
       if later_way or (on_this_way and ent_ahead):
         if d_entry <= LOOKAHEAD:
@@ -1757,6 +1768,7 @@ class MapCurves:
     # the watched exit (also while the match is doubtful: the shapes themselves tell the link from the highway)
     self._watch_update(lat, lon, bearing, max(float((gps or {}).get("dt", 0.05)), 0.0),
                        float(gps["v_ego"]) if gps is not None and "v_ego" in gps else None)
+    self.cur_way = int(way_id or 0)         # (PASS_GHOST_*, review M1) the matched way
     road = self._road(way_id, is_forward) if way_id else None
     if road is not None:
       cid, increasing, s0, s1 = road
@@ -2347,6 +2359,7 @@ class MapCurvesPlanner:
         self.pass_curve, self.pass_x_exit, self.pass_x_next = inside, float("inf"), float("inf")
         self.pass_apex, self.pass_exit, self.pass_vetoed, self.pass_shaky = float("inf"), float("inf"), False, False
         self.pass_trust0 = True
+        self.pass_way = int(getattr(self.mc, "cur_way", 0) or 0)
         self.pass_exits, self.pass_exit_seen = [], None
         # the direction of travel the pass is remembered under: as MapCurves plans this curve now (direction(c))
         self.pass_dir = getattr(self.mc, "inside_dir", None)
@@ -2442,8 +2455,9 @@ class MapCurvesPlanner:
       self.pass_drops = getattr(self, "pass_drops", []) + [{"reason": reason, "name": c.get("name", "") or "",
                                                              "map_turn": turn_c, "driven_turn": round(driven, 1)}]
       if reason == "turn" and getattr(self, "pass_trust0", False) and driven < PASS_GHOST_SHARE * turn_c and \
-         not c.get("ramp") and hasattr(self.mc.memory, "add_ghost"):
-        self.mc.memory.add_ghost(c, direction)          # (PASS_GHOST_*)
+         not c.get("ramp") and int(c.get("cls", 0) or 0) not in LINK_CLASSES and hasattr(self.mc.memory, "add_ghost") and \
+         not self._other_way_near(c, getattr(self, "pass_way", 0)):
+        self.mc.memory.add_ghost(c, direction, way=getattr(self, "pass_way", 0))      # (PASS_GHOST_*)
       return
     if turn_c >= PASS_TURN_MIN and hasattr(self.mc.memory, "clear_ghost"):
       self.mc.memory.clear_ghost(c, direction)          # (it really turned through it)
@@ -2459,6 +2473,22 @@ class MapCurvesPlanner:
         self.mc.memory.add_ramp_pass(c, r, direction, v=curve_pass_speed(samples), flags=flags)
       else:
         self.mc.memory.add_pass(c, r, v=curve_pass_speed(samples), flags=flags, direction=direction)
+
+  def _other_way_near(self, c, way):
+    """(PASS_GHOST_ZONE) a road shape of another way (not `way`, not one of the curve's own) near the curve's apex."""
+    if "apex" not in c:
+      return True
+    la, lo = c["apex"]
+    own = {int(w) for w in (c.get("ways") or [])} | {int(way)}
+    for ri in getattr(self.mc.store, "grid", []) or []:
+      for dla in (-1, 0, 1):
+        for dlo in (-1, 0, 1):
+          cell = cell_key(int(math.floor(la * MATCH_CELL)) + dla, int(math.floor(lo * MATCH_CELL)) + dlo)
+          for la1, lo1, la2, lo2, w, *_ in ri.segments(cell):
+            if int(w) not in own and min(dist_m(la, lo, la1, lo1), dist_m(la, lo, la2, lo2),
+                                         dist_m(la, lo, (la1 + la2) / 2, (lo1 + lo2) / 2)) <= PASS_GHOST_ZONE:
+              return True
+    return False
 
   def _nav_street(self, ni, now):
     """Navigation's limit and next maneuver for the car side's street speed (mapNavSpeedLimit, mapNavManeuver*)."""

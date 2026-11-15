@@ -437,6 +437,27 @@ def test_q4_two_trusted_straight_passes_make_a_ghost_and_a_real_pass_clears_it(t
   import math
   run(TMC._pass(142, seconds=math.radians(40) * 142 / 18.0))  # it really turned through it
   assert mem.ghost(c) == 0
+  # (review M1) marks of another way do not count; marks older than PASS_GHOST_DAYS do not count
+  import time
+  mem.add_ghost(c, way=7)
+  mem.add_ghost(c, way=7)
+  assert mem.ghost(c, way=7) == 2 and mem.ghost(c, way=8) == 0
+  assert mem.ghost(c, way=7, t=time.time() + (MC.PASS_GHOST_DAYS + 1) * 86400.0) == 0
+  # never for a link's curve, never with another way's shape near the apex (a fork, a parallel road)
+  mem2 = MC.CurveMemory(str(tmp_path / "mem2.json"))
+  mem, c0 = mem2, c
+  c = dict(c0, cls=2)
+  run(straight)
+  run(straight)
+  assert mem2.ghost(c) == 0
+  from types import SimpleNamespace as N
+  c = dict(c0, ways=[1])
+  mp = MC.MapCurvesPlanner(P(), P())
+  mp.mc = MC.MapCurves(MC.MapCurveStore(__import__("tempfile").mkdtemp(), background=False), memory=mem2)
+  seg = (10.0, 10.0001, 10.0001, 10.0002, 99, 99, 0, 7)
+  mp.mc.store = N(grid=[N(segments=lambda cell: iter([seg]))])
+  assert mp._other_way_near(c, 1)
+  assert not mp._other_way_near(dict(c, ways=[99]), 1)
 
 
 def test_q4_a_lead_on_a_straight_path_in_our_lane_does_not_blind_the_camera_check():
