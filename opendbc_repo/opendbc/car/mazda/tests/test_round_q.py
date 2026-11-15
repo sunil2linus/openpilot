@@ -826,3 +826,16 @@ def test_rereview_c2_the_too_fast_latch_ends_cam_over_hold_after_the_lateral_is_
     if o.tap:
       taps.append(f)
   assert taps and taps[0] >= 150 + CC.CAM_OVER_HOLD / DT - 1, taps[:1]
+
+
+def test_rereview_c6_no_tap_above_the_governing_map_plan_or_into_the_models_3_to_4_s_peak():
+  # exit 46 curve 1 (drive 74): the governing map plan (for the curve after) falls under the tap's goal: no taps
+  taps, _, outs = _cam_run(3.0, gov_plan=lambda f: (33.8 - 0.002 * f) * MPH)
+  assert not taps and outs[-1].why == "map plan"
+  # a plan at or above the goal does not stop them
+  assert _cam_run(3.0, gov_plan=34.0 * MPH)[0]
+  # the model sees the curve tighten 3-4 s ahead (beyond the 0.5-2 s tightening window): at v+1 at the limit there
+  v = 35 * MPH
+  far = 1.65 / (v * v)       # (1.75 at v+1: the 0.5-3 s window at v+1 ends at 3 (v+1), before it)
+  taps, _, outs = _cam_run(3.0, kappa=lambda x: far if 3.2 * v <= x <= 4.0 * v else 1.2 / (v * v))
+  assert not taps and outs[-1].why == "lateral"

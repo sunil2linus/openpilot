@@ -153,6 +153,7 @@ class CamInputs:
   map_covered: bool = False       # map curve data covers the road beyond the model's horizon (B1)
   apex_d: object = None           # m to the governing map curve's apex (negative: passed), None unknown (R2 / R3)
   cam_target: float = NO_CURVE    # m/s: the camera curve target alone (its plan sees past the 3 s window: R1)
+  gov_plan: float = NO_CURVE      # m/s: the governing map curve's plan (C6)
 
 
 @dataclass
@@ -299,17 +300,19 @@ class CameraCurve:
     v1 = v + MS_PER_MPH
     pk1 = model_peak(i.model_x, i.model_k, v1, 0.5, 3.0)
     pred = None if pk1 is None or v <= 0 else max(lat * (v1 / v) ** 2, pk1)
+    pk_far = model_peak(i.model_x, i.model_k, v1, 3.0, 4.0)     # (C6) what the model sees beyond its reliable 3 s
     goal = i.set_speed + i.step
     set_steps = int(round(i.set_speed / i.step))
     why = ("not in the curve" if not (i.map_in_curve or lat >= CAM_PHANTOM_LAT) else
            "no prediction" if pred is None else
-           "lateral" if pred >= lim else
+           "lateral" if pred >= lim or (pk_far is not None and pk_far >= lim) else
            "set above the speed" if set_steps + 1 > int(round(v / i.step)) + 1 else
            "tightening" if tightening or rising else
            "steering reserve" if no_reserve else
            "cap" if goal > i.cap + 1e-3 else
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
            "camera curve ahead" if goal > i.cam_target + 1e-3 else
+           "map plan" if goal > i.gov_plan + 1e-3 else
            "wait" if self.frame - self.last_tap < int(CAM_TAP_DT / DT_CTRL) else "")
     out.why = why
     if not why:
