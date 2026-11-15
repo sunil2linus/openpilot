@@ -64,7 +64,8 @@ ROAD_NAME_HOLD = 5.0             # s
 # Review of round Q, M6: the held name is no proof of the same public road (into a parking lot, a flicker back to a public
 # class for < 1 s): a send needs the class good continuously for MAP_STABLE_TIME now, and the name fresh (received within
 # ROAD_NAME_FRESH) or the same as at his brake
-ROAD_NAME_FRESH = 1.5            # s
+# (re-review R6: mapdOut's real gaps reach ~3 s, drives 74 / 75; the name compared with the brake's is the last one received)
+ROAD_NAME_FRESH = 4.0            # s
 AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
 LEAD_NEAR = 50.0                 # m
 LEAD_MOVING = 3 * MS_PER_MPH     # m/s (1.34)
@@ -122,6 +123,7 @@ class AutoResumeInputs:
   road_class: int = 0             # starpilotPlan.mapRoadClass
   road_name: str = ""             # mapdOut.roadName ("" unknown)
   road_name_age: float = 0.0      # s since that name was received (M6)
+  road_name_last: str = ""        # the last name received, however old (R6: compared with the name at his brake)
   lead_status: bool = False       # radarState.leadOne (as stopped_car_slowdown reads it)
   lead_d: float = 0.0             # m
   lead_v: float = 0.0             # m/s
@@ -366,7 +368,8 @@ class AutoResumeLogic:
       return "map"
     if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME):
       return "road just changed"
-    if not (i.road_name_age <= ROAD_NAME_FRESH or i.road_name == self.brake_name):
+    last = str(i.road_name_last or i.road_name or "")
+    if not (i.road_name_age <= ROAD_NAME_FRESH or last == self.brake_name):
       return "road name not fresh"
     if not self.creep_ok(i):
       return "slow, no moving lead"
@@ -454,7 +457,7 @@ class AutoResumeLogic:
       return
     self.state = ARMED
     self.armed_frame = f
-    self.brake_name = str(i.road_name or "")
+    self.brake_name = str(i.road_name_last or i.road_name or "")   # (R6) the last name received at his brake
     self.press_spent = i.gas_pressed     # (a gas already down at the brake is not his press)
     self._event("autoResumeArmed", set_mph=i.set_speed / MS_PER_MPH, vEgo_mph=v / MS_PER_MPH,
                 map_ok=self.map_ok(i), road_class=int(i.road_class), gps_trust=int(i.gps_trust))
@@ -563,7 +566,7 @@ class AutoResume:
       set_allowed=bool(getattr(CS, "crz_set_allowed", False)), not_allowed=bool(getattr(CS, "crz_not_allowed", False)),
       op_cancel=bool(CC.cruiseControl.cancel), cancel_sent=bool(cancel_sent), other_button_active=bool(CC.cruiseControl.resume),
       plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0, road_name=road_name,
-      road_name_age=road_age,
+      road_name_age=road_age, road_name_last=self.road_name,
       lead_status=bool(lead is not None and lead.status), lead_d=float(lead.dRel) if lead is not None else 0.0,
       lead_v=float(lead.vLead) if lead is not None else 0.0, can_valid=bool(getattr(out, "canValid", False)),
       gps_trust=self._trust(plan) if plan_alive else 4, engageable=engageable,

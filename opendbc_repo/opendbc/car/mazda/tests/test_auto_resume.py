@@ -635,5 +635,13 @@ def test_review_m6_into_a_parking_lot_a_flicker_back_to_a_public_class_never_sen
   # a name received long ago and another than at his brake: not the same public road for sure
   s = Sim(set_mph=30, v_mph=30, road_class=7, road_name="Main St")
   s.brake_cancel(v_after_mph=25)
-  s.step(int(2.0 * F), gas_pressed=True, road_name="Lot Rd", road_name_age=3.0)
+  s.step(int(2.0 * F), gas_pressed=True, road_name="Lot Rd", road_name_last="Lot Rd", road_name_age=5.0)
   assert s.sent == [] and s.lg.wait_why == "road name not fresh"
+
+
+def test_rereview_r6_an_old_name_equal_to_the_one_at_his_brake_still_sends():
+  # (75 t 1298: mapdOut 11.8 s old, the same road as at his brake) the class public MAP_STABLE_TIME: sent
+  s = Sim(set_mph=30, v_mph=30, road_class=7, road_name="Main St", road_name_last="Main St")
+  s.brake_cancel(v_after_mph=25)
+  s.step(int(2.0 * F), gas_pressed=True, road_name="", road_name_last="Main St", road_name_age=11.8)
+  assert s.sent
