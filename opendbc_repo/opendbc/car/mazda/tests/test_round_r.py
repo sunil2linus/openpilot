@@ -322,7 +322,9 @@ def test_r1_the_model_opens_the_boost_before_the_turn_gate():
   car, lg, log = _loop_end()
   f_up = _first_up(log)
   assert f_up is not None and 100 <= f_up < 160, f_up                      # (the gate only at 400: 3 s later)
-  assert max(s for f, s, *_ in log if f < 400) >= 45                        # the boost's SET+ hold goes on in the loop's end
+  # the boost's SET+ hold goes on in the loop's end, (G1) bounded at the speed rounded + 15 until the gate (one hold: 40)
+  assert 40 <= max(s for f, s, *_ in log if f < 400) <= 31 + 15 + 1e-6
+  assert max(s for f, s, *_ in log if f >= 400) >= 75                       # the full boost once the gate is ok
   old = cs.MERGE_MODEL_OPEN
   try:
     cs.MERGE_MODEL_OPEN = False
@@ -340,8 +342,8 @@ def test_r1_a_second_bend_stops_it_and_takes_the_set_back():
   peak = max(s for f, s, *_ in log if f < 400)
   assert f_up is not None and peak >= 35 - 1e-6
   assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 250 <= f < 700)
-  assert max(s for f, s, *_ in log if 700 <= f < 900) <= round(max(v for f, s, v, *_ in log if 250 <= f < 300)) + 1.0
-  assert max(s for f, s, *_ in log if f >= 900) >= 75                       # up again once the gate is ok
+  assert max(s for f, s, *_ in log if 700 <= f < 900) <= round(max(v for f, s, v, *_ in log if 250 <= f < 300)) + 2.0
+  assert max(s for f, s, *_ in log if f >= 900) >= 75 - 1e-6                      # up again once the gate is ok
   # the model's 0.5-3 s peak rising over the start lateral + 0.2: the same
   car, lg, log = _loop_end(pk=lambda f: 0.5 if f < 250 else 2.5, gate_at=900)
   assert any(b == cs.SET_MINUS for f, s, v, b, *_ in log if 250 <= f < 700)
@@ -356,18 +358,21 @@ def test_r1_its_guards_red_light_a_slow_lead_a_tighter_curve_target():
     assert f_up is None or f_up >= 400, f_up
 
 
-def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0.9, link=True, plan=None, rend=15.0):
+def _merge_model_wrapper(tmp_path, monkeypatch, kappa=0.0, lat_deg=-36.0, lane=0.9, link=True, plan=None, rend=15.0,
+                         kfn=None, path=190.0, was_in=False):
   from types import SimpleNamespace as NS
   c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
   m = c.sm.msgs["modelV2"]
-  xs = [190.0 * (j / 32) ** 2 for j in range(33)]
+  xs = [path * (j / 32) ** 2 for j in range(33)]
   m.position = NS(x=xs, y=[0.0] * 33)
   m.velocity = NS(x=[14.0] * 33, t=[0.0] * 33)
-  m.orientationRate = NS(z=[(2.0 / 14.0 ** 2 if x < 20 else kappa) * 14.0 for x in xs])
+  kfn = kfn or (lambda x: kappa)
+  m.orientationRate = NS(z=[(2.0 / 14.0 ** 2 if x < 20 else kfn(x)) * 14.0 for x in xs])
   m.laneLineProbs = [0.5, lane, lane, 0.5]
   c.sm.updated["modelV2"] = True
   c.map_control.link_now = link
   c.map_control.hwy_ramp_left = rend
+  c.merge_model_was_in = was_in
   p = c.sm.msgs["starpilotPlan"]
   for k, v in (plan or {}).items():
     setattr(p, k, v)
@@ -404,14 +409,55 @@ def test_r1_the_wrappers_model_view_and_its_guards(tmp_path, monkeypatch):
   assert not _merge_model_wrapper(tmp_path, monkeypatch, plan=ahead)[1]["merge_model_open"]
   # the ramp's end far (a long ramp left: a turn the map lacks may come) or unknown: no
   assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=300.0)[1]["merge_model_open"]
-  # (F4) the ramp's end beyond the model's trusted horizon (31 mph x 3 s = 42 m; the end 30 m by the straight line, 1.3 x
-  # that + 20 m to be seen): no
-  assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=30.0)[1]["merge_model_open"]
+  # (G1, F4's horizon rule gone) the ramp's end 30 m by the straight line, beyond 31 mph x 3 s: yes (the boost bounded)
+  assert _merge_model_wrapper(tmp_path, monkeypatch, rend=30.0)[1]["merge_model_open"]
   assert not _merge_model_wrapper(tmp_path, monkeypatch, rend=None)[1]["merge_model_open"]
   # the stock LKAS blocked: no
   c, out = _merge_model_wrapper(tmp_path, monkeypatch)
   c.lkas_blocked = True
   assert not c._merge_model(W.car_state(31.0, 31.0), None, c.sm.msgs["starpilotPlan"], 14.0)["merge_model_open"]
+
+
+def test_g1_the_models_view_to_open_reaches_3_5_s_or_its_paths_end(tmp_path, monkeypatch):
+  # 14 m/s: a turn (1.5 m/s^2) 3.2 s ahead (45 m) holds it back, one 4.5 s ahead (63 m, past MERGE_MODEL_OPEN_T) does not
+  turn = 1.5 / 14.0 ** 2
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 42 < x < 50 else 0.0)[1]["merge_model_open"]
+  assert _merge_model_wrapper(tmp_path, monkeypatch, kfn=lambda x: turn if 60 < x < 70 else 0.0)[1]["merge_model_open"]
+  # a 40 m path (2.9 s): straight to its end opens (no horizon rule: G1); a turn at its end does not
+  assert _merge_model_wrapper(tmp_path, monkeypatch, path=40.0, rend=60.0)[1]["merge_model_open"]
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, path=40.0, rend=60.0,
+                                  kfn=lambda x: turn if x > 34 else 0.0)[1]["merge_model_open"]
+  # after a mapped curve we were in, the map shows the next (R90 200 m ahead: its plan there leaves room, its own speed is
+  # under the bounded raise, the speed + 15 mph): no more for the rest of this link (the turn gate decides, as before)
+  r90 = dict(mapCurveStatus=2, mapCurveRadius=90.0, mapCurveDistance=200.0)
+  c, out = _merge_model_wrapper(tmp_path, monkeypatch, plan=r90)
+  assert out["merge_model_open"]                                    # (the loop itself shown ahead before it: no matter)
+  c, out = _merge_model_wrapper(tmp_path, monkeypatch, plan=r90, was_in=True)
+  assert not out["merge_model_open"] and c.merge_model_later
+  c.map_control.link_now = False                                    # off the link: forgotten
+  c._merge_model(W.car_state(31.0, 31.0), None, c.sm.msgs["starpilotPlan"], 14.0)
+  assert not c.merge_model_later and not c.merge_model_was_in
+  # a path too short for 2.75 s (35 m): no answer, no opening
+  assert not _merge_model_wrapper(tmp_path, monkeypatch, path=25.0)[1]["merge_model_open"]
+
+
+def test_g1_the_model_opened_boost_is_bounded_and_its_stop_takes_one_set_minus_hold_back():
+  # bounded: the speed rounded + MERGE_MODEL_STEP until the gate, then the full boost
+  car, lg, log = _loop_end(gate_at=700)
+  v_open = next(v for f, s, v, b, *_ in log if b == cs.SET_PLUS)
+  assert max(s for f, s, *_ in log if f < 700) <= round(v_open) + 15 + 1e-6
+  assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if 400 <= f < 700)          # (hold then stop)
+  assert max(s for f, s, *_ in log if f >= 700) >= 60
+  # the lateral up 0.2 after the hold landed (40): down to the speed rounded + 2 (40 -> 33: inside the SET- hold's overrun
+  # guard, so SET- taps, within 2 s), nothing up until the gate
+  car, lg, log = _loop_end(lat=lambda f: 2.1 if f < 350 else 2.4, gate_at=1000)
+  v_stop = log[350][2]
+  minus = [f for f, s, v, b, a, an in log if 350 <= f < 1000 and b == cs.SET_MINUS]
+  assert minus and minus[-1] < 350 + 250, minus
+  s_end = log[999][1]
+  assert abs(s_end - (round(v_stop) + 2)) <= 1.0 + 1e-6, (s_end, v_stop)
+  assert not any(b == cs.SET_PLUS for f, s, v, b, *_ in log if 350 <= f < 1000)
+  assert max(s for f, s, *_ in log if f >= 1000) > s_end + 5
 
 
 def test_r1_the_ramps_end_distance_is_kept_when_the_ramp_flag_drops():
