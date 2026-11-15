@@ -141,3 +141,173 @@ def test_q2_a_real_tight_curve_still_ends_it():
   car, lg, log = _loop_end(lambda f, car: (72.0 if f < 300 else car.v_ego / MPH + 2.0) if 60 <= f < 600 else None)
   assert lg.boost is None or "ended" in lg.boost
 
+
+# ---- Q3: the camera-led curve handling (camera_curve.py) ----
+
+CC = _load("camera_curve_round_q", os.path.join(HERE, "..", "camera_curve.py"))
+
+
+def _path(kappa_fn, n=33, x_max=190.0):
+  xs = [x_max * (k / (n - 1)) ** 2 for k in range(n)]      # (modelV2's points crowd near the car)
+  return xs, [kappa_fn(x) for x in xs]
+
+
+def _cam_run(seconds, v_mph=35.0, set_mph=33.0, lat=1.2, kappa=None, **kw):
+  """A steady curve: the measured lateral `lat`, the model's plan with kappa(x) (default: the same curve all along)."""
+  cc = CC.CameraCurve()
+  v = v_mph * MPH
+  k0 = (lat(10 ** 6) if callable(lat) else lat) / (v * v)
+  xs, ks = _path(kappa or (lambda x: k0))
+  set_v, taps, outs = set_mph * MPH, [], []
+  for f in range(int(seconds / DT)):
+    args = dict(v_ego=v, set_speed=set_v, lat=lat(f) if callable(lat) else lat, model_x=xs, model_k=ks, lane_prob=0.8, torque=0.4, curve_on=True,
+                map_in_curve=True, map_curve_id=(1, 100))
+    args.update({k: (val(f) if callable(val) else val) for k, val in kw.items()})
+    o = cc.update(CC.CamInputs(**args))
+    outs.append(o)
+    if o.tap:
+      taps.append(f)
+      set_v = o.tap_goal
+  return taps, set_v / MPH, outs
+
+
+def test_q3_model_peak_and_its_horizon():
+  xs, ks = _path(lambda x: 0.002 if 40 <= x <= 60 else 0.0)
+  v = 20.0
+  assert abs(CC.model_peak(xs, ks, v, 0.5, 3.0) - 0.002 * v * v) < 1e-9
+  assert CC.model_peak(xs, ks, v, 0.5, 1.5) == 0.0           # (40-60 m is past 1.5 s at 20 m/s)
+  assert CC.model_peak(xs[:5], ks[:5], v, 0.5, 3.0) is None   # (the path does not reach that far: no answer)
+
+
+def test_q3_in_curve_taps_every_half_second_up_to_the_speed_plus_one():
+  taps, set_end, _ = _cam_run(5.0)
+  assert taps and all(b - a >= int(CC.CAM_TAP_DT / DT) for a, b in zip(taps, taps[1:], strict=False))
+  assert abs(set_end - 36.0) < 1e-6                         # 33 -> 36: round(35) + 1 at most
+
+
+def test_q3_no_tap_without_the_margin_or_the_reserve():
+  # 1.75 m/s^2 now: at +1 mph 1.85 >= CAM_LAT_LKAS
+  taps, _, outs = _cam_run(3.0, lat=1.75)
+  assert not taps and outs[-1].why == "lateral"
+  # the TI alone (LKAS blocked): CAM_LAT_TI
+  taps, _, outs = _cam_run(3.0, lat=1.35, ti_only=True)
+  assert not taps
+  # tightening ahead (the model's 0.5-2 s peak well above now)
+  v = 35 * MPH
+  taps, _, outs = _cam_run(3.0, kappa=lambda x: 1.6 / (v * v) if x > 20 else 1.2 / (v * v))
+  assert not taps and outs[-1].why == "tightening" and not outs[-1].keep
+  # the steering command near its limit
+  taps, _, outs = _cam_run(3.0, torque=0.9)
+  assert not taps and outs[-1].why == "steering reserve"
+  # a map curve ahead whose plan is under the next step (drive 56: a loop just beyond the model's horizon)
+  taps, _, outs = _cam_run(3.0, map_ahead=33.2 * MPH)
+  assert not taps and outs[-1].why == "map curve ahead"
+  # the street / limit / merge target
+  taps, _, outs = _cam_run(3.0, cap=33.5 * MPH)
+  assert not taps and outs[-1].why == "cap"
+  # no lane lines, too slow
+  assert not _cam_run(3.0, lane_prob=0.2)[0] and not _cam_run(3.0, v_mph=24.0, set_mph=22.0)[0]
+
+
+def test_q3_never_with_a_car_ahead_a_stop_his_steering_a_signal_a_fault_or_a_test_mode():
+  for kw in (dict(lead_slow=True), dict(stop=True), dict(steer_override=True), dict(blinker=True), dict(cam_fault=True),
+             dict(test_mode=True), dict(blocked=True)):
+    taps, _, outs = _cam_run(3.0, **kw)
+    assert not taps and not outs[-1].keep, kw
+  # a signal on a ramp is not a lane change
+  assert _cam_run(3.0, blinker=True, on_ramp=True)[0]
+
+
+def test_q3_no_tap_while_the_lateral_rises_and_nothing_after_a_curve_driven_too_fast():
+  # the curve entry: the measured lateral 0.6 -> 1.5 in 1 s (the 2 Hz model under-reads a tightening, drive 74's exit 46)
+  taps, _, outs = _cam_run(1.5, lat=lambda f: min(0.6 + 0.009 * f, 1.5))
+  assert not [t for t in taps if t < 110], taps
+  # the turnaround at 3.6 m/s^2 (drive 74 t 1111): no tap, no end for the rest of that slowdown
+  cc = CC.CameraCurve()
+  v = 27 * MPH
+  xs, ks = _path(lambda x: 0.0)
+  outs = []
+  for f in range(400):
+    lat = 3.6 if f < 100 else 0.4
+    outs.append(cc.update(CC.CamInputs(v_ego=v, set_speed=25 * MPH, lat=lat, model_x=xs, model_k=ks, lane_prob=0.8,
+                                       torque=0.5, curve_on=True, map_in_curve=True)))
+  assert not any(o.tap or o.ending for o in outs)
+
+
+def test_q3_the_curve_ending_from_the_model_ahead():
+  v = 35 * MPH
+
+  # in the curve 2 s, then the model sees the road straighten 2 s ahead (x > 2 s at v)
+  def kap(f):
+    return (lambda x: 1.4 / (v * v)) if f < 200 else (lambda x: 1.4 / (v * v) if x < 1.5 * v else 0.0)
+  cc = CC.CameraCurve()
+  ends = []
+  for f in range(400):
+    xs, ks = _path(kap(f))
+    o = cc.update(CC.CamInputs(v_ego=v, set_speed=30 * MPH, lat=1.4, model_x=xs, model_k=ks, lane_prob=0.8, torque=0.5,
+                               curve_on=True, map_in_curve=True))
+    if o.ending:
+      ends.append(f)
+  assert ends and 200 <= ends[0] <= 205, ends[:1]
+  # never without a curve actually driven (the approach: the lateral still low)
+  cc = CC.CameraCurve()
+  xs, ks = _path(lambda x: 0.0)
+  outs = [cc.update(CC.CamInputs(v_ego=v, set_speed=30 * MPH, lat=0.3, model_x=xs, model_k=ks, lane_prob=0.8,
+                                 curve_on=True)) for _ in range(300)]
+  assert not any(o.ending for o in outs)
+
+
+def test_q3_phantom_release_on_a_straight_road_past_the_map_curves_start():
+  v = 40 * MPH
+  xs, ks = _path(lambda x: 0.0)
+  cc = CC.CameraCurve()
+  outs = [cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=0.2, model_x=xs, model_k=ks, lane_prob=0.8,
+                                 curve_on=True, map_in_curve=True, map_curve_id=(1, 142))) for _ in range(80)]
+  assert not outs[30].phantom and outs[-1].phantom
+  assert [k for o in outs for k, _ in o.events if k == "camPhantomRelease"] == ["camPhantomRelease"]
+  # another map curve: not released
+  o = cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=0.2, model_x=xs, model_k=ks, lane_prob=0.8, curve_on=True,
+                             map_in_curve=True, map_curve_id=(1, 90)))
+  assert not o.phantom
+  # a real curve (the lateral up): never
+  cc = CC.CameraCurve()
+  outs = [cc.update(CC.CamInputs(v_ego=v, set_speed=36 * MPH, lat=1.3, model_x=xs, model_k=ks, lane_prob=0.8,
+                                 curve_on=True, map_in_curve=True, map_curve_id=(1, 142))) for _ in range(200)]
+  assert not any(o.phantom for o in outs)
+
+
+def test_q3_the_wrapper_raises_the_curve_target_by_its_taps_and_logs_them(tmp_path, monkeypatch):
+  import pytest
+  pytest.importorskip("msgq.ipc_pyx", exc_type=ImportError)
+  from types import SimpleNamespace as N
+  W = _load("tcpw_round_q", os.path.join(HERE, "test_car_profile_wrapper.py"))
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  assert c.cam_curve is not None                               # (MazdaCameraCurveRaise: on by default)
+  records = []
+  if c.recorder is not None:
+    monkeypatch.setattr(c.recorder, "record", lambda kind, t, data, **kw: records.append(kind))
+  v = 35 * MPH
+  xs = [190.0 * (k / 32) ** 2 for k in range(33)]
+  m = c.sm.msgs["modelV2"]
+  m.position, m.velocity = N(x=xs, y=[0.0] * 33), N(x=[v] * 33, t=[0.0] * 33)
+  m.orientationRate = N(z=[1.2 / v] * 33)                      # 1.2 m/s^2 at 35 mph all along
+  m.laneLineProbs = [0.5, 0.9, 0.9, 0.5]
+  c.sm.updated["modelV2"] = True
+  cs_ = W.car_state(35, 33)
+  cs_.out.steeringAngleDeg = 1.2 * 18.9 * 2.7 * (1 + 0.001 * v * v) / (v * v) * 57.29578
+  c.logic.anchor = 45 * MPH
+  plan = c.sm.msgs["starpilotPlan"]
+  got = []
+  for _ in range(120):
+    c.frame += 1
+    r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 33 * MPH, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
+                        False, False, False, False, False, True, 33 * MPH)
+    got.append(r)
+  assert any(r[1] >= 34 * MPH - 1e-3 and r[4] and r[5] for r in got), got[-1]
+  assert "camCurveTap" in records
+  # his steering: nothing raised, the target as it came
+  cs_.out.steeringPressed = True
+  r = c._camera_curve(W.CC, cs_, N(wheelbase=2.7), plan, True, v, 33 * MPH, 45 * MPH, True, 33 * MPH, 0.0, 0, False,
+                      False, False, False, False, False, True, 33 * MPH)
+  assert abs(r[1] - 33 * MPH) < 1e-6 and not r[4]
+

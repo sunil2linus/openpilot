@@ -530,6 +530,12 @@ class VehicleSettingsManagerView(PanelManagerView):
       "set_state": lambda s: self._controller._on_toggle("MazdaSlowLowerLimit"),
     })
     tiles.append({
+      "title": tr("Camera Decides in Curves"),
+      "subtitle": tr("Map curve speeds as a start: inside the curve the camera adds 1 mph when there is room, speeds up as it ends."),
+      "get_state": lambda: params.get_bool("MazdaCameraCurveRaise"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaCameraCurveRaise"),
+    })
+    tiles.append({
       "title": tr("Gas brings cruise back after a brake"),
       "subtitle": tr("If your brake turned the cruise off, pressing the gas turns it back on. Only on mapped public roads, wheel straight."),
       "get_state": lambda: params.get_bool("MazdaBrakeAutoResume"),

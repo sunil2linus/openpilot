@@ -2373,6 +2373,19 @@ class CurveSlowdown:
       self.map_control.ti_plan = self.has_ti       # (TI_ONLY_*)
     from opendbc.car.mazda.map_curve_control import CurveMix
     self.curve_mix = CurveMix(CURVE_MARGIN)
+    # (round Q, camera_curve.py) the camera-led curve handling: MazdaCameraCurveRaise (default on)
+    self.cam_curve = None
+    try:
+      raw = params.get("MazdaCameraCurveRaise", encoding="utf8")
+      if raw is None or raw == "" or raw in ("1", b"1", True):
+        from opendbc.car.mazda.camera_curve import CameraCurve
+        self.cam_curve = CameraCurve()
+    except Exception:
+      self.cam_curve = None
+    self.cam_model = None            # (x list, kappa list, frame) of the last modelV2 plan
+    self.cam_floor = None            # m/s: the set our +1 taps reached in this curve (the curve target kept at it)
+    self.cam_goal = None             # (m/s, frame): a +1 tap on its way
+    self.cam_out = None
     self.learner = None
     # (round P) pandaStates: the per-bus CAN error counts for the camFault / camFaultCleared events (10 Hz, logs only)
     services = ['starpilotPlan', 'radarState', 'modelV2', 'pandaStates']
@@ -2637,6 +2650,7 @@ class CurveSlowdown:
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
                                                          blinker and not ramp_ctx)
     curve_active = curve_active and self.curve_enabled
+    cam_active0, cam_speed0 = curve_active, curve_speed          # (the camera's own, for camera_curve's release)
 
     # The camera's view of our lane for navigation exits (map_curve_control.LaneView), read when the model updates
     if self.map_control is not None:
@@ -2708,6 +2722,17 @@ class CurveSlowdown:
       # planner was alive, a gap stretched the slowdown past the exit point)
       self.map_control.drive(max(v_ego, 0.0) * DT_CTRL)
 
+    cam_end = False
+    if self.cam_curve is not None:
+      try:
+        (curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold, curve_no_accel,
+         fast_restore, cam_end) = self._camera_curve(
+          CC, CS, CP, plan, plan_alive, v_ego, set_speed if cruise_enabled else 0.0, driver_speed, curve_active,
+          curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold, curve_no_accel, fast_restore,
+          stop_active, cam_active0, cam_speed0)
+      except Exception:
+        self.cam_floor, self.cam_goal = None, None
+
     # Posted limit (speed_limit_follow.py; Test: logged only). The driver's speed is the anchor itself, else the set
     # speed: set_speed + offset above mixes this frame's set speed with last frame's offset, a one-step blip on every
     # frame one of our presses lands, which the follower would take for the driver changing his speed.
@@ -2739,6 +2764,8 @@ class CurveSlowdown:
       self.limit_follow.street_active = self._street_active(plan)
       self.limit_want = self.limit_follow.update(li)
     turn_ok, turn_pause = self._merge_turn(CS, CP, v_ego, plan if self._alive('starpilotPlan') else None)
+    if cam_end and self.map_control is not None and self.map_control.link_now:
+      turn_ok = True                 # (camera_curve rule d) on a link: one more "ok" beside MergeTurnGate
     limit_cap = self.limit_follow.cap_speed if self.limit_follow is not None else 0.0
     limit_undo = self.limit_follow.undo_speed if self.limit_follow is not None else 0.0
     limit_ceiling = self.limit_follow.ceiling_speed if self.limit_follow is not None else 0.0
@@ -3104,6 +3131,88 @@ class CurveSlowdown:
     rate = max(v_ego, 0.0) * math.tan(math.radians(angle) / ratio) / wheelbase
     self.heading.update(DT_CTRL, math.degrees(rate), v_ego)
     return self.heading.turned()
+
+  def _camera_curve(self, CC, CS, CP, plan, plan_alive, v_ego, set_speed, driver_speed, curve_active, curve_speed,
+                    curve_floor, curve_budget, curve_track, curve_raise, curve_hold, curve_no_accel, fast_restore, stop_active,
+                    cam_active0, cam_speed0):
+    """(round Q, camera_curve.py) the live camera decides inside a curve: the phantom release, the +1 taps, the curve's
+    end. Returns the curve inputs for the controller (changed or as they were) and whether the curve is ending."""
+    from opendbc.car.mazda.camera_curve import CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT
+    from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, TEST as MAP_TEST
+    from opendbc.car.mazda.speed_limit_follow import TEST as LIMIT_TEST
+    from opendbc.car.mazda.curve_target import map_curve_speed
+    lg, mc, mo = self.logic, self.map_control, self.map_out
+    if self._alive('modelV2') and (self.sm.updated['modelV2'] or self.cam_model is None):
+      m = self.sm['modelV2']
+      xs, ks = model_kappas(list(m.position.x), list(m.orientationRate.z), list(m.velocity.x))
+      probs = list(m.laneLineProbs)
+      self.cam_model = (xs, ks, self.frame, min(probs[1], probs[2]) if len(probs) >= 3 else 0.0)
+    fresh = (self.cam_model is not None and self._alive('modelV2') and
+             (self.frame - self.cam_model[2]) * DT_CTRL <= CAM_MODEL_STALE)
+    status = int(getattr(plan, "mapCurveStatus", 0) or 0) if plan_alive else 0
+    radius = float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) if plan_alive else 0.0
+    dist = float(getattr(plan, "mapCurveDistance", 0.0) or 0.0) if plan_alive else 0.0
+    map_curve = status in (STATUS_CURVE, STATUS_RAMP_CURVE) and radius > 0
+    map_gov = bool(self.map_on_used and mo is not None and mo.active and mo.track)
+    map_ahead = CAM_NONE
+    if map_curve and dist > 10.0 and mc is not None:
+      map_ahead = map_curve_speed(radius, dist, mc.curve.lat_accel, float(getattr(plan, "mapCurveAdvisory", 0.0) or 0.0),
+                                  reaction_speed=v_ego)
+    caps = [c for c in ((self.limit_follow.cap_speed, self.limit_follow.ceiling_speed) if self.limit_follow else ()) if c > 0]
+    if lg.boost is not None and "ended" not in lg.boost:
+      caps.append(lg.anchor if lg.anchor is not None else lg.boost["target"])
+    lead = self.sm['radarState'].leadOne
+    lead_slow = bool(self.trigger.radar_stable and float(lead.vLead) < v_ego - MERGE_LEAD_CLOSING)
+    lat = steer_lateral_accel(max(v_ego, 0.0), float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0),
+                              float(getattr(CP, "wheelbase", 0.0) or 2.7))
+    test = (self.map_mode == MAP_TEST and map_curve) or (self.limit_mode == LIMIT_TEST and self.limit_follow is not None and
+                                                         self.limit_want > 0)
+    ci = CamInputs(
+      v_ego=v_ego, set_speed=set_speed, step=lg.step, lat=lat,
+      model_x=self.cam_model[0] if fresh else [], model_k=self.cam_model[1] if fresh else [],
+      lane_prob=self.cam_model[3] if fresh else 0.0, torque=float(CC.actuators.torque),
+      ti_only=bool(self.ti_only), cam_fault=bool(getattr(self, "ti_fault", False)),
+      curve_on=bool(curve_active and set_speed > 0 and set_speed < driver_speed - lg.half_step),
+      map_in_curve=bool(map_gov and map_curve and dist <= 0.5), map_curve_id=(status, round(radius)) if map_curve else (),
+      map_ahead=map_ahead, cap=min(caps) if caps else CAM_NONE, lead_slow=lead_slow,
+      stop=bool(stop_active or lg.stop_episode or self.plan_stop_raw or getattr(plan, "redLight", False)),
+      steer_override=bool(getattr(CS.out, "steeringPressed", False)),
+      blinker=bool(CS.out.leftBlinker or CS.out.rightBlinker), on_ramp=bool(mc is not None and mc.link_now),
+      blocked=bool(lg.blocked or CS.out.brakePressed), test_mode=bool(test))
+    out = self.cam_out = self.cam_curve.update(ci)
+    if self.recorder is not None and out.events:
+      import time
+      for kind, data in out.events:
+        self.recorder.record(kind, time.monotonic(), data, min_gap=0.0, signals=False)
+    res = (curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold, curve_no_accel,
+           fast_restore)
+    if out.phantom and map_gov:
+      # (b) the map curve released: the camera's own target only, the normal restore
+      res = (cam_active0, cam_speed0, 0.0, 0, False, False, False, False, fast_restore)
+    if not res[0] or set_speed <= 0 or not (out.keep or out.ending):
+      self.cam_floor, self.cam_goal = None, None
+      return res + (False,)
+    if out.ending:
+      # (d) the camera's target let go; a map curve still asking for less keeps governing (its plan caps the restore)
+      self.cam_floor, self.cam_goal = None, None
+      if map_gov and not out.phantom:
+        a, sp, fl, bu, tr, ra = self.curve_mix.update(False, CAM_NONE, mo, drop_floor=max(driver_speed - lg.max_drop_steps * lg.step,
+                                                                                        MIN_SET_SPEED))
+        return (a, sp, fl, bu, tr, ra, self.curve_mix.firm, self.curve_mix.no_accel, res[8], True)
+      return (False, CAM_NONE, 0.0, 0, False, False, False, False, True, True)
+    if out.tap:
+      self.cam_goal = (out.tap_goal, self.frame)
+    if self.cam_goal is not None and (set_speed >= self.cam_goal[0] - lg.half_step or
+                                      (self.frame - self.cam_goal[1]) * DT_CTRL > 3 * CAM_TAP_DT):
+      if set_speed >= self.cam_goal[0] - lg.half_step:
+        self.cam_floor = max(self.cam_floor or 0.0, self.cam_goal[0])
+      self.cam_goal = None
+    keep = max(self.cam_floor or 0.0, self.cam_goal[0] if self.cam_goal is not None else 0.0)
+    if keep > 0:
+      # (c) the curve target kept at what the taps proved (a lower map / camera target no longer takes it back down)
+      a, sp, fl, bu, tr, ra, hold, na, fr = res
+      return (True, max(sp, keep), min(fl, keep) if fl > 0 else fl, bu, True, True, False, na, fr, False)
+    return res + (False,)
 
   def _merge_turn(self, CS, CP, v_ego, plan):
     """The ramp start's turn gate (MergeTurnGate): (a merge may start, a merge going up pauses)."""
