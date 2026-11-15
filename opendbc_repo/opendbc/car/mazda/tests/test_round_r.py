@@ -413,3 +413,85 @@ def test_r1_the_ramps_end_distance_is_kept_when_the_ramp_flag_drops():
   for _ in range(100):
     ctl.update(TE.F(road_class=2, gps_trust=2), 31 * MPH, 0, v_ego=14.0)
   assert ctl.hwy_ramp_left is not None and abs(ctl.hwy_ramp_left - (50.0 - 14.0)) < 1.0, ctl.hwy_ramp_left
+
+
+# ---------------- R7: the loop's second part, past the apex ----------------
+
+CCm = _load("camera_curve_round_r", os.path.join("..", "camera_curve.py"))
+TMC = _load("tmc_round_r", "test_map_curves.py")
+
+
+def _loop_cam(seconds=6.0, v_mph=30.5, set_mph=30.0, lat=2.0, apex=-30.0, torque=0.6, peak_first=2.6, **kw):
+  """In a loop's gentler part at v_mph, its measured lateral `lat` (after peak_first in its tight part for 2 s), the model's
+  plan the same curve on, the governing map plan at the set speed (C6)."""
+  cc = CCm.CameraCurve()
+  v = v_mph * MPH
+  k0 = lat / (v * v)
+  xs = [190.0 * (j / 32) ** 2 for j in range(33)]
+  ks = [k0] * 33
+  set_v, taps = set_mph * MPH, []
+  for f in range(int((2.0 + seconds) / 0.01)):
+    tight = f < 200
+    args = dict(v_ego=v, set_speed=set_v, lat=peak_first if tight else lat, model_x=xs, model_k=ks, lane_prob=0.8,
+                torque=1.0 if tight else torque, curve_on=True, map_in_curve=True, map_curve_id=(2, 72), on_ramp=True,
+                apex_d=(20.0 if tight else apex), gov_plan=set_mph * MPH, cam_target=set_mph * MPH)
+    args.update(kw)
+    o = cc.update(CCm.CamInputs(**args))
+    if o.tap:
+      taps.append(f)
+      set_v = o.tap_goal
+  return taps, set_v / MPH
+
+
+def test_r7_past_the_apex_and_the_peak_taps_up_to_3_mph_over_the_plan():
+  taps, s = _loop_cam()
+  assert taps and taps[0] >= 300, taps[:2]                              # (the tight part 2 s, then the peak + 1 s)
+  assert s <= 30.0 + 3 + 1e-6 and s >= 31.0 - 1e-6, s                    # up to the map plan + 3, the speed + 1 at most
+  assert all(b - a >= 50 for a, b in zip(taps, taps[1:], strict=False))   # at most every 0.5 s
+
+
+def test_r7_no_taps_before_the_apex_unknown_apex_too_little_reserve_or_the_ti_alone():
+  for kw in (dict(apex=15.0), dict(apex=None), dict(torque=0.9), dict(lat=2.3), dict(ti_only=True)):
+    taps, s = _loop_cam(**kw)
+    assert not taps, kw
+  # the lateral not past its peak (the loop's second part as tight as the first): none
+  taps, s = _loop_cam(peak_first=2.0)
+  assert not taps
+  # (round Q's rule without the apex passed: no tap above the governing map plan)
+  old = CCm.CAM_POST_APEX
+  try:
+    CCm.CAM_POST_APEX = False
+    taps, s = _loop_cam()
+  finally:
+    CCm.CAM_POST_APEX = old
+  assert not taps
+
+
+def test_r7_the_planner_publishes_a_ramp_curve_s_apex_once_inside_it():
+  from types import SimpleNamespace as N
+  import math
+  m = TMC.MC.MapCurves()
+  m.odo_ok, m.odo = True, 0.0
+  # a 270 deg loop of radius 60 m around a synthetic origin, entered at its start; the apex at its middle
+  R, lat0, lon0 = 60.0, 10.0, 20.0
+
+  def ll(th):
+    x, y = R * math.cos(th), R * math.sin(th)
+    return lat0 + math.degrees(y / 6371000.0), lon0 + math.degrees(x / (6371000.0 * math.cos(math.radians(lat0))))
+  c = {"s_a": 100.0, "s_b": 100.0 + 1.5 * math.pi * R, "len": 1.5 * math.pi * R, "ramp": True, "apex": ll(0.75 * math.pi),
+       "a": ll(0.0), "b": ll(1.5 * math.pi), "r": R}
+  m.store = N(curves={7: [c]}, ramps={})
+  m.entered = {100.0: 0.0}
+  seen = []
+  for k in range(1, 28):
+    th = 1.5 * math.pi * k / 28
+    m.odo = R * th
+    la, lo = ll(th)
+    m.geom = {}
+    m._curves_ahead(7, True, 0.0, 1000.0, la, lo, (90.0 - math.degrees(th + math.pi / 2)) % 360)
+    g = m.geom.get(id(c))
+    seen.append((round(th / (1.5 * math.pi), 2), None if g is None else round(g[0], 1)))
+  before = [g for fr, g in seen if fr < 0.45]
+  after = [g for fr, g in seen if fr > 0.75]
+  assert before and all(g is not None and g > 0 for g in before), seen       # ahead, closing in
+  assert after and all(g is not None and g < 0 for g in after), seen         # passed (the loop turns the bearing round)

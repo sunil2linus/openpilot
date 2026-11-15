@@ -44,7 +44,8 @@ from dataclasses import dataclass, field, replace
 
 # (review of round Q, M5) what the per-frame camera curve path needs, at module level; the pure logic below does not need it
 try:
-  from opendbc.car.mazda.camera_curve import CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT
+  from opendbc.car.mazda.camera_curve import (CamInputs, NO_CURVE as CAM_NONE, model_kappas, CAM_MODEL_STALE, CAM_TAP_DT,
+                                              CAM_POST_APEX_OVER)
   from opendbc.car.mazda.map_curve_control import STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_PAUSED, TEST as MAP_TEST
   from opendbc.car.mazda.speed_limit_follow import TEST as LIMIT_TEST
   from opendbc.car.mazda.curve_target import map_curve_speed
@@ -3468,7 +3469,9 @@ class CurveSlowdown:
       self.cam_goal = None
     keep = max(self.cam_floor or 0.0, self.cam_goal[0] if self.cam_goal is not None else 0.0)
     # (S1) never above a map curve ahead's plan, nor the governing map curve's plan
-    keep = min(keep, map_ahead, mo.plan if (map_gov and mo is not None and not out.phantom) else CAM_NONE)
+    # (camera_curve.CAM_POST_APEX) past the apex and the lateral's peak: up to CAM_POST_APEX_OVER over the governing plan
+    over = CAM_POST_APEX_OVER if out.post_apex else 0.0
+    keep = min(keep, map_ahead, (mo.plan + over) if (map_gov and mo is not None and not out.phantom) else CAM_NONE)
     if keep > 0 and keep > float(curve_speed):
       # (c) the curve target kept at what the taps proved (a lower map / camera target no longer takes it back down)
       a, sp, fl, bu, tr, ra, hold, na, fr = res

@@ -96,6 +96,21 @@ CAM_OVER = 2.5                  # m/s^2
 CAM_OVER_HOLD = 4.0             # s
 CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the farthest distance asked for
 
+# Round R, R7 (owner: "we can take the exit-46 on-ramp at 33-34 instead of 30"; drive 76's loop: its tight first part R70-75 at
+# 30.3 mph, lateral 2.5-2.65, the command at 1.0 for 6 s, "Turn Exceeds Steering Limit": no raise there; its second part
+# R90-100 at 30.5-31.7, lateral 1.9-2.2, the command 0.5-0.95). Past the governing map curve's apex (apex_d < 0; unknown:
+# never) with the measured lateral past its peak (CAM_POST_PEAK_DROP under the curve's peak for CAM_POST_PEAK_TIME): the
+# +1 taps may predict up to CAM_LAT_POST_APEX (the margin-corrected lateral scaled to v + 1 and the model's 0.5-3 s / 3-4 s
+# peaks, as rule (c)), with the median |torque| under CAM_POST_TORQUE (and the saturation share as always), up to
+# CAM_POST_APEX_OVER over the governing map plan and the camera's own target (C6 relaxed only here); every other rule (c)
+# / (e) guard stays. What the taps reached is kept on the same terms (keep). Not with the TI alone (CAM_LAT_TI then).
+CAM_POST_APEX = True
+CAM_LAT_POST_APEX = 2.3         # m/s^2
+CAM_POST_APEX_OVER = 3 * MS_PER_MPH
+CAM_POST_PEAK_DROP = 0.3        # m/s^2
+CAM_POST_PEAK_TIME = 1.0        # s
+CAM_POST_TORQUE = 0.85
+
 NO_CURVE = 1000.0
 
 
@@ -165,6 +180,7 @@ class CamOutput:
   keep: bool = False              # what earlier taps reached may stay (the live data still shows the margin at this speed)
   end_goal: float = NO_CURVE      # m/s: while ending, the most the end's raise may take the set to (CAM_END_STEP)
   end_cancel: bool = False        # the end was cancelled this frame (the wrapper drops its restore at once)
+  post_apex: bool = False         # (CAM_POST_APEX) past the map curve's apex and the lateral's peak: the relaxed taps / keep
   why: str = ""                   # what held the tap back (logs)
   events: list = field(default_factory=list)       # (kind, data) for the event recorder
 
@@ -185,6 +201,8 @@ class CameraCurve:
     self.end_done = False            # (B1) an end was cancelled in this curve slowdown: no new one until it is over
     self.end_v0 = 0.0                # m/s: the speed when the end began
     self.end_t0 = NO_CURVE           # m/s: the incoming curve target then
+    self.lat_peak = 0.0              # (CAM_POST_APEX) the margin-corrected lateral's peak in this curve slowdown
+    self.below_peak = 0              # ... frames it has been CAM_POST_PEAK_DROP under it
 
   def _never(self, i):
     if i.test_mode:
@@ -212,6 +230,15 @@ class CameraCurve:
     self.trq_hist.append(abs(float(i.torque)))
     lim = CAM_LAT_TI if i.ti_only else CAM_LAT_LKAS
     v = max(float(i.v_ego), 0.0)
+    # (CAM_POST_APEX) past the apex and the lateral's peak
+    if i.curve_on:
+      self.lat_peak = max(self.lat_peak, lat)
+      self.below_peak = self.below_peak + 1 if lat <= self.lat_peak - CAM_POST_PEAK_DROP else 0
+    else:
+      self.lat_peak, self.below_peak = 0.0, 0
+    post = bool(CAM_POST_APEX and not i.ti_only and i.apex_d is not None and i.apex_d < 0.0 and
+                self.below_peak >= int(CAM_POST_PEAK_TIME / DT_CTRL))
+    lim_up = CAM_LAT_POST_APEX if post else lim
     model = bool(i.model_x) and bool(i.model_k)
     guards = model and i.lane_prob >= CAM_LANE_PROB and v >= CAM_MIN_SPEED
     never = self._never(i)
@@ -222,7 +249,7 @@ class CameraCurve:
     elif lat >= CAM_OVER:
       self.over, self.over_clear = True, 0
     elif self.over:
-      self.over_clear = self.over_clear + 1 if lat < lim else 0
+      self.over_clear = self.over_clear + 1 if lat < lim_up else 0
       if self.over_clear >= int(CAM_OVER_HOLD / DT_CTRL):
         self.over = False                     # (C2) CAM_OVER_HOLD back under the limit
     # (b) the phantom release: kept for that map curve until it changes / goes
@@ -261,13 +288,15 @@ class CameraCurve:
     pk_now = model_peak(i.model_x, i.model_k, v, 0.5, 2.0)
     tightening = pk_now is None or pk_now >= lat_raw * CAM_TIGHTEN_GAIN + CAM_TIGHTEN_ADD
     pk_cur = model_peak(i.model_x, i.model_k, v, 0.5, 3.0)
-    out.keep = pk_cur is not None and pk_cur < lim and lat < lim and not tightening
+    out.keep = pk_cur is not None and pk_cur < lim_up and lat < lim_up and not tightening
+    out.post_apex = post
     # (d) the curve ending
     # (C4) 2-4 s (was 2-3 s): between two bends the 2-3 s peak got as low as 0.99; at true ends the 2-4 s peak still fell
     pk_end = model_peak(i.model_x, i.model_k, v, 2.0, CAM_END_FAR)
     trq = sorted(self.trq_hist)[len(self.trq_hist) // 2] if self.trq_hist else 1.0
     sat = (sum(1 for q in self.trq_hist if q >= CAM_TORQUE_SAT) / len(self.trq_hist)) if self.trq_hist else 1.0
     no_reserve = trq >= CAM_TORQUE_RESERVE or sat > CAM_TORQUE_SAT_SHARE      # (C3)
+    no_reserve_up = (trq >= CAM_POST_TORQUE or sat > CAM_TORQUE_SAT_SHARE) if post else no_reserve
     n_rise = int(CAM_RISE_TIME / DT_CTRL)
     rising = len(self.lat_hist) > 1 and lat - self.lat_hist[max(len(self.lat_hist) - 1 - n_rise, 0)] > CAM_RISE
     low_target = i.target < max(v, i.set_speed + i.step) - 1e-3 or i.map_ahead < v     # (R1 a)
@@ -305,23 +334,24 @@ class CameraCurve:
     pred = None if pk1 is None or v <= 0 else max(lat * (v1 / v) ** 2, pk1)
     pk_far = model_peak(i.model_x, i.model_k, v1, 3.0, 4.0)     # (C6) what the model sees beyond its reliable 3 s
     goal = i.set_speed + i.step
+    post_over = CAM_POST_APEX_OVER if post else 0.0
     set_steps = int(round(i.set_speed / i.step))
     why = ("not in the curve" if not (i.map_in_curve or lat >= CAM_PHANTOM_LAT) else
            "no prediction" if pred is None else
-           "lateral" if pred >= lim or (pk_far is not None and pk_far >= lim) else
+           "lateral" if pred >= lim_up or (pk_far is not None and pk_far >= lim_up) else
            "set above the speed" if set_steps + 1 > int(round(v / i.step)) + 1 else
            "tightening" if tightening or rising else
-           "steering reserve" if no_reserve else
+           "steering reserve" if no_reserve_up else
            "cap" if goal > i.cap + 1e-3 else
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
-           "camera curve ahead" if goal > i.cam_target + 1e-3 else
-           "map plan" if goal > i.gov_plan + 1e-3 else
+           "camera curve ahead" if goal > i.cam_target + post_over + 1e-3 else
+           "map plan" if goal > i.gov_plan + post_over + 1e-3 else
            "wait" if self.frame - self.last_tap < int(CAM_TAP_DT / DT_CTRL) else "")
     out.why = why
     if not why:
       self.last_tap = self.frame
       out.tap, out.tap_goal = True, goal
-      out.events.append(("camCurveTap", {"lat": round(lat, 2), "pred_lat": round(pred, 2), "lim": lim,
+      out.events.append(("camCurveTap", {"lat": round(lat, 2), "pred_lat": round(pred, 2), "lim": lim_up, "post_apex": post,
                                          "model_peak_0p5_2s": round(pk_now, 2), "torque_med": round(trq, 2),
                                          "vEgo_mph": round(v / MS_PER_MPH, 1), "set_mph": round(i.set_speed / MS_PER_MPH, 1),
                                          "goal_mph": round(goal / MS_PER_MPH, 1), "lane_prob": round(i.lane_prob, 2),

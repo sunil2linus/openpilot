@@ -110,6 +110,11 @@ ONRAMP_KEEP = 2.0             # s
 ONRAMP_NAV_ALL = 3
 ONRAMP_NAV_ALL_TOL = 50.0     # m
 ONRAMP_NAV_PRIMARY = ("turn", "end of road", "continue", "fork")
+# Round R, R7: a ramp curve we are in publishes its apex too (mapCurveApexDistance; before: unknown once inside), judged by
+# the distance to it (see _curves_ahead); the car side's post-apex raise (camera_curve.CAM_POST_APEX) needs it passed
+RAMP_APEX_NEAR = 25.0     # m: the car came this close to the apex ...
+RAMP_APEX_PASS = 8.0      # m: ... and is this much farther from it again: passed
+RAMP_APEX_SLACK = 1.0     # m: the distance within this of its minimum: still closing in (ahead); between: unknown
 APEX_PASSED = 10.0        # m: a road curve stops governing once its apex is this far behind (slow in, speed up from
                           # the apex), when the camera curve slowdown is on to hold the speed for what is left of it
 # Ramp loops (drive 53, the on-ramp loop onto M-59: 71 m, 243 deg, 386 m long): "ahead" is a straight-line bearing test,
@@ -1573,6 +1578,7 @@ class MapCurves:
     self.odo = 0.0               # m driven (update()'s gps speed x time)
     self.odo_ok = False          # update() has been given the speed (the planner always; offline callers may not)
     self.entered = {}            # ramp curve s_a -> odo at its entry, on the ramp chain `entered_chain`
+    self.apex_seen = {}          # (RAMP_APEX_*) ramp curve s_a -> [closest m to its apex so far, passed]
     self.entered_chain = 0
     self.watches = []            # navigation exits watched past the split (_watch_add), newest last
     self.onramp_keep = None      # [s left, curve, ramp start (lat, lon), m from the start to the curve] (ONRAMP_KEEP)
@@ -1644,6 +1650,23 @@ class MapCurves:
           # (RAMP_MEMORY_*) the ramp curve we are in, for its pass
           self.inside, inside_exit = c, left
           self.inside_exit, self.inside_dir = left, curve_direction(c, increasing)
+        if "apex" in c:
+          # (round R, R7: RAMP_APEX_*) the apex of a ramp curve we are in: by the distance to it, which shrinks to its minimum
+          # at the apex and grows after it (a loop turns the bearing around, so "ahead" says nothing there). Passed once it
+          # came within RAMP_APEX_NEAR and is RAMP_APEX_PASS past that minimum; closing in: ahead; else unknown (none)
+          d_ap = dist_m(lat, lon, *c["apex"])
+          tr = self.apex_seen.setdefault(c["s_a"], [d_ap, False])
+          tr[0] = min(tr[0], d_ap)
+          if not tr[1] and tr[0] <= RAMP_APEX_NEAR and d_ap >= tr[0] + RAMP_APEX_PASS:
+            tr[1] = True
+          if tr[1]:
+            self.geom[id(c)] = (-d_ap, left)
+          elif d_ap <= tr[0] + RAMP_APEX_SLACK:
+            self.geom[id(c)] = (d_ap, left)
+          else:
+            self.geom.pop(id(c), None)            # (unknown: not the stale view from before the entry)
+        else:
+          self.geom.pop(id(c), None)
         r_here = self.store.ramps.get(cid)          # (on_ramp is only known after this, each update)
         to_hwy = bool(r_here is not None and ((r_here.get("to") or {}).get("cls") in HIGHWAY_CLASSES))
         if left > (RAMP_HWY_RELEASE if to_hwy else 0.0):
@@ -1784,6 +1807,7 @@ class MapCurves:
       self.chain_id, self.increasing = cid, increasing
       if cid != self.entered_chain:
         self.entered, self.entered_chain = {}, cid      # another road: its ramp curves are new
+        self.apex_seen = {}
       cands = self._curves_ahead(cid, increasing, s0, s1, lat, lon, bearing)
       if self.watches:
         cands = self._fork_filter(cid, cands)
