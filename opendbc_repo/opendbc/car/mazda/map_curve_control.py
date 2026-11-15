@@ -341,8 +341,8 @@ NAV_UPDATE_TRAVEL = 2.5         # s
 # cruise's dead time (CHIME_DEAD), MAP_LEAD_TIME before its entry (the cruise's strongest is ~0.9-1.0 and takes ~2 s to
 # build up, SHORT_PLAN_DECEL): a firm follow starts once the car's speed is within TENT_REACH_START of that profile. It is let
 # go at once by any "highway" evidence (the shapes, the trusted road match, the model path), his gas held
-# (GAS_OVERTURN_*), or the time bounds: TENT_HARD_MAX after the split with navigation's route taking it and his signal toward
-# it (or navigation moving on at the split), else TENT_MAX_QUIET. Its cost when he stays on with nothing answering is
+# (GAS_OVERTURN_*), or TENT_HARD_MAX after the split; only with navigation's route taking it and his signal toward it
+# within NAV_SIGNAL_REACH before the split. Its cost when he stays on with nothing answering is
 # what those seconds of a firm slowdown take (test_round_q's false exit table).
 TENT_REACH = True
 TENT_REACH_DECEL = 0.7          # m/s^2
@@ -630,7 +630,6 @@ class ExitPlan:
     self.gas_past = False         # his gas held (GAS_OVERTURN_*) past the split with no "link" answer since
     self.nav_miss_s = 0.0         # s navigation has not announced it near it (NAV_NEAR_CLEAR)
     self.nav_d = None             # navigation's last distance taken (a repeat of it is stale: nothing moves)
-    self.nav_passed = False       # navigation stopped announcing it within NAV_CLOSE of the split (weak: he took it)
     self.reach_on = False         # (TENT_REACH) the firm follow toward the reachable profile is on
     self.reach_off = ""           # ... why it was let go (logs)
     self.revived = 0              # taken on again after "rerouted" (NAV_REVIVE)
@@ -838,8 +837,6 @@ class MapCurveControl:
         p.nav_near = False
     elif p is not None:
       p.nav_miss_s = 0.0
-    if p is not None and not announced and p.nav_near and p.exit_at - self.odo <= NAV_CLOSE:
-      p.nav_passed = True                           # (moving on at the split: not a cancel; weak evidence he took it)
     if announced:
       if p is not None and p.same(self.odo, f, v):
         p.update_nav(self.odo, f)
