@@ -112,6 +112,9 @@ CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the 
 CAM_POST_APEX = True
 CAM_LAT_POST_APEX = 2.3         # m/s^2
 CAM_POST_APEX_OVER = 3 * MS_PER_MPH
+# Re-review of round R (F3 minor): the same on the car's side, whatever the planner does: no taps / relaxed keep with the
+# ramp's end (CamInputs.ramp_left, the planner's mapRampEndDistance as the map control keeps it) within CAM_POST_RAMP_END
+CAM_POST_RAMP_END = 120.0       # m
 CAM_POST_PEAK_DROP = 0.3        # m/s^2
 CAM_POST_PEAK_TIME = 1.0        # s
 CAM_POST_TORQUE = 0.85
@@ -175,6 +178,7 @@ class CamInputs:
   cam_target: float = NO_CURVE    # m/s: the camera curve target alone (its plan sees past the 3 s window: R1)
   gov_plan: float = NO_CURVE      # m/s: the governing map curve's plan (C6)
   hwy_ramp: bool = False          # (CAM_POST_APEX, F3) on an on-ramp to a highway
+  ramp_left: object = None        # m to that ramp's end (None unknown): CAM_POST_RAMP_END
 
 
 @dataclass
@@ -243,7 +247,8 @@ class CameraCurve:
     else:
       self.lat_peak, self.below_peak = 0.0, 0
     post = bool(CAM_POST_APEX and i.hwy_ramp and not i.ti_only and i.apex_d is not None and i.apex_d < 0.0 and
-                self.below_peak >= int(CAM_POST_PEAK_TIME / DT_CTRL))
+                self.below_peak >= int(CAM_POST_PEAK_TIME / DT_CTRL) and
+                not (i.ramp_left is not None and i.ramp_left <= CAM_POST_RAMP_END))
     lim_up = CAM_LAT_POST_APEX if post else lim
     model = bool(i.model_x) and bool(i.model_k)
     guards = model and i.lane_prob >= CAM_LANE_PROB and v >= CAM_MIN_SPEED

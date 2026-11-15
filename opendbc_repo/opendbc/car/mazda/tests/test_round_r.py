@@ -740,6 +740,13 @@ def test_r8_f2_no_raise_in_a_subdivision_or_a_lot_only_at_a_roads_speed(tmp_path
   assert not [p for p in presses if p[1] == cs.SET_PLUS]
 
 
+def test_r7_rereview_no_taps_within_120_m_of_the_ramps_end_whatever_the_planner_does():
+  taps, s = _loop_cam(ramp_left=100.0)
+  assert not taps
+  taps, s = _loop_cam(ramp_left=200.0)
+  assert taps
+
+
 def test_r3_f7_no_fast_hold_with_a_short_model_path_or_a_lead_we_close_on(tmp_path, monkeypatch):
   # the guard off: taps only (no hold of the raise), never faster than before round R's taps
   car, lg, log, reach = _res_after_our_stop(extra=lambda f, car: dict(auto_hold_ok=f < 0))

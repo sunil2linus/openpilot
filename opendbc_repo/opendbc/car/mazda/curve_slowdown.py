@@ -3547,7 +3547,8 @@ class CurveSlowdown:
       map_covered=bool(self.map_on_used and status != STATUS_PAUSED and int(getattr(plan, "mapRoadClass", 0) or 0) > 0 and
                        int(getattr(plan, "mapGpsTrust", 4) or 0) < 2),
       # (camera_curve.CAM_POST_APEX, F3) an on-ramp to a highway
-      hwy_ramp=bool(plan_alive and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False)))
+      hwy_ramp=bool(plan_alive and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False)),
+      ramp_left=self._hwy_ramp_left(plan if plan_alive else None))
     out = self.cam_out = self.cam_curve.update(ci)
     if out.end_cancel:
       # (B1) the end cancelled: no restore of ours left in the way of the camera target taking the set down again
@@ -3790,6 +3791,14 @@ class CurveSlowdown:
     reserve = bool(cmds) and cmds[len(cmds) // 2] < MERGE_EARLY_RESERVE
     self.merge_early_now = bool(reserve and not near)
     return self.merge_early_now
+
+  def _hwy_ramp_left(self, plan):
+    """m to the end of the on-ramp to a highway we are on (the map control's count, else the planner's), None unknown."""
+    mc = self.map_control
+    left = mc.hwy_ramp_left if mc is not None else None
+    if left is None and plan is not None and bool(getattr(plan, "mapOnRamp", False)) and bool(getattr(plan, "mapRampToHighway", False)):
+      left = float(getattr(plan, "mapRampEndDistance", 0.0) or 0.0) or None
+    return left
 
   def _model_view(self):
     """(xs, kappas, lane prob) of the last modelV2 plan when fresh (CAM_MODEL_STALE), else None (camera_curve's view)."""
