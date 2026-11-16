@@ -2694,6 +2694,8 @@ class CurveSlowdown:
     self.has_ti = bool(CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR)
     self.lat_limit = lateral_limit(self.has_ti, float(getattr(CP, "maxLateralAccel", 0.0) or 0.0))
     self.curve_target = CurveTarget(self.lat_limit)
+    from opendbc.car.mazda.curve_target import NO_MAP_LATERAL
+    self.curve_target.no_map_lat = NO_MAP_LATERAL   # (round T, T6) while the map curves have no position
     if self.has_ti:
       from opendbc.car.mazda.map_curve_control import TI_ONLY_LAT
       self.curve_target.ti_lat = TI_ONLY_LAT
@@ -3024,6 +3026,8 @@ class CurveSlowdown:
     self._lkas_state(CS, v_ego)
     # (second review: only a held / governing ramp curve, not every link: the merge's lane change at the ramp's end)
     ramp_ctx = mc is not None and mc.ramp_last_cmd is not None
+    # (curve_target.NO_MAP_LATERAL, round T T6) no usable position for the map curves: the camera target more careful
+    self.curve_target.no_map = self._no_gps(plan, self._alive('starpilotPlan'))
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
                                                          blinker and not ramp_ctx)
     curve_active = curve_active and self.curve_enabled

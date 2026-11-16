@@ -32,6 +32,11 @@ DEFAULT_LATERAL_ACCEL = 2.0     # m/s^2 when the car reports no maxLateralAccel
 MIN_LATERAL_ACCEL = 0.8
 MAX_LATERAL_ACCEL = 3.0         # openpilot's MAX_LATERAL_ACCEL_NO_ROLL
 CONFIRM_TIME = 1.0              # s a curve must be seen before it counts
+# Round T, T6 (drive 77 t 51-55: a curve at 48 mph before the first GPS fix, lateral up to 3.7, the command clipped 2.9 s; the
+# camera target at 3.0 only went under the set once the car was in the curve): while the map curves cannot work for lack of
+# a position (CurveTarget.no_map, the wrapper: curve_slowdown._no_gps) the camera target is planned at NO_MAP_LATERAL (when
+# lower than its normal lateral; the TI-only lateral still wins when lower), with the same confirm time
+NO_MAP_LATERAL = 2.3            # m/s^2
 START_GAP = 2.0 * MS_PER_MPH    # m/s below the driver's speed before we act
 END_GAP = 1.0 * MS_PER_MPH      # m/s: the curve is over once it needs less than this
 MIN_CURVATURE = 1e-5            # 1/m (100 km radius)
@@ -90,10 +95,22 @@ class CurveTarget:
     # camera's fault) is planned at ti_lat (only the TI steers there); None: off
     self.ti_lat = None
     self.ti_only = False
+    # (NO_MAP_LATERAL) no position for the map curves: planned at no_map_lat (None: off)
+    self.no_map_lat = None
+    self.no_map = False
     self.window = deque(maxlen=max(1, int(round(confirm_time / DT_CTRL))))
     self.active = False
     self.speed = NO_CURVE          # the least demanding target of the last CONFIRM_TIME (m/s, true speed)
     self.raw = NO_CURVE            # this frame's target
+
+  def plan_lat(self):
+    """m/s^2 the target is planned at now: lat_accel, NO_MAP_LATERAL without a position, TI-only's when lower."""
+    lat = self.lat_accel
+    if self.no_map and self.no_map_lat is not None and self.no_map_lat < lat:
+      lat = self.no_map_lat
+    if self.ti_only and self.ti_lat is not None and self.ti_lat < lat:
+      lat = self.ti_lat
+    return lat
 
   def reset(self):
     self.window.clear()
@@ -106,10 +123,8 @@ class CurveTarget:
     if not plan_alive:
       self.reset()
       return False, NO_CURVE
-    self.raw = NO_CURVE if blinker else curve_speed(curvature, self.lat_accel)
-    if (self.ti_lat is not None and self.ti_lat < self.lat_accel and self.raw < NO_CURVE and
-        self.ti_only):
-      self.raw = curve_speed(curvature, self.ti_lat)
+    lat = self.plan_lat()
+    self.raw = NO_CURVE if blinker else curve_speed(curvature, lat)
     self.window.append(self.raw)
     self.speed = max(self.window)
     if not self.active:

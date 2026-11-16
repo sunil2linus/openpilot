@@ -378,3 +378,49 @@ def test_t4_with_the_offset_plan_plus_max_offset_5_never_the_sum():
   TS = _load("trs_round_t", "test_round_s.py")
   assert TS._post_apex_cam(32.0, 2.0) <= 35.0 + 1e-6               # 30 + max(2, 5)
   assert TS._post_apex_cam(30.0 + 5.0, 5.0) <= 35.0 + 1e-6         # 30 + max(5, 5), not 30 + 10
+
+
+# ---------------- T6: without a GPS position the camera curve target is more careful ----------------
+
+CT = _load("ct_round_t", os.path.join("..", "curve_target.py"))
+
+
+def _ct_run(k, frames=150, **attrs):
+  t = CT.CurveTarget(3.0)
+  t.ti_lat = 1.8
+  for a, v in attrs.items():
+    setattr(t, a, v)
+  first = None
+  for f in range(frames):
+    act, sp = t.update(k, 60 * MPH)
+    if act and first is None:
+      first = f
+  return t, first
+
+
+def test_t6_no_position_plans_the_camera_target_at_2p3_with_the_same_confirm_time():
+  k = 1 / 160.0
+  base, f0 = _ct_run(k)
+  nomap, f1 = _ct_run(k, no_map=True, no_map_lat=CT.NO_MAP_LATERAL)
+  assert abs(base.speed - (3.0 / k) ** 0.5) < 1e-9 and abs(nomap.speed - (2.3 / k) ** 0.5) < 1e-9
+  assert f0 == f1 == int(CT.CONFIRM_TIME / DT) - 1                       # the confirm time unchanged (1 s)
+  assert CT.CONFIRM_TIME >= 0.5
+  # TI-only still wins when lower; a position again: back to 3.0
+  ti, _ = _ct_run(k, no_map=True, no_map_lat=CT.NO_MAP_LATERAL, ti_only=True)
+  assert abs(ti.speed - (1.8 / k) ** 0.5) < 1e-9
+  nomap.no_map = False
+  for _ in range(150):
+    nomap.update(k, 50 * MPH)
+  assert abs(nomap.speed - (3.0 / k) ** 0.5) < 1e-9
+  # a car whose own lateral is under 2.3 keeps it
+  low = CT.CurveTarget(1.09)
+  low.no_map, low.no_map_lat = True, CT.NO_MAP_LATERAL
+  assert low.plan_lat() == 1.09
+
+
+def test_t6_the_wrapper_switches_on_the_no_gps_state(tmp_path, monkeypatch):
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  assert c.curve_target.no_map_lat == CT.NO_MAP_LATERAL
+  Pl = lambda **k: NS(**{**dict(mapCurveMode=2, mapRoadClass=0, mapCurveStatus=0, mapGpsAccuracy=0.0), **k})  # noqa: E731
+  assert c._no_gps(Pl(mapCurveStatus=MC.STATUS_NO_GPS), True)            # "no GPS position yet": careful
+  assert not c._no_gps(Pl(mapCurveStatus=1, mapRoadClass=5, mapGpsAccuracy=5.0), True)   # a position: normal
