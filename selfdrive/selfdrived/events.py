@@ -260,9 +260,20 @@ def _map_curve_needs(radius: float, advisory: float) -> float:
   return needs
 
 
-def _map_curve_target(sp) -> float:
-  """The governing map curve's speed as the car side takes it (mapCurveTarget: the Max Drop floor counted), else its
-  shape and advisory alone (an older planner)."""
+def _car_state(sm):
+  try:
+    return sm["starpilotCarState"]
+  except Exception:
+    return None
+
+
+def _map_curve_target(sp, scs=None) -> float:
+  """The governing map curve's speed as the car side takes it: the car side's own (starpilotCarState.mazdaCurveTarget:
+  its TI-only lateral, round T), else the planner's (mapCurveTarget: the Max Drop floor counted), else its shape and
+  advisory alone (an older planner)."""
+  car = float(getattr(scs, "mazdaCurveTarget", 0.0) or 0.0) if scs is not None else 0.0
+  if car > 0:
+    return car
   target = float(getattr(sp, "mapCurveTarget", 0.0) or 0.0)
   return target if target > 0 else _map_curve_needs(sp.mapCurveRadius, sp.mapCurveAdvisory)
 
@@ -322,7 +333,7 @@ def map_curve_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster
   where = "now" if sp.mapCurveDistance <= 1 else "in " + _map_distance(sp.mapCurveDistance, metric)
   action = "Test: would slow to" if sp.mapCurveMode == 1 else "Slowing to"
   return Alert(
-    f"{what} {where} · {action} {get_display_speed(_map_curve_target(sp), metric)}",
+    f"{what} {where} · {action} {get_display_speed(_map_curve_target(sp, _car_state(sm)), metric)}",
     "",
     StarPilotAlertStatus.starpilot, AlertSize.small,
     Priority.LOW, VisualAlert.none, AudibleAlert.none, 6.)   # 3 s was easy to miss (drive 37)

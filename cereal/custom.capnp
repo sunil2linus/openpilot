@@ -130,6 +130,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaCamFault @40 :UInt8;          # Mazda + TI only (0 without a TI): the car's camera (CAM_LKAS): 0 none, 1 lane lines off at speed, 2 its ERR bits set
   mazdaLkasBlock @41 :Bool;          # Mazda: the EPS blocks the stock LKAS torque (STEER_RATE LKAS_BLOCK: under ~45 km/h, a fault)
   mazdaTiState @42 :UInt8;           # Mazda + TI: TI_FEEDBACK STATE (0 discover, 1 off, 2 driver override, 3 run); 0 without a TI
+  mazdaCurveTarget @43 :Float32;     # (round T, T3c) Mazda: the governing map curve's speed as the car side plans it (m/s); 0 none
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {

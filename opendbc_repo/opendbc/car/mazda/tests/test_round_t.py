@@ -213,3 +213,134 @@ def test_t2_his_speed_at_the_merges_target_is_his_but_is_decided_again_if_the_ne
   # his speed above the highway's target: still his
   ofs, _ = _merge_run(lambda k: 70, driver=76)
   assert not ofs
+
+
+# ---------------- T3: the loop's speed is kept at the LKAS cut-off ----------------
+
+cs = W.cs
+
+
+def _inp(**k):
+  d = dict(enabled=True, cruise_enabled=True, set_speed=20 * MPH, v_ego=25 * MPH, gas_pressed=False, brake_pressed=False,
+           standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0, other_button_active=False)
+  d.update(k)
+  return cs.SlowdownInputs(**d)
+
+
+def _run_logic(frames=1500, start=45.0, **kw):
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=start * MPH, v_ego=start * MPH))
+  set_mph, low = start, start
+  for f in range(frames):
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=max(set_mph + 4, 31) * MPH, btn_counter=(f // 10) % 16, **kw))
+    if b == cs.SET_MINUS and (lg.last_action != "hold" or f % 10 == 0):
+      set_mph -= 1
+    low = min(low, set_mph)
+  return low
+
+
+def test_t3a_the_followers_undershoot_never_takes_the_set_under_29_and_stops_still_go_lower():
+  # drive 77: the ramp follower asked 28 (and lower when firm) with the car well above the cut-off
+  firm = dict(csc_active=True, csc_speed=24.3 * MPH, curve_track=True, curve_hold=True, curve_floor=24.3 * MPH, curve_budget=60)
+  assert _run_logic(**firm) <= 26                                         # before: under the cut-off
+  assert _run_logic(lkas_hard=cs.LKAS_HARD_SPEED[0], **firm) == 29        # on the approach too (the car at 33+)
+  stop = dict(stop_active=True, stop_target=20 * MPH, stop_urgent=True)
+  assert _run_logic(lkas_hard=cs.LKAS_HARD_SPEED[0], **stop, **firm) <= 25
+  # never above his own speed
+  assert _run_logic(start=27.0, lkas_hard=cs.LKAS_HARD_SPEED[0], **firm) <= 27
+
+
+def _w(own_mph, why="ramp", cam=None, ti_only=False, metric=False):
+  return NS(lkas_hard=0.0, has_ti=True, ti_only=ti_only, map_on_used=True, curve_enabled=True,
+            logic=NS(step=0.277778 if metric else MPH),
+            map_out=NS(active=True, track=True, why=why, curve_speed=own_mph * MPH),
+            curve_target=NS(active=cam is not None, speed=(cam or 0.0) * MPH),
+            _followed_map_curve=lambda: True)
+
+
+def test_t3a_the_hard_floor_only_for_a_followed_map_curve_at_or_above_30():
+  def hard(w):
+    w._followed_map_curve = lambda: cs.CurveSlowdown._followed_map_curve(w)
+    return cs.CurveSlowdown._lkas_hard(w, True, False)
+  assert abs(hard(_w(31.0)) - 29 * MPH) < 1e-9 and abs(hard(_w(30.0, why="curve")) - 29 * MPH) < 1e-9
+  assert hard(_w(29.5)) == 0.0                                           # a curve that needs less: as before
+  assert abs(hard(_w(31.0, cam=27.5)) - 27.5 * MPH) < 1e-9               # the camera's own lower target counts
+  assert hard(_w(31.0, ti_only=True)) == 0.0                             # TI-only planning (a block from before)
+  assert hard(_w(31.0, why="nav exit")) == 0.0
+  w = _w(31.0)
+  w.map_out.track = False
+  assert hard(w) == 0.0
+  assert abs(hard(_w(31.0, metric=True)) - cs.LKAS_HARD_SPEED[1]) < 1e-9 and abs(cs.LKAS_HARD_SPEED[1] / 0.277778 - 47) < 0.01
+  assert cs.CurveSlowdown._lkas_hard(_w(31.0), True, True) == 0.0        # the street speed governs: not a curve
+
+
+def _cs_block(tmp_path, monkeypatch):
+  c = W.make_cs(tmp_path, W.FakeParams({"IsMetric": False}), monkeypatch)
+  c.has_ti = True
+  return c
+
+
+def _blk(c, block, v_mph=27.0, fault=False):
+  c._lkas_state(NS(lkas_block=block, cam_fault=2 if fault else 0, ti_state_log=3, cam_err=fault, stock_lkas_off=False),
+                v_mph * MPH)
+
+
+def test_t3b_a_block_that_starts_in_a_followed_curve_keeps_its_plan(tmp_path, monkeypatch):
+  c = _cs_block(tmp_path, monkeypatch)
+  c.map_on_used, c.map_out = True, NS(active=True, track=True, why="ramp", curve_speed=30.5 * MPH)
+  _blk(c, False)
+  _blk(c, True)                                   # the car fell under the cut-off in the loop
+  assert c.block_hold and not c.ti_only and not c.curve_target.ti_only
+  for _ in range(300):
+    _blk(c, True)
+  assert not c.ti_only
+  # the curve is not followed any more: TI-only after TI_ONLY_HYST (the block still on)
+  c.map_out = NS(active=False, track=False, why="", curve_speed=100.0)
+  for _ in range(int(cs.TI_ONLY_HYST / DT) + 2):
+    _blk(c, True)
+  assert c.ti_only and not c.block_hold
+  # the next curve while the block is still on: TI-only (the block was there before it)
+  c.map_out = NS(active=True, track=True, why="ramp", curve_speed=30.5 * MPH)
+  _blk(c, True)
+  assert c.ti_only
+
+
+def test_t3b_a_camera_fault_or_a_block_from_before_the_curve_plans_ti_only(tmp_path, monkeypatch):
+  c = _cs_block(tmp_path, monkeypatch)
+  c.map_on_used, c.map_out = True, NS(active=True, track=True, why="ramp", curve_speed=30.5 * MPH)
+  _blk(c, False)
+  _blk(c, True, fault=True)
+  assert c.ti_only and not c.block_hold
+  c2 = _cs_block(tmp_path, monkeypatch)
+  c2.map_on_used, c2.map_out = True, NS(active=False, track=False, why="", curve_speed=100.0)
+  _blk(c2, True)                                  # blocked first
+  c2.map_out = NS(active=True, track=True, why="ramp", curve_speed=30.5 * MPH)
+  _blk(c2, True)
+  assert c2.ti_only and not c2.block_hold
+  # a hold ends with a camera fault
+  c3 = _cs_block(tmp_path, monkeypatch)
+  c3.map_on_used, c3.map_out = True, NS(active=True, track=True, why="curve", curve_speed=31 * MPH)
+  _blk(c3, False)
+  _blk(c3, True)
+  assert c3.block_hold
+  _blk(c3, True, fault=True)
+  assert c3.ti_only and not c3.block_hold
+
+
+def test_t3c_the_notice_shows_the_car_sides_own_target():
+  c = CTL.MapCurveControl(3.0)
+  c.ti_plan = True
+  f = CTL.MapFields(mode=CTL.ON)
+  f.status, f.radius, f.distance, f.on_ramp, f.road_class = 2, 84.0, 0.0, True, 2
+  for _ in range(200):
+    c.update(f, 45 * MPH, 0, v_ego=30 * MPH)
+  normal = c.target_now
+  assert normal > 0
+  c.ti_only = True
+  c.update(f, 45 * MPH, 0, v_ego=30 * MPH)
+  assert 0 < c.target_now < normal - 1.0                                  # TI-only: the lower speed is what is shown
+  w = NS(map_control=c)
+  assert cs.CurveSlowdown.curve_target_speed.fget(w) == c.target_now
+  f.status, f.radius = 0, 0.0
+  c.update(f, 45 * MPH, 0, v_ego=30 * MPH)
+  assert c.target_now == 0.0

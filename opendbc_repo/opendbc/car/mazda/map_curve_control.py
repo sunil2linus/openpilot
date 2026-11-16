@@ -814,6 +814,7 @@ class MapCurveControl:
     self.ti_plan = False            # a Torque Interceptor car: TI_ONLY_* apply (the wrapper sets it)
     self.offset_ok = False          # (OFFSET_*) the car side's reading of the setting is not 0 (the wrapper sets it)
     self.offset_now = 0.0           # m/s added to the governing map curve's speed this update (0 none)
+    self.target_now = 0.0           # (round T, T3c) m/s, the governing map curve's speed as planned this update (0 none)
 
   def _lat(self, radius, advisory=0.0, scaled=False):
     """m/s^2 a map curve of `radius` m is planned at (TI_ONLY_*): TI_ONLY_LAT (scaled for a ramp / exit curve's
@@ -1305,6 +1306,7 @@ class MapCurveControl:
     limit_lower_gas: his gas held ends it (a lower limit's, rule 9; not rule 8's match)."""
     out = MapOutput()
     self.frame += 1
+    self.target_now = 0.0
     if f.ramp_type == RAMP_EXIT and not f.ramp_to_highway and f.ramp_to_speed > 0:
       self.exit_to_seen = (f.ramp_to_speed + self.street_add, self.frame)   # (EXIT_RAMP_HANDOVER)
     if a_ego is None:
@@ -1373,6 +1375,8 @@ class MapCurveControl:
                              f.status in (STATUS_CURVE, STATUS_RAMP_CURVE)) else 0.0
     self.offset_now = min(max(off, 0.0), OFFSET_MAX) if off == off else 0.0
     radius = offset_radius(radius, self.offset_now, self.curve.lat_accel)
+    # (round T, T3c) the governing map curve's speed as planned here (the notice shows it: starpilotCarState.mazdaCurveTarget)
+    self.target_now = map_curve_target(radius, self.curve.lat_accel, f.advisory, floor) if radius > 0 else 0.0
     a, sp = self.curve.update(radius, f.distance, driver_speed, f.advisory, floor=floor,
                               lead_time=MAP_ROAD_LEAD_TIME if road_curve else (MAP_RAMP_LEAD_TIME if ramp_st else MAP_LEAD_TIME),
                               reaction_speed=v_ego if (ramp_st and v_ego > 0) else None)

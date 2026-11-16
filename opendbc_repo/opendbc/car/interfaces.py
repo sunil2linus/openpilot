@@ -468,6 +468,10 @@ class CarInterfaceBase(ABC):
       fp_ret.mazdaExitCurveBrake = bool(getattr(slowdown, "exit_brake_alert", False))
       fp_ret.mazdaLimitSlowLimit = float(getattr(slowdown, "limit_slow_limit", 0.0) or 0.0)
       fp_ret.mazdaSetSpeedHigh = bool(getattr(slowdown, "set_speed_high", False))
+      try:
+        fp_ret.mazdaCurveTarget = float(getattr(slowdown, "curve_target_speed", 0.0) or 0.0)
+      except (AttributeError, ValueError):
+        pass                       # (an older cereal without the field)
     fp_ret.mazdaStockLkasOff = bool(getattr(self.CS, "stock_lkas_off", False))
     # Mazda (round P): the camera's fault, the EPS's LKAS block, the TI's state (carstate; logged with the curve slowdown's rows)
     fp_ret.mazdaCamFault, fp_ret.mazdaLkasBlock, fp_ret.mazdaTiState = mazda_lkas_state(self.CS)

@@ -442,6 +442,21 @@ LKAS_KEEP_SPEED = (30 * MS_PER_MPH, 49 * MS_PER_KPH)
 # no SET- under it, and a set under it is brought up to it by SET+ taps (never above the floor, which is never above the
 # curve's own target nor his speed) while no stop, red light, planned stop or slower car ahead asks for less.
 LKAS_KEEP_MARGIN = (2 * MS_PER_MPH, 3 * MS_PER_KPH)
+# Round T, T3a (drive 77 t 303-313, the loop: the ramp follower's undershoot put the set at 28 with the car at 33.7, the
+# LKAS_KEEP floor acts only within LKAS_KEEP_MARGIN and its SET+ came too late; the car fell to 27.9 and the EPS blocked
+# the stock LKAS). With a TI, the LKAS not blocked (or LKAS_BLOCK_HOLD): while a map curve (road / ramp curve, its ramp
+# hold) whose own target is at least LKAS_KEEP_SPEED is followed, the curve target is never under LKAS_HARD_SPEED
+# (approach included; never above his speed, nor above the camera curve's own target when that is lower). Stops, red
+# lights and a stopped car ahead are not floored (their own targets), the car ahead is the cruise's.
+LKAS_HARD = True
+LKAS_HARD_SPEED = (29 * MS_PER_MPH, 47 * MS_PER_KPH)
+LKAS_HARD_WHYS = ("curve", "ramp", "ramp hold")    # map_curve_control.MapOutput.why of a followed map curve
+# Round T, T3b (drive 77 t 309-313: the block started in the loop only because the car fell under the cut-off; the TI-only
+# re-plan took the loop's target 28 -> 25.2 and switched the floor off): when LKAS_BLOCK starts while a map curve is
+# followed (LKAS_HARD_WHYS), with no camera fault, that curve keeps its plan (no TI-only re-plan, the floors stay) until it
+# is no longer followed for TI_ONLY_HYST (then TI-only as before if the block is still on). A block that was on before the
+# curve, or a camera fault (ti_fault), plans TI-only as before.
+LKAS_BLOCK_HOLD = True
 TI_ONLY_HYST = 2.0            # s
 # ... and while the car's camera reports a fault (CAM_LKAS ERR_BIT_1 / ERR_BIT_2, or its lane lines off at speed:
 # carstate stock_lkas_off) or LKAS_BLOCK is set above the cut-off (LKAS_CUTOFF): curves TI-only as above and the merge's
@@ -700,6 +715,8 @@ class SlowdownInputs:
   engage_goal: float = 0.0
   # m/s, 0 none (LKAS_KEEP): curve targets are never under this (nor his speed); stop targets are not floored
   lkas_keep: float = 0.0
+  # m/s, 0 none (LKAS_HARD): the same, at all times while a map curve at or above LKAS_KEEP_SPEED is followed
+  lkas_hard: float = 0.0
   # (ENGAGE_AUTO) the cruise came back on by our auto resume's RES (auto_resume.AutoResume.own_engaged)
   auto_resumed: bool = False
   auto_hold_ok: bool = True       # (ENGAGE_AUTO_PATH_TIME / _LEAD_D, F7) its SET+ hold may go
@@ -1038,6 +1055,12 @@ class CurveSlowdownLogic:
     if not LKAS_KEEP or i.lkas_keep <= 0:
       return 0.0
     return math.floor(min(i.lkas_keep, driver_speed) / self.step + 1e-3) * self.step
+
+  def _hard_floor(self, i, driver_speed):
+    """(LKAS_HARD) m/s, min(lkas_hard, his speed) rounded down to a whole step; 0 none."""
+    if not LKAS_HARD or i.lkas_hard <= 0:
+      return 0.0
+    return math.floor(min(i.lkas_hard, driver_speed) / self.step + 1e-3) * self.step
 
   def _engage_auto(self):
     """(ENGAGE_AUTO) the raise after our auto resume's RES is going."""
@@ -2069,7 +2092,7 @@ class CurveSlowdownLogic:
       # (last review of round P) while it is on in this curve the floor only goes down: the lowest seen (a curve's own
       # target wobbling across a whole mph tapped SET-/SET+ about once a second)
       self.keep_held = (keep if self.keep_held is None else min(self.keep_held, keep)) if self.keep_on else None
-      targets.append(("curve", max(curve_t, floor, self.keep_held if self.keep_on else 0.0)))
+      targets.append(("curve", max(curve_t, floor, self.keep_held if self.keep_on else 0.0, self._hard_floor(i, driver_speed))))
     else:
       self.keep_on, self.keep_held = False, None
     if i.stop_active:
@@ -2654,6 +2677,9 @@ class CurveSlowdown:
     self.ti_fault = False            # the camera's fault / LKAS_BLOCK above the cut-off (held TI_ONLY_HYST after it clears)
     self.fault_clear_frames = 0
     self.lkas_keep = 0.0             # this frame's LKAS_KEEP floor (m/s, 0 none)
+    self.lkas_hard = 0.0             # this frame's LKAS_HARD floor (m/s, 0 none)
+    self.block_hold = False          # (LKAS_BLOCK_HOLD) a block that started in a followed map curve: no TI-only re-plan
+    self.block_hold_gone = 0         # ... frames that curve has not been followed
     self.cam_fault_now = 0           # carstate's cam_fault / lkas_block / TI state this frame (the signal rows)
     self.lkas_block_now = False
     self.ti_state_now = 0
@@ -3150,6 +3176,7 @@ class CurveSlowdown:
       curve_hold=curve_hold,
       street_lower=curve_street,
       lkas_keep=self._lkas_keep(curve_active, curve_street),
+      lkas_hard=self._lkas_hard(curve_active, curve_street),
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -3697,6 +3724,7 @@ class CurveSlowdown:
     """(TI_ONLY_*) the stock LKAS blocked (LKAS_BLOCK), the camera's fault (ERR bits, lane lines off) or LKAS_BLOCK above
     the cut-off (ti_fault), each held TI_ONLY_HYST after it clears: curves planned for the TI."""
     raw = bool(getattr(CS, "lkas_block", False))
+    was_blocked = self.lkas_blocked
     self.cam_fault_now = int(getattr(CS, "cam_fault", 0) or 0)
     self.lkas_block_now, self.ti_state_now = raw, int(getattr(CS, "ti_state_log", 0) or 0)
     self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
@@ -3705,7 +3733,19 @@ class CurveSlowdown:
                              (raw and v_ego > LKAS_CUTOFF))
     self.fault_clear_frames = 0 if fault else self.fault_clear_frames + 1
     self.ti_fault = fault or (self.ti_fault and self.fault_clear_frames < _frames(TI_ONLY_HYST))
-    self.ti_only = bool(self.has_ti and (self.lkas_blocked or self.ti_fault))
+    if LKAS_BLOCK_HOLD and self.has_ti:
+      # (LKAS_BLOCK_HOLD) from last frame's map output (this frame's is made after this)
+      followed = self._followed_map_curve()
+      if self.lkas_blocked and not was_blocked and followed and not self.ti_fault and not self.block_hold:
+        self.block_hold, self.block_hold_gone = True, 0
+        self._record_block_hold(v_ego)
+      if self.block_hold:
+        self.block_hold_gone = 0 if followed else self.block_hold_gone + 1
+        if self.ti_fault or not self.lkas_blocked or self.block_hold_gone >= _frames(TI_ONLY_HYST):
+          self.block_hold = False
+    else:
+      self.block_hold = False
+    self.ti_only = bool(self.has_ti and (self.lkas_blocked or self.ti_fault) and not self.block_hold)
     self.curve_target.ti_only = self.ti_only
     if self.map_control is not None:
       self.map_control.ti_only = self.ti_only
@@ -3744,6 +3784,47 @@ class CurveSlowdown:
       self.recorder.record("camFaultCleared", t, {"kind": kind, "lasted_s": round(t - t0, 1), "vEgo_mph": i.v_ego / MS_PER_MPH,
                                                   "lkas_block": self.lkas_block_now, "panda_can": self._panda_errors()},
                            min_gap=1.0, signals=False)
+
+  def _followed_map_curve(self):
+    """(LKAS_HARD_WHYS) a map curve (road / ramp curve, its ramp hold) is followed (map curves On), by the last map output."""
+    mo = getattr(self, "map_out", None)
+    return bool(getattr(self, "map_on_used", False) and mo is not None and mo.active and mo.track and
+                mo.why in LKAS_HARD_WHYS and mo.curve_speed < 100.0)
+
+  def _record_block_hold(self, v_ego):
+    rec = getattr(self, "recorder", None)
+    if rec is None:
+      return
+    try:
+      import time
+      mo = self.map_out
+      rec.record("lkasBlockHold", time.monotonic(), {"vEgo_mph": v_ego / MS_PER_MPH, "why": mo.why,
+                                                      "curve_mph": mo.curve_speed / MS_PER_MPH}, min_gap=1.0, signals=False)
+    except Exception:
+      pass
+
+  def _lkas_hard(self, curve_active, curve_street):
+    """(LKAS_HARD) m/s, the hard floor for this frame's curve target: a TI car, not planning TI-only, a followed map curve
+    whose own target (mo.curve_speed) is at least LKAS_KEEP_SPEED: LKAS_HARD_SPEED (the camera curve's own target if
+    lower); 0 none."""
+    self.lkas_hard = 0.0
+    if not (LKAS_HARD and self.has_ti and curve_active) or self.ti_only or curve_street or not self._followed_map_curve():
+      return 0.0
+    unit = 1 if self.logic.step < MS_PER_MPH else 0
+    if self.map_out.curve_speed < LKAS_KEEP_SPEED[unit] - 1e-6:
+      return 0.0
+    hard = LKAS_HARD_SPEED[unit]
+    if self.curve_enabled and self.curve_target.active:
+      hard = min(hard, self.curve_target.speed)
+    self.lkas_hard = hard
+    return hard
+
+  @property
+  def curve_target_speed(self):
+    """(round T, T3c) starpilotCarState.mazdaCurveTarget: the governing map curve's speed as the car side plans it this
+    frame (its lateral: normal, TI-only; the offset; the Max Drop floor), m/s; 0 none."""
+    mc = getattr(self, "map_control", None)
+    return float(getattr(mc, "target_now", 0.0) or 0.0) if mc is not None else 0.0
 
   def _lkas_keep(self, curve_active, curve_street):
     """(LKAS_KEEP) m/s, the floor for this frame's curve target: a TI car, the LKAS not blocked, a curve whose own target
