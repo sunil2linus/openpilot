@@ -220,6 +220,9 @@ RAMP_TYPES = {"exit": 1, "entrance": 2, "interchange": 3, "link": 4, "two-way": 
 # frogpilotPlan.mapCurveStatus (the car side acts on 1 and 2 only: 4 and 5 are "no curve" on purpose)
 STATUS_NONE, STATUS_CURVE, STATUS_RAMP_CURVE, STATUS_NO_DATA = 0, 1, 2, 3
 STATUS_PAUSED, STATUS_HELD = 4, 5   # paused: the GPS is not trusted; held: a curve found, but the road match is not trusted
+# (round T, T1b) the planner has no GPS position (no fix yet at the start of a drive, or none fresh): not "no curve data
+# here" (status 3 with trust 0 read like a good map with nothing on it); published with mapGpsTrust TRUST_NO_GPS
+STATUS_NO_GPS = 6
 
 # GPS trust (GpsTrust). The device's GPS can be off by 100 m or more for a whole drive while reporting a fix (drive
 # 3f: the track had the road's exact shape, 90-180 m to one side): then nothing matches, or worse, a parallel road
@@ -227,6 +230,13 @@ STATUS_PAUSED, STATUS_HELD = 4, 5   # paused: the GPS is not trusted; held: a cu
 # the safety net.
 # starpilotPlan.mapGpsTrust
 TRUST_OK, TRUST_SHAKY, TRUST_LOW, TRUST_PAUSED_ACCURACY, TRUST_PAUSED_LOST = 0, 1, 2, 3, 4
+TRUST_NO_GPS = 5           # (round T, T1b) paused: no GPS position (every car-side check reads trust > 0 as not OK)
+# (round T, T1c) starpilotPlan.mapGpsShakyWhy, why the trust is 1 (shaky): 0 it is not 1; 1 only the start of the drive's
+# STEADY_TIME (no pause, no suspicious gap restarted it); 2 the steady time restarted after a pause or a suspicious gap
+SHAKY_NONE, SHAKY_START, SHAKY_RESTART = 0, 1, 2
+# (round T, T1b) "Map curves off: no GPS yet": once per drive, before the first position, once cruise is engaged or the car
+# is above this
+NOGPS_NOTICE_SPEED = 15 * 0.44704   # m/s
 # The GPS chip's own error estimate (qcomgpsd fills gpsLocation.horizontalAccuracy since StarPilot; openpilot left
 # it 0). Its values have not been checked against a drive yet: until then it is only logged, and the pause and
 # the ambiguity distance work without it (USE_GPS_ACCURACY). Turn on once a drive shows ~3-15 m on open roads.
@@ -678,6 +688,7 @@ class GpsTrust:
     self.bad_t = self.lost_t = self.good_t = self.steady_t = self.gap_t = 0.0
     self.low = False
     self.shaky = True
+    self.restarted = False                 # (T1c) the steady time was restarted this drive (a pause, a suspicious gap)
     self.events = []                       # (what, info) for the planner's log
 
   @property
@@ -687,6 +698,13 @@ class GpsTrust:
     if self.low:
       return TRUST_LOW
     return TRUST_SHAKY if self.shaky else TRUST_OK
+
+  @property
+  def shaky_why(self):
+    """(T1c, SHAKY_*) why the status is TRUST_SHAKY."""
+    if self.status != TRUST_SHAKY:
+      return SHAKY_NONE
+    return SHAKY_RESTART if self.restarted else SHAKY_START
 
   def update(self, dt, v_ego, acc, rel, data_here, matched, ambiguous):
     """acc: m (0 unknown), rel: reliability 0-4 (0 not set), matched: RoadMatcher found a road."""
@@ -712,6 +730,7 @@ class GpsTrust:
     self.low = (not self.paused) and (bool(ambiguous) or ACC_LOW <= acc < ACC_PAUSE or rel == 2)
     self.gap_t = self.gap_t + dt if suspicious else 0.0
     if self.paused or self.gap_t > STEADY_GAP:
+      self.restarted = self.restarted or self.paused or self.steady_t > 0.0
       self.steady_t = 0.0
     elif matched:
       self.steady_t += dt
@@ -719,6 +738,7 @@ class GpsTrust:
 
   def _pause(self, reason, acc, rel):
     self.paused, self.reason, self.good_t, self.steady_t = True, reason, 0.0, 0.0
+    self.restarted = True
     self.events.append(("pause", {"reason": reason, "acc": acc, "rel": rel, "unmatched_s": round(self.lost_t, 1)}))
 
 
@@ -1751,6 +1771,8 @@ class MapCurves:
     self.paused = False          # GpsTrust paused: nothing planned from the map
     self.held = None             # (curve, distance) found but not acted on: the road match is not trusted
     self.trust_status = TRUST_OK # starpilotPlan.mapGpsTrust
+    self.trust_why = SHAKY_NONE  # (T1c) starpilotPlan.mapGpsShakyWhy
+    self.no_gps = False          # (T1b) the planner has no GPS position: STATUS_NO_GPS / TRUST_NO_GPS
     self.watch = None            # the watched exit the mapExit* fields are about this frame
     self.exit_shape = EXIT_SHAPE_NONE
     self.exit_link = (0.0, 0.0)  # (m, deg) to the exit link's nearest shape (0, 0 none)
@@ -1996,6 +2018,7 @@ class MapCurves:
       trust.update(float(g.get("dt", 0.05)), float(g.get("v_ego", 0.0)), float(g.get("acc", 0.0)), int(g.get("rel", 0)),
                    self.data_here, bool(way_id), bool(g.get("ambiguous", False)))
       self.trust_status = trust.status
+      self.trust_why = trust.shaky_why
       if trust.paused:
         self.paused = True
         return                   # no curve, ramp or exit: all of them come from the position
@@ -2414,6 +2437,14 @@ class MapCurvesPlanner:
     except Exception:
       return 0
 
+  @staticmethod
+  def _cruise_on(sm):
+    """Cruise engaged (never raises)."""
+    try:
+      return bool(sm["carState"].cruiseState.enabled)
+    except Exception:
+      return False
+
   def _floor(self, set_speed):
     return max_drop_floor(set_speed, self.max_drop_mph, self.metric)
 
@@ -2436,6 +2467,7 @@ class MapCurvesPlanner:
       self.trust.reset_drive()
       self.pause_announced, self.prev_slowing = False, False
       self.held_logged = set()
+      self.had_fix, self.nogps_announced = False, False     # (T1b)
     self.call_dt = now - getattr(self, "last_call", now - 0.05)   # unclamped: curve memory's distance travelled
     dt = min(max(self.call_dt, 0.01), 0.2)
     self.prev_started = started
@@ -2459,7 +2491,14 @@ class MapCurvesPlanner:
       self.mc.store.rescan_if_changed(now, force=drive_start)
     if gps_position is None:
       self.mc.reset()
+      self.mc.no_gps, self.mc.trust_status = True, TRUST_NO_GPS     # (T1b) not "no curve data here", not "OK"
+      if (not getattr(self, "had_fix", False) and not getattr(self, "nogps_announced", False) and
+          (self._cruise_on(sm) or v_ego > NOGPS_NOTICE_SPEED)):
+        self.nogps_announced = True
+        self.notice = "no_gps"   # "Map curves off: no GPS yet": once per drive, never once a position came
       return
+    self.had_fix = True
+    self.mc.no_gps = False
     # The road is matched here on the curve files' road shapes (StarPilot's map program publishes no way match; the
     # old FrogPilot MapMatchedWay path read a key that never existed, so it never ran, and is gone).
     self.gps_acc = float(gps_position.get("accuracy", 0.0) or 0.0)
@@ -2820,7 +2859,9 @@ class MapCurvesPlanner:
     ns = getattr(self, "nav_street", None)
     if ns is not None and getattr(self, "now", ns[3]) - ns[3] <= NAV_FRESH:
       plan.mapNavSpeedLimit, plan.mapNavManeuverDistance, plan.mapNavManeuverTurn = ns[0], ns[1], ns[2]
-    if not mc.data_here:
+    if getattr(mc, "no_gps", False):
+      plan.mapCurveStatus = STATUS_NO_GPS
+    elif not mc.data_here:
       plan.mapCurveStatus = STATUS_NO_DATA
     elif mc.paused:
       plan.mapCurveStatus = STATUS_PAUSED
@@ -2876,6 +2917,10 @@ class MapCurvesPlanner:
     plan.mapCurveVetoRadius = float(mc.veto_radius)
     plan.mapCurveSource = int(mc.source)
     plan.mapGpsTrust = int(mc.trust_status)
+    try:
+      plan.mapGpsShakyWhy = int(getattr(mc, "trust_why", SHAKY_NONE)) if int(mc.trust_status) == TRUST_SHAKY else SHAKY_NONE
+    except (AttributeError, ValueError):
+      pass                       # (an older cereal without the field)
     plan.mapGpsAccuracy = float(self.gps_acc)
     plan.mapNavExit = mc.nav_exit
     plan.mapNavExitDistance = float(mc.nav_exit_dist)

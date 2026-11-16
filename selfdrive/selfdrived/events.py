@@ -1333,6 +1333,15 @@ STARPILOT_EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: map_paused_alert,
   },
 
+  # (round T, T1b) the planner has no GPS position yet: map curves cannot work (once per drive, nothing once it comes)
+  StarPilotEventName.mapCurvesNoGps: {
+    ET.PERMANENT: Alert(
+      "Map curves off: no GPS yet",
+      "",
+      StarPilotAlertStatus.starpilot, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 4.),
+  },
+
   # Mazda navigation exit (map curves On): the stock cruise cannot slow enough for the exit's curve (its ~0.9 m/s^2
   # from the exit speed at the split, or from here once on the ramp): the driver brakes. Same chime as the stop warnings.
   StarPilotEventName.mapExitCurveBrake: {

@@ -133,6 +133,7 @@ ADOPT_LANDED_FRAMES = 2         # the street speed reached: adopted this frame a
 HWY_RESET = 1.0                 # s matched to a highway: the exit sequence starts over
 STATUS_CURVE, STATUS_RAMP_CURVE = 1, 2
 STATUS_PAUSED, STATUS_HELD = 4, 5   # the planner's: GPS not trusted / a curve found but the road match not trusted
+STATUS_NO_GPS = 6                   # (round T, T1b) the planner's: no GPS position (map_curves.STATUS_NO_GPS)
 # A ramp curve lost to status 4 / 5 (drive 69 t 529: in the on-ramp loop's entry GPS trust fell to 2, the loop's 30 mph
 # curve became a held 212 m one, and with the camera curve off for his signal the restore held SET+ 31 -> 35 where the
 # car was at ~3.4 m/s^2): while on a link, or for RAMP_STATUS_HOLD after a ramp curve last governed, status 4 / 5 keeps
@@ -1425,7 +1426,7 @@ class MapCurveControl:
         hwy_end = ((self.hwy_ramp_left is not None and self.hwy_ramp_left <= RAMP_STATUS_HWY_RELEASE) or
                    self.ramp_hold_frames >= int(RAMP_STATUS_HOLD_MAX / DT_CTRL))
       # (also a ramp curve matched again whose ramp is not held yet, RAMP_HOLD: drive 69 t 530.8-531.8)
-      lost = f.status in (STATUS_PAUSED, STATUS_HELD) or (f.status == STATUS_RAMP_CURVE and radius <= 0.0)
+      lost = f.status in (STATUS_PAUSED, STATUS_HELD, STATUS_NO_GPS) or (f.status == STATUS_RAMP_CURVE and radius <= 0.0)
       window = on_link or self.ramp_last_frames > 0 or in_loop
       if not a and lost and window and not hwy_end:
         # (RAMP_STATUS_HOLD) its last command, or the set speed when that is above it: no raise, no further SET-

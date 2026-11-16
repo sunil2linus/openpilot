@@ -3099,6 +3099,8 @@ class CurveSlowdown:
       li = LimitInputs(limit=float(getattr(plan, "slcSpeedLimit", 0.0) or 0.0) if plan_alive else 0.0,
                        source=str(getattr(plan, "slcSpeedLimitSource", "") or ""),
                        gps_trust=int(getattr(plan, "mapGpsTrust", 0) or 0), driver_speed=limit_driver,
+                       gps_shaky_why=int(getattr(plan, "mapGpsShakyWhy", 0) or 0) if plan_alive else 0,
+                       gps_acc=float(getattr(plan, "mapGpsAccuracy", 0.0) or 0.0) if plan_alive else 0.0,
                        cruise_enabled=cruise_enabled,
                        road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0,
                        ramp_to_highway=bool(plan_alive and getattr(plan, "mapOnRamp", False) and
@@ -3635,7 +3637,8 @@ class CurveSlowdown:
     if not plan_alive or int(getattr(plan, "mapCurveMode", 0) or 0) <= 0 or int(getattr(plan, "mapRoadClass", 0) or 0):
       return False
     acc = float(getattr(plan, "mapGpsAccuracy", 0.0) or 0.0)
-    no_fix = int(getattr(plan, "mapCurveStatus", 0) or 0) == 3 and acc <= 0.0       # (map_curves.STATUS_NO_DATA)
+    # (map_curves.STATUS_NO_DATA; round T: STATUS_NO_GPS 6, the planner's own "no position" state, the same way)
+    no_fix = int(getattr(plan, "mapCurveStatus", 0) or 0) in (3, 6) and acc <= 0.0
     return bool(no_fix or acc > NOGPS_ACC_MAX)
 
   def _nogps_wait(self, si, lead, v_ego):

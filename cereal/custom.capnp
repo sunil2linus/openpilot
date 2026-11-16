@@ -222,6 +222,7 @@ struct StarPilotOnroadEvent @0xe344718567f9ce71 {
     mazdaSetSpeedHigh @50;
     mazdaCruiseResumed @51;
     mazdaCamFaultCleared @52;
+    mapCurvesNoGps @53;     # (round T, T1b) "Map curves off: no GPS yet", once per drive
   }
 }
 
@@ -274,7 +275,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   slcIsLimitingMaxSet @44 :Bool;  # SLC target is below the configured Max Set
   # Mazda map curves from the curve files (starpilot/controls/lib/map_curves.py)
   mapCurveMode @45 :UInt8;           # 0 off, 1 test, 2 on
-  mapCurveStatus @46 :UInt8;         # 0 none, 1 curve, 2 ramp curve, 3 no curve data here, 4 paused: GPS not trusted, 5 curve held: road match not trusted
+  mapCurveStatus @46 :UInt8;         # 0 none, 1 curve, 2 ramp curve, 3 no curve data here, 4 paused: GPS not trusted, 5 curve held: road match not trusted, 6 no GPS position
   mapCurveDistance @47 :Float32;     # m to the governing curve's entry (0 = in it)
   mapCurveRadius @48 :Float32;       # m (0 = no curve)
   mapCurveName @49 :Text;
@@ -294,7 +295,7 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveVeto @63 :UInt8;           # camera check of map curves: 0 none, 1 a map curve the camera sees as much gentler is ignored, 2 the governing curve was ignored and taken back this drive
   mapCurveVetoRadius @64 :Float32;   # m, the camera's radius of that curve (0 none)
   mapCurveSource @65 :UInt8;         # governing curve's radius from: 0 the map, 1 curve memory (driven passes), 2 a memory speed cap
-  mapGpsTrust @66 :UInt8;            # GPS trust for map curves: 0 ok, 1 shaky, 2 low (curves held), 3 paused: accuracy, 4 paused: not on a known road
+  mapGpsTrust @66 :UInt8;            # GPS trust for map curves: 0 ok, 1 shaky, 2 low (curves held), 3 paused: accuracy, 4 paused: not on a known road, 5 paused: no GPS position
   mapGpsAccuracy @67 :Float32;       # m, the GPS chip's own error estimate (0 unknown)
   # the navigation exit watched past the split (map_curves.MapCurves._watch_update)
   mapExitShape @68 :UInt8;           # 0 no answer, 1 the car matches the highway's shape, 2 the exit link's (position and heading)
@@ -324,6 +325,9 @@ struct StarPilotPlan @0xf98d843bfd7004a3 {
   mapCurveSpeedOffset @89 :Float32;
   mapCurveOffsetState @90 :UInt8;
   mapCurveOffsetCapRadius @91 :Float32;
+  # (round T, T1c, map_curves.SHAKY_*) why mapGpsTrust is 1: 0 it is not 1, 1 only the start of the drive's steady time,
+  # 2 the steady time restarted after a pause or a suspicious gap
+  mapGpsShakyWhy @92 :UInt8;
 }
 
 struct StarPilotRadarState @0xb86e6369214c01c8 {

@@ -22,6 +22,7 @@ from openpilot.common.utils import retry
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.system.hardware.tici.pins import GPIO
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.qcomgpsd.assist_retry import AssistRetryThread
 from openpilot.system.qcomgpsd.modemdiag import ModemDiag, DIAG_LOG_F, setup_logs, send_recv
 from openpilot.system.qcomgpsd.structs import (dict_unpacker, position_quality, position_report, relist,
                                               gps_measurement_report, gps_measurement_report_sv,
@@ -161,9 +162,10 @@ def inject_assistance():
   cmd = f"mmcli -m any --timeout 30 --location-inject-assistance-data={ASSIST_DATA_FILE}"
   subprocess.check_output(cmd, stderr=subprocess.PIPE, shell=True)
   cloudlog.info("successfully loaded assistance data")
+  return True
 
 @retry(attempts=5, delay=1.0)
-def setup_quectel(diag: ModemDiag) -> bool:
+def setup_quectel(diag: ModemDiag, assist_retry: AssistRetryThread | None = None) -> bool:
   ret = False
 
   # enable OEMDRE in the NV
@@ -196,8 +198,10 @@ def setup_quectel(diag: ModemDiag) -> bool:
   at_cmd("AT+QGPSSUPLURL=\"NULL\"")
   if os.path.exists(ASSIST_DATA_FILE):
     ret = True
-    inject_assistance()
-    os.remove(ASSIST_DATA_FILE)
+    # StarPilot (round T, T1a): a failed injection keeps the data for the background retries (assist_retry.py)
+    if inject_assistance() or assist_retry is None or not assist_retry.keep(ASSIST_DATA_FILE):
+      if os.path.exists(ASSIST_DATA_FILE):
+        os.remove(ASSIST_DATA_FILE)
   #at_cmd("AT+QGPSXTRADATA?")
   if system_time_valid():
     time_str = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y/%m/%d,%H:%M:%S")
@@ -261,6 +265,7 @@ def main() -> NoReturn:
 
   wait_for_modem()
 
+  assist_retry = AssistRetryThread(time.monotonic(), log=cloudlog.warning)
   stop_download_event = Event()
   assist_fetch_proc = Process(target=downloader_loop, args=(stop_download_event,))
   assist_fetch_proc.start()
@@ -275,6 +280,7 @@ def main() -> NoReturn:
       cloudlog.warning('quectel not yet setup')
 
     stop_download_event.set()
+    assist_retry.fix()
     assist_fetch_proc.kill()
     assist_fetch_proc.join()
 
@@ -284,7 +290,7 @@ def main() -> NoReturn:
 
   # connect to modem
   diag = ModemDiag()
-  r = setup_quectel(diag)
+  r = setup_quectel(diag, assist_retry)
   want_assistance = not r
   last_failure_code = 0
   cloudlog.warning("quectel setup done")
@@ -295,7 +301,7 @@ def main() -> NoReturn:
 
   while 1:
     if os.path.exists(ASSIST_DATA_FILE) and want_assistance:
-      setup_quectel(diag)
+      setup_quectel(diag, assist_retry)
       want_assistance = False
 
     opcode, payload = diag.recv()
@@ -397,6 +403,7 @@ def main() -> NoReturn:
       if gps.hasFix:
         want_assistance = False
         stop_download_event.set()
+        assist_retry.fix()
       pm.send('gpsLocation', msg)
 
     elif log_type == LOG_GNSS_OEMDRE_SVPOLY_REPORT:

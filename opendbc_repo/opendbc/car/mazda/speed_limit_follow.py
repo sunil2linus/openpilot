@@ -206,6 +206,12 @@ MERGE_SURFACE_MAX_KPH = 90
 # (owner, drive 54: the raise came 382 m before the merge, he was on the gas from 456; now as soon as the window is ready,
 # 2 s: drive 54's would have come at 448.3 at 30 mph, 554 m before the highway's limit)
 MERGE_STABLE_TIME = 2.0      # s
+# Round T, T1c (drive 77 t 112-136: an on-ramp 2 minutes into the drive, trust 1 for the planner's start-of-drive
+# STEADY_TIME, no boost and nothing logged): the merge window (rule 5 only) also opens with GPS trust 1 when the only reason
+# is the start of the drive's steady time (starpilotPlan.mapGpsShakyWhy 1), the car is matched on a link to a highway and
+# the GPS reports an accuracy of at most MERGE_SHAKY_ACC_MAX. A window refused for the trust is logged (once per link).
+MERGE_SHAKY_START = True
+MERGE_SHAKY_ACC_MAX = 15.0   # m (starpilotPlan.mapGpsAccuracy; 0 unknown: not accepted)
 # Owner after drive 69: the merge raise goes to the highway's limit plus this (only rule 5's target; the limit itself is
 # what rules 4 / 5 compare with: the undo, the watch, the offer's end once his speed is there)
 MERGE_OVER_MPH = 5
@@ -388,6 +394,8 @@ class LimitInputs:
   stop_active: bool = False # a stop reason (stopped car, stop ahead, red light head start) is on (rule 6's raise waits)
   red_light: bool = False   # the stop-light detector sees a red light (rule 6's raise waits)
   no_gps: bool = False      # (NOGPS_FALLBACK) no usable position at all (no fix yet / far too poor), not "a road not mapped"
+  gps_shaky_why: int = 0    # (MERGE_SHAKY_START) starpilotPlan.mapGpsShakyWhy: 1 trust 1 only for the start of the drive
+  gps_acc: float = 0.0      # (MERGE_SHAKY_START) starpilotPlan.mapGpsAccuracy, m (0 unknown)
 
 
 @dataclass
@@ -476,6 +484,7 @@ class SpeedLimitFollower:
     self.cruise_on_frame = -10_000  # the frame cruise last came on
     self.ramp_next = None          # the next limit ahead on this link (steps; RAMP_START: a highway's is known)
     self.merge_logged = None       # (link start frame, reason) of the last merge refusal logged (M3)
+    self.merge_waits = set()       # (round T) (link start frame, reason) of the merge waits logged
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
     self.rise_retry = None         # rule 1: (old, new, frame) refused only for the GPS trust: tried again once trust is 0
@@ -1025,10 +1034,13 @@ class SpeedLimitFollower:
       if not ready:
         self.merge_window = None     # (once steady, a drop of the next limit only waits: slcNextSpeedLimit flickers)
       return
-    if w is None or w[0] != n or abs(w[1] - d) >= 0.5 or (not ready and i.gps_trust > LIMIT_FIRM_TRUST_MAX):
+    trust_ok = i.gps_trust <= LIMIT_FIRM_TRUST_MAX or self._merge_start_trust(i)
+    if w is None or w[0] != n or abs(w[1] - d) >= 0.5 or (not ready and not trust_ok):
       # trust 0 is needed for the steady time only: near the merge the highway runs next to the ramp and the trust
-      # drops (drive 53: 2 from 200 m before both merges)
-      self.merge_window = (n, d, self.frame) if i.gps_trust <= LIMIT_FIRM_TRUST_MAX else None
+      # drops (drive 53: 2 from 200 m before both merges); (MERGE_SHAKY_START) or the start of the drive's trust 1
+      self.merge_window = (n, d, self.frame) if trust_ok else None
+      if not trust_ok:
+        self._merge_wait(n, f"GPS trust {i.gps_trust} (waiting)")
       return
     if not ready:
       return
@@ -1061,6 +1073,21 @@ class SpeedLimitFollower:
     self.last_next = (i.next_limit, self.next_dist if self.next_dist is not None else -1.0)
     old = self.stable if (self.stable is not None and self.frame - self.stable_last_seen <= _frames(LIMIT_OLD_MAX_AGE)) else None
     self.offer = Offer(old if old is not None and old < n else round(d), n, "Map Data", self.frame, "merge", d, tgt=tgt)
+
+  def _merge_start_trust(self, i):
+    """(MERGE_SHAKY_START) GPS trust 1 only for the start of the drive's steady time, on a link to a highway, with a
+    reported accuracy of at most MERGE_SHAKY_ACC_MAX."""
+    return bool(MERGE_SHAKY_START and i.gps_trust == 1 and int(i.gps_shaky_why) == 1 and self.road in LINK_CLASSES and
+                self.link_to_hwy and 0.0 < float(i.gps_acc) <= MERGE_SHAKY_ACC_MAX)
+
+  def _merge_wait(self, n, why):
+    """(round T) a merge window not opened (yet): logged once per link and reason, never silent."""
+    key = (self.link_start, why)
+    if key not in self.merge_waits:
+      self.merge_waits.add(key)
+      if len(self.merge_waits) > 64:
+        self.merge_waits = {key}
+      self._not_followed(None, n, "Map Data", "merge: " + why)
 
   def _new_limit(self, i, d):
     new, start = self.candidate, self.frame - self.candidate_frames    # start: the new limit's first frame
