@@ -109,12 +109,18 @@ CAM_PATH_SHORT = 0.8            # the model's path must reach this share of the 
 # on-ramp to a highway (CamInputs.hwy_ramp), the owner's case. There the planner lets the loop go RAMP_HWY_RELEASE (120 m)
 # before its end: the apex is then unknown, so no taps and no relaxed keep in the loop's last 120 m (the set back under
 # the normal limits).
+# Round T, T4 (drive 77, the loop on the gas with the car steering: its tight entry, real R 63-68 m, limited to ~30 mph with
+# the command clipped 3.5 s at 2.6-2.8 m/s^2; its second part, R 90-97 m, held 36-40 mph at 2.9-3.4 m/s^2 with the command
+# 0.65-0.95, not saturated): up to CAM_POST_APEX_OVER 5 mph over the plan (was 3), the taps' predicted lateral up to 2.9
+# (was 2.3); the torque median (CAM_POST_TORQUE) and the saturation share unchanged. With the Curve Speed Offset: still
+# plan + max(offset, CAM_POST_APEX_OVER), never the sum.
 CAM_POST_APEX = True
-CAM_LAT_POST_APEX = 2.3         # m/s^2
-CAM_POST_APEX_OVER = 3 * MS_PER_MPH
+CAM_LAT_POST_APEX = 2.9         # m/s^2
+CAM_POST_APEX_OVER = 5 * MS_PER_MPH
 # Re-review of round R (F3 minor): the same on the car's side, whatever the planner does: no taps / relaxed keep with the
 # ramp's end (CamInputs.ramp_left, the planner's mapRampEndDistance as the map control keeps it) within CAM_POST_RAMP_END
-CAM_POST_RAMP_END = 120.0       # m
+# (round T, T4: 120 -> 60 m; the owner's loop ends ~64 m before its ramp's end, so 120 m took the gain away there)
+CAM_POST_RAMP_END = 60.0        # m
 CAM_POST_PEAK_DROP = 0.3        # m/s^2
 CAM_POST_PEAK_TIME = 1.0        # s
 CAM_POST_TORQUE = 0.85

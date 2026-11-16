@@ -108,11 +108,12 @@ def _post_apex_cam(gov_mph, offset_mph):
 
 
 def test_the_post_apex_taps_and_the_offset_together_never_pass_the_plan_plus_3():
-  # base: the plan 30 (no offset), taps to 33; with +2 in the plan (32): still 33 at most (plan + max(+3, offset))
-  assert abs(_post_apex_cam(30.0, 0.0) - 33.0) < 1e-6
-  assert _post_apex_cam(32.0, 2.0) <= 33.0 + 1e-6
-  assert _post_apex_cam(34.0, 4.0) <= 34.0 + 1e-6       # (the offset alone, already capped by the planner's 2.3 m/s^2)
-  assert abs(_post_apex_cam(32.0, 0.0) - 35.0) < 1e-6     # (what the same plan without the offset in it would allow)
+  # (round T, T4: the allowance is now 5 mph) base: the plan 30 (no offset), taps to 35; with +2 in the plan (32): still 35
+  # at most (plan + max(+5, offset))
+  assert abs(_post_apex_cam(30.0, 0.0) - 35.0) < 1e-6
+  assert _post_apex_cam(32.0, 2.0) <= 35.0 + 1e-6
+  assert _post_apex_cam(34.0, 4.0) <= 35.0 + 1e-6
+  assert abs(_post_apex_cam(32.0, 0.0) - 37.0) < 1e-6     # (what the same plan without the offset in it would allow)
 
 
 # ---------------- the planner's real publish path ----------------

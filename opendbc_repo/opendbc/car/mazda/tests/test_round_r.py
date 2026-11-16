@@ -559,15 +559,17 @@ def _loop_cam(seconds=6.0, v_mph=30.5, set_mph=30.0, lat=2.0, apex=-30.0, torque
 
 
 def test_r7_past_the_apex_and_the_peak_taps_up_to_3_mph_over_the_plan():
+  # (round T, T4: up to CAM_POST_APEX_OVER, now 5 mph)
   taps, s = _loop_cam()
   assert taps and taps[0] >= 300, taps[:2]                              # (the tight part 2 s, then the peak + 1 s)
-  assert s <= 30.0 + 3 + 1e-6 and s >= 31.0 - 1e-6, s                    # up to the map plan + 3, the speed + 1 at most
+  assert s <= 30.0 + 5 + 1e-6 and s >= 31.0 - 1e-6, s                    # up to the map plan + 5, the speed + 1 at most
   assert all(b - a >= 50 for a, b in zip(taps, taps[1:], strict=False))   # at most every 0.5 s
 
 
 def test_r7_no_taps_before_the_apex_unknown_apex_too_little_reserve_or_the_ti_alone():
   # (F3) a ramp that does not lead to a highway: never
-  for kw in (dict(apex=15.0), dict(apex=None), dict(torque=0.9), dict(lat=2.3), dict(ti_only=True), dict(hwy_ramp=False)):
+  # (round T, T4: the lateral limit 2.9, so 2.9 is the "too much" case now)
+  for kw in (dict(apex=15.0), dict(apex=None), dict(torque=0.9), dict(lat=2.9), dict(ti_only=True), dict(hwy_ramp=False)):
     taps, s = _loop_cam(**kw)
     assert not taps, kw
   # the lateral not past its peak (the loop's second part as tight as the first): none
@@ -765,7 +767,8 @@ def test_r8_rereview_the_no_gps_offer_expires_120_s_after_the_engagement(tmp_pat
 
 
 def test_r7_rereview_no_taps_within_120_m_of_the_ramps_end_whatever_the_planner_does():
-  taps, s = _loop_cam(ramp_left=100.0)
+  # (round T, T4: CAM_POST_RAMP_END 120 -> 60 m)
+  taps, s = _loop_cam(ramp_left=50.0)
   assert not taps
   taps, s = _loop_cam(ramp_left=200.0)
   assert taps

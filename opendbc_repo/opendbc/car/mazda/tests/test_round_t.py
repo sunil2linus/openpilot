@@ -344,3 +344,37 @@ def test_t3c_the_notice_shows_the_car_sides_own_target():
   f.status, f.radius = 0, 0.0
   c.update(f, 45 * MPH, 0, v_ego=30 * MPH)
   assert c.target_now == 0.0
+
+
+# ---------------- T4: the loop's second part, past the apex: more room ----------------
+
+CCm = _load("camera_curve_round_t", os.path.join("..", "camera_curve.py"))
+TR = _load("trr_round_t", "test_round_r.py")
+
+
+def test_t4_the_new_post_apex_limits():
+  assert abs(CCm.CAM_POST_APEX_OVER - 5 * MPH) < 1e-9 and CCm.CAM_LAT_POST_APEX == 2.9 and CCm.CAM_POST_RAMP_END == 60.0
+  assert CCm.CAM_POST_TORQUE == 0.85                               # unchanged
+
+
+def test_t4_taps_up_to_plan_plus_5_at_a_lateral_the_old_limit_refused():
+  # the second part at 2.3 m/s^2 (margin-corrected and predicted at v + 1: over the old 2.3, under 2.9; under CAM_OVER):
+  # taps now, at most the plan + 5
+  taps, s = TR._loop_cam(seconds=12.0, lat=2.3, peak_first=3.0)
+  assert taps and s <= 30.0 + 5 + 1e-6
+  TS = _load("trs_round_t0", "test_round_s.py")
+  assert abs(TS._post_apex_cam(30.0, 0.0) - 35.0) < 1e-6            # the car following the set: plan + 5 exactly
+  # the torque median, the TI alone, before the apex: as before
+  for kw in (dict(torque=0.9), dict(ti_only=True), dict(apex=15.0)):
+    assert not TR._loop_cam(**kw)[0], kw
+
+
+def test_t4_the_ramp_end_rule_is_60_m():
+  assert TR._loop_cam(ramp_left=64.0)[0]                           # the owner's loop: ~64 m before the ramp's end
+  assert not TR._loop_cam(ramp_left=59.0)[0]
+
+
+def test_t4_with_the_offset_plan_plus_max_offset_5_never_the_sum():
+  TS = _load("trs_round_t", "test_round_s.py")
+  assert TS._post_apex_cam(32.0, 2.0) <= 35.0 + 1e-6               # 30 + max(2, 5)
+  assert TS._post_apex_cam(30.0 + 5.0, 5.0) <= 35.0 + 1e-6         # 30 + max(5, 5), not 30 + 10
