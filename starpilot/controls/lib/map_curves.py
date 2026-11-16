@@ -59,27 +59,55 @@ def ramp_radius(c):
 # It is published as its own field (starpilotPlan.mapCurveSpeedOffset, m/s granted) next to the unchanged radius, and the car
 # side adds it where the map curve's speed is made (map_curve_control: the approach, the hold, the follower, the floors, the
 # camera's caps all come from that one number), except TI-only (the stock LKAS blocked / the camera's fault) and Test.
-#   A (lateral cap): never above CURVE_OFFSET_LAT on the radius the plan is based on: a road curve's planning radius (the
-#     map's, or the curve memory's learned one), a ramp curve's map radius UNscaled (ramp_radius' RAMP_LAT is not stacked
-#     on), or, once the ramp memory has RAMP_MEMORY_MIN_PASSES agreeing clean passes, the tighter of its last two measured
-#     radii. A curve already planned at or above CURVE_OFFSET_LAT on that radius gets nothing (every ramp curve on its map
-#     radius: 2.6 > 2.3). Never above its yellow sign + ADVISORY_OVER either.
+#   A (lateral cap, the setting MazdaCurveOffsetLat, CURVE_OFFSET_LATS): never above the cap on the radius the plan is based
+#     on: a road curve's planning radius (the map's, or the curve memory's learned one), a ramp curve's map radius UNscaled
+#     (ramp_radius' RAMP_LAT is not stacked on), or, once the ramp memory has RAMP_MEMORY_MIN_PASSES agreeing clean passes,
+#     the tighter of its last two measured radii. A curve already planned at or above the cap on that radius gets nothing (a
+#     ramp curve on its map radius with the cap at 2.6 or less). Never above its yellow sign + ADVISORY_OVER, never more
+#     than the setting. A ramp / link curve only with OFFSET_CLEAN_PASSES clean passes recorded this way.
 #   B (proved too tight): a pass through the curve with the offset granted that ends with the steering at its limit (as the
 #     ramp memory: > PASS_SAT_BLIP at PASS_SATURATED), his steering or his brake in the curve, "Turn Exceeds Steering Limit",
-#     or the measured lateral (1 s average, + OFFSET_MEAS_MARGIN) at CURVE_OFFSET_MARK_LAT or more stores a "no offset" mark
+#     or the measured lateral (1 s average, + OFFSET_MEAS_MARGIN) at offset_mark_lat(cap) or more stores a "no offset" mark
 #     in that curve's memory record (its own way id and the direction of travel, as the ghost marks; the record lives on the
 #     device only). Kept until curve memory is cleared (a mark costs at most this setting on one curve one way).
 #   Nothing (as with the setting 0) with the GPS trust not OK, the direction of travel unknown, no curve memory, any ghost
 #   mark or camera veto on the curve, a memory speed cap (the steering maxed out there), an on-ramp's curve before the turn.
-CURVE_OFFSET_LAT = 2.3        # m/s^2
+# Owner, after round S: the cap is a setting, MazdaCurveOffsetLat (an index into CURVE_OFFSET_LATS, default 2.5; a missing or
+# bad value: the default), read at the start of a drive. Above RAMP_LAT a ramp / link curve gets an offset too, but only once
+# its curve memory holds OFFSET_CLEAN_PASSES clean passes this way (the car has shown it holds the plan there: ~10 % of loop
+# entries and ramp-end turns are tighter than mapped); road curves need none.
+CURVE_OFFSET_LATS = (2.0, 2.5, 3.0, 3.5, 4.0)   # m/s^2
+CURVE_OFFSET_LAT_DEFAULT = 1                    # index: 2.5
+CURVE_OFFSET_LAT = CURVE_OFFSET_LATS[CURVE_OFFSET_LAT_DEFAULT]
+OFFSET_CLEAN_PASSES = 2
+# the lateral trigger of a mark: CURVE_OFFSET_MARK_LAT with the cap at most CURVE_OFFSET_MARK_UPTO, else the cap + this (a
+# high cap does not mark every curve it allows; the saturation / his steering / brake / the alert triggers stay)
+CURVE_OFFSET_MARK_UPTO = 2.5
+CURVE_OFFSET_MARK_OVER = 0.3
 CURVE_OFFSET_MAX = 5          # setting 0..5 (mph steps; km/h: CURVE_OFFSET_KPH)
 CURVE_OFFSET_KPH = (0, 2, 3, 5, 6, 8)
 CURVE_OFFSET_MARK_LAT = 2.6   # m/s^2, margin-corrected: a pass this hard removes the offset there
 OFFSET_MEAS_MARGIN = 0.15     # m/s^2: the wheel angle's lateral reads low in curves (camera_curve.CAM_MEAS_MARGIN)
 # starpilotPlan.mapCurveOffsetState: 0 off (setting 0, no curve), 1 granted (cap on the map's radius), 2 granted (cap on a
 # measured / learned radius), 3 none: the curve's "no offset" mark, 4 none: not eligible (GPS, ghost, veto, cap, direction),
-# 5 none: the lateral cap leaves nothing
-OFS_OFF, OFS_MAP, OFS_MEMORY, OFS_MARK, OFS_NOT, OFS_CAP = 0, 1, 2, 3, 4, 5
+# 5 none: the lateral cap leaves nothing, 6 none: a ramp / link curve without OFFSET_CLEAN_PASSES clean passes yet
+OFS_OFF, OFS_MAP, OFS_MEMORY, OFS_MARK, OFS_NOT, OFS_CAP, OFS_PASSES = 0, 1, 2, 3, 4, 5, 6
+
+
+def curve_offset_lat(raw):
+  """m/s^2: the cap the setting MazdaCurveOffsetLat chooses (CURVE_OFFSET_LATS; missing or bad: the default)."""
+  try:
+    if isinstance(raw, bytes):
+      raw = raw.decode()
+    n = int(str(raw)) if raw not in (None, "") else CURVE_OFFSET_LAT_DEFAULT    # (an index, never a value such as "2.5")
+  except (TypeError, ValueError, UnicodeDecodeError):
+    n = CURVE_OFFSET_LAT_DEFAULT
+  return CURVE_OFFSET_LATS[n] if 0 <= n < len(CURVE_OFFSET_LATS) else CURVE_OFFSET_LATS[CURVE_OFFSET_LAT_DEFAULT]
+
+
+def offset_mark_lat(cap):
+  """m/s^2 (margin-corrected) a pass's measured lateral marks its curve at, with the cap `cap`."""
+  return CURVE_OFFSET_MARK_LAT if cap <= CURVE_OFFSET_MARK_UPTO + 1e-9 else cap + CURVE_OFFSET_MARK_OVER
 
 
 def curve_offset_setting(raw, metric=False):
@@ -1255,6 +1283,21 @@ class CurveMemory:
     except (KeyError, TypeError, IndexError, ValueError, AttributeError):
       return None
 
+  def clean_passes(self, c, direction=None):
+    """(OFFSET_CLEAN_PASSES) the clean passes recorded through `c` this way: full, openpilot steering, no saturation, his
+    steering or brake, no steering alert (a ramp curve's: its ramp passes, which a bad pass clears); 0 without a direction."""
+    try:
+      if direction is None:
+        return 0
+      e = self._find(*c["apex"], direction)
+      if e is None or e.get("dir") is None:
+        return 0
+      bad = {"alert", "brake"}
+      return sum(1 for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 4 and "full" in (p[3] or []) and
+                 not bad & set(p[3] or []) and (not c.get("ramp") or "ramp" in (p[3] or [])))
+    except (KeyError, TypeError, ValueError, IndexError):
+      return 0
+
   def no_offset(self, c, direction=None, way=0):
     """(CURVE_OFFSET_*) the curve's "no offset" mark for `direction` on way `way` (0: any): its reason, or "" for none."""
     try:
@@ -1669,6 +1712,7 @@ class MapCurves:
     self.onramp_keep = None      # [s left, curve, ramp start (lat, lon), m from the start to the curve] (ONRAMP_KEEP)
     self.nav_all = []            # navigation's first maneuvers (ONRAMP_NAV_ALL)
     self.offset_set = 0.0        # (CURVE_OFFSET_*) m/s the setting asks for (the planner sets it at the start of a drive)
+    self.offset_lat = CURVE_OFFSET_LAT   # m/s^2: the cap (MazdaCurveOffsetLat, set with it)
     self._ofs = {}               # id(curve) -> this update's (granted m/s, state, cap radius m)
     self._ofs_mem = {}           # (id(curve), direction, id(memory), setting) -> (memory gen, curve, the memory's part)
     self.reset()
@@ -1869,7 +1913,7 @@ class MapCurves:
       if self.veto.is_vetoed(key) or self.veto.flips(key) > 0:
         return 0.0, OFS_NOT, 0.0
       # what the curve memory says (a few scans of its records): kept until the memory changes
-      mkey, gen = (id(c), d, id(mem), self.offset_set), getattr(mem, "gen", None)
+      mkey, gen = (id(c), d, id(mem), self.offset_set, self.offset_lat), getattr(mem, "gen", None)
       hit = self._ofs_mem.get(mkey)
       if gen is not None and hit is not None and hit[0] == gen and hit[1] is c:
         return hit[2]
@@ -1887,6 +1931,9 @@ class MapCurves:
     try:
       if mem.ghost(c, d, way=curve_way(c)) > 0 or mem.speed_cap(c, d) is not None:
         return 0.0, OFS_NOT, 0.0
+      link = bool(c.get("ramp")) or int(c.get("cls", 0) or 0) in LINK_CLASSES
+      if link and mem.clean_passes(c, d) < OFFSET_CLEAN_PASSES:
+        return 0.0, OFS_PASSES, 0.0             # (a ramp / link curve: the car has not shown it holds the plan there yet)
       if c.get("ramp"):
         measured = mem.ramp_measured(c, d)
         r_cap, state = (measured, OFS_MEMORY) if measured is not None else (float(c["r"]), OFS_MAP)
@@ -1899,7 +1946,7 @@ class MapCurves:
         return 0.0, OFS_MARK, r_cap
       adv = float(c.get("adv", 0.0) or 0.0)
       v_base = curve_speed_limit(self._radius(c), adv)
-      room = math.sqrt(CURVE_OFFSET_LAT * r_cap) - v_base
+      room = math.sqrt(self.offset_lat * r_cap) - v_base
       if adv > 0:
         room = min(room, adv + ADVISORY_OVER - v_base)
       g = min(self.offset_set, room)
@@ -2325,6 +2372,7 @@ class MapCurvesPlanner:
     self.held_logged = set()
     self.gps_acc, self.gps_rel = 0.0, 0
     self.offset_set = 0.0       # (CURVE_OFFSET_*) m/s, read with the mode
+    self.offset_lat = CURVE_OFFSET_LAT   # m/s^2, the cap (MazdaCurveOffsetLat), read with the mode
     self.offset_events = []     # (CURVE_OFFSET_*) curveOffsetRemoved events for the feature log
 
   def _read_mode(self):
@@ -2348,9 +2396,14 @@ class MapCurvesPlanner:
       self.offset_set = curve_offset_setting(self.params.get("MazdaCurveSpeedOffset", encoding="utf8"), self.metric)
     except Exception:
       self.offset_set = 0.0
+    try:
+      self.offset_lat = curve_offset_lat(self.params.get("MazdaCurveOffsetLat", encoding="utf8"))
+    except Exception:
+      self.offset_lat = CURVE_OFFSET_LAT
     if self.mc is not None:
       self.mc.decel = self.decel
       self.mc.offset_set = self.offset_set
+      self.mc.offset_lat = self.offset_lat
 
   @staticmethod
   def _signal(sm):
@@ -2397,6 +2450,7 @@ class MapCurvesPlanner:
       # for whatever is left of the curve, and the next curve keeps governing when it is close)
       self.mc = MapCurves(release_after_apex=self.params.get_bool("MazdaCurveSlowdown"), memory=CurveMemory(), decel=self.decel)
       self.mc.offset_set = getattr(self, "offset_set", 0.0)
+      self.mc.offset_lat = getattr(self, "offset_lat", CURVE_OFFSET_LAT)
       self.pass_curve, self.pass_samples = None, []
       self.matcher = RoadMatcher(self.mc.store)
     elif started:
@@ -2637,7 +2691,7 @@ class MapCurvesPlanner:
     lats = [v * v * abs(k) for v, k, _, _, _ in samples]
     n = max(int(round(PASS_FILTER / PASS_DT)), 1)
     peak = max((sum(lats[j:j + n]) / n for j in range(len(lats) - n + 1)), default=max(lats, default=0.0))
-    if peak + OFFSET_MEAS_MARGIN >= CURVE_OFFSET_MARK_LAT:
+    if peak + OFFSET_MEAS_MARGIN >= offset_mark_lat(getattr(self.mc, "offset_lat", CURVE_OFFSET_LAT)):
       return "lateral"
     return ""
 
@@ -2729,6 +2783,8 @@ class MapCurvesPlanner:
     if r is not None:
       full = self.pass_exit <= PASS_EXIT_NEAR or getattr(self, "pass_stop_cut", False)
       flags = (["full"] if full else []) + (["vetoed"] if self.pass_vetoed else [])
+      # (OFFSET_CLEAN_PASSES) the steering alert or his brake in it: kept as before, not a clean pass for the offset
+      flags += (["alert"] if getattr(self, "pass_alert", False) else []) + (["brake"] if getattr(self, "pass_brake", False) else [])
       if c.get("ramp"):
         self.mc.memory.add_ramp_pass(c, r, direction, v=curve_pass_speed(samples), flags=flags)
       else:

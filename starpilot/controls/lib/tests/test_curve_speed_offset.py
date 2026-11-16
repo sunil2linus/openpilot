@@ -63,51 +63,80 @@ def test_the_setting_in_mph_and_km_h_steps_and_bad_values_are_off():
   assert mp.offset_set == 0.0
 
 
-def test_a_road_curve_gets_the_offset_only_up_to_2p3_on_its_planning_radius(tmp_path):
-  m = _mc(str(tmp_path))
-  for r in (60, 90, 131, 142, 200, 400, 800):
-    c = _curve(r, k=r)
-    g, st, rc = m._offset(c)
-    v = math.sqrt(MC.PLAN_LAT * r)
-    assert st == MC.OFS_MAP and rc == r
-    assert abs(g - min(4 * MPH, math.sqrt(MC.CURVE_OFFSET_LAT * r) - v)) < 1e-9, (r, g)
-    assert (v + g) ** 2 / r <= MC.CURVE_OFFSET_LAT + 1e-9
-  # (the cap leaves ~2.2 % of the curve's speed on its own planning radius: +1 mph at ~46 mph, the full +4 only past 180 mph)
-  assert m._offset(_curve(200, k=1))[0] < 1.1 * MPH
-  m.offset_set = MC.curve_offset_setting(1)
-  assert m._offset(_curve(200, k=3))[0] == min(1 * MPH, math.sqrt(2.3 * 200) - math.sqrt(2.2 * 200))
-  m.offset_set = MC.curve_offset_setting(4)
+def test_the_cap_setting_each_option_the_default_and_bad_values():
+  assert [MC.curve_offset_lat(n) for n in range(5)] == [2.0, 2.5, 3.0, 3.5, 4.0]
+  assert [MC.curve_offset_lat(str(n)) for n in range(5)] == [2.0, 2.5, 3.0, 3.5, 4.0]
+  for bad in (None, "", "x", -1, 5, "25", "2.5", 2.5):
+    assert MC.curve_offset_lat(bad) == 2.5, bad
+  for raw, want in (("2", 3.0), (None, 2.5), ("9", 2.5)):
+    mp = MC.MapCurvesPlanner(P({"MazdaMapCurves": "2", "MazdaCurveSpeedOffset": "4", "MazdaCurveOffsetLat": raw}), P())
+    mp.mc = MC.MapCurves(MC.MapCurveStore(tempfile.mkdtemp(), background=False))
+    mp._read_mode()                                    # (at the start of a drive: the planner and its map curves)
+    assert mp.offset_lat == want and mp.mc.offset_lat == want
+
+
+def test_a_road_curve_gets_the_offset_up_to_the_cap_on_its_planning_radius_never_more_than_the_setting(tmp_path):
+  for cap in (2.0, 2.5, 3.0, 4.0):
+    m = _mc(tempfile.mkdtemp())
+    m.offset_lat = cap
+    for r in (60, 90, 131, 142, 200, 400):
+      c = _curve(r, k=r)
+      g, st, rc = m._offset(c)
+      v = math.sqrt(MC.PLAN_LAT * r)
+      want = max(min(4 * MPH, math.sqrt(cap * r) - v), 0.0)
+      assert abs(g - want) < 1e-9, (cap, r, g)
+      assert st == (MC.OFS_MAP if want > 0 else MC.OFS_CAP) and rc == r
+      assert g <= 4 * MPH + 1e-12 and ((v + g) ** 2 / r <= cap + 1e-9 or g == 0.0)
+  # cap 4.0: the setting in full on every road curve of these radii (the worst case: plan + 4 mph)
+  m = _mc(tempfile.mkdtemp())
+  m.offset_lat = 4.0
+  assert all(m._offset(_curve(r, k=r))[0] == 4 * MPH for r in (60, 90, 131, 200))
   # the memory's learned radius: the plan and its cap on it (two agreeing clean passes)
+  m = _mc(str(tmp_path))
   c = _curve(131, k=2)
   _passes(m, c, 157.0)
-  m._ofs = {}
   g, st, rc = m._offset(c)
-  assert st == MC.OFS_MEMORY and abs(rc - 157.0) < 0.5 and abs((math.sqrt(2.2 * rc) + g) ** 2 / rc - 2.3) < 1e-6
+  assert st == MC.OFS_MEMORY and abs(rc - 157.0) < 0.5 and abs((math.sqrt(2.2 * rc) + g) ** 2 / rc - 2.5) < 1e-6
 
 
-def test_a_ramp_curve_gets_nothing_on_its_map_radius_and_its_measured_radius_after_clean_passes(tmp_path):
-  m = _mc(str(tmp_path))
-  for r in (60, 71, 100, 200):
-    g, st, rc = m._offset(_curve(r, ramp=True, k=r))
-    assert g == 0.0 and st == MC.OFS_CAP and rc == r             # (planned at 2.6 on it already: the cap leaves nothing)
-  # exit 46's second curve (map 100, really ~116): the ramp memory plans it faster itself, the cap still leaves nothing
-  c = _curve(100, ramp=True, k=1)
-  _passes(m, c, 116.0)
+def test_a_ramp_curve_needs_two_clean_passes_and_its_cap_is_on_the_measured_radius(tmp_path):
+  for cap in (2.5, 4.0):
+    m = _mc(tempfile.mkdtemp())
+    m.offset_lat = cap
+    for r in (60, 71, 100, 200):
+      assert m._offset(_curve(r, ramp=True, k=r)) == (0.0, MC.OFS_PASSES, 0.0)      # (no clean passes: nothing at any cap)
+    c = _curve(90, ramp=True, k=3)
+    _passes(m, c, 92.0, n=1)
+    assert m._offset(c)[:2] == (0.0, MC.OFS_PASSES)                                # (one pass)
+  # exit 46's second curve (map 100, really ~116), two clean passes: up to the cap on 116 m
+  for cap, lo, hi in ((2.5, 1.0, 1.5), (3.0, 3.5, 4.0), (4.0, 4.0, 4.0)):
+    m = _mc(tempfile.mkdtemp())
+    m.offset_lat = cap
+    c = _curve(100, ramp=True, k=1)
+    _passes(m, c, 116.0)
+    g, st, rc = m._offset(c)
+    assert st == MC.OFS_MEMORY and abs(rc - 116) < 0.5 and lo * MPH - 1e-9 <= g <= hi * MPH + 1e-9, (cap, g / MPH)
+    assert (math.sqrt(2.2 * m._radius(c)) + g) ** 2 / 116.0 <= cap + 1e-9
+  # a pass with the steering alert or his brake recorded: not clean (the ramp memory itself is unchanged by them)
+  m = _mc(tempfile.mkdtemp())
+  m.offset_lat = 3.0
+  c = _curve(100, ramp=True, k=4)
+  d = m.direction(c)
+  m.memory.add_ramp_pass(c, 116.0, d, t=1000.0, v=15.0, flags=["full"])
+  m.memory.add_ramp_pass(c, 116.0, d, t=2000.0, v=15.0, flags=["full", "alert"])
+  assert m.memory.ramp_radius(c, d) is not None and m.memory.clean_passes(c, d) == 1
+  assert m._offset(c)[:2] == (0.0, MC.OFS_PASSES)
+  m.memory.add_ramp_pass(c, 116.0, d, t=3000.0, v=15.0, flags=["full"])
+  m._ofs = {}                                       # (the next planner update)
+  assert m._offset(c)[0] > 0
+  # a saturated pass (the ramp memory clears its passes): back to none, e.g. the M-59 loop
+  m.memory.clear_ramp(c, d)
   m._ofs = {}
-  g, st, rc = m._offset(c)
-  assert m.memory.ramp_radius(c, m.direction(c)) is not None and g == 0.0 and st == MC.OFS_CAP and abs(rc - 116) < 0.5
-  # measured much gentler than the map (map 90, two clean passes at 135 m): the offset up to 2.3 on the measured radius
-  c = _curve(90, ramp=True, k=2)
-  _passes(m, c, 135.0)
-  m._ofs = {}
-  g, st, rc = m._offset(c)
-  v = math.sqrt(MC.PLAN_LAT * m._radius(c))
-  assert st == MC.OFS_MEMORY and rc == 135.0 and 2.0 * MPH < g < 4 * MPH and abs((v + g) ** 2 / 135.0 - 2.3) < 1e-6
-  # one pass only: the map's radius
-  c = _curve(90, ramp=True, k=3)
-  _passes(m, c, 135.0, n=1)
-  m._ofs = {}
-  assert m._offset(c)[:2] == (0.0, MC.OFS_CAP)
+  assert m._offset(c)[:2] == (0.0, MC.OFS_PASSES)
+  # a road curve on a link road (no ramp flag) needs them too; a road curve does not
+  m = _mc(tempfile.mkdtemp())
+  assert m._offset(dict(_curve(400, k=5), cls=2))[:2] == (0.0, MC.OFS_PASSES)
+  assert m._offset(_curve(400, k=6))[0] > 0
 
 
 def test_never_with_the_setting_0_untrusted_gps_unknown_direction_a_veto_a_ghost_mark_a_speed_cap_or_no_memory(tmp_path):
@@ -195,6 +224,36 @@ def test_a_pass_that_proved_the_curve_too_tight_marks_it_for_that_direction_only
   m.increasing = True
   assert m2.no_offset(c, m.direction(c), way=MC.curve_way(c)) == "lateral"
   assert m2.no_offset(c, m.direction(c), way=999) == ""           # (another way's: not this curve's)
+
+
+def test_the_lateral_mark_is_2p6_up_to_a_cap_of_2p5_then_the_cap_plus_0p3_the_other_triggers_stay():
+  assert [MC.offset_mark_lat(c) for c in (2.0, 2.5)] == [2.6, 2.6]
+  assert [round(MC.offset_mark_lat(c), 3) for c in (3.0, 3.5, 4.0)] == [3.3, 3.8, 4.3]
+  for cap, lat, marked in ((2.5, 2.55, False), (2.5, 2.7, True), (3.0, 2.7, False), (3.0, 3.2, False), (3.0, 3.4, True), (4.0, 4.2, False), (4.0, 4.4, True)):
+    m = _mc(tempfile.mkdtemp())
+    m.offset_lat = cap
+    c = _curve(400)
+    v = 17.0
+    _finish(m, c, _samples(v * v / (lat - MC.OFFSET_MEAS_MARGIN), v=v))
+    assert bool(m.memory.no_offset(c, m.direction(c))) == marked, (cap, lat)
+  for kw in (dict(samples=_samples(400, sat_s=0.2)), dict(samples=_samples(400, driver=True)), dict(alert=True), dict(brake=True)):
+    m = _mc(tempfile.mkdtemp())
+    m.offset_lat = 4.0
+    c = _curve(400)
+    samples = kw.pop("samples", _samples(400))
+    _finish(m, c, samples, **kw)
+    assert m.memory.no_offset(c, m.direction(c)), kw
+
+
+def test_passes_record_the_alert_and_his_brake_as_not_clean(tmp_path):
+  m = _mc(str(tmp_path))
+  c = _curve(150)
+  for k, kw in enumerate((dict(alert=True), dict(brake=True), dict())):
+    mp = _finish(m, c, _samples(150), ofs=0.0, **kw)
+    mp.mc.memory.entries[-1]["passes"][-1][1] = 1000.0 * k          # (separate passes in time)
+  flags = [p[3] for p in m.memory._find(*c["apex"], m.direction(c))["passes"]]
+  assert flags[0] == ["alert", "full"] and flags[1] == ["brake", "full"] and flags[2] == ["full"], flags
+  assert m.memory.clean_passes(c, m.direction(c)) == 1
 
 
 def test_a_clean_pass_a_pass_without_the_offset_or_with_his_signal_marks_nothing(tmp_path):

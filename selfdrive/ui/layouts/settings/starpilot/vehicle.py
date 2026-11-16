@@ -537,6 +537,14 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_value": get_value,
       "on_click": on_click,
     })
+    get_value, on_click = choice("MazdaCurveOffsetLat", (tr_noop("2.0 m/s²"), tr_noop("2.5 m/s²"), tr_noop("3.0 m/s²"),
+                                                         tr_noop("3.5 m/s²"), tr_noop("4.0 m/s²")), 1)
+    tiles.append({
+      "title": tr("Curve Offset Side-Force Limit"),
+      "subtitle": tr("The curve speed offset never plans a curve above this side force. The steering delivers about 2.5 today; higher values let the offset apply fully and rely on the car removing the offset from a curve that proved too tight."),  # noqa: E501
+      "get_value": get_value,
+      "on_click": on_click,
+    })
     tiles.append({
       "title": tr("Camera Decides in Curves"),
       "subtitle": tr("Map curve speeds as a start: inside the curve the camera adds 1 mph when there is room, speeds up as it ends."),
