@@ -190,3 +190,26 @@ def test_t1c_the_merge_opens_with_the_start_of_drive_trust_1_on_a_link_to_a_high
   assert not ofs and "merge: GPS trust 2 (waiting)" in reasons
   ofs, _ = _merge_run(lambda k: 70, trust=0)
   assert ofs
+
+
+# ---------------- T2: the street's limit at the link's start does not end the merge for the link ----------------
+
+def test_t2_the_streets_45_at_the_start_of_the_link_waits_for_the_highways_70():
+  # drive 77 t 310.1: the next limit 45 for 5 s on the link, then 70; his speed 50
+  ofs, reasons = _merge_run(lambda k: 45 if k < 500 else 70, driver=50)
+  assert ofs and ofs[0][0] >= 500 and ofs[0][1] == 75, (ofs, reasons)
+  assert "merge: next limit 45 is not a highway limit (waiting)" in reasons
+  assert not any("is not below" in r for r in reasons), reasons
+
+
+def test_t2_his_speed_at_the_merges_target_is_his_but_is_decided_again_if_the_next_limit_rises():
+  # the next limit 50 (a highway limit: 50 + 5 = 55), his speed 55: refused; then 70: offered
+  ofs, reasons = _merge_run(lambda k: 50 if k < 800 else 70, driver=55)
+  assert any("driver's speed 55 is not below the merge's 55" in r for r in reasons), reasons
+  assert ofs and ofs[0][0] >= 800 and ofs[0][1] == 75
+  # it stays 50: refused for the link, once
+  ofs, reasons = _merge_run(lambda k: 50, driver=55)
+  assert not ofs and sum("is not below" in r for r in reasons) == 1
+  # his speed above the highway's target: still his
+  ofs, _ = _merge_run(lambda k: 70, driver=76)
+  assert not ofs

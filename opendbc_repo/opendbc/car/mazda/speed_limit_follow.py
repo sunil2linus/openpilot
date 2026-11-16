@@ -484,6 +484,7 @@ class SpeedLimitFollower:
     self.cruise_on_frame = -10_000  # the frame cruise last came on
     self.ramp_next = None          # the next limit ahead on this link (steps; RAMP_START: a highway's is known)
     self.merge_logged = None       # (link start frame, reason) of the last merge refusal logged (M3)
+    self.merge_refused = None      # (round T, T2) (link start frame, next limit) refused for his speed: again if it rises
     self.merge_waits = set()       # (round T) (link start frame, reason) of the merge waits logged
     self.exit_kind = "exit"        # rule 6's window: "exit" (after a link from a highway) or "turn" (rule 7)
     self.exit_retry = None         # rule 6 / 7: the first limit refused only for the GPS trust (steps): tried again
@@ -1006,6 +1007,11 @@ class SpeedLimitFollower:
         max(self.cruise_on_frame, self.driver_set_frame) > self.merge_frame):
       # (RAMP_START) cruise back on, or his SET+ / SET, after rule 5 decided on this link: decided again (his speed then)
       self.merge_done, self.merge_window = False, None
+    rf = self.merge_refused
+    if (self.merge_done and rf is not None and rf[0] == self.link_start and self.link_start is not None and
+        self.offer is None and n is not None and n > rf[1] and self.driver_minus_frame < self.link_start):
+      # (round T, T2) refused only for his speed against a lower next limit: decided again now that the limit rose
+      self.merge_done, self.merge_window, self.merge_refused = False, None, None
     if self.link_start is None or self.merge_done or not self.link_to_hwy or self.link_from in HIGHWAY_CLASSES:
       self.merge_window = None
       return
@@ -1034,6 +1040,13 @@ class SpeedLimitFollower:
       if not ready:
         self.merge_window = None     # (once steady, a drop of the next limit only waits: slcNextSpeedLimit flickers)
       return
+    unit_mph = self.step / MS_PER_MPH
+    if n % self.multiple or n * unit_mph > LIMIT_MAX_MPH + 1e-6 or n < self.merge_min:
+      # (round T, T2; drive 77 t 310.1: the street's 45 was still the next limit at the link's start, the highway's 70
+      # came 5 s later) not a highway limit (yet): no window, and this link keeps waiting for one
+      self.merge_window = None
+      self._merge_wait(n, f"next limit {n} is not a highway limit (waiting)")
+      return
     trust_ok = i.gps_trust <= LIMIT_FIRM_TRUST_MAX or self._merge_start_trust(i)
     if w is None or w[0] != n or abs(w[1] - d) >= 0.5 or (not ready and not trust_ok):
       # trust 0 is needed for the steady time only: near the merge the highway runs next to the ramp and the trust
@@ -1044,7 +1057,6 @@ class SpeedLimitFollower:
       return
     if not ready:
       return
-    unit_mph = self.step / MS_PER_MPH
     top = int(LIMIT_MAX_MPH / unit_mph + 1e-6)          # (never above LIMIT_MAX_MPH)
     tgt = min(n + self.merge_over, max(top, n))
     why = ""
@@ -1052,8 +1064,6 @@ class SpeedLimitFollower:
       why = f"driver's speed {round(d)} is not below the merge's {tgt}"   # (his SET+ to it or above: his)
     elif not RAMP_START and d >= n - 0.5:
       why = f"driver's speed {round(d)} is not below the highway's {n}"
-    elif n % self.multiple or n * unit_mph > LIMIT_MAX_MPH + 1e-6 or n < self.merge_min:
-      why = f"next limit {n} is not a highway limit"
     elif not RAMP_START and d > self.surface_max + 0.5:
       why = f"driver's speed {round(d)} is not a street's (more than {self.surface_max})"
     # (no jump limit: drive 59, both merges refused, "jump 43 > 30" and "jump 35 > 30": from a light or a loop at 25-35
@@ -1061,6 +1071,8 @@ class SpeedLimitFollower:
     if why:
       self.merge_done = True
       self.merge_frame = self.frame
+      # (round T, T2) his speed against this highway limit: decided again if the next limit rises on this link
+      self.merge_refused = (self.link_start, n) if why.startswith("driver's speed") and "street" not in why else None
       # (review of round k, M3) a reopened decision refused again for the same reason on this link: logged once
       if (self.link_start, why) != self.merge_logged:
         self.merge_logged = (self.link_start, why)
