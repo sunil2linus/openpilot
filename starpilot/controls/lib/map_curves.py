@@ -88,6 +88,23 @@ CURVE_OFFSET_MAX = 5          # setting 0..5 (mph steps; km/h: CURVE_OFFSET_KPH)
 CURVE_OFFSET_KPH = (0, 2, 3, 5, 6, 8)
 CURVE_OFFSET_MARK_LAT = 2.6   # m/s^2, margin-corrected: a pass this hard removes the offset there
 OFFSET_MEAS_MARGIN = 0.15     # m/s^2: the wheel angle's lateral reads low in curves (camera_curve.CAM_MEAS_MARGIN)
+# Round T, T5a (drive 77, Dobry Dr: a "no offset" mark from a pass with cruise OFF where he drove faster by hand, offset 2.5,
+# 49.8 mph). A pass stores a mark only when the offset plan made its speed: cruise engaged for the whole pass, no gas in it,
+# and the car's top speed in the curve at most the offset plan + OFFSET_MARK_OVER_PLAN (else curveOffsetMarkSkipped). Wrong
+# marks go away: a mark older than OFFSET_MARK_DAYS is not read any more, and a clean pass at the offset plan (the curve's
+# median speed at least the plan the offset would give - OFFSET_CLEAR_TOL; openpilot steering throughout, no saturation of
+# OFFSET_CLEAR_SAT or more, no steering / brake of his, no steering alert, the lateral under the mark's, GPS trusted)
+# removes it (curveOffsetMarkCleared).
+OFFSET_MARK_OVER_PLAN = 2 * MPH
+OFFSET_MARK_DAYS = 30.0
+OFFSET_CLEAR_TOL = 1 * MPH
+OFFSET_CLEAR_SAT = 1.0        # s
+# Round T, T5b: he always signals onto a ramp, so a ramp / link curve's pass with his signal in its window never counted
+# (the offset's OFFSET_CLEAN_PASSES on ramps, and the ramp memory, which goes through the same check, could never build up).
+# For a ramp / link curve only a signal on at or after the curve's apex (where the pass came nearest to it; unknown: past
+# PASS_BLINK_SHARE of the pass) drops the pass (a lane change, an exit); one that ended before it does not. Road curves as
+# before (any signal in the window).
+PASS_BLINK_SHARE = 0.4
 # starpilotPlan.mapCurveOffsetState: 0 off (setting 0, no curve), 1 granted (cap on the map's radius), 2 granted (cap on a
 # measured / learned radius), 3 none: the curve's "no offset" mark, 4 none: not eligible (GPS, ghost, veto, cap, direction),
 # 5 none: the lateral cap leaves nothing, 6 none: a ramp / link curve without OFFSET_CLEAN_PASSES clean passes yet
@@ -1327,6 +1344,8 @@ class CurveMemory:
       m = e.get("no_offset") if e is not None and e.get("dir") is not None else None
       if not isinstance(m, list) or len(m) < 3:
         return ""
+      if time.time() - float(m[0]) > OFFSET_MARK_DAYS * 86400.0:   # (wall time, as the passes)
+        return ""                       # (T5a) expired
       return str(m[2]) if (not way or not m[1] or int(m[1]) == int(way)) else ""
     except (KeyError, TypeError, ValueError, IndexError):
       return ""
@@ -1340,6 +1359,18 @@ class CurveMemory:
     e = self._entry(c, direction)
     e["no_offset"] = [round(t, 1), int(way), str(reason)]
     self.save()
+
+  def clear_no_offset(self, c, direction):
+    """(T5a) a clean pass at the offset plan: the curve's "no offset" mark for `direction` is removed."""
+    try:
+      e = self._find(*c["apex"], direction) if direction is not None else None
+      if e is not None and e.get("dir") is not None and "no_offset" in e:
+        e.pop("no_offset", None)
+        self.save()
+        return True
+    except (KeyError, TypeError, ValueError):
+      pass
+    return False
 
   def add_ramp_pass(self, c, r, direction, t=None, v=None, flags=None):
     """A clean pass through ramp curve `c` (tagged "ramp", the record too); nothing without a direction."""
@@ -1935,7 +1966,8 @@ class MapCurves:
       if self.veto.is_vetoed(key) or self.veto.flips(key) > 0:
         return 0.0, OFS_NOT, 0.0
       # what the curve memory says (a few scans of its records): kept until the memory changes
-      mkey, gen = (id(c), d, id(mem), self.offset_set, self.offset_lat), getattr(mem, "gen", None)
+      # (T5a: the day too, so a mark's expiry is seen without a memory change)
+      mkey, gen = (id(c), d, id(mem), self.offset_set, self.offset_lat, int(time.time() // 86400)), getattr(mem, "gen", None)
       hit = self._ofs_mem.get(mkey)
       if gen is not None and hit is not None and hit[0] == gen and hit[1] is c:
         return hit[2]
@@ -1948,7 +1980,17 @@ class MapCurves:
     except (KeyError, TypeError, ValueError, AttributeError):
       return 0.0, OFS_NOT, 0.0
 
-  def _offset_mem(self, c, d, mem):
+  def offset_would(self, c):
+    """(T5a) m/s the offset would grant `c` without its "no offset" mark (0 none): for the pass that may clear the mark."""
+    try:
+      d = self.direction(c)
+      if self.offset_set <= 0 or self.memory is None or d is None or self.trust_status != TRUST_OK:
+        return 0.0
+      return float(self._offset_mem(c, d, self.memory, ignore_mark=True)[0])
+    except (KeyError, TypeError, ValueError, AttributeError):
+      return 0.0
+
+  def _offset_mem(self, c, d, mem, ignore_mark=False):
     """_offset_calc's part from the curve memory (ghost marks, a speed cap, the radii, the curve's mark) and the cap."""
     try:
       if mem.ghost(c, d, way=curve_way(c)) > 0 or mem.speed_cap(c, d) is not None:
@@ -1964,7 +2006,7 @@ class MapCurves:
         r_cap, state = (learned, OFS_MEMORY) if learned is not None else (float(c["r"]), OFS_MAP)
       if not (r_cap > 0 and math.isfinite(r_cap)):
         return 0.0, OFS_NOT, 0.0
-      if mem.no_offset(c, d, way=curve_way(c)):
+      if not ignore_mark and mem.no_offset(c, d, way=curve_way(c)):
         return 0.0, OFS_MARK, r_cap
       adv = float(c.get("adv", 0.0) or 0.0)
       v_base = curve_speed_limit(self._radius(c), adv)
@@ -2620,6 +2662,9 @@ class MapCurvesPlanner:
       for info in getattr(self, "offset_events", []):
         rec.record("curveOffsetRemoved", now, info)
       self.offset_events = []
+      for info in getattr(self, "offset_skips", []):
+        rec.record(info.get("kind", "curveOffsetMarkSkipped"), now, {k: v for k, v in info.items() if k != "kind"})
+      self.offset_skips = []
       rec.tick(now)
     except Exception:
       pass
@@ -2634,6 +2679,7 @@ class MapCurvesPlanner:
       if counter - getattr(self, "pass_frame", counter) > 1 or not hasattr(self, "pass_buf") or not 0.0 <= dt <= PASS_MAX_DT:
         # a gap in the calls (no GPS, a pause between drives, a stalled planner): the distance travelled is unknown
         self.pass_buf, self.pass_x, self.pass_prev_end = [], 0.0, -float("inf")
+        self.pass_ctl = []                    # (T5a) (m travelled, cruise engaged, gas) beside pass_buf
         self.pass_curve = None
       self.pass_frame = counter
       cs, cc = sm["carState"], sm["carControl"]
@@ -2645,8 +2691,14 @@ class MapCurvesPlanner:
       stopping = bool(getattr(cs, "brakePressed", False)) or v < PASS_MIN_SPEED
       self.pass_buf.append((x, (v, float(sm["controlsState"].curvature), bool(cc.latActive), bool(cs.steeringPressed),
                                 abs(float(cc.actuators.torque))), bool(cs.leftBlinker or cs.rightBlinker), stopping))
+      ctl = getattr(self, "pass_ctl", None)
+      if ctl is None:
+        ctl = self.pass_ctl = []
+      ctl.append((x, self._cruise_on(sm), bool(getattr(cs, "gasPressed", False))))
       if len(self.pass_buf) > PASS_BUFFER + 200:
         del self.pass_buf[:200]
+      if len(ctl) > PASS_BUFFER + 200:
+        del ctl[:200]
       if inside is not None and self.pass_curve is not None and inside is not self.pass_curve and \
          same_curve(inside, self.pass_curve):
         self.pass_curve = inside              # the same curve from rebuilt curve files (a rescan): carry on
@@ -2662,6 +2714,8 @@ class MapCurvesPlanner:
         self.pass_dir = getattr(self.mc, "inside_dir", None)
         self.pass_ofs, self.pass_alert = 0.0, False      # (CURVE_OFFSET_*)
         self.pass_ofs_way = curve_way(inside)
+        self.pass_ofs_plan, self.pass_mark_plan = 0.0, None   # (T5a) m/s, the offset plan; the one a marked curve would get
+        self.pass_apex_x = None                            # (T5b) m travelled where the pass came nearest the apex
       c = self.pass_curve
       if c is None:
         return
@@ -2669,6 +2723,12 @@ class MapCurvesPlanner:
       gov = getattr(self.mc, "curve", None)
       if gov is not None and self._same(gov, c) and getattr(self.mc, "offset", 0.0) > 0:
         self.pass_ofs = max(getattr(self, "pass_ofs", 0.0), self.mc.offset)
+        self.pass_ofs_plan = max(getattr(self, "pass_ofs_plan", 0.0),
+                                 curve_speed_limit(offset_radius(self.mc.radius, self.mc.offset), self.mc.advisory))
+      elif (gov is not None and self._same(gov, c) and getattr(self.mc, "offset_state", OFS_OFF) == OFS_MARK and
+            getattr(self, "pass_mark_plan", 0.0) is None and hasattr(self.mc, "offset_would")):
+        g = self.mc.offset_would(gov)          # (T5a, once per pass)
+        self.pass_mark_plan = curve_speed_limit(offset_radius(self.mc.radius, g), self.mc.advisory) if g > 0 else 0.0
       if self._same(inside, c) and self._steer_alert(sm):
         self.pass_alert = True
       if inside is c:
@@ -2686,7 +2746,10 @@ class MapCurvesPlanner:
         # turn cancels this one's, its tighter stretch reads as this curve's radius)
         self.pass_x_next = min(self.pass_x_next, x + self.mc.next_entry - v * PASS_GPS_LAG)
       if lat is not None and "apex" in c:
-        self.pass_apex = min(self.pass_apex, dist_m(lat, lon, *c["apex"]))
+        d_ap = dist_m(lat, lon, *c["apex"])
+        if d_ap < self.pass_apex:
+          self.pass_apex_x = x                 # (T5b)
+        self.pass_apex = min(self.pass_apex, d_ap)
       self.pass_vetoed |= self.mc.veto.is_vetoed((self.mc.chain_id, c["s_a"]))
       self.pass_shaky |= bool(self.trust.shaky)
       self.pass_trust0 = getattr(self, "pass_trust0", True) and int(getattr(self.mc, "trust_status", 1) or 0) == 0
@@ -2734,13 +2797,63 @@ class MapCurvesPlanner:
       return "lateral"
     return ""
 
+  def _mark_skip(self, samples):
+    """(T5a) why a pass that proved the curve too tight may not mark it ("" when it may): the offset plan did not make its
+    speed. Unknown (a pass set up without _end_pass): as before."""
+    if not getattr(self, "pass_cruise_all", True):
+      return "cruise off in the pass"
+    if getattr(self, "pass_gas", False):
+      return "his gas in the pass"
+    plan = float(getattr(self, "pass_ofs_plan", 0.0) or 0.0)
+    vs = getattr(self, "pass_curve_v", None) or [v for v, *_ in samples]
+    if plan > 0 and vs and max(vs) > plan + OFFSET_MARK_OVER_PLAN:
+      return "faster than the offset plan"
+    return ""
+
+  def _mark_clear(self, c, samples, direction):
+    """(T5a) a clean pass at the offset plan through a marked curve: the mark is removed."""
+    mem = self.mc.memory
+    plan = getattr(self, "pass_mark_plan", None)
+    if not plan or not hasattr(mem, "clear_no_offset") or getattr(self, "pass_shaky", True):
+      return
+    if not mem.no_offset(c, direction, way=getattr(self, "pass_ofs_way", curve_way(c))):
+      return
+    vs = sorted(getattr(self, "pass_curve_v", None) or [])
+    if not vs or vs[len(vs) // 2] < plan - OFFSET_CLEAR_TOL:
+      return                                  # not at the offset plan
+    sat_s = sum(1 for *_, cmd in samples if cmd >= PASS_SATURATED) * PASS_DT
+    if (sat_s >= OFFSET_CLEAR_SAT - 1e-9 or not all(la for _, _, la, _, _ in samples) or any(drv for _, _, _, drv, _ in samples)
+        or getattr(self, "pass_brake", False) or getattr(self, "pass_alert", False)):
+      return
+    lats = [v * v * abs(k) for v, k, _, _, _ in samples]
+    n = max(int(round(PASS_FILTER / PASS_DT)), 1)
+    peak = max((sum(lats[j:j + n]) / n for j in range(len(lats) - n + 1)), default=max(lats, default=0.0))
+    if peak + OFFSET_MEAS_MARGIN >= offset_mark_lat(getattr(self.mc, "offset_lat", CURVE_OFFSET_LAT)):
+      return
+    if mem.clear_no_offset(c, direction):
+      self.offset_skips = (getattr(self, "offset_skips", []) + [{
+        "kind": "curveOffsetMarkCleared", "name": c.get("name", "") or "", "ramp": bool(c.get("ramp")),
+        "plan_mph": round(plan / MPH, 1), "v_median_mph": round(vs[len(vs) // 2] / MPH, 1), "lat_peak": round(peak, 2)}])[-20:]
+
   def _offset_pass(self, c, samples, direction):
-    """(CURVE_OFFSET_*) a pass with the offset granted: its "no offset" mark when it proved the curve too tight."""
+    """(CURVE_OFFSET_*) a pass with the offset granted: its "no offset" mark when it proved the curve too tight; (T5a) a
+    pass without it through a marked curve: the mark's removal when it was a clean pass at the offset plan."""
+    if not samples or direction is None or not hasattr(self.mc.memory, "add_no_offset"):
+      return
     g = getattr(self, "pass_ofs", 0.0)
-    if g <= 0 or not samples or not hasattr(self.mc.memory, "add_no_offset"):
+    if g <= 0:
+      self._mark_clear(c, samples, direction)
       return
     why = self._offset_verdict(samples)
-    if not why or direction is None:
+    if not why:
+      return
+    skip = self._mark_skip(samples)
+    if skip:
+      vs = getattr(self, "pass_curve_v", None) or [v for v, *_ in samples]
+      self.offset_skips = (getattr(self, "offset_skips", []) + [{
+        "kind": "curveOffsetMarkSkipped", "reason": why, "skip": skip, "name": c.get("name", "") or "",
+        "ramp": bool(c.get("ramp")), "offset_mph": round(g / MPH, 2), "v_max_mph": round(max(vs) / MPH, 1),
+        "plan_mph": round(float(getattr(self, "pass_ofs_plan", 0.0) or 0.0) / MPH, 1)}])[-20:]
       return
     self.mc.memory.add_no_offset(c, direction, way=getattr(self, "pass_ofs_way", curve_way(c)), reason=why)
     lats = [v * v * abs(k) for v, k, _, _, _ in samples]
@@ -2773,7 +2886,20 @@ class MapCurvesPlanner:
     window = [(s, b) for xx, s, b, st in self.pass_buf if x_start <= xx <= x_end and
               not (PASS_STOP_CUT and st and xx >= self.pass_x_exit)]
     self.pass_curve, self.pass_samples = c, [s for s, _ in window]
-    self.pass_blinker = any(b for _, b in window)
+    if c.get("ramp") or int(c.get("cls", 0) or 0) in LINK_CLASSES:
+      # (PASS_BLINK_SHARE, T5b) a ramp / link curve: only a signal on at or after the apex drops the pass
+      ax = getattr(self, "pass_apex_x", None)
+      cut = ax if ax is not None else x_start + PASS_BLINK_SHARE * (x_end - x_start)
+      self.pass_blinker = any(b for xx, s, b, st in self.pass_buf if cut <= xx <= x_end and
+                              not (PASS_STOP_CUT and st and xx >= self.pass_x_exit))
+    else:
+      self.pass_blinker = any(b for _, b in window)
+    # (T5a) cruise engaged throughout, his gas, the speeds in the curve itself
+    ctl = [(cr, gas) for xx, cr, gas in getattr(self, "pass_ctl", []) if x_start <= xx <= x_end]
+    self.pass_cruise_all = bool(ctl) and all(cr for cr, _ in ctl)
+    self.pass_gas = any(gas for _, gas in ctl)
+    x_in = self.pass_x_exit - float(c.get("len", 0.0))
+    self.pass_curve_v = [s[0] for xx, s, b, st in self.pass_buf if x_in <= xx <= self.pass_x_exit]
     # (RAMP_MEMORY_*) a stop in the curve: braking below PASS_MIN_SPEED before its end
     self.pass_stop = any(st and s[0] < PASS_MIN_SPEED for xx, s, b, st in self.pass_buf
                          if x_start <= xx <= min(x_end, self.pass_x_exit))
