@@ -404,6 +404,18 @@ STOP_AHEAD_RED_HOLD_MAX = 8.0   # s
 RED_RELEASE_HOLD_MAX = 20.0  # s
 REARM_CHAIN_TIME = 30.0      # s
 WARN_RED_RECENT = 1.5        # s (3 s would have let the drive 50 false stop through; redLight gaps seen: <= 1 s)
+# Round U, U7 (drive 7e t 1193, Mound Rd at 53 mph: the plan's stop ratio 0.63-0.70 at 145 m and redLight on for only 0.49 s,
+# no lead: "stop ahead" with the floor hold, 53 -> 30 in 4 s; no brake followed, a green light). Above FAST_FAR_SPEED with the
+# planned stop FAST_FAR_DIST or farther and no radar lead (CRZ_CTRL's, raw or tracked), a stop ahead start is guarded (the 1 mph
+# taps of WARN_GUARD_*) unless redLight has been on FAST_FAR_RED_TIME without a break, or the plan's ratio under
+# FAST_FAR_RATIO for FAST_FAR_RATIO_TIME; while it stays that fast and far, only those confirm it (not a redLight blip, not the
+# plan's WARN_GUARD_PLAN_HOLD). Nearer stops, a radar lead, 45 mph or less: as before.
+FAST_FAR_GUARD = True
+FAST_FAR_SPEED = 45 * MS_PER_MPH
+FAST_FAR_DIST = 140.0        # m
+FAST_FAR_RED_TIME = 1.0      # s
+FAST_FAR_RATIO = 0.6
+FAST_FAR_RATIO_TIME = 1.0    # s
 WARN_GUARD_PLAN_HOLD = 4.0   # s
 # A far stop ahead (drive 6a t 580: the plan's stop 116 m ahead at 50.5 mph, the real light > 250 m away and green; set
 # 50 -> 20 at once, the car down to 22 mph). The plan's stop distance is the distance to its slowest point in the 8 s
@@ -648,6 +660,8 @@ class StoppedCarTrigger:
     self.red_frames = 0              # frames redLight has been on (gaps up to RED_START_DROPOUT)
     self.red_gap = _frames(RED_DROPOUT) + 1   # (off so far: a light on at the first frame is an onset)
     self.last_red_frame = -10_000
+    self.red_run = 0                 # (FAST_FAR_GUARD) frames redLight has been on without a break
+    self.ratio_low = 0               # ... the plan's stop with its ratio under FAST_FAR_RATIO without a break
     self.red_latched = False         # an episode was released while the light was on: it must go off before a head start
     self.rearm_on_red = False        # released as a stop ahead cleared / gone: a red light and the planned stop restart it
     self.release_frame = -10_000     # (REARM_ON_RED_TIME)
@@ -684,6 +698,8 @@ class StoppedCarTrigger:
       self.red_onset_rolling = self.rolling_frames
     # a light on before / through our stop counts as coming on when we start rolling again (review a8)
     self.red_onset_rolling = min(self.red_onset_rolling, self.rolling_frames)
+    self.red_run = self.red_run + 1 if i.red_light else 0          # (FAST_FAR_GUARD) without a break
+    self.ratio_low = self.ratio_low + 1 if (i.plan_stop and i.plan_ratio < FAST_FAR_RATIO) else 0
     if i.red_light:
       self.red_frames += 1
       self.red_gap = 0
@@ -1101,7 +1117,11 @@ class StoppedCarTrigger:
     if self.active and self.warn_unsure:
       # the guarded stop ahead: the stop-light detector agreeing or the plan holding the stop long enough confirms it
       # (a car confirming it: the early start rule above)
-      if not self.confirmed and (i.red_light or self.latch_frames >= _frames(WARN_GUARD_PLAN_HOLD)):
+      if self._fast_far(i):
+        ok = self._fast_far_confirmed()        # (FAST_FAR_GUARD) still fast and far: only these confirm it
+      else:
+        ok = i.red_light or self.latch_frames >= _frames(WARN_GUARD_PLAN_HOLD)
+      if not self.confirmed and ok:
         self.confirmed = True
         self.confirm_frame = self.frame
       if self.confirmed:
@@ -1197,6 +1217,8 @@ class StoppedCarTrigger:
     # WARN_RED_RECENT) and no slower car confirmed: taps only until it is confirmed (WARN_GUARD_*)
     self.warn_unsure = bool(WARN_GUARD_ENABLED and self.warn_start and
                             self.frame - self.last_red_frame > _frames(WARN_RED_RECENT) and not self._slow_car(i))
+    if self.warn_start and self._fast_far(i) and not self._fast_far_confirmed():
+      self.warn_unsure = True          # (FAST_FAR_GUARD) a fast, far stop ahead the light / plan has not confirmed yet
     self.warn_guarded = self.warn_unsure
     if self.warn_unsure:
       # the cap: the taps so far stay (an unsure car / head start taken over), otherwise the unsure car's
@@ -1240,6 +1262,14 @@ class StoppedCarTrigger:
     self.unsure_frames = self.unsure_gap = 0
     self.pull_accel_frames = 0
     self.release_reason = None
+
+  def _fast_far(self, i):
+    """(FAST_FAR_GUARD) a fast car, its planned stop far, no radar lead."""
+    return bool(FAST_FAR_GUARD and i.v_ego > FAST_FAR_SPEED and i.plan_stop_d >= FAST_FAR_DIST and
+                not i.radar_has_lead and not self.radar_stable)
+
+  def _fast_far_confirmed(self):
+    return self.red_run >= _frames(FAST_FAR_RED_TIME) or self.ratio_low >= _frames(FAST_FAR_RATIO_TIME)
 
   @staticmethod
   def _d_stop(i):

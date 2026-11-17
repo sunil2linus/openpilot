@@ -418,3 +418,65 @@ def test_u6_a_learned_maximum_under_90_is_forgotten_once_the_set_is_above_it():
   lg.set_max = 90 * MPH                                                   # the real top: kept
   lg.update(_inp(set_speed=90 * MPH, v_ego=80 * MPH))
   assert lg.set_max is not None
+
+
+# ---------------- U7: a fast, far "stop ahead" with a red light blip only taps until confirmed ----------------
+
+scs = _load("scs_round_u", os.path.join("..", "stopped_car_slowdown.py"))
+
+
+def _stop_in(**kw):
+  base = dict(enabled=True, cruise_enabled=True, brake_pressed=False, v_ego=53 * MPH, lead_alive=True, lead_status=False,
+              lead_prob=0.0, lead_d=0.0, lead_v=0.0, lead_y=0.0, model_alive=True, model_accel=-0.6, plan_stop=True,
+              plan_ratio=0.66, plan_stop_d=145.0, red_light=False, set_speed=53 * MPH)
+  base.update(kw)
+  return scs.StoppedCarInputs(**base)
+
+
+def _mound(red_frames=49, then=0, **kw):
+  """Drive 7e t 1193: the planned stop at 145 m (ratio 0.66) at 53 mph, redLight on for its first red_frames frames."""
+  tr = scs.StoppedCarTrigger()
+  for _ in range(60):
+    tr.update(_stop_in(plan_stop=False, **kw))
+  started = None
+  for n in range(150 + then):
+    if tr.update(_stop_in(red_light=n < red_frames, **kw)) and started is None:
+      started = n
+  return tr, started
+
+
+def test_u7_the_mound_rd_case_taps_instead_of_the_floor_hold():
+  old = scs.FAST_FAR_GUARD
+  try:
+    scs.FAST_FAR_GUARD = False
+    tr, _ = _mound()
+    assert tr.active and tr.kind == scs.STOP_AHEAD and tr.floor_mode and not tr.warn_unsure     # before: the floor hold
+  finally:
+    scs.FAST_FAR_GUARD = old
+  tr, started = _mound(then=600)                          # 7.5 s of the plan's 0.66 at 145 m: never confirmed
+  assert started is not None and tr.active and tr.kind == scs.STOP_AHEAD and tr.warn_unsure and not tr.floor_mode
+  assert tr.target / MPH >= 53 - 5 - 1e-6 and not tr.urgent
+
+
+def test_u7_confirmed_by_a_red_light_held_1_s_or_the_plan_under_0p6_for_1_s():
+  tr, _ = _mound(red_frames=99)                           # 0.99 s: not yet
+  assert tr.active and tr.warn_unsure and not tr.floor_mode
+  tr, _ = _mound(red_frames=150)                          # on for 1 s without a break: the floor
+  assert tr.active and tr.floor_mode and not tr.warn_unsure
+  # guarded first, then the plan's ratio under 0.6 for 1 s
+  tr, _ = _mound()
+  assert tr.warn_unsure
+  for _ in range(101):
+    tr.update(_stop_in(plan_ratio=0.5))
+  assert not tr.warn_unsure and tr.floor_mode
+
+
+def test_u7_near_stops_leads_and_45_mph_unchanged():
+  for kw in (dict(plan_stop_d=120.0), dict(v_ego=45 * MPH, set_speed=45 * MPH), dict(radar_has_lead=True)):
+    tr, _ = _mound(**kw)
+    assert tr.active and tr.floor_mode and not tr.warn_unsure, kw
+  # guarded far away, the stop comes nearer: a redLight frame confirms it as before
+  tr, _ = _mound()
+  assert tr.warn_unsure
+  tr.update(_stop_in(plan_stop_d=100.0, red_light=True))
+  assert not tr.warn_unsure and tr.floor_mode
