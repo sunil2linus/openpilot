@@ -18,9 +18,10 @@ RANDOM_EVENT_START = StarPilotEventName.accel30
 RANDOM_EVENT_END = StarPilotEventName.youveGotMail
 
 # Mazda + TI (round P): the car's camera fault notice (starpilotCarState.mazdaCamFault 2, the ERR bits) again when the
-# fault comes back after clearing, at most every CAM_FAULT_REPEAT; "cleared" once it has been gone CAM_FAULT_CLEAR. Its lane
-# lines off (mazdaCamFault 1, mazdaStockLkasOff, latched by carstate for the drive): the notice once per drive, never a
-# "cleared" (re-review of round P, N2)
+# fault comes back after clearing, at most every CAM_FAULT_REPEAT; "cleared" once it has been gone CAM_FAULT_CLEAR.
+# Round U, U9 (drive 7e: the lane lines off kind, mazdaCamFault 1, cleared by itself): the lane lines off kind is an episode
+# of its own the same way (its notice at most every CAM_FAULT_REPEAT, "cleared" once it has been gone CAM_FAULT_CLEAR; carstate
+# clears it only after 5 s of lines back at speed). "Cleared" only when no fault of either kind is left (third review, T2).
 CAM_FAULT_REPEAT = 60.0      # s
 CAM_FAULT_CLEAR = 2.0        # s
 
@@ -30,21 +31,28 @@ class MazdaCamNotice:
   def __init__(self, dt=DT_MDL):
     self.dt = dt
     self.t = 0.0
-    self.active = False          # a fault episode is on (its notice shown, or held back by CAM_FAULT_REPEAT)
+    self.active = False          # an ERR bits episode is on (its notice shown, or held back by CAM_FAULT_REPEAT)
     self.shown = False           # ... and its notice was shown
-    self.last = None             # t of the last fault notice
+    self.last = None             # t of the last ERR bits notice
     self.clear_s = 0.0
-    self.lines_shown = False     # the lane lines off notice (once per drive)
+    self.l_active = False        # (U9) a lane lines off episode is on
+    self.l_shown = False         # ... and a notice was shown in it
+    self.l_last = None           # t of the last lane lines notice
+    self.l_clear = 0.0
+
+  def _lines_start(self):
+    self.l_active, self.l_clear = True, 0.0
+    self.l_shown = self.l_last is None or self.t - self.l_last >= CAM_FAULT_REPEAT - 1e-6
+    if self.l_shown:
+      self.l_last = self.t
+      return "fault"
+    return None
 
   def update(self, fault):
     self.t += self.dt
     lines = fault == 1
-    fault = fault == 2
-    if lines and not self.active and not self.lines_shown:
-      self.lines_shown = True
-      return "fault"
-    if fault:
-      self.clear_s = 0.0
+    if fault == 2:
+      self.clear_s = self.l_clear = 0.0
       if not self.active:
         self.active = True
         self.shown = self.last is None or self.t - self.last >= CAM_FAULT_REPEAT - 1e-6
@@ -57,13 +65,25 @@ class MazdaCamNotice:
       if self.clear_s >= CAM_FAULT_CLEAR - 1e-6:
         self.active = False
         shown, self.shown = self.shown, False
-        # (third review, T2) "cleared" only when nothing is left; the ERR bits gone with the lane lines still off: the
-        # lane lines notice instead, if not shown yet this drive
         if lines:
-          if not self.lines_shown:
-            self.lines_shown = True
-            return "fault"
-          return None
+          # (third review, T2) the ERR bits gone with the lane lines still off: that episode goes on (its notice if not
+          # shown within CAM_FAULT_REPEAT); "cleared" when it ends
+          out = None if self.l_active else self._lines_start()
+          self.l_shown = self.l_shown or shown
+          return out
+        l_shown = self.l_active and self.l_shown
+        self.l_active = self.l_shown = False
+        if shown or l_shown:
+          return "cleared"
+      return None
+    if lines:
+      self.l_clear = 0.0
+      return None if self.l_active else self._lines_start()
+    if self.l_active:
+      self.l_clear += self.dt
+      if self.l_clear >= CAM_FAULT_CLEAR - 1e-6:
+        self.l_active = False
+        shown, self.l_shown = self.l_shown, False
         if shown:
           return "cleared"
     return None

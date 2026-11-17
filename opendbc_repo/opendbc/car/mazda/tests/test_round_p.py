@@ -732,7 +732,8 @@ def test_the_camera_fault_notice_text_by_kind():
   # (the UI's width, test_alerts.test_alert_text_length: 1809 of 1860 px at Inter-SemiBold 66)
   assert a.alert_text_2 == "Collision warning, lane keep may be off · steering weaker"
   b = events.mazda_cam_fault_alert(None, None, {"starpilotCarState": N(mazdaCamFault=1)}, False, 0, None, N())
-  assert b.alert_text_1 == "Car's Lane Keep Assist is off" and b.alert_text_2.endswith("Restart the car to reset it")
+  # (round U, U9: it clears by itself)
+  assert b.alert_text_1 == "Car's Lane Keep Assist is off" and b.alert_text_2 == "Steering is weaker in curves until it clears"
   assert events.mazda_cam_fault_alert(None, None, {}, False, 0, None, N()).alert_text_1 == "Car's Lane Keep Assist is off"
   E = events.STARPILOT_EVENTS
   assert E[events.StarPilotEventName.mazdaStockLkasOff][events.ET.PERMANENT] is events.mazda_cam_fault_alert
@@ -752,12 +753,17 @@ def test_the_camera_fault_notice_comes_back_after_clearing_at_most_every_60_s():
 
 
 def test_rereview_n2_lane_lines_off_once_per_drive_never_cleared():
+  # (round U, U9: the lane lines off kind is an episode like the ERR bits' now: "cleared" when it clears by itself, its
+  # notice again at most every 60 s)
   _, spe = _events_modules()
   n = spe.MazdaCamNotice(dt=0.05)
   run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
   assert run(1, 5.0) == ["fault"]
-  for _ in range(5):                                        # (whatever the flag does: never "cleared", never again)
-    assert run(0, 10.0) == [] and run(1, 70.0) == []
+  assert run(0, 1.0) == [] and run(1, 1.0) == []            # a short dropout: the same episode
+  assert run(0, 3.0) == ["cleared"]
+  assert run(1, 5.0) == [] and run(0, 3.0) == []            # back within 60 s of the notice: held back (and no "cleared")
+  run(0, 60.0)
+  assert run(1, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]
   assert run(2, 1.0) == ["fault"] and run(0, 3.0) == ["cleared"]   # the ERR bits as built
 
 
@@ -1040,9 +1046,10 @@ def test_third_review_t2_cleared_only_when_no_fault_is_left():
     n = spe.MazdaCamNotice(dt=0.05)
     return lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]
   run = mk()                                                # 2 -> 1: the ERR bits gone, the lane lines still off
-  assert run(2, 5.0) == ["fault"] and run(1, 10.0) == ["fault"] and run(0, 5.0) == []   # (the lines notice, no "cleared")
+  # (the lines notice; round U, U9: "cleared" once the lane lines are back too)
+  assert run(2, 5.0) == ["fault"] and run(1, 10.0) == ["fault"] and run(0, 5.0) == ["cleared"]
   run = mk()                                                # 1 -> 2 -> 1
-  assert run(1, 5.0) == ["fault"] and run(2, 5.0) == ["fault"] and run(1, 10.0) == []
+  assert run(1, 5.0) == ["fault"] and run(2, 5.0) == ["fault"] and run(1, 10.0) == [] and run(0, 3.0) == ["cleared"]
   run = mk()                                                # 2 -> 0
   assert run(2, 5.0) == ["fault"] and run(0, 5.0) == ["cleared"]
 

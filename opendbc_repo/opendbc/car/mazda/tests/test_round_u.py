@@ -480,3 +480,39 @@ def test_u7_near_stops_leads_and_45_mph_unchanged():
   assert tr.warn_unsure
   tr.update(_stop_in(plan_stop_d=100.0, red_light=True))
   assert not tr.warn_unsure and tr.floor_mode
+
+
+# ---------------- U9: the lane lines off notice: its text, and "cleared" when it clears by itself ----------------
+
+def _events_modules():
+  import pytest
+  try:
+    from openpilot.selfdrive.selfdrived import events
+    from openpilot.starpilot.controls.lib import starpilot_events as spe
+  except Exception as e:                                          # (needs the device's native modules, or their stubs)
+    pytest.skip(f"events.py not importable here: {e}")
+  return events, spe
+
+
+def test_u9_the_lane_lines_off_text_fits_the_ui():
+  import pytest
+  events, _ = _events_modules()
+  a = events.mazda_cam_fault_alert(None, None, {"starpilotCarState": NS(mazdaCamFault=1)}, False, 0, None, NS())
+  assert a.alert_text_2 == "Steering is weaker in curves until it clears"
+  pil = pytest.importorskip("PIL.ImageFont")
+  from PIL import Image, ImageDraw
+  fonts = os.path.join(HERE, "..", "..", "..", "..", "..", "selfdrive", "assets", "fonts")
+  if not os.path.exists(os.path.join(fonts, "Inter-SemiBold.ttf")):
+    pytest.skip("no fonts here")
+  d = ImageDraw.Draw(Image.new("RGB", (0, 0)))
+  w2 = d.textlength(a.alert_text_2, font=pil.truetype(os.path.join(fonts, "Inter-SemiBold.ttf"), 66))
+  w1 = d.textlength(a.alert_text_1, font=pil.truetype(os.path.join(fonts, "Inter-Bold.ttf"), 88))
+  assert w1 <= 1860 and w2 <= 1860, (w1, w2)                      # (test_alerts.test_alert_text_length's limit)
+
+
+def test_u9_the_lane_lines_off_kind_shows_cleared_when_it_clears_by_itself():
+  _, spe = _events_modules()
+  n = spe.MazdaCamNotice(dt=0.05)
+  run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
+  # drive 7e: the lane lines off, then back by itself
+  assert run(1, 84.0) == ["fault"] and run(0, 1.9) == [] and run(0, 0.2) == ["cleared"]
