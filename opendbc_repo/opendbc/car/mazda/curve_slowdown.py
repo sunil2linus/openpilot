@@ -3182,7 +3182,8 @@ class CurveSlowdown:
                        ours=bool(lg.anchor is not None and getattr(lg, "anchor_ours", False)),
                        stop_active=bool(self.trigger.active) and self.stop_mode == ON,
                        red_light=bool(plan_alive and getattr(plan, "redLight", False)),
-                       no_gps=self._no_gps(plan, plan_alive))
+                       no_gps=self._no_gps(plan, plan_alive),
+                       ramp_curve=self._ramp_curve_on(plan, plan_alive))
       # rules 8 / 9 only act with Speed Limit Follow and Map Curves both On (second review: Map Curves in Test left the
       # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
       self.limit_follow.street_active = self._street_active(plan)
@@ -3866,6 +3867,16 @@ class CurveSlowdown:
       hard = min(hard, self.curve_target.speed)
     self.lkas_hard = hard
     return hard
+
+  def _ramp_curve_on(self, plan, plan_alive):
+    """(speed_limit_follow.RAMP_CURVE_MINUS) a map ramp curve ahead or being driven: the planner's ramp curve, the map
+    control following one (its ramp hold too), or its tail (RAMP_TAIL: the loop not really ended yet)."""
+    mo = getattr(self, "map_out", None)
+    followed = bool(mo is not None and mo.active and mo.track and mo.why in ("ramp", "ramp hold"))
+    planned = bool(plan_alive and int(getattr(plan, "mapCurveStatus", 0) or 0) == 2 and
+                   float(getattr(plan, "mapCurveRadius", 0.0) or 0.0) > 0)
+    tail = getattr(self, "ramp_tail", None)
+    return bool(followed or planned or (tail is not None and tail.active))
 
   def _curve_own(self, plan, curve_active, curve_street):
     """(CURVE_OWN_RAISE) m/s, inside a followed map curve (its distance 0, or its ramp hold): the curve's own target

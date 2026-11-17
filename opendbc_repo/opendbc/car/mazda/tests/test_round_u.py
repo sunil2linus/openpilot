@@ -158,3 +158,57 @@ def test_u2_the_wrapper_gives_the_own_target_only_inside_a_followed_curve():
             dict(_followed_map_curve=lambda: False)):
     assert own(w(**k)) == 0.0, k
   assert own(w(), street=True) == 0.0 and own(w(), act=False) == 0.0
+
+
+# ---------------- U3: his SET- in a ramp curve is a curve speed, not a merge decision ----------------
+
+slf = _load("slf_round_u", os.path.join("..", "speed_limit_follow.py"))
+STREET, LINK = 5, 2
+
+
+def _minus_run(minus_at, curve=(0, 500), next_from=600, frames=2200, link_at=600, flag=True):
+  """A street (45), a link to a highway from link_at; his SET- (45 -> 30) at link + minus_at; a ramp curve on the link from
+  link + curve[0] to link + curve[1]; the highway's 70 the next limit from link + next_from."""
+  f = slf.SpeedLimitFollower(False)
+  offers = []
+  old = slf.RAMP_CURVE_MINUS
+  slf.RAMP_CURVE_MINUS = flag
+  try:
+    for k in range(frames):
+      kl = k - link_at
+      on_link = k >= link_at
+      d = 30 if (on_link and kl >= minus_at) else 45
+      li = slf.LimitInputs(limit=45 * MPH, source="Map Data", gps_trust=0, driver_speed=d * MPH, cruise_enabled=True,
+                           road_class=LINK if on_link else STREET, ramp_to_highway=on_link,
+                           next_limit=(70 * MPH if (on_link and kl >= next_from) else 0.0),
+                           next_distance=400.0 if on_link else -1.0, v_ego=d * MPH, driver_set=on_link and kl == minus_at,
+                           driver_minus=on_link and kl == minus_at, ramp_curve=on_link and curve[0] <= kl < curve[1])
+      f.update(li)
+      if f.offer is not None and f.offer.kind == "merge" and not offers:
+        offers.append((kl, f.offer.target, f.offer.driver))
+  finally:
+    slf.RAMP_CURVE_MINUS = old
+  reasons = [e[1]["reason"] for e in f.events if e[0] == "speedLimitNotFollowed"]
+  return offers, reasons, f
+
+
+def test_u3_his_set_minus_in_the_ramp_curve_keeps_the_merge_which_opens_after_the_curve_from_his_speed():
+  ofs, reasons, _ = _minus_run(300, flag=False)
+  assert not ofs and "merge: the driver set his speed lower on the link" in reasons      # before: off for the link
+  ofs, reasons, f = _minus_run(300)
+  assert ofs and ofs[0][0] >= 600 + 200 and ofs[0][1] == 75 and ofs[0][2] == 30, (ofs, reasons)
+  assert "merge: the driver set his speed lower on the link" not in reasons
+  # the highway's limit known early: the merge waits for the curve's end, then its usual steady time
+  ofs, reasons, _ = _minus_run(300, curve=(0, 900), next_from=100)
+  assert ofs and ofs[0][0] >= 900 + 200, ofs
+  assert "merge: his SET- in the ramp curve (waiting for its end)" in reasons
+
+
+def test_u3_his_set_minus_after_the_curve_or_with_no_curve_still_declines():
+  ofs, reasons, _ = _minus_run(550)                         # the curve ended at 500
+  assert not ofs and "merge: the driver set his speed lower on the link" in reasons
+  ofs, reasons, _ = _minus_run(300, curve=(0, 0))
+  assert not ofs and "merge: the driver set his speed lower on the link" in reasons
+  # (the SET- in the curve is marked as a curve speed, not his decision on the link)
+  f = _minus_run(300, frames=600 + 520)[2]
+  assert f._curve_minus_on_link() and not f._his_minus_on_link()

@@ -221,6 +221,12 @@ MERGE_OVER_MPH = 5
 # it. His speed's street check (MERGE_SURFACE_MAX) is off: on the ramp the set speed means nothing.
 RAMP_START = True
 MERGE_OVER_KPH = 8
+# Round U, U3 (drive 7e t 546: his SET- in the ramp's curve switched the merge off for the whole link, "merge: the driver set
+# his speed lower on the link"). His SET- on a link while a map ramp curve is ahead or being driven (LimitInputs.ramp_curve,
+# the wrapper: until the curve really ended, curve_slowdown.RAMP_TAIL) is a curve speed, not a merge decision: the merge
+# waits (no window) and opens when the ramp curve has ended, from his speed then, with every normal check. His SET- on the
+# link with no ramp curve ahead or being driven (also after the ramp curve ended) declines the merge as before.
+RAMP_CURVE_MINUS = True
 # When: the stock cruise's speed-up with the set speed above the speed (drives 4c-53, median m/s^2 by the gap in mph:
 # up to 5 below, 5-10, ..., 20 and more), so the cruise is MERGE_NEAR_MPH below the highway's limit where it starts
 # (mapdOut.nextSpeedLimitDistance). 45 -> 65 mph: 11.9 s, 300 m; with MERGE_LEAD_TIME for our presses (a SET+ hold to 5
@@ -396,6 +402,7 @@ class LimitInputs:
   no_gps: bool = False      # (NOGPS_FALLBACK) no usable position at all (no fix yet / far too poor), not "a road not mapped"
   gps_shaky_why: int = 0    # (MERGE_SHAKY_START) starpilotPlan.mapGpsShakyWhy: 1 trust 1 only for the start of the drive
   gps_acc: float = 0.0      # (MERGE_SHAKY_START) starpilotPlan.mapGpsAccuracy, m (0 unknown)
+  ramp_curve: bool = False  # (RAMP_CURVE_MINUS) a map ramp curve ahead on this link or being driven (until it really ended)
 
 
 @dataclass
@@ -480,6 +487,7 @@ class SpeedLimitFollower:
     self.exit_street = None        # the frame the car first got onto a street after it
     self.driver_set_frame = -10_000  # the last frame the driver was on SET-/SET+
     self.driver_minus_frame = -10_000  # ... on SET- (RAMP_START)
+    self.curve_minus_frame = -10_000   # ... that SET- with a ramp curve ahead or being driven (RAMP_CURVE_MINUS)
     self.merge_frame = -10_000     # the frame rule 5 last decided on this link (RAMP_START: a later engagement reopens it)
     self.cruise_on_frame = -10_000  # the frame cruise last came on
     self.ramp_next = None          # the next limit ahead on this link (steps; RAMP_START: a highway's is known)
@@ -568,6 +576,8 @@ class SpeedLimitFollower:
       self.driver_set_frame = self.frame
     if i.driver_minus and self.cruise_frames > _frames(ENGAGE_SET_QUIET):
       self.driver_minus_frame = self.frame     # (with cruise off SET- engages the cruise: that is not a SET- of his)
+      if RAMP_CURVE_MINUS and i.ramp_curve:
+        self.curve_minus_frame = self.frame    # (a curve speed, not a merge decision)
     if d is not None and self.cruise_off_frame == self.frame - 1:
       self.cruise_on_frame = self.frame
     self._road(i)
@@ -1003,13 +1013,13 @@ class SpeedLimitFollower:
         self._not_followed(o.old, o.new, o.source, "merge: off the link onto a road that is not a highway")
       return
     if (RAMP_START and self.merge_done and self.link_start is not None and self.offer is None and d is not None and
-        self.driver_minus_frame < self.link_start and not i.driver_set and
+        not self._his_minus_on_link() and not i.driver_set and
         max(self.cruise_on_frame, self.driver_set_frame) > self.merge_frame):
       # (RAMP_START) cruise back on, or his SET+ / SET, after rule 5 decided on this link: decided again (his speed then)
       self.merge_done, self.merge_window = False, None
     rf = self.merge_refused
     if (self.merge_done and rf is not None and rf[0] == self.link_start and self.link_start is not None and
-        self.offer is None and n is not None and n > rf[1] and self.driver_minus_frame < self.link_start):
+        self.offer is None and n is not None and n > rf[1] and not self._his_minus_on_link()):
       # (round T, T2) refused only for his speed against a lower next limit: decided again now that the limit rose
       self.merge_done, self.merge_window, self.merge_refused = False, None, None
     if self.link_start is None or self.merge_done or not self.link_to_hwy or self.link_from in HIGHWAY_CLASSES:
@@ -1018,11 +1028,16 @@ class SpeedLimitFollower:
     if RAMP_START:
       # the ramp start (owner, round k: 95 % of on-ramps are entered from a stop or a slow 90 degree turn, cruise off or
       # the set speed meaningless): only his SET- on the link is his speed; cruise off, RES, SET and SET+ are not
-      if self.driver_minus_frame >= self.link_start:
+      if self._his_minus_on_link():
         self.merge_done = True
         self.merge_frame = self.frame
         self._not_followed(None, self.merge_window[0] if self.merge_window is not None else n, "Map Data",
                            "merge: the driver set his speed lower on the link")
+        return
+      if self._curve_minus_on_link() and i.ramp_curve:
+        # (RAMP_CURVE_MINUS) his SET- in the ramp's curve: the merge waits for the curve's end (his speed then)
+        self.merge_window = None
+        self._merge_wait(n, "his SET- in the ramp curve (waiting for its end)")
         return
     elif self.driver_set_frame >= self.link_start or self.cruise_drop_frame >= self.link_start:
       # the driver sets his own speed, cancels or brakes at any time since the link began (as rules 2 and 6): his
@@ -1387,7 +1402,17 @@ class SpeedLimitFollower:
     """(RAMP_START) on a link to a highway from a street, his SET- not on it: the merge decides his speed here (the
     controller's old anchor from before the link is not restored)."""
     return bool(RAMP_START and self.link_start is not None and self.link_to_hwy and self.link_from not in HIGHWAY_CLASSES and
-                self.driver_minus_frame < self.link_start and self.ramp_next is not None and self.ramp_next >= self.merge_min)
+                not self._his_minus_on_link() and self.ramp_next is not None and self.ramp_next >= self.merge_min)
+
+  def _curve_minus_on_link(self):
+    """(RAMP_CURVE_MINUS) his last SET- was on this link with a ramp curve ahead or being driven."""
+    return bool(RAMP_CURVE_MINUS and self.link_start is not None and self.driver_minus_frame >= self.link_start and
+                self.curve_minus_frame == self.driver_minus_frame)
+
+  def _his_minus_on_link(self):
+    """(RAMP_START) his SET- on this link decides his speed: not one in a ramp curve (RAMP_CURVE_MINUS)."""
+    return bool(self.link_start is not None and self.driver_minus_frame >= self.link_start and
+                not self._curve_minus_on_link())
 
   @property
   def offer_speed(self):
