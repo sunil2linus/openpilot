@@ -3583,6 +3583,9 @@ class CurveSlowdown:
       target=float(curve_speed) if curve_active else CAM_NONE,
       cam_target=float(cam_speed0) if cam_active0 else CAM_NONE,
       gov_plan=float(mo.plan) if (map_gov and mo is not None and mo.plan < CAM_NONE) else CAM_NONE,
+      # (camera_curve.CAM_MAP_APPROACH, U1) the governing map curve still ahead, its follower's command
+      map_approach=bool(map_gov and map_curve and mo is not None and mo.plan < CAM_NONE and dist > 0.5),
+      gov_cmd=float(mo.speed) if (map_gov and mo is not None and mo.speed < CAM_NONE) else CAM_NONE,
       # (map_curve_control.OFFSET_*) the offset in that plan: the post-apex taps' allowance over it shrinks by as much
       map_offset=float(mc.offset_now) if (map_gov and mc is not None) else 0.0,
       apex_d=(float(getattr(plan, "mapCurveApexDistance", 0.0) or 0.0)
@@ -3645,7 +3648,11 @@ class CurveSlowdown:
     # (camera_curve.CAM_POST_APEX) past the apex and the lateral's peak: up to CAM_POST_APEX_OVER over the governing plan
     # (map_curve_control.OFFSET_*) the governing plan's offset counts against that allowance: plan + max(offset, +3)
     over = max(CAM_POST_APEX_OVER - (mc.offset_now if (map_gov and mc is not None) else 0.0), 0.0) if out.post_apex else 0.0
-    keep = min(keep, map_ahead, (mo.plan + over) if (map_gov and mo is not None and not out.phantom) else CAM_NONE)
+    # (camera_curve.CAM_MAP_APPROACH, U1) before the apex: at most the follower's command (not its distance plan)
+    gov_cap = CAM_NONE
+    if map_gov and mo is not None and not out.phantom:
+      gov_cap = (mo.plan + over) if out.post_apex else min(mo.plan, mo.speed)
+    keep = min(keep, map_ahead, gov_cap)
     if keep > 0 and keep > float(curve_speed):
       # (c) the curve target kept at what the taps proved (a lower map / camera target no longer takes it back down)
       a, sp, fl, bu, tr, ra, hold, na, fr = res

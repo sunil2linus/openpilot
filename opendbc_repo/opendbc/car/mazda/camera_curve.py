@@ -121,6 +121,12 @@ CAM_POST_APEX_OVER = 5 * MS_PER_MPH
 # ramp's end (CamInputs.ramp_left, the planner's mapRampEndDistance as the map control keeps it) within CAM_POST_RAMP_END
 # (round T, T4: 120 -> 60 m; the owner's loop ends ~64 m before its ramp's end, so 120 m took the gain away there)
 CAM_POST_RAMP_END = 60.0        # m
+# Round U, U1 (drive 7e t 255.6-260.2 W Utica curve 2, t 423.7-426.5 exit 46: six SET+ taps from the bend before while a
+# governing map curve was ahead; their cap was the map's distance plan, above the follower's command by design, and `keep`
+# then held the tapped speed: the slowdown came late, the car still slowing inside the curve). While a governing map curve
+# is ahead and not entered yet (CamInputs.map_approach): no taps and no keep. Every tap / keep is capped at the follower's
+# command (CamInputs.gov_cmd), not its distance plan; past the apex (CAM_POST_APEX) as before (the plan + its allowance).
+CAM_MAP_APPROACH = True
 CAM_POST_PEAK_DROP = 0.3        # m/s^2
 CAM_POST_PEAK_TIME = 1.0        # s
 CAM_POST_TORQUE = 0.85
@@ -186,6 +192,8 @@ class CamInputs:
   hwy_ramp: bool = False          # (CAM_POST_APEX, F3) on an on-ramp to a highway
   ramp_left: object = None        # m to that ramp's end (None unknown): CAM_POST_RAMP_END
   map_offset: float = 0.0         # m/s: the Curve Speed Offset in gov_plan (map_curve_control.OFFSET_*): counts against CAM_POST_APEX_OVER
+  map_approach: bool = False      # (CAM_MAP_APPROACH) a governing map curve ahead (its plan known), not entered yet (> 0.5 m)
+  gov_cmd: float = NO_CURVE       # (CAM_MAP_APPROACH) m/s: the governing follower's command (MapOutput.speed)
 
 
 @dataclass
@@ -307,6 +315,9 @@ class CameraCurve:
     tightening = pk_now is None or pk_now >= lat_raw * CAM_TIGHTEN_GAIN + CAM_TIGHTEN_ADD
     pk_cur = model_peak(i.model_x, i.model_k, v, 0.5, 3.0)
     out.keep = pk_cur is not None and pk_cur < lim_up and lat < lim_up and not tightening
+    approach = bool(CAM_MAP_APPROACH and i.map_approach and not post)
+    if approach:
+      out.keep = False                  # (U1) the map's slowdown for the curve ahead governs
     out.post_apex = post
     # (d) the curve ending
     # (C4) 2-4 s (was 2-3 s): between two bends the 2-3 s peak got as low as 0.99; at true ends the 2-4 s peak still fell
@@ -356,7 +367,8 @@ class CameraCurve:
     # (round S) the governing plan's Curve Speed Offset counts against its allowance: at most plan + max(offset, +3 mph)
     plan_over = max(post_over - max(float(i.map_offset), 0.0), 0.0)
     set_steps = int(round(i.set_speed / i.step))
-    why = ("not in the curve" if not (i.map_in_curve or lat >= CAM_PHANTOM_LAT) else
+    why = ("map curve approach" if approach else
+           "not in the curve" if not (i.map_in_curve or lat >= CAM_PHANTOM_LAT) else
            "no prediction" if pred is None else
            "lateral" if pred >= lim_up or (pk_far is not None and pk_far >= lim_up) else
            "set above the speed" if set_steps + 1 > int(round(v / i.step)) + 1 else
@@ -366,6 +378,7 @@ class CameraCurve:
            "map curve ahead" if goal > i.map_ahead + 1e-3 else
            "camera curve ahead" if goal > i.cam_target + post_over + 1e-3 else
            "map plan" if goal > i.gov_plan + plan_over + 1e-3 else
+           "map command" if CAM_MAP_APPROACH and not post and goal > i.gov_cmd + 1e-3 else
            "wait" if self.frame - self.last_tap < int(CAM_TAP_DT / DT_CTRL) else "")
     out.why = why
     if not why:
