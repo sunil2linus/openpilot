@@ -516,3 +516,71 @@ def test_u9_the_lane_lines_off_kind_shows_cleared_when_it_clears_by_itself():
   run = lambda fault, s: [x for x in (n.update(fault) for _ in range(int(round(s / 0.05)))) if x]  # noqa: E731
   # drive 7e: the lane lines off, then back by itself
   assert run(1, 84.0) == ["fault"] and run(0, 1.9) == [] and run(0, 0.2) == ["cleared"]
+
+
+# ---------------- U10: the steering limit test (MazdaTiSteerMaxTest, off by default) ----------------
+
+def _params(on, ti=True):
+  class P:
+    def __init__(self, *a, **k):
+      pass
+
+    def get(self, key, encoding=None):
+      return None
+
+    def get_bool(self, key):
+      return (ti and key == "TorqueInterceptorEnabled") or (on and key == "MazdaTiSteerMaxTest")
+  return P
+
+
+def _cp(monkeypatch, on, ti=True):
+  from opendbc.car.mazda import interface as I
+  from opendbc.car.mazda.values import CAR
+  monkeypatch.setattr(I, "Params", _params(on, ti))
+  ret = I.CarInterface.get_std_params(CAR.MAZDA_CX5)
+  ret.flags |= int(CAR.MAZDA_CX5.config.flags)         # (as CarInterfaceBase.get_params does before _get_params)
+  return I.CarInterface._get_params(ret, CAR.MAZDA_CX5, {}, [], False, False, False)
+
+
+def test_u10_off_by_default_and_the_flag_only_with_the_ti(monkeypatch):
+  from opendbc.car.mazda.values import CarControllerParams, MazdaSafetyFlags
+  assert int(MazdaSafetyFlags.TI_STEER_700) == 512 and int(MazdaSafetyFlags.AUTO_RESUME) == 256
+  off, on, no_ti = _cp(monkeypatch, False), _cp(monkeypatch, True), _cp(monkeypatch, True, ti=False)
+  assert not off.flags & MazdaSafetyFlags.TI_STEER_700 and not off.safetyConfigs[0].safetyParam & 512
+  assert on.flags & MazdaSafetyFlags.TI_STEER_700 and on.safetyConfigs[0].safetyParam & 512
+  assert not no_ti.flags & MazdaSafetyFlags.TI_STEER_700 and not no_ti.safetyConfigs[0].safetyParam & 512
+  assert CarControllerParams(off).STEER_MAX == 600 and CarControllerParams(on).STEER_MAX == 700
+  assert CarControllerParams(no_ti).STEER_MAX == 800
+  ns = NS(flags=int(MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TI_STEER_700))      # the flag alone: ignored
+  assert CarControllerParams(ns).STEER_MAX == 800
+  # the default of the setting: off
+  keys = open(os.path.join(HERE, "..", "..", "..", "..", "..", "common", "params_keys.h")).read()
+  assert '{"MazdaTiSteerMaxTest", {PERSISTENT, BOOL, "0", "0"}}' in keys
+
+
+def test_u10_the_torque_for_a_lateral_acceleration_is_unchanged_only_the_ceiling_moves(monkeypatch):
+  from opendbc.car.mazda.values import CarControllerParams
+  off, on = _cp(monkeypatch, False), _cp(monkeypatch, True)
+  t0, t1 = off.lateralTuning.torque, on.lateralTuning.torque
+  assert abs(t1.latAccelFactor - t0.latAccelFactor * 700 / 600) < 1e-5 and abs(t1.friction - t0.friction * 600 / 700) < 1e-5
+  for lat in (0.5, 1.0, 1.5):
+    # the torque controller: normalised command = lat / latAccelFactor (+ friction x latAccelFactor / latAccelFactor)
+    raw0 = lat / t0.latAccelFactor * CarControllerParams(off).STEER_MAX
+    raw1 = lat / t1.latAccelFactor * CarControllerParams(on).STEER_MAX
+    assert abs(raw0 - raw1) < 1e-3                       # (float32 fields)
+  assert abs(t0.friction * 600 - t1.friction * 700) < 1e-3
+  # the ceiling (command 1.0): 700 instead of 600, the lateral the controller may ask for at it 700/600 higher
+  assert abs(t1.latAccelFactor * 1.0 - t0.latAccelFactor * 7 / 6) < 1e-5
+
+
+def test_u10_the_controller_sends_up_to_700_and_the_rows_log_the_limit(monkeypatch):
+  from opendbc.car.mazda.values import CarControllerParams
+  on = _cp(monkeypatch, True)
+  ccp = CarControllerParams(on)
+  assert int(round(1.0 * ccp.STEER_MAX)) == 700
+  # the event rows carry the limit, TI_FEEDBACK's violation and the steering faults (round U columns)
+  cols = cs.CurveSlowdown.EVENT_COLUMNS
+  for c in ("ti_viol", "steer_fault_tmp", "steer_fault_perm", "steer_max", "ti_state", "lkas_block", "cam_fault"):
+    assert c in cols, c
+  # the curve logic's own limits are unchanged by the test
+  assert CCm.CAM_LAT_LKAS == 1.7 and CCm.CAM_LAT_TI == 1.4 and CCm.CAM_LAT_POST_APEX == 2.9 and CCm.CAM_TORQUE_SAT == 0.99

@@ -557,6 +557,12 @@ class VehicleSettingsManagerView(PanelManagerView):
       "get_state": lambda: params.get_bool("MazdaBrakeAutoResume"),
       "set_state": lambda s: self._controller._on_toggle("MazdaBrakeAutoResume"),
     })
+    tiles.append({
+      "title": tr("Steering limit test (700)"),
+      "subtitle": tr("Test only. Raises the steering command limit from 600 to 700. Watch for steering faults; turn off if any appear."),
+      "get_state": lambda: params.get_bool("MazdaTiSteerMaxTest"),
+      "set_state": lambda s: self._controller._on_toggle("MazdaTiSteerMaxTest"),
+    })
     get_value, on_click = choice("MazdaModelFollow", (tr_noop("Off"), tr_noop("Test")), 1)
     tiles.append({
       "title": tr("Model Follow (Test)"),

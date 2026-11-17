@@ -49,6 +49,7 @@ const int FLAG_RADAR_INTERCEPTOR = 16;
 const int FLAG_NO_FSC = 32;
 const int FLAG_NO_MRCC = 64;
 const int FLAG_AUTO_RESUME = 256;   // MazdaSafetyFlags.AUTO_RESUME (setting MazdaBrakeAutoResume)
+const int FLAG_TI_STEER_700 = 512;  // MazdaSafetyFlags.TI_STEER_700 (setting MazdaTiSteerMaxTest, off by default): TI limit 700
 
 bool gen1 = false;
 bool gen2 = false;
@@ -58,6 +59,7 @@ bool radar_interceptor = false;
 bool no_fsc = false;
 bool no_mrcc = false;
 bool auto_resume = false;
+bool ti_steer_700 = false;
 
 // Gen1 stock MRCC, gas auto-resume (opendbc/car/mazda/auto_resume.py, setting MazdaBrakeAutoResume, default off).
 // While controls are not allowed only CANCEL may be sent, except in this narrow window: after the driver's brake
@@ -262,6 +264,18 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     .type = TorqueDriverLimited,
   };
 
+  // Steering limit test (setting MazdaTiSteerMaxTest, off by default; only with the TI flag): carcontroller STEER_MAX 700.
+  // Everything but max_torque is the same as MAZDA_TI_STEERING_LIMITS.
+  const TorqueSteeringLimits MAZDA_TI_STEERING_LIMITS_700 = {
+    .max_torque = 700,
+    .max_rate_up = 10,
+    .max_rate_down = 25,
+    .max_rt_delta = 300,
+    .driver_torque_multiplier = 1,
+    .driver_torque_allowance = 15,
+    .type = TorqueDriverLimited,
+  };
+
   const TorqueSteeringLimits MAZDA_2019_STEERING_LIMITS = {
     .max_torque = 8000,
     .max_rate_up = 45,
@@ -273,7 +287,8 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   };
 
   bool tx = true;
-  const TorqueSteeringLimits gen1_limits = torque_interceptor ? MAZDA_TI_STEERING_LIMITS : MAZDA_STEERING_LIMITS;
+  const TorqueSteeringLimits gen1_limits = torque_interceptor ?
+    (ti_steer_700 ? MAZDA_TI_STEERING_LIMITS_700 : MAZDA_TI_STEERING_LIMITS) : MAZDA_STEERING_LIMITS;
   // Check if msg is sent on the main BUS
   if (msg->bus == (unsigned char)MAZDA_MAIN) {
     // steer cmd checks
@@ -388,6 +403,7 @@ static safety_config mazda_init(uint16_t param) {
   no_fsc = GET_FLAG(param, FLAG_NO_FSC);
   no_mrcc = GET_FLAG(param, FLAG_NO_MRCC);
   auto_resume = GET_FLAG(param, FLAG_AUTO_RESUME);
+  ti_steer_700 = torque_interceptor && GET_FLAG(param, FLAG_TI_STEER_700);
   mazda_ar_window = false;
   mazda_ar_cruise_prev = false;
   mazda_ar_moving_prev = false;

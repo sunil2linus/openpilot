@@ -11,6 +11,17 @@ from opendbc.car.mazda.radar_interface import RadarInterface
 from opendbc.car.mazda.values import CAR, LKAS_LIMITS, MazdaSafetyFlags, GEN1, GEN2, GEN3
 from openpilot.common.params import Params
 
+STEER_MAX_NORMAL_TI = 600
+
+
+def scale_ti_steer_test(tune):
+  """(round U, U10) the torque tune for STEER_MAX TI_STEER_MAX_TEST instead of 600: the same torque for the same lateral
+  acceleration below the old ceiling (linear torque_from_lateral_accel: torque = lat / latAccelFactor)."""
+  from opendbc.car.mazda.values import TI_STEER_MAX_TEST
+  k = TI_STEER_MAX_TEST / STEER_MAX_NORMAL_TI
+  tune.torque.latAccelFactor = float(tune.torque.latAccelFactor) * k
+  tune.torque.friction = float(tune.torque.friction) / k
+
 NON_LINEAR_TORQUE_PARAMS = {
   CAR.MAZDA_3_2019: (4.6, 0.6, 0.134, 0.3605),
   CAR.MAZDA_CX_30: (4.68689, 0.79999, 0.18244, 0.38763),
@@ -100,6 +111,14 @@ class CarInterface(CarInterfaceBase):
         # The TI steers below the stock LKAS speed, so there is no minimum steer speed.
         # steerAtStandstill stays False like mazda-frogpilot-dev: no TI torque while stopped.
         ret.minSteerSpeed = 0.0
+        if p.get_bool("MazdaTiSteerMaxTest"):
+          # (round U, U10) the owner's steering limit test: the TI command limit 600 -> 700 (values.CarControllerParams,
+          # mazda.h). The torque controller's normalised command x STEER_MAX is the torque sent, so the same command
+          # would give 700/600 more torque everywhere: latAccelFactor x 700/600 and friction x 600/700 keep the torque
+          # for a given lateral acceleration (and the friction torque) as before; only the ceiling moves.
+          ret.flags |= MazdaSafetyFlags.TI_STEER_700.value
+          ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.TI_STEER_700.value
+          scale_ti_steer_test(ret.lateralTuning)
       if p.get_bool("RadarInterceptorEnabled"): # Radar Interceptor Installed
         ret.flags |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value
         ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.RADAR_INTERCEPTOR.value

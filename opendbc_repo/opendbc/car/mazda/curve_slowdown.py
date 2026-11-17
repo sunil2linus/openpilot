@@ -2797,7 +2797,9 @@ class CurveSlowdown:
                    "model_rel", "model_verdict", "bend_hwy", "bend_link",
                    # (round P) the car's camera fault (0 none, 1 lane lines off, 2 ERR bits), the EPS's LKAS block, the TI's
                    # state, curves planned TI-only (TI_ONLY_*)
-                   "cam_fault", "lkas_block", "ti_state", "ti_only"]
+                   "cam_fault", "lkas_block", "ti_state", "ti_only",
+                   # (round U, U10) TI_FEEDBACK's violation, carState's steering faults, the steering command limit in use
+                   "ti_viol", "steer_fault_tmp", "steer_fault_perm", "steer_max"]
   # The exit log (owner's request): one "mapExit" event per navigation exit, from EXIT_LOG_BEFORE before its exit point
   # to EXIT_LOG_AFTER past it (or the plan's end), with the rows above, so a drive can show what the camera's lane check,
   # the shape check and the confirmation did. No GPS position in it.
@@ -2853,6 +2855,13 @@ class CurveSlowdown:
     self.cam_fault_now = 0           # carstate's cam_fault / lkas_block / TI state this frame (the signal rows)
     self.lkas_block_now = False
     self.ti_state_now = 0
+    self.ti_viol_now = 0             # (round U, U10) TI_FEEDBACK VIOL
+    self.steer_fault_now = (False, False)
+    try:
+      from opendbc.car.mazda.values import CarControllerParams
+      self.steer_max = int(CarControllerParams(CP).STEER_MAX)    # (round U, U10) the limit in use this drive
+    except Exception:
+      self.steer_max = 0
     self.cam_fault_since = None      # (t, kind) of the camera fault going on (camFault / camFaultCleared events)
     from collections import deque
     self.steer_cmds = deque(maxlen=max(1, int(round(MERGE_EARLY_RESERVE_TIME * 10))))   # |actuators.torque| at 10 Hz
@@ -3942,6 +3951,10 @@ class CurveSlowdown:
     was_blocked = self.lkas_blocked
     self.cam_fault_now = int(getattr(CS, "cam_fault", 0) or 0)
     self.lkas_block_now, self.ti_state_now = raw, int(getattr(CS, "ti_state_log", 0) or 0)
+    # (round U, U10) for the logged rows
+    self.ti_viol_now = int(getattr(CS, "ti_violation", 0) or 0) if self.has_ti else 0
+    out = getattr(CS, "out", None)
+    self.steer_fault_now = (bool(getattr(out, "steerFaultTemporary", False)), bool(getattr(out, "steerFaultPermanent", False)))
     self.lkas_clear_frames = 0 if raw else self.lkas_clear_frames + 1
     self.lkas_blocked = raw or (self.lkas_blocked and self.lkas_clear_frames < _frames(TI_ONLY_HYST))
     fault = self.has_ti and (bool(getattr(CS, "cam_err", False)) or bool(getattr(CS, "stock_lkas_off", False)) or
@@ -4600,7 +4613,8 @@ class CurveSlowdown:
         str(getattr(plan, "slcSpeedLimitSource", "") or "") if plan is not None else "",
         self.limit_follow.stable_speed / MS_PER_MPH if self.limit_follow else 0.0,
         self.limit_follow.offer_speed / MS_PER_MPH if self.limit_follow else 0.0, self.limit_want / MS_PER_MPH,
-        *self._exit_row(plan), self.cam_fault_now, self.lkas_block_now, self.ti_state_now, self.ti_only))
+        *self._exit_row(plan), self.cam_fault_now, self.lkas_block_now, self.ti_state_now, self.ti_only,
+        self.ti_viol_now, self.steer_fault_now[0], self.steer_fault_now[1], self.steer_max))
     self._cam_fault_event(t, i)
     if lg.driver_events:
       # driver set speed changes while we managed it (what happened to the restore): one summary-only event per

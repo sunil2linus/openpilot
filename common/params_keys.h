@@ -828,7 +828,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MazdaExitSplitSpeed", {PERSISTENT, INT, "0", "0"}},            // navigation exit: speed at the split, 0 highway limit, 1 +5, 2 +10, 3 off
     {"MazdaStreetSpeedOffset", {PERSISTENT, INT, "2", "2"}},         // street targets from a posted limit: 0 the limit, 1 +3, 2 +5, 3 +8 mph (0/5/8/13 km/h)
     {"MazdaSlowLowerLimit", {PERSISTENT, BOOL, "1", "1"}},           // on a street: slow (gently) for a lower posted limit steady 5 s (speed_limit_follow rule 9)
-    {"MazdaBrakeAutoResume", {PERSISTENT, BOOL, "0", "0"}},          // brake cancelled the cruise: the gas brings it back (RES), mapped public roads only (auto_resume.py)
+    {"MazdaBrakeAutoResume", {PERSISTENT, BOOL, "0", "0"}},
+    {"MazdaTiSteerMaxTest", {PERSISTENT, BOOL, "0", "0"}},           // steering limit test: TI command limit 600 -> 700 (values.py, mazda.h; read at drive start)          // brake cancelled the cruise: the gas brings it back (RES), mapped public roads only (auto_resume.py)
     {"MazdaCameraCurveRaise", {PERSISTENT, BOOL, "1", "1"}},         // in a curve the live camera decides: +1 taps with margin, SET+ at its end, a phantom map curve let go (camera_curve.py)
     {"MazdaCurveSpeedOffset", {PERSISTENT, INT, "0", "0"}},         // map curves: 0..5 mph (0/2/3/5/6/8 km/h) added to the planned curve speed, capped at 2.3 m/s^2 (map_curves.CURVE_OFFSET_*)
     {"MazdaCurveOffsetLat", {PERSISTENT, INT, "1", "1"}},           // Curve Speed Offset's side-force cap: 0..4 = 2.0/2.5/3.0/3.5/4.0 m/s^2 (map_curves.CURVE_OFFSET_LATS)

@@ -102,7 +102,9 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
   MAX_TORQUE_LOOKUP = [0], [600]
 
   def _torque_driver_msg(self, torque):
-    values = {"TI_TORQUE_SENSOR": torque}
+    # (round U, U10) TI_TORQUE_SENSOR is 8 bits with offset -127: a driver torque outside -127..128 is sent as the nearest
+    # it can be (the packer would wrap it: 716, the generic "arbitrary high driver torque" for 700, read as -52)
+    values = {"TI_TORQUE_SENSOR": max(-127, min(128, torque))}
     return self.packer.make_can_msg_safety("TI_FEEDBACK", 1, values)
 
   def _ti_cmd_msg(self, torque):
@@ -118,7 +120,7 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
     torque = 0
     for frame in range(1, 81):
       self.safety.set_timer(frame * 10000)
-      torque = min(torque + self.MAX_RATE_UP, 600)
+      torque = min(torque + self.MAX_RATE_UP, self.MAX_TORQUE_LOOKUP[1][0])
       self.assertTrue(self._tx(self._torque_cmd_msg(torque)), f"CAM_LKAS {torque=}")
       self.assertTrue(self._tx(self._ti_cmd_msg(torque)), f"CAM_LKAS2 {torque=}")
 
@@ -128,15 +130,16 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
     self.assertFalse(self._tx(self._ti_cmd_msg(self.MAX_RATE_UP)))
 
   def test_ti_cmd_max_torque(self):
+    top = self.MAX_TORQUE_LOOKUP[1][0]       # 600 (700 with the steering limit test's flag)
     self.safety.set_controls_allowed(True)
-    self._set_prev_torque(600)
-    self.assertTrue(self._tx(self._ti_cmd_msg(600)))
-    self._set_prev_torque(600)
-    self.assertFalse(self._tx(self._ti_cmd_msg(601)))
-    self._set_prev_torque(-600)
-    self.assertTrue(self._tx(self._ti_cmd_msg(-600)))
-    self._set_prev_torque(-600)
-    self.assertFalse(self._tx(self._ti_cmd_msg(-601)))
+    self._set_prev_torque(top)
+    self.assertTrue(self._tx(self._ti_cmd_msg(top)))
+    self._set_prev_torque(top)
+    self.assertFalse(self._tx(self._ti_cmd_msg(top + 1)))
+    self._set_prev_torque(-top)
+    self.assertTrue(self._tx(self._ti_cmd_msg(-top)))
+    self._set_prev_torque(-top)
+    self.assertFalse(self._tx(self._ti_cmd_msg(-top - 1)))
 
   def test_ti_cmd_rate_limit(self):
     self.safety.set_controls_allowed(True)
@@ -158,14 +161,55 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
     for _ in range(6):
       self._rx(self._torque_driver_msg(0))
       self._rx(self.packer.make_can_msg_safety("STEER_TORQUE", 0, {"STEER_TORQUE_SENSOR": -100}))
-    self._set_prev_torque(600)
-    self.assertTrue(self._tx(self._torque_cmd_msg(600)))
+    self._set_prev_torque(self.MAX_TORQUE_LOOKUP[1][0])
+    self.assertTrue(self._tx(self._torque_cmd_msg(self.MAX_TORQUE_LOOKUP[1][0])))
+
+  def test_steer_700_only_with_the_test_flag(self):
+    # (round U, U10) 601..700 pass only with TI_STEER_700 (and the TI); 701 never
+    allowed = bool(self.SAFETY_PARAM & MazdaSafetyFlags.TI_STEER_700)
+    self.safety.set_controls_allowed(True)
+    for msg in (self._torque_cmd_msg, self._ti_cmd_msg):
+      for t in (650, 700, -700):
+        self._set_prev_torque(t)
+        self.assertEqual(allowed, self._tx(msg(t)), (msg.__name__, t))
+      self._set_prev_torque(700)
+      self.assertFalse(self._tx(msg(701)))
 
 
 class TestMazdaTorqueInterceptorCmdSafety(TestMazdaTorqueInterceptorSafety):
   """Runs the generic torque steering tests on the TI command (CAM_LKAS2, bus 1) instead of CAM_LKAS."""
   def _torque_cmd_msg(self, torque, steer_req=1):
     return self._ti_cmd_msg(torque)
+
+
+class TestMazdaTiSteer700Safety(TestMazdaTorqueInterceptorSafety):
+  """(round U, U10) Gen1 + TI with the steering limit test (MazdaTiSteerMaxTest): both steering messages limited to 700;
+  the rate limits, the real-time delta and the driver allowance as without it. Every TI test runs with it."""
+  SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR | MazdaSafetyFlags.TI_STEER_700
+  MAX_TORQUE_LOOKUP = [0], [700]
+
+
+class TestMazdaTiSteer700CmdSafety(TestMazdaTiSteer700Safety):
+  """The generic torque steering tests on the TI command with the test's 700."""
+  def _torque_cmd_msg(self, torque, steer_req=1):
+    return self._ti_cmd_msg(torque)
+
+
+class TestMazdaTiSteer700AutoResumeSafety(TestMazdaTiSteer700Safety):
+  """The test's flag together with the auto-resume flag: 700 still."""
+  SAFETY_PARAM = (MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TORQUE_INTERCEPTOR | MazdaSafetyFlags.TI_STEER_700 |
+                  MazdaSafetyFlags.AUTO_RESUME)
+
+
+class TestMazdaSteer700FlagWithoutTiSafety(TestMazdaSafety):
+  """(round U, U10) the test's flag without a TI is ignored: Gen1's 800 on CAM_LKAS as always, no CAM_LKAS2."""
+  SAFETY_PARAM = MazdaSafetyFlags.GEN1 | MazdaSafetyFlags.TI_STEER_700
+
+  def test_no_ti_command_with_the_flag_alone(self):
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(0)
+    values = {"LKAS_REQUEST": 0, "CHKSUM": 0, "KEY": 3294744160}
+    self.assertFalse(self._tx(self.packer.make_can_msg_safety("CAM_LKAS2", 1, values)))
 
 
 class AutoResumeHelpers:

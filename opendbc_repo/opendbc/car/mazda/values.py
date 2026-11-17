@@ -9,13 +9,21 @@ from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries
 
 Ecu = CarParams.Ecu
 
+TI_STEER_MAX_TEST = 700   # (round U, U10) the steering limit test's TI command limit (normal: 600)
+
+
 class CarControllerParams:
   def __init__(self, CP):
     self.STEER_STEP = 1 # 100 Hz
     if CP.flags & MazdaSafetyFlags.GEN1:
       # With a Torque Interceptor the same command is also sent to the TI (CAM_LKAS2), so use the
       # proven mazda-frogpilot-dev Gen1+TI limit of 600. The panda safety (mazda.h) uses the same limit.
-      self.STEER_MAX = 600 if CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR else 800  # theoretical max_steer 2047
+      # (round U, U10) the owner's steering limit test (MazdaTiSteerMaxTest, off by default; flag TI_STEER_700, set only
+      # with the TI): 700, the panda's MAZDA_TI_STEERING_LIMITS_700 the same.
+      if CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
+        self.STEER_MAX = TI_STEER_MAX_TEST if CP.flags & MazdaSafetyFlags.TI_STEER_700 else 600
+      else:
+        self.STEER_MAX = 800               # theoretical max_steer 2047
       self.STEER_DELTA_UP = 10             # torque increase per refresh
       self.STEER_DELTA_DOWN = 25           # torque decrease per refresh
       self.STEER_DRIVER_ALLOWANCE = 15     # allowed driver torque before start limiting
@@ -69,6 +77,9 @@ class MazdaSafetyFlags(IntFlag):
   MANUAL_TRANSMISSION = 128
   # panda safety (mazda.h): allow the gas auto-resume window (RES only, after a brake cancel; MazdaBrakeAutoResume)
   AUTO_RESUME = 256
+  # (round U, U10) panda safety (mazda.h) and STEER_MAX: the TI command limit 700 instead of 600 (MazdaTiSteerMaxTest, a test;
+  # ignored without TORQUE_INTERCEPTOR)
+  TI_STEER_700 = 512
 
 
 @dataclass

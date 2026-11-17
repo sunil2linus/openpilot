@@ -131,6 +131,7 @@ struct StarPilotCarState @0xf35cc4560bbf6ec2 {
   mazdaLkasBlock @41 :Bool;          # Mazda: the EPS blocks the stock LKAS torque (STEER_RATE LKAS_BLOCK: under ~45 km/h, a fault)
   mazdaTiState @42 :UInt8;           # Mazda + TI: TI_FEEDBACK STATE (0 discover, 1 off, 2 driver override, 3 run); 0 without a TI
   mazdaCurveTarget @43 :Float32;     # (round T, T3c) Mazda: the governing map curve's speed as the car side plans it (m/s); 0 none
+  mazdaSteerMax @44 :UInt16;         # (round U, U10) Mazda: the steering command limit in use this drive (CarControllerParams.STEER_MAX: 600, 700 test, 800)
 }
 
 struct StarPilotDeviceState @0xda96579883444c35 {
