@@ -212,3 +212,64 @@ def test_u3_his_set_minus_after_the_curve_or_with_no_curve_still_declines():
   # (the SET- in the curve is marked as a curve speed, not his decision on the link)
   f = _minus_run(300, frames=600 + 520)[2]
   assert f._curve_minus_on_link() and not f._his_minus_on_link()
+
+
+# ---------------- U4: a map ramp curve that "ends" while the loop goes on keeps its target ----------------
+
+HELD = (True, 30 * MPH, 24 * MPH, 60, True, True, True, False)
+FREE = (False, 100.0, 0.0, 0, False, False, False, False)
+
+
+def _tail(lat_fn, frames=2000, angle=40.0, rate=0.0, cam_end_at=None, cam=None):
+  t = cs.RampTail()
+  for _ in range(100):
+    t.update(True, HELD, 2.0, angle, 0.0, False)
+  out, whys = [], []
+  for f in range(frames):
+    inp = FREE if cam is None else (True, cam * MPH, 0.0, 0, False, False, False, False)
+    o = t.update(False, inp, lat_fn(f), angle, rate, cam_end_at is not None and f >= cam_end_at)
+    out.append(o)
+    if t.why:
+      whys.append((f, t.why))
+  return t, out, whys
+
+
+def test_u4_the_loop_going_on_keeps_the_curves_target_until_the_lateral_is_down_1_s():
+  t, out, whys = _tail(lambda f: 2.0 if f < 700 else 0.4)
+  assert whys[0] == (0, "start") and whys[-1][1] == "lateral" and 700 + 100 - 2 <= whys[-1][0] <= 700 + 101, whys
+  held = out[:whys[-1][0]]
+  assert all(o[0] and abs(o[1] - 30 * MPH) < 1e-9 and o[4] and not o[5] for o in held)    # kept, no raise
+  assert out[-1] == FREE
+  # a lower camera curve target in the tail still counts
+  _, out, _ = _tail(lambda f: 2.0, frames=50, cam=27.0)
+  assert abs(out[-1][1] - 27 * MPH) < 1e-9
+
+
+def test_u4_a_real_end_lets_go_at_once_and_the_other_ends():
+  # the lateral low and the wheel unwinding at the map's end: no tail (as before)
+  t, out, whys = _tail(lambda f: 0.3, rate=-20.0)
+  assert not whys and out[0] == FREE and not t.active
+  # the lateral low but the wheel held (not unwinding): a tail, over after 1 s under the limit
+  t, out, whys = _tail(lambda f: 0.6)
+  assert whys[0][1] == "start" and whys[-1][1] == "lateral" and whys[-1][0] <= 101, whys
+  # the camera's curve end
+  _, _, whys = _tail(lambda f: 2.0, cam_end_at=300)
+  assert whys[-1] == (300, "camera end")
+  # at most 15 s
+  _, _, whys = _tail(lambda f: 2.0, frames=2000)
+  assert whys[-1][1] == "max" and abs(whys[-1][0] - (cs.RAMP_TAIL_MAX / DT - 1)) <= 1
+  old = cs.RAMP_TAIL
+  try:
+    cs.RAMP_TAIL = False
+    assert not _tail(lambda f: 2.0)[2]
+  finally:
+    cs.RAMP_TAIL = old
+
+
+def test_u4_the_tail_is_the_ramp_curve_for_the_merge():
+  on = lambda **k: cs.CurveSlowdown._ramp_curve_on(NS(**k), NS(), False)  # noqa: E731
+  assert on(map_out=None, ramp_tail=NS(active=True))
+  assert not on(map_out=None, ramp_tail=NS(active=False))
+  assert on(map_out=NS(active=True, track=True, why="ramp hold"), ramp_tail=None)
+  assert not on(map_out=NS(active=True, track=True, why="curve"), ramp_tail=None)
+  assert cs.CurveSlowdown._ramp_curve_on(NS(map_out=None, ramp_tail=None), NS(mapCurveStatus=2, mapCurveRadius=70.0), True)

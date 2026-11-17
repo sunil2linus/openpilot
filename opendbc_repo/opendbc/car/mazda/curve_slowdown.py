@@ -467,6 +467,61 @@ LKAS_BLOCK_HOLD = True
 # while on (the lowest seen, as LKAS_KEEP's keep_held): a curve that tightens is followed down, never back up in it.
 CURVE_OWN_RAISE = True
 CURVE_OWN_NEAR = 2 * MS_PER_MPH   # m/s
+# Round U, U4 (drive 7e t 562: the map's ramp curve "ended" while the loop went on to 569.5; the restore took the set to his 35,
+# the steering saturated again, alert). When a followed map ramp curve (MapOutput.why "ramp" / "ramp hold") stops being
+# followed while the measured lateral (steer_lateral_accel + camera_curve.CAM_MEAS_MARGIN) is still at
+# camera_curve.CAM_IN_CURVE_LAT or more, or the wheel is turned (that lateral at RAMP_TAIL_TURNED or more) and not unwinding
+# (|angle| not falling RAMP_TAIL_UNWIND_RATE): the curve's last target is kept (no restore, no merge boost: the controller's
+# curve reason stays on) until the lateral has been under CAM_IN_CURVE_LAT for RAMP_TAIL_CLEAR, the camera's curve end
+# (camera_curve rule d) passes, or RAMP_TAIL_MAX. That moment is the ramp curve's real end for the merge too
+# (speed_limit_follow.RAMP_CURVE_MINUS). A lower camera curve target still counts.
+RAMP_TAIL = True
+RAMP_TAIL_IN_LAT = 1.2            # m/s^2 (camera_curve.CAM_IN_CURVE_LAT; this file is also loaded alone in tests)
+RAMP_TAIL_MARGIN = 0.15           # m/s^2 (camera_curve.CAM_MEAS_MARGIN)
+RAMP_TAIL_TURNED = 0.5            # m/s^2
+RAMP_TAIL_UNWIND_RATE = 2.0       # deg/s
+RAMP_TAIL_CLEAR = 1.0             # s
+RAMP_TAIL_MAX = 15.0              # s
+
+
+class RampTail:
+  """(RAMP_TAIL) the followed map ramp curve's tail: update() every frame; `active` while its target is kept."""
+
+  def __init__(self):
+    self.active = False
+    self.last = None                 # the curve inputs of the last frame the ramp curve was followed
+    self.frames = 0
+    self.clear = 0
+    self.why = ""
+
+  def update(self, followed, inputs, lat, angle, rate, cam_end):
+    """followed: a map ramp curve followed this frame; inputs: this frame's curve inputs (curve_active, speed, floor,
+    budget, track, raise, hold, no_accel); lat: |measured lateral| (m/s^2, without the margin); angle / rate: the wheel's
+    (deg, deg/s); cam_end: the camera's curve end. Returns the inputs to use (the held ones while active)."""
+    lat_m = abs(float(lat)) + RAMP_TAIL_MARGIN
+    unwinding = float(angle) * float(rate) < 0 and abs(float(rate)) >= RAMP_TAIL_UNWIND_RATE
+    self.why = ""
+    if followed:
+      self.active, self.last = False, tuple(inputs)
+      return inputs
+    if self.last is not None and not self.active:
+      if RAMP_TAIL and (lat_m >= RAMP_TAIL_IN_LAT or (lat_m >= RAMP_TAIL_TURNED and not unwinding)):
+        self.active, self.frames, self.clear, self.why = True, 0, 0, "start"
+      else:
+        self.last = None
+    if not self.active:
+      return inputs
+    self.frames += 1
+    self.clear = self.clear + 1 if lat_m < RAMP_TAIL_IN_LAT else 0
+    end = ("lateral" if self.clear >= int(RAMP_TAIL_CLEAR / DT_CTRL) else "camera end" if cam_end else
+           "max" if self.frames >= int(RAMP_TAIL_MAX / DT_CTRL) else "")
+    if end:
+      self.active, self.last, self.why = False, None, end
+      return inputs
+    a, sp, fl, bu, tr, ra, hold, na = self.last
+    if inputs[0]:
+      sp = min(sp, inputs[1])          # a lower camera curve target still counts
+    return (True, sp, fl, bu, True, False, hold, na)
 TI_ONLY_HYST = 2.0            # s
 # ... and while the car's camera reports a fault (CAM_LKAS ERR_BIT_1 / ERR_BIT_2, or its lane lines off at speed:
 # carstate stock_lkas_off) or LKAS_BLOCK is set above the cut-off (LKAS_CUTOFF): curves TI-only as above and the merge's
@@ -2793,6 +2848,7 @@ class CurveSlowdown:
     self.cam_floor = None            # m/s: the set our +1 taps reached in this curve (the curve target kept at it)
     self.cam_goal = None             # (m/s, frame): a +1 tap on its way
     self.cam_out = None
+    self.ramp_tail = RampTail() if RAMP_TAIL else None     # (round U, U4)
     self.learner = None
     # (round P) pandaStates: the per-bus CAN error counts for the camFault / camFaultCleared events (10 Hz, logs only)
     services = ['starpilotPlan', 'radarState', 'modelV2', 'pandaStates']
@@ -3141,6 +3197,32 @@ class CurveSlowdown:
       # a planner gap: a carried exit is still counted on by the car's own speed (review: counted only while the
       # planner was alive, a gap stretched the slowdown past the exit point)
       self.map_control.drive(max(v_ego, 0.0) * DT_CTRL)
+
+    if self.ramp_tail is not None:
+      # (RAMP_TAIL) a followed map ramp curve that ended with the loop still going on: its target kept
+      try:
+        mo_t = self.map_out
+        followed = bool(self.map_on_used and mo_t is not None and mo_t.active and mo_t.track and
+                        mo_t.why in ("ramp", "ramp hold") and cruise_enabled)
+        angle = float(getattr(CS.out, "steeringAngleDeg", 0.0) or 0.0)
+        lat_t = steer_lateral_accel(max(v_ego, 0.0), angle, float(getattr(CP, "wheelbase", 0.0) or 2.7))
+        cam_out = getattr(self, "cam_out", None)
+        (curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold,
+         curve_no_accel) = self.ramp_tail.update(
+          followed, (curve_active, curve_speed, curve_floor, curve_budget, curve_track, curve_raise, curve_hold,
+                     curve_no_accel), lat_t, angle, float(getattr(CS.out, "steeringRateDeg", 0.0) or 0.0),
+          bool(cam_out is not None and cam_out.ending))
+        if self.ramp_tail.active or self.ramp_tail.why:
+          fast_restore = False
+        if self.ramp_tail.why and self.recorder is not None:
+          self.recorder.record("rampCurveTail", time.monotonic(), {"what": self.ramp_tail.why, "lat": round(abs(lat_t), 2),
+                                                                   "vEgo_mph": round(v_ego / MS_PER_MPH, 1),
+                                                                   "s": round(self.ramp_tail.frames * DT_CTRL, 2)},
+                               min_gap=0.0, signals=False)
+        if not cruise_enabled:
+          self.ramp_tail.active, self.ramp_tail.last = False, None
+      except Exception:
+        self.ramp_tail.active, self.ramp_tail.last = False, None
 
     cam_end = False
     if self.cam_curve is not None:
