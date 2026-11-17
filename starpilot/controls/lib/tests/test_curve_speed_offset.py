@@ -156,6 +156,9 @@ def test_never_with_the_setting_0_untrusted_gps_unknown_direction_a_veto_a_ghost
       m.memory.add_ghost(c, m.direction(c), way=100)
     elif prep == "cap":
       m.memory.add_saturated_pass(c, 18.0, direction=m.direction(c))
+      # (round U, U8 c: a cap with its saturated pass's speed may leave room for the offset; one without it, an older
+      # cap, still blocks it)
+      m.memory._find(*c["apex"], m.direction(c)).pop("cap_v")
     elif prep == "memory":
       m.memory = None
     assert m._offset(c) == (0.0, MC.OFS_NOT, 0.0), prep
@@ -252,7 +255,8 @@ def test_passes_record_the_alert_and_his_brake_as_not_clean(tmp_path):
     mp = _finish(m, c, _samples(150), ofs=0.0, **kw)
     mp.mc.memory.entries[-1]["passes"][-1][1] = 1000.0 * k          # (separate passes in time)
   flags = [p[3] for p in m.memory._find(*c["apex"], m.direction(c))["passes"]]
-  assert flags[0] == ["alert", "full"] and flags[1] == ["brake", "full"] and flags[2] == ["full"], flags
+  # (round U, U8 a: every clean pass now also carries "op")
+  assert flags[0] == ["alert", "full", "op"] and flags[1] == ["brake", "full", "op"] and flags[2] == ["full", "op"], flags
   assert m.memory.clean_passes(c, m.direction(c)) == 1
 
 

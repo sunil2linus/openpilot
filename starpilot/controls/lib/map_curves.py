@@ -1109,6 +1109,20 @@ CAP_JUMP = 5 * MPH         # ... a clean pass well above the cap raises it to th
 # cap raises it CAP_JUMP, every such pass (review: never removed outright). A pass with the steering maxed out caps the
 # curve again whatever was lifted (add_saturated_pass).
 CAP_LIFT_MARGIN = 5 * MPH
+# Round U, U8 (drive 7e: memory speed caps, the planner's "map source 2" and offset state 4, blocked the Curve Speed Offset on
+# both West Utica curves; the first one is limited by the wheel angle, not the speed). A cap (speed_cap):
+#  (a) is never below the fastest recorded clean pass of that curve this way that openpilot steered with no steering alert
+#      and no steering of his (passes carry "op" from round U: openpilot steered all through, no saturation, no driver
+#      steering; "alert" since round S; older passes do not count);
+#  (b) expires CAP_EXPIRE_DAYS after its last confirming pass (a saturated pass: "cap_sat_t", else its "cap_t"), when both
+#      times are real wall times (CAP_CLOCK_MIN: a device clock not set yet never expires anything);
+#  (c) no longer blocks the Curve Speed Offset outright: the offset applies to min(plan, cap) when the cap's own saturated
+#      pass ("cap_v", recorded from round U: the lowest speed one maxed the steering at) was faster than the offset's speed
+#      + OFFSET_CLEAR_TOL (the offset bounded to that); a cap without "cap_v" (older) or one at or under that speed: no
+#      offset (state 4, as before).
+# (d) curve_memory_tool.py lists the records by road name and clears caps / "no offset" marks of a road.
+CAP_EXPIRE_DAYS = 30.0
+CAP_CLOCK_MIN = 1577836800.0     # 2020-01-01: wall times before this are not real (an unset clock, offline tests)
 # One trusted gentle pass: a map curve much sharper than the road really is (a kink where two map ways join) is
 # corrected after a single clean pass, when that pass was full, fast enough and right through the curve's apex.
 MEMORY_ONE_PASS = 1.6      # the newest pass measured at least this many times the map's radius ...
@@ -1419,12 +1433,54 @@ class CurveMemory:
       e = self._find(*c["apex"], direction)
       if e is None:
         return None
-      cap = e.get("cap")
+      cap = self._live_cap(e)
       if not cap and direction is not None and e.get("dir") is not None and \
          len([p for p in e.get("passes", []) if isinstance(p, list) and len(p) >= 2]) < MEMORY_MIN_PASSES:
         legacy = self._find(*c["apex"])          # the record without a direction, if any
-        cap = None if legacy is None or legacy.get("dir") is not None else legacy.get("cap")
-      return float(cap) if cap else None
+        cap = None if legacy is None or legacy.get("dir") is not None else self._live_cap(legacy)
+      if not cap:
+        return None
+      return max(float(cap), self.clean_op_speed(e))       # (U8 a)
+    except (KeyError, TypeError, ValueError):
+      return None
+
+  @staticmethod
+  def _live_cap(e, now=None):
+    """(U8 b) the record's cap (m/s) unless it expired; None."""
+    cap = e.get("cap")
+    if not cap:
+      return None
+    t_conf = e.get("cap_sat_t", e.get("cap_t"))
+    now = time.time() if now is None else now   # (wall time, as the passes)
+    try:
+      if t_conf is not None and float(t_conf) >= CAP_CLOCK_MIN and now >= CAP_CLOCK_MIN and \
+         now - float(t_conf) > CAP_EXPIRE_DAYS * 86400.0:
+        return None
+    except (TypeError, ValueError):
+      pass
+    return float(cap)
+
+  @staticmethod
+  def clean_op_speed(e):
+    """(U8 a) m/s, the fastest pass of record `e` that openpilot steered cleanly ("op") with no steering alert; 0 none."""
+    best = 0.0
+    for p in e.get("passes", []) if e is not None else []:
+      try:
+        if isinstance(p, list) and len(p) >= 4 and p[2] is not None and "op" in (p[3] or []) and "alert" not in (p[3] or []):
+          best = max(best, float(p[2]))
+      except (TypeError, ValueError):
+        continue
+    return best
+
+  def cap_speed(self, c, direction=None):
+    """(U8 c) m/s, the lowest speed a saturated pass maxed the steering at, for the cap now in force ("cap_v"); None
+    unknown (an older cap) or no cap."""
+    try:
+      e = self._find(*c["apex"], direction)
+      if e is None or not self._live_cap(e):
+        return None
+      v = e.get("cap_v")
+      return float(v) if v else None
     except (KeyError, TypeError, ValueError):
       return None
 
@@ -1447,9 +1503,13 @@ class CurveMemory:
     if abs(t - float(e.get("cap_t", -1e12))) < MEMORY_SAME_PASS:
       return                                  # the same pass again (the other carriageway's record)
     floor = max(CAP_FLOOR, float(c.get("adv", 0.0) or 0.0))
-    old = float(e["cap"]) if e.get("cap") else float("inf")
+    live = self._live_cap(e, now=t)             # (U8 b) an expired cap starts over
+    old = float(live) if live else float("inf")
+    old_v = float(e["cap_v"]) if (live and e.get("cap_v")) else float("inf")
     e["cap"] = round(max(floor, min(old, SAT_FACTOR * v)), 2)
     e["cap_t"] = round(t, 1)
+    e["cap_sat_t"] = round(t, 1)                # (U8 b) the last confirming pass
+    e["cap_v"] = round(min(old_v, float(v)), 2)  # (U8 c) the lowest speed the steering maxed out at
     e["cap_hits"] = int(e.get("cap_hits", 0)) + 1
     e.pop("cap_lift", None)                   # (the lifts are counted again from here)
     self.save()
@@ -1993,7 +2053,12 @@ class MapCurves:
   def _offset_mem(self, c, d, mem, ignore_mark=False):
     """_offset_calc's part from the curve memory (ghost marks, a speed cap, the radii, the curve's mark) and the cap."""
     try:
-      if mem.ghost(c, d, way=curve_way(c)) > 0 or mem.speed_cap(c, d) is not None:
+      if mem.ghost(c, d, way=curve_way(c)) > 0:
+        return 0.0, OFS_NOT, 0.0
+      cap = mem.speed_cap(c, d)
+      # (U8 c) a cap: the offset on min(plan, cap) only below the speed its own saturated pass maxed the steering at
+      cap_v = (mem.cap_speed(c, d) if hasattr(mem, "cap_speed") else None) if cap is not None else None
+      if cap is not None and cap_v is None:
         return 0.0, OFS_NOT, 0.0
       link = bool(c.get("ramp")) or int(c.get("cls", 0) or 0) in LINK_CLASSES
       if link and mem.clean_passes(c, d) < OFFSET_CLEAN_PASSES:
@@ -2014,6 +2079,10 @@ class MapCurves:
       if adv > 0:
         room = min(room, adv + ADVISORY_OVER - v_base)
       g = min(self.offset_set, room)
+      if cap_v is not None:
+        g = min(g, cap_v - OFFSET_CLEAR_TOL - v_base)     # (U8 c) under the speed the cap's pass saturated at
+        if g <= 1e-3:
+          return 0.0, OFS_NOT, 0.0
       if g <= 1e-3:
         return 0.0, OFS_CAP, r_cap
       return g, state, r_cap
@@ -2950,6 +3019,7 @@ class MapCurvesPlanner:
       flags = (["full"] if full else []) + (["vetoed"] if self.pass_vetoed else [])
       # (OFFSET_CLEAN_PASSES) the steering alert or his brake in it: kept as before, not a clean pass for the offset
       flags += (["alert"] if getattr(self, "pass_alert", False) else []) + (["brake"] if getattr(self, "pass_brake", False) else [])
+      flags += ["op"]       # (U8 a) openpilot steered all through (curve_pass_radius), no saturation, no steering of his
       if c.get("ramp"):
         self.mc.memory.add_ramp_pass(c, r, direction, v=curve_pass_speed(samples), flags=flags)
       else:

@@ -2129,10 +2129,10 @@ def test_a_pass_with_the_turn_signal_or_off_the_apex_counts_for_nothing(tmp_path
     return e["passes"] if e else []
 
   ps = run()
-  assert len(ps) == 1 and ps[0][3] == ["full", "vetoed"]
+  assert len(ps) == 1 and ps[0][3] == ["full", "op", "vetoed"]               # (round U, U8: "op")
   assert run(blinker=True) == []                                       # a lane change in the curve
   assert run(apex=30.0) == []                                          # never near the apex: another road
-  assert run(exit_=200.0)[0][3] == ["vetoed"]                          # lost the road before the exit: not full
+  assert run(exit_=200.0)[0][3] == ["op", "vetoed"]                    # lost the road before the exit: not full
 
 
 # ---------------- GPS trust: a GPS that is off the road, or a road match that may be the wrong road ----------------
