@@ -273,3 +273,75 @@ def test_u4_the_tail_is_the_ramp_curve_for_the_merge():
   assert on(map_out=NS(active=True, track=True, why="ramp hold"), ramp_tail=None)
   assert not on(map_out=NS(active=True, track=True, why="curve"), ramp_tail=None)
   assert cs.CurveSlowdown._ramp_curve_on(NS(map_out=None, ramp_tail=None), NS(mapCurveStatus=2, mapCurveRadius=70.0), True)
+
+
+# ---------------- U5: the on-ramp's raise does not wait for the map's next limit ----------------
+
+def _ramp_to_run(next_fn, ramp_to=70, trust=0, why=0, acc=0.0, driver=35, frames=2000, link_at=600):
+  f = slf.SpeedLimitFollower(False)
+  offers = []
+  for k in range(frames):
+    on_link = k >= link_at
+    li = slf.LimitInputs(limit=45 * MPH, source="Map Data", gps_trust=0 if not on_link else trust, driver_speed=driver * MPH,
+                         cruise_enabled=True, road_class=LINK if on_link else STREET, ramp_to_highway=on_link,
+                         next_limit=(next_fn(k - link_at) * MPH if on_link else 0.0), next_distance=-1.0, v_ego=driver * MPH,
+                         gps_shaky_why=why if on_link else 0, gps_acc=acc, ramp_to_speed=ramp_to * MPH if on_link else 0.0)
+    f.update(li)
+    if f.offer is not None and f.offer.kind == "merge" and not offers:
+      offers.append((k - link_at, f.offer.target))
+  return offers, [e[1]["reason"] for e in f.events if e[0] == "speedLimitNotFollowed"]
+
+
+def test_u5a_the_planners_ramp_to_speed_is_the_highways_limit_when_the_next_limit_is_missing_or_a_streets():
+  for nxt in (lambda k: 0, lambda k: 45):
+    ofs, _ = _ramp_to_run(nxt, ramp_to=0)
+    assert not ofs                                                         # before: waits for mapd's next limit
+    ofs, reasons = _ramp_to_run(nxt)
+    assert ofs and ofs[0][1] == 75 and ofs[0][0] <= 2.0 / DT + 5, (ofs, reasons)
+  # a real highway next limit wins; a ramp-to speed that is no highway limit is not used
+  ofs, _ = _ramp_to_run(lambda k: 65, ramp_to=70)
+  assert ofs and ofs[0][1] == 70
+  assert not _ramp_to_run(lambda k: 0, ramp_to=35)[0]
+  # the trust rules as for the normal merge: trust 2 waits; the start of the drive's trust 1 with good accuracy opens
+  assert not _ramp_to_run(lambda k: 0, trust=2)[0]
+  MCm = _load("mc_round_u", os.path.join("..", "..", "..", "..", "..", "starpilot", "controls", "lib", "map_curves.py"))
+  assert _ramp_to_run(lambda k: 0, trust=1, why=MCm.SHAKY_START, acc=8.0)[0]
+  old = slf.MERGE_RAMP_TO
+  try:
+    slf.MERGE_RAMP_TO = False
+    assert not _ramp_to_run(lambda k: 0)[0]
+  finally:
+    slf.MERGE_RAMP_TO = old
+
+
+def _res_run(frames=400, hwy_link=True, auto=True, v=31.6, set0=20.0, gas=False, **kw):
+  """Cruise off (his brake), then cruise back at the old set 20 by our auto resume's RES on the link at 31.6 mph."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  for f in range(100):
+    lg.update(_inp(set_speed=set0 * MPH, v_ego=20 * MPH, btn_counter=(f // 10) % 16))
+  for f in range(200):
+    lg.update(_inp(cruise_enabled=False, set_speed=0.0, v_ego=v * MPH, btn_counter=(f // 10) % 16))
+  set_mph, presses = set0, []
+  for f in range(frames):
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v * MPH, auto_resumed=auto, hwy_link=hwy_link, gas_pressed=gas,
+                          btn_counter=(f // 10) % 16, **kw))
+    if b is not None:
+      presses.append((f, b, lg.last_action))
+      if b == cs.SET_PLUS:
+        set_mph = (int(v) if lg.last_action == "jump" else set_mph + (5 if lg.last_action == "hold" and f % 10 == 0 else
+                                                                      (1 if lg.last_action != "hold" else 0)))
+  return lg, presses, set_mph
+
+
+def test_u5b_our_res_on_the_link_with_an_old_low_set_takes_the_set_to_the_cars_speed():
+  lg, presses, s = _res_run()
+  assert presses and presses[0][1] == cs.SET_PLUS and presses[0][0] <= 100, presses[:3]
+  assert abs(s - 32) < 1e-6, (s, presses[:5])                          # the car's 31.6 as a whole step
+  # on his gas: the jump to the car's speed
+  lg, presses, s = _res_run(gas=True)
+  assert presses and any(a == "jump" for _, _, a in presses), presses[:3]
+  # not: his own RES, not on a link to a highway, the set near the car's speed, a curve target or a slow car ahead
+  for kw in (dict(auto=False), dict(hwy_link=False), dict(set0=28.0), dict(radar_lead=True, lead_v=20 * MPH),
+             dict(red_light=True)):
+    lg, presses, s = _res_run(**kw)
+    assert not any(b == cs.SET_PLUS for _, b, _ in presses), kw

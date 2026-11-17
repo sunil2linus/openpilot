@@ -411,6 +411,16 @@ ENGAGE_AUTO_CLEAN_HOLDS = 3
 # ENGAGE_AUTO_LEAD_D that we close on (any lead, also one the cruise does not track); else taps, as before round R
 # (SlowdownInputs.auto_hold_ok, the wrapper)
 ENGAGE_AUTO_PATH_TIME = 4.0   # s
+# Round U, U5b (drive 7e t 318-324: our auto resume's RES on an on-ramp to a highway brought back the old set 20 at 31.6 mph:
+# the car slowed toward it until the merge window opened). After OUR auto resume's RES (SlowdownInputs.auto_resumed) on a link
+# to a highway (SlowdownInputs.hwy_link) with the set more than LINK_LIFT_GAP under the car's speed: his speed becomes the
+# car's speed (whole steps; on his gas GAS_JUMP_MARGIN over it, where the jump lands; never above the car's maximum / a
+# lower limit's ceiling) at once, raised by the restore's
+# fast SET+ (the jump to the car's speed on his gas, else a hold / taps); a curve target, a stop on or planned, a red light,
+# a slow or closing car ahead or his buttons / brake: not (within ENGAGE_RAISE_MAX of the RES, else nothing). The merge
+# boost then follows its normal rules.
+LINK_LIFT = True
+LINK_LIFT_GAP = (5 * MS_PER_MPH, 8 * MS_PER_KPH)
 ENGAGE_AUTO_LEAD_D = 80.0     # m
 # Round P (drive 73 t 1296.2, the South Blvd exit with stopped cars on the ramp): the exit's end by adoption (map_curve_control
 # adopt, adopt_forgets) took the 26 its slowdown and the queue left as his speed though the street cap was 48 (he held SET+
@@ -749,6 +759,7 @@ class SlowdownInputs:
   # on a link to a highway (speed_limit_follow ramp_start): cruise back on there, our old anchor from before is not
   # restored (the ramp start: the merge decides the speed)
   ramp_start: bool = False
+  hwy_link: bool = False          # (LINK_LIFT) on a link to a highway (the limit follower's link, the planner's ramp flags)
   # the road changed since our stop episode began (mapdOut's road name, or speed_limit_follow's heading watch saw a
   # turn): his RES gets the gentle restore, not the fast one (RESUME_RESTORE; review of round k, S4)
   road_changed: bool = False
@@ -960,6 +971,7 @@ class CurveSlowdownLogic:
     self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
     self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
     self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"][, "auto"]}
+    self.link_lift = None            # (LINK_LIFT) the frame of our auto resume's RES on a link to a highway, its lift to come
     self.lock_clean = 0              # phase-locked holds measured with nothing landing after the release (ENGAGE_AUTO)
     self.keep_on = False             # the LKAS_KEEP floor acts in this curve (LKAS_KEEP_MARGIN)
     self.keep_held = None            # ... at the lowest floor seen while on (m/s)
@@ -1136,6 +1148,33 @@ class CurveSlowdownLogic:
     if not LKAS_HARD or i.lkas_hard <= 0:
       return 0.0
     return math.floor(min(i.lkas_hard, driver_speed) / self.step + 1e-3) * self.step
+
+  def _link_lift(self, i, cruise_ok, red_block):
+    """(LINK_LIFT) after our auto resume's RES on a link to a highway: the set up to the car's speed, once clear."""
+    f0 = getattr(self, "link_lift", None)
+    if f0 is None:
+      return
+    if (not cruise_ok or self.blocked or i.brake_pressed or self.boost is not None or self.engage is not None or
+        self.frame - f0 > _frames(ENGAGE_RAISE_MAX)):
+      self.link_lift = None
+      return
+    lead_slow = i.radar_lead and (i.lead_v < 0 or i.lead_v < i.v_ego - MERGE_LEAD_CLOSING)
+    if (i.csc_active or i.stop_active or i.hold_restore or red_block or i.red_stop or i.red_light or i.model_plan_stop or
+        i.stop_slower_ahead or lead_slow or i.driver_button is not None):
+      return                           # (waits, within ENGAGE_RAISE_MAX)
+    # the car's speed in whole steps (a SET+ with the car faster jumps there; on his gas GAS_JUMP_MARGIN over it, as the jump
+    # rule needs)
+    gas = i.gas_pressed or self.frame - self.last_gas_frame <= _frames(GAS_JUMP_RECENT)
+    goal = (int(round(max(i.v_ego, 0.0) / self.step)) + (GAS_JUMP_MARGIN if gas else 0)) * self.step
+    ceiling = self._ceiling()
+    goal = min(goal, self._set_top(), ceiling if ceiling is not None else goal)
+    self.link_lift = None
+    if goal <= i.set_speed + self.half_step:
+      return
+    self.anchor = goal
+    self.anchor_ours = True
+    self.restoring = False
+    self.restore_pending = self.raise_fast = True
 
   def _engage_auto(self):
     """(ENGAGE_AUTO) the raise after our auto resume's RES is going."""
@@ -1941,6 +1980,10 @@ class CurveSlowdownLogic:
     if (RAMP_START_FORGET and i.ramp_start and cruise_ok and self.cruise_gap and self.boost is None and
         self.anchor is not None and not self.inflight):
       self._forget()                   # (the ramp start) back on on the ramp: our old anchor is not his speed here
+    if (LINK_LIFT and cruise_ok and self.cruise_gap and getattr(i, "auto_resumed", False) and i.hwy_link and
+        self.boost is None and i.v_ego - i.set_speed > self._metric_pick(LINK_LIFT_GAP)):
+      self.link_lift = self.frame      # (LINK_LIFT) our RES on the link brought back an old, low set
+    self._link_lift(i, cruise_ok, red_block)
     if cruise_ok:
       self._observe_set_speed(i)
     self._forget_hold_misses()
@@ -3265,7 +3308,9 @@ class CurveSlowdown:
                        stop_active=bool(self.trigger.active) and self.stop_mode == ON,
                        red_light=bool(plan_alive and getattr(plan, "redLight", False)),
                        no_gps=self._no_gps(plan, plan_alive),
-                       ramp_curve=self._ramp_curve_on(plan, plan_alive))
+                       ramp_curve=self._ramp_curve_on(plan, plan_alive),
+                       ramp_to_speed=(float(getattr(plan, "mapRampToSpeed", 0.0) or 0.0)
+                                      if (plan_alive and getattr(plan, "mapOnRamp", False)) else 0.0))
       # rules 8 / 9 only act with Speed Limit Follow and Map Curves both On (second review: Map Curves in Test left the
       # slowdown never carried out, never finished, its alert on, rules 8 / 9 blocked)
       self.limit_follow.street_active = self._street_active(plan)
@@ -3337,6 +3382,9 @@ class CurveSlowdown:
       limit_undo=limit_undo if self.limit_mode == LIMIT_ON else 0.0,
       limit_ceiling=limit_ceiling if self.limit_mode == LIMIT_ON else 0.0,
       auto_resumed=bool(getattr(self, "auto_resumed", False)),
+      hwy_link=bool((self.limit_follow is not None and self.limit_follow.link_start is not None and
+                     self.limit_follow.link_to_hwy) or
+                    (plan_alive and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False))),
       auto_hold_ok=self._auto_hold_ok(model_length, lead, v_ego),
     )
     if self.ramp_handover is not None:

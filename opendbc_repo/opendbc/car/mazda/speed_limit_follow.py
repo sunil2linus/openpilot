@@ -227,6 +227,11 @@ MERGE_OVER_KPH = 8
 # waits (no window) and opens when the ramp curve has ended, from his speed then, with every normal check. His SET- on the
 # link with no ramp curve ahead or being driven (also after the ramp curve ended) declines the merge as before.
 RAMP_CURVE_MINUS = True
+# Round U, U5a (drive 7e t 318-324: mapd's next limit missing, then the street's 45 until 322.6, while the planner knew the
+# ramp leads to a 70 highway, mapRampToSpeed): on a link to a highway (ramp_to_highway) with no next limit, or one that is not
+# a highway limit, the planner's mapRampToSpeed is the highway's limit for the merge (the same checks after it: the GPS
+# trust or round T's start-of-drive trust 1, the steady time, his speed against the target).
+MERGE_RAMP_TO = True
 # When: the stock cruise's speed-up with the set speed above the speed (drives 4c-53, median m/s^2 by the gap in mph:
 # up to 5 below, 5-10, ..., 20 and more), so the cruise is MERGE_NEAR_MPH below the highway's limit where it starts
 # (mapdOut.nextSpeedLimitDistance). 45 -> 65 mph: 11.9 s, 300 m; with MERGE_LEAD_TIME for our presses (a SET+ hold to 5
@@ -403,6 +408,7 @@ class LimitInputs:
   gps_shaky_why: int = 0    # (MERGE_SHAKY_START) starpilotPlan.mapGpsShakyWhy: 1 trust 1 only for the start of the drive
   gps_acc: float = 0.0      # (MERGE_SHAKY_START) starpilotPlan.mapGpsAccuracy, m (0 unknown)
   ramp_curve: bool = False  # (RAMP_CURVE_MINUS) a map ramp curve ahead on this link or being driven (until it really ended)
+  ramp_to_speed: float = 0.0  # (MERGE_RAMP_TO) m/s, starpilotPlan.mapRampToSpeed on a ramp (0 unknown)
 
 
 @dataclass
@@ -998,6 +1004,11 @@ class SpeedLimitFollower:
       v += step
     return dist
 
+  def _hwy_limit(self, n):
+    """steps n is a highway's limit (whole multiple, under LIMIT_MAX_MPH, at least merge_min)."""
+    return n is not None and not (n % self.multiple or n * self.step / MS_PER_MPH > LIMIT_MAX_MPH + 1e-6 or
+                                  n < self.merge_min)
+
   def _merge(self, i, d):
     """Rule 5: on a link to a highway, the highway's limit ahead becomes the driver's speed, timed for the merge."""
     n = None
@@ -1005,6 +1016,12 @@ class SpeedLimitFollower:
       x = self._steps(i.next_limit)
       if abs(x - round(x)) <= LIMIT_WHOLE_TOL:
         n = int(round(x))
+    if MERGE_RAMP_TO and not self._hwy_limit(n) and i.ramp_to_highway and i.ramp_to_speed >= 1.0:
+      # (MERGE_RAMP_TO) the planner's limit of the road the ramp leads into
+      x = self._steps(i.ramp_to_speed)
+      r = int(round(x)) if abs(x - round(x)) <= LIMIT_WHOLE_TOL else None
+      if self._hwy_limit(r):
+        n = r
     self.ramp_next = n if self.link_start is not None else None
     o = self.offer
     if o is not None and o.kind == "merge":
