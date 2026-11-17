@@ -88,7 +88,8 @@ def test_a_lower_maximum_is_learned_and_its_refused_presses_are_no_no_effect():
   car, lg, log = _boost73(step=KPH, max_set=143 * KPH, set0=42 * MPH / KPH)
   assert lg.set_max is not None and abs(lg.set_max / KPH - 143) < 0.6, lg.set_max
   ups_at_max = [f for f, s, _, b, *_ in log if b == cs.SET_PLUS and s * MPH / KPH >= 143 - 0.5]
-  assert len(ups_at_max) <= 1, ups_at_max
+  # (round U, U6: under 145 km/h the maximum is learned from 2 separate single presses unanswered at the same set)
+  assert len(ups_at_max) <= 2, ups_at_max
   assert lg.no_effect_trips == 0 and all(bu == 0 for *_, bu in log)
 
 

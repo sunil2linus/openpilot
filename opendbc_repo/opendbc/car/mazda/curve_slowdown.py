@@ -288,6 +288,16 @@ MERGE_UP_HOLD_MAX = 9.0       # s
 # no-effect back-off never blocks or delays the boost's way down (BOOST_DOWN_NO_BACKOFF).
 MERGE_BOOST_MAX = (90, 145)
 SET_MAX_LEARN = (88, 142)
+# Round U, U6 (drive 7e t 332-334: two SET+ taps in flight near the top, both lost, learned 88 as the car's maximum: no more
+# SET+ for the drive, the car takes 90). The maximum is learned from an unanswered SET+ of ours only with the set at
+# MERGE_BOOST_MAX (90 mph / 145 km/h) less half a step, or after SET_MAX_MISSES separate single presses (nothing else of ours
+# in flight when each was sent), at least SET_MAX_MISS_GAP apart, went unanswered at the same set (from SET_MAX_LEARN up).
+# Within SET_MAX_NEAR of the top no second SET+ tap goes while one of ours is still in flight. A learned maximum under
+# MERGE_BOOST_MAX is forgotten as soon as the set is seen above it (a later SET+ landed there).
+SET_MAX_TWO = True
+SET_MAX_MISSES = 2
+SET_MAX_MISS_GAP = 0.6        # s
+SET_MAX_NEAR = (3 * MS_PER_MPH, 5 * MS_PER_KPH)
 BOOST_DOWN_NO_BACKOFF = True
 # Owner (round P: "come down earlier"; a72/sim1.py: ~1.2-1.5 s more to 73, the peak ~75 instead of 81): during the boost,
 # once the car is within MERGE_TAPER_GAP of the target (65 on a 70 road, the target 75) or the road is matched as the
@@ -861,6 +871,7 @@ class Press:
   jump: bool = False       # a SET+ on the gas: the set speed jumps to the current speed (up to `reserve` steps, once)
   stop_frame: int = -1     # hold: frame it was stopped (HOLD_MISS_*: how long it ran)
   cut: bool = False        # hold: cut by the brake, cruise off, openpilot off, the gas or the driver's buttons
+  alone: bool = False      # (SET_MAX_TWO) sent with nothing else of ours in flight
 
 
 class CurveSlowdownLogic:
@@ -969,6 +980,7 @@ class CurveSlowdownLogic:
     self.prev_radar_lead = False
     self.boost_reopen = None         # {"target", "frame"}: a boost ended for a lead gone in a turn (MERGE_LEAD_GONE_REOPEN)
     self.set_max = None              # m/s: the car's maximum set speed as learned this drive (SET_MAX_LEARN), None unknown
+    self.max_miss = None             # (SET_MAX_TWO) (set m/s, unanswered single presses there, frame of the last)
     self.boost_csc_frames = 0        # frames a curve target under the boost's target has been on (MERGE_CSC_END)
     self.engage = None               # his RES with a raise to come (ENGAGE_RAISE): {"frame", "goal"[, "go"][, "auto"]}
     self.link_lift = None            # (LINK_LIFT) the frame of our auto resume's RES on a link to a highway, its lift to come
@@ -1841,6 +1853,7 @@ class CurveSlowdownLogic:
       self.hold_log[-1]["frames_sent"] = self.hold.frames_sent
     else:
       p = Press(button, self.frame)
+      p.alone = not self.inflight and self.hold is None
       p.frames_sent = 1
       self.pending = p
       self.inflight.append(p)
@@ -1880,6 +1893,9 @@ class CurveSlowdownLogic:
       i = replace(i, csc_active=False)   # (MERGE_MODEL_CSC) the loop being left: no curve for the merge
     cruise_ok = i.cruise_enabled and i.set_speed > 0
     self.cruise_on_frames = self.cruise_on_frames + 1 if cruise_ok else 0
+    if (SET_MAX_TWO and cruise_ok and self.set_max is not None and i.set_speed > self.set_max + self.half_step and
+        self.set_max < MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step - self.half_step):
+      self.set_max = None              # (SET_MAX_TWO) the set is above the learned maximum: it was not the car's
     if not cruise_ok:
       if self.last_set_speed is not None:
         self.cruise_gap = True
@@ -1997,7 +2013,24 @@ class CurveSlowdownLogic:
       learn = SET_MAX_LEARN[1 if self.step < MS_PER_MPH else 0] * self.step
       if p.direction == SET_PLUS and self.last_set_speed is not None and self.last_set_speed >= learn - self.half_step:
         # (SET_MAX_LEARN) refused by the car's maximum, not ignored: never a no-effect press
-        self.set_max = self.last_set_speed if self.set_max is None else min(self.set_max, self.last_set_speed)
+        full = MERGE_BOOST_MAX[1 if self.step < MS_PER_MPH else 0] * self.step
+        m = self.max_miss
+        if not SET_MAX_TWO or self.last_set_speed >= full - self.half_step:
+          learned = True
+        elif p.alone:
+          # (SET_MAX_TWO) a single press with nothing else in flight: counted at this set
+          if m is not None and abs(m[0] - self.last_set_speed) < self.half_step:
+            if p.frame - m[2] >= _frames(SET_MAX_MISS_GAP):
+              m = (self.last_set_speed, m[1] + 1, p.frame)   # (closer than SET_MAX_MISS_GAP: not counted)
+          else:
+            m = (self.last_set_speed, 1, p.frame)
+          self.max_miss = m
+          learned = m[1] >= SET_MAX_MISSES
+        else:
+          learned = False
+        if learned:
+          self.set_max = self.last_set_speed if self.set_max is None else min(self.set_max, self.last_set_speed)
+          self.max_miss = None
       else:
         self.no_effect += 1
     window = self._in_flight_window()
@@ -2640,6 +2673,9 @@ class CurveSlowdownLogic:
     if (button == SET_PLUS and not hold and self.boost is not None and "model" in self.boost and
         "ended" not in self.boost):
       return None, None                # (re-review G1-C) the bounded raise is one SET+ hold, never taps
+    if (SET_MAX_TWO and button == SET_PLUS and not hold and any(p.direction == SET_PLUS for p in self.inflight) and
+        i.set_speed >= self._set_top() - self._metric_pick(SET_MAX_NEAR) - 1e-3):
+      return None, None                # (SET_MAX_TWO) near the top: one SET+ tap of ours in flight at a time
     if hold and self.phase_lock and not self.new_wheel:
       self._start_hold(button)        # its first frame goes out with the next wheel frame
       off = None

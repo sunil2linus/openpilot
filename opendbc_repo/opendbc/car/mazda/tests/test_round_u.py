@@ -345,3 +345,76 @@ def test_u5b_our_res_on_the_link_with_an_old_low_set_takes_the_set_to_the_cars_s
              dict(red_light=True)):
     lg, presses, s = _res_run(**kw)
     assert not any(b == cs.SET_PLUS for _, b, _ in presses), kw
+
+
+# ---------------- U6: the car's maximum set speed is not learned from lost taps ----------------
+
+class _TopCar:
+  """The set speed follows our taps after `lag` frames, except `lost` taps (by number) and nothing above `max_set`."""
+
+  def __init__(self, set_mph, max_set=90.0, lost=(), lag=15):
+    self.set_mph, self.max_set, self.lost, self.lag, self.n, self.queue = set_mph, max_set, set(lost), lag, 0, []
+
+  def press(self, f, b):
+    self.n += 1
+    if self.n not in self.lost:
+      self.queue.append((f + self.lag, 1 if b == cs.SET_PLUS else -1))
+
+  def tick(self, f):
+    for due, d in [q for q in self.queue if q[0] <= f]:
+      self.queue.remove((due, d))
+      self.set_mph = min(self.set_mph + d, self.max_set)
+
+
+def _top_run(set0=84.0, anchor=90.0, frames=1500, **car_kw):
+  lg = cs.CurveSlowdownLogic(False, 10)
+  car = _TopCar(set0, **car_kw)
+  lg.update(_inp(set_speed=set0 * MPH, v_ego=80 * MPH))
+  lg.anchor = anchor * MPH
+  lg.restore_pending = True
+  sent = []
+  for f in range(frames):
+    b, _ = lg.update(_inp(set_speed=car.set_mph * MPH, v_ego=80 * MPH, btn_counter=(f // 10) % 16))
+    if b is not None and lg.last_action != "hold":
+      sent.append((f, b, car.set_mph, len(lg.inflight)))
+      car.press(f, b)
+    car.tick(f)
+  return lg, car, sent
+
+
+def test_u6_a_lost_tap_near_the_top_does_not_teach_88():
+  # drive 7e: taps lost at 88: the old rule learned 88 at the first unanswered one (no more SET+ for the drive)
+  old = cs.SET_MAX_TWO
+  try:
+    cs.SET_MAX_TWO = False
+    lg, car, _ = _top_run(lost=(5,))
+    assert lg.set_max is not None and abs(lg.set_max / MPH - 88) < 1e-6 and car.set_mph == 88
+  finally:
+    cs.SET_MAX_TWO = old
+  lg, car, sent = _top_run(lost=(5,))
+  assert lg.set_max is None or lg.set_max / MPH >= 90 - 0.5, (lg.set_max, sent)
+  assert abs(car.set_mph - 90) < 1e-6, (car.set_mph, sent)
+  # never a second SET+ tap while one is in flight within 3 mph of the top
+  assert all(n == 1 for f, b, s, n in sent if b == cs.SET_PLUS and s >= 87 - 1e-6), sent
+
+
+def test_u6_the_cars_real_maximum_is_still_learned():
+  lg, car, sent = _top_run(max_set=90.0, anchor=95.0)                     # (never a SET+ at 90 itself, as before)
+  assert car.set_mph == 90 and not any(b == cs.SET_PLUS and s >= 90 - 0.5 for f, b, s, n in sent)
+  lg, car, sent = _top_run(max_set=88.0, anchor=90.0, frames=2500)       # a car that really stops at 88: two single presses
+  ups = [f for f, b, s, n in sent if b == cs.SET_PLUS and s >= 88 - 0.5]
+  assert lg.set_max is not None and abs(lg.set_max / MPH - 88) < 1e-6 and len(ups) == 2, ups
+  assert ups[1] - ups[0] >= cs.SET_MAX_MISS_GAP / DT
+
+
+def test_u6_a_learned_maximum_under_90_is_forgotten_once_the_set_is_above_it():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=86 * MPH, v_ego=80 * MPH))
+  lg.set_max = 88 * MPH
+  lg.update(_inp(set_speed=88 * MPH, v_ego=80 * MPH))
+  assert lg.set_max is not None
+  lg.update(_inp(set_speed=89 * MPH, v_ego=80 * MPH))
+  assert lg.set_max is None
+  lg.set_max = 90 * MPH                                                   # the real top: kept
+  lg.update(_inp(set_speed=90 * MPH, v_ego=80 * MPH))
+  assert lg.set_max is not None
