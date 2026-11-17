@@ -457,6 +457,16 @@ LKAS_HARD_WHYS = ("curve", "ramp", "ramp hold")    # map_curve_control.MapOutput
 # is no longer followed for TI_ONLY_HYST (then TI-only as before if the block is still on). A block that was on before the
 # curve, or a camera fault (ti_fault), plans TI-only as before.
 LKAS_BLOCK_HOLD = True
+# Round U, U2 (drive 7e, exit 46: in the loop the set stayed at 30 with the curve's own target 33.25: LKAS_KEEP only taps up to
+# its floor, keep_held only goes down, the follower's undershoot sits under the curve's speed). Once inside a followed map
+# curve (LKAS_HARD_WHYS; its distance 0, or its ramp hold) with the car at most CURVE_OWN_NEAR above the curve's own target
+# (SlowdownInputs.curve_own: MapOutput.curve_speed, the offset in it), the curve target is floored at that target rounded
+# down to a whole step (never above his speed) and a set under it is brought up by SET+ taps (MIN_DWELL after our last
+# SET-; no stop / red light / planned stop / slow or closing car ahead / his buttons; the wrapper gives 0 with the LKAS
+# blocked, TI-only planning, the camera's fault, the camera's too-fast latch, a street target). The floor only goes down
+# while on (the lowest seen, as LKAS_KEEP's keep_held): a curve that tightens is followed down, never back up in it.
+CURVE_OWN_RAISE = True
+CURVE_OWN_NEAR = 2 * MS_PER_MPH   # m/s
 TI_ONLY_HYST = 2.0            # s
 # ... and while the car's camera reports a fault (CAM_LKAS ERR_BIT_1 / ERR_BIT_2, or its lane lines off at speed:
 # carstate stock_lkas_off) or LKAS_BLOCK is set above the cut-off (LKAS_CUTOFF): curves TI-only as above and the merge's
@@ -717,6 +727,8 @@ class SlowdownInputs:
   lkas_keep: float = 0.0
   # m/s, 0 none (LKAS_HARD): the same, at all times while a map curve at or above LKAS_KEEP_SPEED is followed
   lkas_hard: float = 0.0
+  # m/s, 0 none (CURVE_OWN_RAISE): inside a followed map curve, its own target (the offset in it)
+  curve_own: float = 0.0
   # (ENGAGE_AUTO) the cruise came back on by our auto resume's RES (auto_resume.AutoResume.own_engaged)
   auto_resumed: bool = False
   auto_hold_ok: bool = True       # (ENGAGE_AUTO_PATH_TIME / _LEAD_D, F7) its SET+ hold may go
@@ -896,6 +908,8 @@ class CurveSlowdownLogic:
     self.lock_clean = 0              # phase-locked holds measured with nothing landing after the release (ENGAGE_AUTO)
     self.keep_on = False             # the LKAS_KEEP floor acts in this curve (LKAS_KEEP_MARGIN)
     self.keep_held = None            # ... at the lowest floor seen while on (m/s)
+    self.own_on = False              # (CURVE_OWN_RAISE) the curve's own target is the floor in this curve
+    self.own_held = None             # ... at the lowest seen while on (m/s)
     self.undo_cap = None             # rule 4 without the undo: like limit_cap at the driver's old speed, kept until applied
     self.limit_undone = None         # (driver's speed before, back to, "undo" / "cap") on the frame rule 4 was dealt with
     self.limit_ceiling = None        # this frame's provisional ceiling (SlowdownInputs.limit_ceiling) below the anchor
@@ -1055,6 +1069,12 @@ class CurveSlowdownLogic:
     if not LKAS_KEEP or i.lkas_keep <= 0:
       return 0.0
     return math.floor(min(i.lkas_keep, driver_speed) / self.step + 1e-3) * self.step
+
+  def _own_floor(self, i, driver_speed):
+    """(CURVE_OWN_RAISE) m/s, min(curve_own, his speed) rounded down to a whole step; 0 none."""
+    if not CURVE_OWN_RAISE or i.curve_own <= 0:
+      return 0.0
+    return math.floor(min(i.curve_own, driver_speed) / self.step + 1e-3) * self.step
 
   def _hard_floor(self, i, driver_speed):
     """(LKAS_HARD) m/s, min(lkas_hard, his speed) rounded down to a whole step; 0 none."""
@@ -2092,9 +2112,18 @@ class CurveSlowdownLogic:
       # (last review of round P) while it is on in this curve the floor only goes down: the lowest seen (a curve's own
       # target wobbling across a whole mph tapped SET-/SET+ about once a second)
       self.keep_held = (keep if self.keep_held is None else min(self.keep_held, keep)) if self.keep_on else None
-      targets.append(("curve", max(curve_t, floor, self.keep_held if self.keep_on else 0.0, self._hard_floor(i, driver_speed))))
+      # (CURVE_OWN_RAISE) inside the curve, the car near its own target: that target (rounded down), the lowest seen
+      own = self._own_floor(i, driver_speed)
+      if own > 0 and i.v_ego <= i.curve_own + CURVE_OWN_NEAR:
+        self.own_on = True
+      if own <= 0:
+        self.own_on = False
+      self.own_held = (own if self.own_held is None else min(self.own_held, own)) if self.own_on else None
+      targets.append(("curve", max(curve_t, floor, self.keep_held if self.keep_on else 0.0, self._hard_floor(i, driver_speed),
+                                   self.own_held if self.own_on else 0.0)))
     else:
       self.keep_on, self.keep_held = False, None
+      self.own_on, self.own_held = False, None
     if i.stop_active:
       # (review of round P, B3: a stop, a red light or a stopped car goes under LKAS_KEEP_SPEED in a curve as before)
       targets.append(("stop", max(min(i.stop_target, driver_speed), STOP_MIN_SET_SPEED)))
@@ -2315,10 +2344,17 @@ class CurveSlowdownLogic:
                   set_speed + self.step <= keep_t + UP_STEP_TOL * self.step and not i.stop_active and not i.hold_restore and
                   not i.red_stop and not self.red_up_block and not i.stop_slower_ahead and not lead_slow and not restore_only and
                   dwell_ok and (ceiling is None or set_speed + self.step <= ceiling + 1e-3))
+    # (CURVE_OWN_RAISE) the set under the curve's own target inside it: SET+ taps up to it (bounded by it)
+    own_t = self.own_held if (self.own_on and self.own_held is not None) else 0.0
+    own_raise = (CURVE_OWN_RAISE and self.own_on and reason == "curve" and i.curve_own > 0 and not self.blocked and
+                 i.driver_button is None and set_speed + self.step <= own_t + UP_STEP_TOL * self.step and
+                 not i.stop_active and not i.hold_restore and not i.red_stop and not i.red_light and not i.model_plan_stop and
+                 not self.red_up_block and not i.stop_slower_ahead and not lead_slow and not restore_only and dwell_ok and
+                 (ceiling is None or set_speed + self.step <= ceiling + 1e-3))
     if want_lower:
       self.restoring = False
       button = SET_MINUS
-    elif keep_raise:
+    elif keep_raise or own_raise:
       # (T1) not `restoring`: a tightening curve's re-lowering needs one step of room, not two
       button = SET_PLUS
       raise_in_curve = True            # (taps only, as the curve's own raise)
@@ -3181,6 +3217,7 @@ class CurveSlowdown:
       street_lower=curve_street,
       lkas_keep=self._lkas_keep(curve_active, curve_street),
       lkas_hard=self._lkas_hard(curve_active, curve_street),
+      curve_own=self._curve_own(plan if plan_alive else None, curve_active, curve_street),
       fast_restore=fast_restore,
       other_button_active=other_button_active,
       driver_button=SET_MINUS if CS.crz_set_minus else (SET_PLUS if CS.crz_set_plus else None),
@@ -3829,6 +3866,24 @@ class CurveSlowdown:
       hard = min(hard, self.curve_target.speed)
     self.lkas_hard = hard
     return hard
+
+  def _curve_own(self, plan, curve_active, curve_street):
+    """(CURVE_OWN_RAISE) m/s, inside a followed map curve (its distance 0, or its ramp hold): the curve's own target
+    (MapOutput.curve_speed, the Curve Speed Offset in it); 0 none, also with the LKAS blocked, TI-only planning, the
+    camera's fault or its too-fast latch, or a street target governing."""
+    if not (CURVE_OWN_RAISE and curve_active) or curve_street or plan is None or not self._followed_map_curve():
+      return 0.0
+    if self.ti_only or getattr(self, "lkas_blocked", False) or getattr(self, "ti_fault", False):
+      return 0.0
+    cc = getattr(self, "cam_curve", None)
+    if cc is not None and getattr(cc, "over", False):
+      return 0.0
+    mo = self.map_out
+    status = int(getattr(plan, "mapCurveStatus", 0) or 0)
+    radius = float(getattr(plan, "mapCurveRadius", 0.0) or 0.0)
+    dist = float(getattr(plan, "mapCurveDistance", 0.0) or 0.0)
+    inside = mo.why == "ramp hold" or (status in (1, 2) and radius > 0 and dist <= 0.5)
+    return float(mo.curve_speed) if inside and 0 < mo.curve_speed < 100.0 else 0.0
 
   @property
   def curve_target_speed(self):

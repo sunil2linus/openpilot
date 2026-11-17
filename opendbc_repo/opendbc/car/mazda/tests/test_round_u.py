@@ -71,3 +71,90 @@ def test_u1_post_apex_taps_unaffected():
   assert taps and abs(s - base_s) < 1e-6 and base_taps == taps
   # (post-apex: the approach flag cannot stop them either)
   assert TR._loop_cam(gov_cmd=30 * MPH, map_approach=True)[0]
+
+
+# ---------------- U2: inside a map curve the set comes up to the curve's own target ----------------
+
+def _inp(**k):
+  d = dict(enabled=True, cruise_enabled=True, set_speed=20 * MPH, v_ego=25 * MPH, gas_pressed=False, brake_pressed=False,
+           standstill=False, plan_alive=True, csc_active=False, csc_speed=0.0, other_button_active=False)
+  d.update(k)
+  return cs.SlowdownInputs(**d)
+
+
+def _in_curve(frames=800, set0=30.0, v=31.0, own=33.25, own_fn=None, anchor=45.0, **kw):
+  """Inside a followed loop: the curve target 30 (the camera's lowest), the car at v mph; returns the set speeds."""
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=set0 * MPH, v_ego=v * MPH))
+  lg.anchor = anchor * MPH
+  set_mph, sets = set0, []
+  for f in range(frames):
+    o = own_fn(f) if own_fn else own
+    b, _ = lg.update(_inp(set_speed=set_mph * MPH, v_ego=v * MPH, csc_active=True, csc_speed=30 * MPH, curve_track=True, curve_floor=24 * MPH,
+                          curve_budget=60, curve_own=o * MPH, btn_counter=(f // 10) % 16, **kw))
+    if b == cs.SET_PLUS and lg.last_action != "hold":
+      set_mph += 1
+    elif b == cs.SET_MINUS and lg.last_action != "hold":
+      set_mph -= 1
+    sets.append(set_mph)
+  return sets, lg
+
+
+def test_u2_inside_the_curve_the_set_comes_up_to_its_own_target_rounded_down():
+  sets, _ = _in_curve(own=0.0)
+  assert max(sets) == 30.0                                              # before: left at the floor
+  sets, _ = _in_curve()
+  assert max(sets) == 33.0 and sets[-1] == 33.0                         # 33.25 -> 33, never 34
+  sets, _ = _in_curve(own=33.0)
+  assert max(sets) == 33.0
+  # not while the car is more than 2 mph above the curve's own target
+  assert max(_in_curve(v=35.5)[0]) == 30.0
+  # never above his speed
+  assert max(_in_curve(anchor=32.0)[0]) == 32.0
+
+
+def test_u2_the_guards():
+  for kw in (dict(stop_active=True, stop_target=20 * MPH), dict(hold_restore=True), dict(red_stop=True), dict(red_light=True),
+             dict(model_plan_stop=True), dict(radar_lead=True, lead_v=20 * MPH), dict(driver_button=cs.SET_MINUS)):
+    sets, _ = _in_curve(frames=300, **kw)
+    assert max(sets) <= 30.0, kw
+  old = cs.CURVE_OWN_RAISE
+  try:
+    cs.CURVE_OWN_RAISE = False
+    assert max(_in_curve()[0]) == 30.0
+  finally:
+    cs.CURVE_OWN_RAISE = old
+
+
+def test_u2_a_second_after_our_set_minus_and_the_lowest_target_held():
+  lg = cs.CurveSlowdownLogic(False, 10)
+  lg.update(_inp(set_speed=30 * MPH, v_ego=31 * MPH))
+  lg.anchor = 45 * MPH
+  lg.last_minus_frame = lg.frame
+  first = None
+  for f in range(300):
+    b, _ = lg.update(_inp(set_speed=30 * MPH, v_ego=31 * MPH, csc_active=True, csc_speed=30 * MPH, curve_track=True,
+                          curve_own=33.25 * MPH, btn_counter=(f // 10) % 16))
+    if b == cs.SET_PLUS and first is None:
+      first = f
+  assert first is not None and first + 1 >= cs.MIN_DWELL / DT
+  # the curve tightens (own 31.4 from 2 s), then opens again (34): held at 31, no SET- / SET+ churn
+  sets, _ = _in_curve(frames=1200, own_fn=lambda f: 33.25 if f < 200 else (31.4 if f < 600 else 34.0))
+  assert max(sets[:200]) == 33.0 and sets[-1] == 31.0 and max(sets[700:]) == 31.0
+
+
+def test_u2_the_wrapper_gives_the_own_target_only_inside_a_followed_curve():
+  def w(**k):
+    d = dict(ti_only=False, lkas_blocked=False, ti_fault=False, cam_curve=NS(over=False),
+             map_out=NS(why="ramp", curve_speed=33.25 * MPH, active=True, track=True), _followed_map_curve=lambda: True)
+    d.update(k)
+    return NS(**d)
+  plan = NS(mapCurveStatus=2, mapCurveRadius=80.0, mapCurveDistance=0.0)
+  own = lambda o, p=plan, act=True, street=False: cs.CurveSlowdown._curve_own(o, p, act, street)  # noqa: E731
+  assert abs(own(w()) - 33.25 * MPH) < 1e-9
+  assert own(w(), NS(mapCurveStatus=2, mapCurveRadius=80.0, mapCurveDistance=40.0)) == 0.0     # still ahead
+  assert abs(own(w(map_out=NS(why="ramp hold", curve_speed=33.25 * MPH)), NS()) - 33.25 * MPH) < 1e-9
+  for k in (dict(ti_only=True), dict(lkas_blocked=True), dict(ti_fault=True), dict(cam_curve=NS(over=True)),
+            dict(_followed_map_curve=lambda: False)):
+    assert own(w(**k)) == 0.0, k
+  assert own(w(), street=True) == 0.0 and own(w(), act=False) == 0.0
