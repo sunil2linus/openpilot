@@ -2,7 +2,7 @@
 
 VEHICLE_BOOL_KEYS = frozenset(("AlphaLongitudinalEnabled", "SubaruAvhStartup", "SubaruStopStartOff", "SubaruSNG", "SubaruRedneckCruise",
                               "GMPedalLongitudinal", "DisableOpenpilotLongitudinal", "LongPitch", "VoltSNG", "SNGHack", "GMAutoHold", "VoltOnePedalMode",
-                              "TeslaCoopSteering", "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake",
+                              "TeslaCoopSteering", "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake", "TorqueInterceptorEnabled",
                               "RemoteStartBootsComma", "HKGRemoteStartBootsComma", "IgnoreIgnitionLine", "TeslaWakeOnCAN"))
 
 
@@ -42,6 +42,9 @@ def confirmation_question(request):
     return f"{verb} Volt one-pedal driving after the next startup? Lifting off the accelerator can apply the brakes with cruise disengaged and cruise main on."
   if request.key == "LongPitch":
     return f"{verb} compensation for road grade? This refreshes during the drive."
+  if request.key == "TorqueInterceptorEnabled":
+    return (f"{verb} the Mazda Torque Interceptor after the next startup? Turn this on only if a MoreTorque " +
+            "Torque Interceptor is installed.")
   if request.key == "TeslaCoopSteering":
     return f"{verb} Tesla cooperative steering after the next startup? Light steering input adjusts the assisted steering angle within its limits."
   if request.key == "TeslaAOLScreenTap":
