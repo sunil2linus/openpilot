@@ -25,6 +25,7 @@ whole steps, no margin: Contribution.anchor); the planner takes it only by these
   * "merge": up from an anchor that is ours, a street's (MERGE_SURFACE_MAX), or his curve speed on that link (the
     proposal's band: his SET- in a ramp curve); down (the taper, the end) only from our merge anchor;
   * "handover" (exit onto a street): only down, any owner (the contributor ends it for good on his gas / buttons);
+  * "restore" (a handover overturned: the exit was not taken): only up, only from our handover anchor;
   * never in a frame with his own change (his buttons win), never with the cruise off.
 The first proposal in the order handover, merge, limit, fallback that passes is taken.
 Pure logic (tests/test_planner.py).
@@ -38,7 +39,7 @@ SET_MINUS = "SET_MINUS"
 
 
 HIS, ENGAGED, OURS = "his", "engaged", "ours"
-KINDS = ("handover", "merge", "limit", "fallback")
+KINDS = ("restore", "handover", "merge", "limit", "fallback")
 MERGE_SURFACE_MAX = (55 * M.MPH, 90 * M.KPH)   # an anchor at or under this is a street's: a merge may raise it
 
 
@@ -112,6 +113,8 @@ class Planner:
       return False
     if c.kind == "handover":
       return c.anchor < a
+    if c.kind == "restore":
+      return c.anchor > a and self.owner == OURS and self.ours_why == "handover"
     if c.kind == "merge":
       if c.anchor > a:
         his_curve = c.band is not None and c.band[0] - half <= a <= c.band[1] + half   # his curve speed on the link

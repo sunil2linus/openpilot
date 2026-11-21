@@ -85,7 +85,8 @@ class SpeedControl:
       ctx = self.sources.context(d) if self.sources is not None else dict(d)
     else:
       ctx.update(d)
-    ctx.update(anchor=self.planner.anchor, owner=self.planner.owner, act_events=self.events, contribs={})
+    ctx.update(anchor=self.planner.anchor, owner=self.planner.owner, ours_why=self.planner.ours_why,
+               act_events=self.events, contribs={})
     contributions = []
     for c in self.contributors:
       got = c(ctx)

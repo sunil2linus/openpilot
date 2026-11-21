@@ -30,10 +30,19 @@ more than SAME_EXIT, starts with nothing; a stale view is followed by the distan
   * Released at once (the speed comes back): "highway" from the shapes for HWY_CONFIRM, the match on the highway with
     GPS trust 0 for HWY_MATCH past HWY_MATCH_FROM with the shapes' last answer not link, the model path straight
     (along the highway, MODEL_CONFIRM) with the shapes' last answer not link; his gas held GAS_HELD; any button of his;
-    PASSED past the split unresolved.
-  * Bounds until confirmed: the cruise's set (true speed) never more than DIP_MAX under the speed at the split (past
-    it), so the car does not go lower either; firm slowing at most FIRM_MAX. Before the split only the reach bound
-    slows (his blinker, once the car is on it), never deeper.
+    PASSED past the split unresolved. A "link" answer is forgotten after SHAPE_QUIET_T / SHAPE_QUIET_M of silent
+    shapes (scattered link frames never add up to a confirmation, one frame never blocks the release).
+  * A confirmation is overturned (everything released: the ramp target, the handover, his speed restored) by the
+    shapes saying highway for HWY_CONFIRM, the trusted highway match (as above), or his gas held GAS_HELD unless the
+    car is matched on the link with GPS trust 0 right now.
+  * His blinker to the OTHER side cancels his exit blinker and the reach profile (his blinker going off does not: he
+    cancels it once in the exit lane).
+  * The split's place is refreshed from every new view of the same exit (the straight distance shortens toward the
+    road distance as the car gets close; a moved link start beyond SAME_EXIT is another exit: a fresh plan). The map
+    view gives no along-road distance (the matcher has no position along the road): straight, so never late.
+  * Bounds until confirmed: the cruise's set (true speed) never more than DIP_MAX under the speed where OUR slowing
+    began (the reach profile taking over, else the split), so the car does not go lower either; firm slowing at most
+    FIRM_MAX. Before the split only the reach bound slows (his blinker, once the car is on it), never deeper.
   * Exit handover (an exit onto a street, after the exit was confirmed): with a confident (trust 0) match of the ramp
     or the street, the anchor is proposed down ("handover") to the street's limit + offset (7.0's reading once the
     street is matched, else the ramp's destination speed from the map, at most STREET_MAX), never more than
@@ -72,6 +81,10 @@ HWY_CONFIRM = 0.5           # s of the shapes saying highway
 HWY_MATCH = 2.0             # s matched on the highway with GPS trust 0 ...
 HWY_MATCH_FROM = 90.0       # m ... this far past the split
 GAS_HELD = 1.5              # s
+SHAPE_QUIET_T = 0.75        # s / ...
+SHAPE_QUIET_M = 40.0        # m of the shapes silent after a "link": that "link" is forgotten (old GAS_QUIET_LINK)
+AT_GAIN = 0.3               # per new view: the split's place follows the view's fresh distance (same exit)
+RESTORE_MAX = 2.0           # s the restore of his speed is proposed after a handover was overturned
 PASSED = 400.0              # m past the split unresolved: released
 HANDOVER_MAX = 3000.0       # m past the split: a handover not done by then is given up
 DEAD_RECKON = 5.0           # s a plan is followed by the distance driven without a fresh view
@@ -180,6 +193,11 @@ class Plan:
     self.last_shape = 0
     self.gas_t = 0.0
     self.reach_on = False       # the car got onto the reach profile (REACH_START)
+    self.v_ref = None           # m/s where our slowing began (DIP_MAX)
+    self.quiet_t = self.quiet_m = 0.0
+    self.view_t = None          # the last view the split's place was refreshed from
+    self.before = None          # his anchor before the handover lowered it (a restore when overturned)
+    self.restore = None         # (anchor, until)
     self.pts = []               # [(odometer m, radius)] of the ramp's profile
     self.hwy = False
     self.spd = 0.0
@@ -294,6 +312,10 @@ class ExitPlan:
           self._end("another exit")
         if p is None or not p.handover or p.id != e["id"]:
           p = self.plan = Plan(e["id"], at, e.get("side", 0))
+          p.view_t = gview["t"]
+      elif fresh and gview["t"] != p.view_t and p.at - self.odo > 0.0:
+        p.at += AT_GAIN * (at - p.at)          # the same exit: its split's place from the new view
+        p.view_t = gview["t"]
       if fresh:
         p.pts = [(gt_odo + d, r) for d, r in e.get("pts", [])]
         p.hwy, p.spd = bool(e.get("hwy")), float(e.get("spd", 0.0) or 0.0)
@@ -309,6 +331,8 @@ class ExitPlan:
     if p.confirmed and not p.released and d < -PASSED:
       self._end("ramp done")         # (the curve plan has the ramp's curves; the handover goes on)
     if p.released:
+      if p.restore is not None:
+        return self._restore(ctx, out, now)
       if p.handover and not (p.cancelled or p.handed) and d > -HANDOVER_MAX:
         return self._handover(ctx, out)
       if d < -PASSED or (e is None and fresh):
@@ -326,6 +350,10 @@ class ExitPlan:
     # ---- evidence ----
     if 0.0 < d <= SIGNAL_REACH and p.side and (ctx.get("right_blinker") if p.side > 0 else ctx.get("left_blinker")):
       p.signal = True
+    if p.side and not p.confirmed and (ctx.get("left_blinker") if p.side > 0 else ctx.get("right_blinker")):
+      p.signal = p.reach_on = False            # his blinker to the other side: not this exit
+      if d > 0.0:
+        p.v_ref = None
     if 0.0 < d <= DECIDE_NEAR and p.side and self.lanes.edge.get(p.side):
       p.lane = True
     ex = e if (e is not None and fresh) else {}
@@ -340,6 +368,17 @@ class ExitPlan:
     sh = ex.get("sh", 0) if ex else 0
     if sh:
       p.last_shape = sh
+    if sh == 2:
+      p.quiet_t = p.quiet_m = 0.0
+    elif sh == 0:
+      p.quiet_t += dt
+      p.quiet_m += v * dt
+      p.link_t = max(p.link_t - dt, 0.0)       # scattered "link" frames do not add up
+      if p.quiet_t >= SHAPE_QUIET_T - 1e-6 or p.quiet_m >= SHAPE_QUIET_M:
+        p.link_t = 0.0
+        p.shape_link_seen = False
+        if p.last_shape == 2:
+          p.last_shape = 0                     # an old "link" no longer blocks the release
     p.link_t = p.link_t + dt if sh == 2 else (0.0 if sh == 1 else p.link_t)
     p.shape_link_seen = p.shape_link_seen or sh == 2
     p.hwy_t = p.hwy_t + dt if sh == 1 else (0.0 if sh == 2 else p.hwy_t)
@@ -347,6 +386,13 @@ class ExitPlan:
     m = ex.get("m", 0) if ex else 0
     p.match_t = p.match_t + dt if (m == 2 and trust_ok) else 0.0
     p.hwy_match_t = p.hwy_match_t + dt if (m == 1 and trust_ok and d <= -HWY_MATCH_FROM) else 0.0
+    # ---- a confirmation overturned ----
+    if p.confirmed and d <= 0.0:
+      on_link_now = m == 2 and trust_ok
+      if p.hwy_t >= HWY_CONFIRM - 1e-6 or (p.hwy_match_t >= HWY_MATCH - 1e-6 and p.last_shape != 2):
+        return self._overturn(ctx, out, "highway after the confirmation", now)
+      if p.gas_t >= GAS_HELD - 1e-6 and not on_link_now:
+        return self._overturn(ctx, out, "his gas after the confirmation", now)
     # ---- resolve past the split ----
     if d <= 0.0:
       if p.v_split is None:
@@ -367,12 +413,15 @@ class ExitPlan:
     full, reach = self.targets(p, v, self.lat(ctx))
     target, why = None, "watch"
     if p.signal and reach is not None and v <= reach + REACH_START:
+      if not p.reach_on and p.v_ref is None:
+        p.v_ref = v                            # our slowing begins here: DIP_MAX from this speed
       p.reach_on = True
     if p.confirmed:
       target, why = full, "confirmed"
     elif d > 0.0:
       if p.reach_on and reach is not None:
         target, why = reach, "reach"
+        target = max(target, p.v_ref - DIP_MAX + M.UNDERSHOOT)
     else:
       evidence = p.signal or p.lane or p.model
       firm_ok = p.signal or (p.lane and p.model)     # the edge lane alone is also the ordinary right lane
@@ -388,8 +437,10 @@ class ExitPlan:
           p.hold = v
         target, why = p.hold, "hold"
       if target is not None:
-        # the set (true) never under the split speed - DIP_MAX: the planner's undershoot taken into account
-        target = max(target, p.v_split - DIP_MAX + M.UNDERSHOOT)
+        # the set (true) never more than DIP_MAX under where our slowing began (the reach profile, else the split):
+        # the planner's undershoot taken into account
+        ref = p.v_ref if p.v_ref is not None else p.v_split
+        target = max(target, ref - DIP_MAX + M.UNDERSHOOT)
     if target is not None and full is not None and p.confirmed:
       target = full
     out.target = target
@@ -447,11 +498,35 @@ class ExitPlan:
     if p.street_t >= STREET_STEADY - 1e-6:
       prop = street_target
       anchor = ctx.get("anchor")
-      if anchor is not None and abs(anchor - prop) < 0.5 * self.unit:
-        p.handed = True             # the anchor is ours now: the limit follow carries on
+      if anchor is not None and anchor <= prop + 0.5 * self.unit:
+        p.handed = True             # at or under the street's target (a faster street: never raised): done
     else:
       floor = math.ceil((v + M.DASH_OFFSET - HANDOVER_GAP) / self.unit) * self.unit
       prop = max(street_target, floor)
+    if p.before is None and ctx.get("anchor") is not None and not (ctx.get("owner") == "ours" and
+                                                                   ctx.get("ours_why") == "handover"):
+      p.before = ctx.get("anchor")
     out.anchor, out.kind = prop, "handover"
     self.last = ("handover", prop)
+    return out
+
+  def _overturn(self, ctx, out, why, now):
+    """A confirmation taken back: the ramp target, the handover and our lowered anchor go; his speed comes back."""
+    p = self.plan
+    p.confirmed = False
+    p.cancelled = True
+    self._end(why)
+    if p.before is not None:
+      p.restore = (p.before, now + RESTORE_MAX)
+    self.last = ("released", why)
+    return self._restore(ctx, out, now) if p.restore is not None else out
+
+  def _restore(self, ctx, out, now):
+    p = self.plan
+    value, until = p.restore
+    anchor = ctx.get("anchor")
+    if now > until or (anchor is not None and anchor >= value - 0.5 * self.unit):
+      p.restore = None
+      return out
+    out.anchor, out.kind = value, "restore"
     return out

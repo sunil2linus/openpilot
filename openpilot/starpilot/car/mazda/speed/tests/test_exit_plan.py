@@ -102,11 +102,15 @@ def test_exit_48_his_blinker_before_the_split_arrives_at_the_curve_speed():
   trace, ctl, plan = run(road)
   _, v_split, _, _ = at(trace, SPLIT)
   _, v_curve, _, _ = at(trace, SPLIT + 250)
-  assert v_curve / MPH <= 38.5, (v_split / MPH, v_curve / MPH)
-  # the reach bound: from the split the tight point was still reachable at <= 0.9 m/s^2
-  assert reach_room(v_split, 35 * MPH) <= 250.0 + 1e-6, v_split / MPH
   whys = {w for s, _, _, w in trace if SPLIT - 300 <= s < SPLIT}
   assert "reach" in whys
+  # The false-exit bound holds from where our slowing began (review #3b): until the exit is confirmed the cruise's
+  # set (true) is never more than 12 mph under the speed then (70 here). That bound wins over the reach profile:
+  # the car is ~61 mph at the split (the reach bound wanted ~55) and ~52 mph at the 35 mph curve, so the DRIVER
+  # MUST BRAKE (about 1.4 m/s^2 over the last ~180 m after the confirmation). Documented in the README / settings.
+  conf = next(x for x in trace if x[3] == "confirmed")
+  assert min(x[2] for x in trace if x[0] < conf[0]) - 2.0 >= 70.0 - 12.0 - 0.5          # set (dash - 2) vs the bound
+  assert 50.0 <= v_split / MPH <= 63.0 and v_curve / MPH <= 54.0, (v_split / MPH, v_curve / MPH)
   # without his blinker (the same exit, taken): no slowing before the split, and it comes in faster
   road0 = ExitRoad(set_mph=72)
   trace0, _, _ = run(road0)
@@ -266,3 +270,150 @@ def test_the_model_path_against_the_maps_laterals():
   assert plan._model_verdict(ctx, {"ly": 2.0, "hy": 0.0}) is None   # not apart enough
   assert plan._model_verdict(dict(ctx, model_age=1.0), {"ly": 5.0, "hy": 0.0}) is None
   assert plan._model_verdict(ctx, {"ly": None, "hy": 0.0}) is None
+
+
+
+# ---- review items 1-4: a direct frame loop on the exit plan (no planner) ----
+
+def frames(plan, seconds_or_until, v=29.0, s0=SPLIT - 600.0, view_fn=None, ctx_fn=None, t0=0.0):
+  """Drive the exit plan at v from s0 until `until(s)`; view_fn(s, t) -> the exit entry fields, ctx_fn(s) -> ctx."""
+  s, t, log = s0, t0, []
+  until = seconds_or_until
+  while not until(s):
+    t += 0.01
+    s += v * 0.01
+    d = SPLIT - s
+    ex = {"id": "x0", "d": d, "side": 1, "hwy": False, "spd": 20.0, "m": 1, "sh": 0, "ly": None, "hy": None,
+          "pts": [[d + 250 + x, R35] for x in (0.0, 40.0)]}
+    vw = {"v": 2, "t": round(t, 1), "gps": "ok", "trust": 0, "matched": True, "cls": 1, "link": False}
+    if view_fn is not None:
+      view_fn(s, t, ex, vw)
+    vw["exits"] = [ex]
+    ctx = {"now": t, "v_ego": v, "view": vw, "act_events": []}
+    if ctx_fn is not None:
+      ctx.update(ctx_fn(s))
+    out = plan(ctx)
+    log.append((s, plan.last[0] if plan.last else "", out.target, plan.plan, ctx))
+  return log
+
+
+def blink_right(lo, hi):
+  return lambda s: {"right_blinker": lo <= s < hi}
+
+
+def test_review_1a_scattered_link_frames_never_add_up_to_a_confirmation():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+
+  def jitter(s, t, ex, vw):
+    if s > SPLIT + 10 and int(round(t * 10)) % 8 == 0:
+      ex["sh"] = 2                                  # one view in eight says "link", the rest nothing
+  log = frames(plan, lambda s: s > SPLIT + 300, view_fn=jitter, ctx_fn=blink_right(SPLIT - 380, SPLIT - 300))
+  assert not any(p is not None and p.confirmed for *_, p, _c in log)
+
+
+def test_review_1b_one_link_frame_then_silence_does_not_block_the_highway_release():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+
+  def once_then_highway_match(s, t, ex, vw):
+    if SPLIT + 20 <= s < SPLIT + 23:
+      ex["sh"] = 2                                  # one view of "link"
+    # (then silent shapes; the trusted match stays on the highway)
+  log = frames(plan, lambda s: s > SPLIT + 300, view_fn=once_then_highway_match,
+               ctx_fn=blink_right(SPLIT - 380, SPLIT - 300))
+  ended = plan.ended
+  assert ended is not None and ended.released == "highway" and not ended.confirmed
+  assert all(entry[2] is None for entry in log if entry[0] > SPLIT + 250)
+
+
+def test_review_1c_a_false_confirmation_is_overturned_by_highway_evidence_or_his_gas():
+  def false_link_then_highway(s, t, ex, vw):
+    if SPLIT + 20 <= s < SPLIT + 60:
+      ex["sh"] = 2                                  # a false "link" long enough to confirm ...
+    elif s >= SPLIT + 80:
+      ex["sh"] = 1                                  # ... then the shapes say highway
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  log = frames(plan, lambda s: s > SPLIT + 200, view_fn=false_link_then_highway,
+               ctx_fn=blink_right(SPLIT - 380, SPLIT - 300))
+  assert plan.ended.released == "highway after the confirmation" and plan.ended.cancelled   # (it was confirmed)
+  assert all(entry[2] is None for entry in log if entry[0] > SPLIT + 110)
+
+  def false_link_then_silent(s, t, ex, vw):
+    if SPLIT + 20 <= s < SPLIT + 60:
+      ex["sh"] = 2
+  gas = lambda s: {"gas": s > SPLIT + 70, **blink_right(SPLIT - 380, SPLIT - 300)(s)}  # noqa: E731
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  log = frames(plan, lambda s: s > SPLIT + 200, view_fn=false_link_then_silent, ctx_fn=gas)
+  assert plan.ended.released == "his gas after the confirmation"
+  assert all(entry[2] is None for entry in log if entry[0] > SPLIT + 130)
+  # his gas held while matched on the link with trust 0 (a real ramp): the ramp's slowdown stays
+  def on_ramp(s, t, ex, vw):
+    false_link_then_silent(s, t, ex, vw)
+    if s > SPLIT + 60:
+      ex["m"] = 2
+      vw.update(link=True, cls=2)
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  log = frames(plan, lambda s: s > SPLIT + 150, view_fn=on_ramp, ctx_fn=gas)
+  p = plan.plan
+  assert p is not None and p.confirmed and not p.released and log[-1][2] is not None
+
+
+def test_review_1c_an_overturned_handover_restores_his_speed():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  p = E.Plan("x0", 0.0, 1)
+  p.confirmed = p.handover = True
+  p.before = 72 * MPH
+  plan.plan = p
+  out = plan._overturn({"anchor": 52 * MPH}, E.Contribution("exit", None, kind="handover"), "highway", 1.0)
+  assert out.kind == "restore" and abs(out.anchor - 72 * MPH) < 1e-6 and p.cancelled
+  from openpilot.starpilot.car.mazda.speed.planner import Planner, PlanInputs, OURS
+  pl = Planner()
+  pl._set_anchor(52 * MPH, "handover")
+  pl.owner, pl.ours_why = OURS, "handover"
+  pl.update(PlanInputs(v_ego=25.0, set_speed=52 * MPH, cruise_enabled=True, main_on=True, events=[], contributions=[out]))
+  assert abs(pl.anchor - 72 * MPH) < 1e-6
+  pl.ours_why = "limit"                             # a restore never raises anything but our handover anchor
+  pl._set_anchor(52 * MPH, "limit")
+  pl.update(PlanInputs(v_ego=25.0, set_speed=52 * MPH, cruise_enabled=True, main_on=True, events=[], contributions=[out]))
+  assert abs(pl.anchor - 52 * MPH) < 1e-6
+
+
+def test_review_2_the_splits_place_follows_the_view_and_the_plan_keeps_its_evidence():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+
+  def chord(s, t, ex, vw):
+    d = SPLIT - s
+    ex["d"] = d * 0.93 if d > 0 else d              # the straight distance: up to ~100 m short far out
+  frames(plan, lambda s: s > SPLIT - 20, s0=SPLIT - 1450, view_fn=chord, ctx_fn=blink_right(SPLIT - 380, SPLIT - 300))
+  p = plan.plan
+  assert p is not None and p.signal and plan.ended is None          # never "another exit"
+  assert abs((p.at - plan.odo) - 20.0) < 6.0                        # its split where the view says, 20 m ahead
+
+
+def test_review_3a_his_other_blinker_cancels_the_exit_blinker():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  ctx = lambda s: {"right_blinker": SPLIT - 380 <= s < SPLIT - 330, "left_blinker": SPLIT - 250 <= s < SPLIT - 220}  # noqa: E731
+  log = frames(plan, lambda s: s > SPLIT - 5, ctx_fn=ctx)
+  assert any(entry[1] == "reach" for entry in log if entry[0] < SPLIT - 260)
+  assert all(entry[2] is None for entry in log if entry[0] > SPLIT - 215)
+  assert not plan.plan.signal and not plan.plan.reach_on
+  # his exit blinker simply going off keeps it
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  log = frames(plan, lambda s: s > SPLIT - 5, ctx_fn=blink_right(SPLIT - 380, SPLIT - 330))
+  assert plan.plan.signal and log[-1][1] == "reach"
+
+
+def test_review_4_a_handover_onto_a_faster_street_is_done_and_frees_the_limit():
+  plan = E.ExitPlan(C.Config(enabled=True, exits="on"))
+  p = E.Plan("x0", 0.0, 1)
+  p.confirmed = p.handover = True
+  p.spd = 55 * MPH
+  p.street_t = 5.0
+  plan.plan = p
+  ctx = {"now": 1.0, "v_ego": 35 * MPH, "anchor": 45 * MPH, "slc": {"limit": 55 * MPH, "upcoming": 0.0, "t": 1.0},
+         "view": {"gps": "ok", "t": 1.0, "trust": 0, "matched": True, "link": False, "cls": 5}}
+  plan.dt = 0.01
+  plan._handover(ctx, E.Contribution("exit", None, kind="handover"))
+  assert p.handed                                   # his 45 is under the street's 58: nothing to lower, done
+  ctx2 = {}
+  plan._handover(ctx2, E.Contribution("exit", None, kind="handover"))
+  assert "exit_busy" not in ctx2
