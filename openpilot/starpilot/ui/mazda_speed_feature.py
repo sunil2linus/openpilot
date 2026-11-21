@@ -39,7 +39,8 @@ SUB_ROWS = (
   ("exits", "Exit ramps",
    "Slows before an exit ramp's curves when you signal toward the exit within about 400 m of it, and hands the " +
    "speed to the street's limit after. Lets go at once if you stay on the highway, press a button or hold the gas. " +
-   "Without your signal it only slows once the ramp is confirmed, past the split.", 0.),
+   "It slows at most 12 mph before the ramp is confirmed: brake yourself for a tight exit curve. Without your " +
+   "signal it only slows once the ramp is confirmed, past the split.", 0.),
 )
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 

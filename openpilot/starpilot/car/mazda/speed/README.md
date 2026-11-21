@@ -43,8 +43,9 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   never. All pressing is still the one actuator.
 * **Limit**: steady 3 s (lower) / 5 s (higher, first) with GPS trust 0 on every frame (restarts at a bad frame);
   limit + offset (default 3 mph), whole dash steps, no margin; nothing on links or while merge / exit are busy; a raise
-  waits for a lower preview seen on the same road; 43 mph fallback with the limit unknown (3 s at >= 35 mph, within
-  120 s of engaging, up only).
+  waits for a lower preview (mapdOut's previewSpeedLimit; slcState's upcoming value is never filled on this car)
+  seen on the same road; engaging inside the band of a known limit adopts limit + offset; 43 mph fallback only with
+  no GPS position and the limit unknown (3 s at >= 35 mph, within 120 s of engaging, up only).
 * **Merge**: on a link to a highway with trust 0 (or the start-of-drive trust on that link with GPS error <= 15 m);
   the highway limit from the preview / reading, else the ramp's destination speed from the map; boost to target + 20
   (car max 90), taper to target + 5 within 10 mph, end at the target. Waits for: a curve ahead planning below
@@ -54,10 +55,16 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   destination speed, the match and the map shapes past the split). With his blinker toward the exit within 400 m the
   car is kept on a reach profile (0.7 m/s^2 planned, so the ramp's first tight point stays reachable at <= 0.9); at the
   split with his blinker (or the camera's edge lane and the model path toward the link together) the full ramp plan
-  runs for at most 3 s without a "link" confirmation (the edge lane or the model alone only hold the speed); until confirmed the cruise's set never goes more than 12 mph under the speed at
-  the split. Released at once on "highway" (shapes, trusted match, model path), his gas held 1.5 s, any button.
+  runs for at most 3 s without a "link" confirmation (the edge lane or the model alone only hold the speed); until confirmed the cruise's set never goes more than 12 mph under the speed where our slowing began (the
+  reach profile taking over, else the split). Released at once on "highway" (shapes, trusted match, model path), his
+  gas held 1.5 s, any button; a confirmation is overturned by the same highway evidence or his gas held (unless the
+  car is matched on the ramp with trust 0), and our handover then gives his speed back. His blinker to the other
+  side cancels the exit blinker. **That 12 mph bound wins over the reach profile: from highway speed a tight exit
+  curve is NOT reached by the cruise alone** (the unit "exit 48" case: 72 set, 70 mph, his blinker 370 m out,
+  35 mph curve 250 m past the split: ~61 mph at the split, ~52 mph at the curve; he must brake ~1.4 m/s^2 over the
+  last ~180 m).
   **Without his blinker an exit is only slowed for from the split, mostly once the ramp is confirmed (about 2-3 s past
-  it)**: signal early for a tight exit. Exit handover to the street's limit + offset on a trust-0 match, never
+  it)**: signal early and brake for a tight exit. Exit handover to the street's limit + offset on a trust-0 match, never
   more than 10 mph under the car until the street is matched; his gas / buttons / brake cancel it.
 * **No GPS**: the view says "none"; the camera-only curve uses its more careful side force; an unconfirmed exit plan
   is dropped.
