@@ -49,6 +49,8 @@ class VehicleStartupPreferences:
   toyota_unlock_doors: bool = False
   gm_cancel_remap: bool = False
   vw_stock_long: bool = field(default=False, kw_only=True)
+  # Mazda Gen1 + MoreTorque Torque Interceptor: a hardware declaration, so it does not depend on SafeMode
+  mazda_torque_interceptor: bool = field(default=False, kw_only=True)
 
   @classmethod
   def read(cls, params, *, enabled: bool):
@@ -63,6 +65,10 @@ class VehicleStartupPreferences:
     preap_stock = stock_configuration(params, radar, pedal)
     from openpilot.starpilot.car.volkswagen.preferences import stock_long_requested
     vw_stock_long = stock_long_requested(params)
+    try:
+      mazda_ti = read_saved(params, "TorqueInterceptorEnabled", 8) == (b"1", True)
+    except (OSError, TypeError, ValueError):
+      mazda_ti = False
     try:
       raw_radar, radar_readable = read_saved(params, "HondaBoschARadar", 8)
       honda_radar = radar_readable and raw_radar in (None, b"1")
@@ -86,7 +92,7 @@ class VehicleStartupPreferences:
       volt_one_pedal = bool(enabled and not disable_bolt and read_saved(params, "VoltOnePedalMode", 8) == (b"1", True) and
                             readable and safe in (None, b"0"))
     except (OSError, TypeError, ValueError):
-      return cls(vw_stock_long=vw_stock_long,
+      return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
                  subaru_smoothing=smoothing, disable_bolt_long=disable_bolt, honda_bosch_a_radar=honda_radar, tesla_preap_stock=preap_stock,
                  tesla_preap_radar=radar, tesla_preap_pedal=pedal,
                  gm_camera_pedal=False, toyota_filter=False)
@@ -106,7 +112,7 @@ class VehicleStartupPreferences:
     cooperative = bool(enabled and readable and safe in (None, b"0") and
                        read_saved(params, "TeslaCoopSteering", 8) == (b"1", True))
     screen_brake = read_saved(params, 'TeslaAOLDisengageOnBrake', 8) == (b'1', True)
-    return cls(vw_stock_long=vw_stock_long,
+    return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
                subaru_smoothing=smoothing, subaru_avh_startup=bool(enabled and readable and safe in (None, b"0") and
                     read_saved(params, "IsReleaseBranch", 8) in ((None, True), (b"0", True)) and
                     read_saved(params, "SubaruAvhStartup", 8) == (b"1", True)),
@@ -198,6 +204,8 @@ class VehicleStartupPreferences:
     from openpilot.starpilot.car.tesla.coop_preferences import prepare
     prepare(cp, self.tesla_cooperative)
     self._prepare_honda_radar(cp)
+    from opendbc.car.mazda.torque_interceptor import prepare as prepare_mazda_ti
+    prepare_mazda_ti(cp, self.mazda_torque_interceptor)
     from opendbc.car.chrysler.brake_hold import apply_brake_hold
     apply_brake_hold(cp, self.jeep_brake_hold)
     if not self.toyota_filter:
