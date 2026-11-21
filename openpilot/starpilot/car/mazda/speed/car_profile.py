@@ -130,7 +130,7 @@ class CarProfile:
 
   # ---- file ----
   def empty(self):
-    now = round(time.time(), 1)   # wall time: the file is read by people, across reboots
+    now = round(time.time(), 1)   # wall time: the file is read by people, across reboots  # noqa: TID251
     return {"version": PROFILE_VERSION, "fingerprint": self.fingerprint, "ti": self.ti, "created": now, "updated": now,
             "drives": 0, "latencies": [], "latency_samples": 0,
             "hold": {"worst_after_release": 0, "holds": 0, "driver_holds": 0, "last": None},
@@ -185,7 +185,7 @@ class CarProfile:
 
   def _snapshot(self):
     data = json.loads(json.dumps(self.data))   # a copy the writer owns
-    data["updated"] = round(time.time(), 1)
+    data["updated"] = round(time.time(), 1)  # noqa: TID251
     return data
 
   def _write(self, data):
@@ -294,7 +294,7 @@ class CarProfile:
     h["holds"] += 1
     if driver:
       h["driver_holds"] += 1
-    h["last"] = {"after": int(quanta_after), "driver": bool(driver), "t": round(time.time(), 1)}
+    h["last"] = {"after": int(quanta_after), "driver": bool(driver), "t": round(time.time(), 1)}  # noqa: TID251
     self.dirty = True
 
   def add_decel_episode(self, decel):

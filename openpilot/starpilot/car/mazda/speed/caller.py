@@ -8,7 +8,7 @@ Any exception turns the feature off for the rest of the drive (steering is never
 import time
 
 from openpilot.starpilot.car.mazda.speed import config as C
-from openpilot.starpilot.car.mazda.speed.actuator import Actuator, ActInputs, SET_PLUS, SET_MINUS
+from openpilot.starpilot.car.mazda.speed.actuator import Actuator, ActInputs, SET_PLUS
 from openpilot.starpilot.car.mazda.speed.planner import Planner, PlanInputs
 
 CRZ_BTNS = 0x09D
@@ -55,12 +55,12 @@ class SpeedControl:
     ocs = card.CI.CS
     other = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume or
                  any(f[0] == CRZ_BTNS for f in can_sends))
-    return dict(cruise_enabled=bool(CS.cruiseState.enabled), main_on=bool(CS.cruiseState.available),
-                set_speed=float(CS.cruiseState.speed), v_ego=float(CS.vEgo), gas=bool(CS.gasPressed),
-                brake=bool(CS.brakePressed), standstill=bool(CS.standstill or CS.cruiseState.standstill),
-                set_plus=bool(ocs.crz_set_plus), set_minus=bool(ocs.crz_set_minus), resume=bool(ocs.crz_resume),
-                cancel=bool(ocs.crz_cancel), wheel_counter=int(ocs.crz_btns_counter), other_button=other,
-                engaged=bool(CC.enabled), lkas_blocked=bool(getattr(ocs, "lkas_blocked", False)))
+    return {"cruise_enabled": bool(CS.cruiseState.enabled), "main_on": bool(CS.cruiseState.available),
+                "set_speed": float(CS.cruiseState.speed), "v_ego": float(CS.vEgo), "gas": bool(CS.gasPressed),
+                "brake": bool(CS.brakePressed), "standstill": bool(CS.standstill or CS.cruiseState.standstill),
+                "set_plus": bool(ocs.crz_set_plus), "set_minus": bool(ocs.crz_set_minus), "resume": bool(ocs.crz_resume),
+                "cancel": bool(ocs.crz_cancel), "wheel_counter": int(ocs.crz_btns_counter), "other_button": other,
+                "engaged": bool(CC.enabled), "lkas_blocked": bool(getattr(ocs, "lkas_blocked", False))}
 
   def step(self, d, ctx=None, now=None):
     """d: the dict from inputs(); ctx: what contributors get (the car's other signals). Returns (button, counter)."""

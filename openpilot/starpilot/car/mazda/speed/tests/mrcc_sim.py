@@ -104,8 +104,8 @@ def run(act, car, frames, command=None, cruise=True, every=None, **kw):
   for _ in range(frames):
     car.tick()
     cmd = command(car.frame) if callable(command) else command
-    fields = dict(cruise_enabled=cruise, set_speed=car.set, v_ego=car.v, wheel_counter=car.counter,
-                  command=None if cmd is None else cmd * car.unit)
+    fields = {"cruise_enabled": cruise, "set_speed": car.set, "v_ego": car.v, "wheel_counter": car.counter,
+                  "command": None if cmd is None else cmd * car.unit}
     fields.update(kw)
     if every is not None:
       every(car.frame, fields)

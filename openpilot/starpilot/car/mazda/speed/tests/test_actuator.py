@@ -17,7 +17,7 @@ def test_taps_down_exactly_to_the_command_with_the_counter_pattern_and_gap():
   taps = sends(car)
   assert len(taps) == 3 and all(b == A.SET_MINUS for _, b, _ in taps)
   frames = [f for f, _, _ in taps]
-  assert all(b - a >= A.BUTTON_GAP for a, b in zip(frames, frames[1:]))
+  assert all(b - a >= A.BUTTON_GAP for a, b in zip(frames, frames[1:], strict=False))
   run(act, car, 300, command=42)
   assert len(sends(car)) == 3                       # nothing more once there
   assert act.latency is not None
