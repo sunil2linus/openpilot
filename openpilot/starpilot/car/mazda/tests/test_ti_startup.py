@@ -19,6 +19,7 @@ from opendbc.car.chrysler.values import CAR as CHRYSLER
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.torque_interceptor import prepare
 from opendbc.car.mazda.values import CAR, TI_STATE
+from openpilot.cereal import messaging
 from openpilot.common.params import Params
 from openpilot.selfdrive.car.card import Car, EventName, obd_callback
 from openpilot.starpilot.car.mazda.ti_startup import TorqueInterceptorStartup, panda_ti_configured, required
@@ -70,10 +71,6 @@ def car_frames(ci, packer):
     for state in parser.message_states.values():
       frames.append(packer.make_can_msg(state.name, parser.bus, {}))
   return frames
-
-
-from openpilot.cereal import messaging
-from openpilot.starpilot.car.mazda.ti_startup import TorqueInterceptorStartup, panda_ti_configured
 
 
 class Harness:
@@ -338,15 +335,20 @@ def _cam_lkas2_raw_torque(dat):
 def test_full_startup_sequence_with_ti_wakeup():
   h = Harness(ti_cp(), ti_present=True, ti_needs_wakeup=True, obd_car_traffic=True)
   try:
-    startup = TorqueInterceptorStartup(h.params, timeout_s=0.1, sleep=lambda _: h.pandad.loop())
-    startup.request(h.cp)
-    assert h.pandad.obd_can2()
+    h.after_fingerprint()
+    startup = TorqueInterceptorStartup(h.params, sleep=lambda _: h.pandad.loop())
+    assert startup.request(h.cp, h.pandad.panda_states()) == 'requested'
+    assert h.pandad.mode == ('elm327', 0) and h.pandad.obd_can2()
+    h.params.put_bool("FirmwareQueryDone", True, block=True)
     card = h.card(startup)
 
-    # Step 1: bus 1 has OBD traffic but no TI_FEEDBACK; card sets ControlsReady early while panda stays elm327
+    # Step 1: bus 1 has OBD traffic but no TI_FEEDBACK; card sets ControlsReady early while panda was elm327
     h.step(card)
+    assert wait_for(lambda: h.params.get_bool("ControlsReady"))
+    h.pandad.loop()
     assert not h.cs.canValid
-    assert h.params.get_bool("ControlsReady")
+    assert card.ci_initialized
+    assert h.pandad.mode == ('mazda', 8)
     assert panda_ti_configured(h.pandad.panda_states())
     assert h.sendcan == []
     assert not h.ti_awake
@@ -363,7 +365,7 @@ def test_full_startup_sequence_with_ti_wakeup():
     assert int.from_bytes(ti_frames[0][1][4:8], 'big') == 3294744160
     assert h.ti_awake
     assert not startup.pending
-    assert not h.params.get_bool("ObdMultiplexingEnabled")
+    assert wait_for(lambda: not h.params.get_bool("ObdMultiplexingEnabled"))
 
     # Step 3: TI is now awake and emitting TI_FEEDBACK, but selfdrived is still initializing -> keepalive with valid=True
     h.step(card)
@@ -387,6 +389,7 @@ def test_full_startup_sequence_with_ti_wakeup():
     assert len(h.sendcan) == 3
     assert h.sendcan[2][0] is True
     assert card.CI.apply.call_args_list[-1].args[0].latActive is True
+    card.CI.init.assert_called_once()
   finally:
     h.directory.cleanup()
 
@@ -394,9 +397,11 @@ def test_full_startup_sequence_with_ti_wakeup():
 def test_fail_closed_bus1_traffic_without_ti():
   h = Harness(ti_cp(), ti_present=False, obd_car_traffic=True)
   try:
-    startup = TorqueInterceptorStartup(h.params, timeout_s=0.1, sleep=lambda _: h.pandad.loop())
-    startup.request(h.cp)
-    assert h.pandad.obd_can2()
+    h.after_fingerprint()
+    startup = TorqueInterceptorStartup(h.params, sleep=lambda _: h.pandad.loop())
+    assert startup.request(h.cp, h.pandad.panda_states()) == 'requested'
+    assert h.pandad.mode == ('elm327', 0) and h.pandad.obd_can2()
+    h.params.put_bool("FirmwareQueryDone", True, block=True)
     card = h.card(startup)
 
     # Even if onroadEvents lacks selfdriveInitializing and CarControl requests torque, controls_update must not run
@@ -406,11 +411,14 @@ def test_fail_closed_bus1_traffic_without_ti():
     cc.actuators.torque = 0.5
     card.control = cc.as_reader()
 
+    h.step(card)
+    assert wait_for(lambda: h.params.get_bool("ControlsReady"))
+    h.pandad.loop()
     for _ in range(5):
       h.step(card)
 
     assert not h.cs.canValid
-    assert len(h.sendcan) >= 1
+    assert len(h.sendcan) >= 5
     assert all(valid is False for valid, _ in h.sendcan)
     assert all(_cam_lkas2_raw_torque(dat) == 2048 for _, frames in h.sendcan for _, dat, _ in _ti_wakeup_frames(frames))
     assert all(not call.args[0].latActive for call in card.CI.apply.call_args_list)
