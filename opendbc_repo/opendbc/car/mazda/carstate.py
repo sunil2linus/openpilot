@@ -36,6 +36,9 @@ class CarState(CarStateBase):
     self.shifter_values = can_define.dv["GEAR"]["GEAR"]
 
     self.crz_btns_counter = 0
+    self.crz_set_plus = self.crz_set_minus = self.crz_resume = self.crz_cancel = False
+    self.lkas_blocked = False
+    self.radar_has_lead = False
     self.acc_active_last = False
     self.lkas_allowed_speed = False
 
@@ -155,6 +158,14 @@ class CarState(CarStateBase):
     self.acc_active_last = ret.cruiseState.enabled
 
     self.crz_btns_counter = cp.vl["CRZ_BTNS"]["CTR"]
+    # raw wheel buttons, LKAS block and the radar's lead bit for the optional Mazda speed control (attributes only:
+    # the CarState message is unchanged; all from messages this parser already reads)
+    self.crz_set_plus = cp.vl["CRZ_BTNS"]["SET_P"] == 1
+    self.crz_set_minus = cp.vl["CRZ_BTNS"]["SET_M"] == 1
+    self.crz_resume = cp.vl["CRZ_BTNS"]["RES"] == 1
+    self.crz_cancel = cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1
+    self.lkas_blocked = lkas_blocked
+    self.radar_has_lead = cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"] == 1
 
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
