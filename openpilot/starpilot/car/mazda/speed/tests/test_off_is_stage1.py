@@ -30,11 +30,13 @@ def fake_card(params, cp=None):
 
 def cs(enabled=True, speed=25.0, v=24.0):
   return N(cruiseState=N(enabled=enabled, available=True, speed=speed, standstill=False), vEgo=v, gasPressed=False,
-           brakePressed=False, standstill=False)
+           brakePressed=False, standstill=False, leftBlinker=False, rightBlinker=False, steeringAngleDeg=0.0,
+           steeringPressed=False)
 
 
 def cc():
-  return N(enabled=True, cruiseControl=N(cancel=False, resume=False))
+  return N(enabled=True, latActive=True, cruiseControl=N(cancel=False, resume=False), actuators=N(torque=0.0),
+           hudControl=N(visualAlert="none"))
 
 
 @pytest.fixture
@@ -82,6 +84,8 @@ def test_on_without_a_map_never_presses(tmp_path, monkeypatch):
   monkeypatch.setattr(E, "LOG_DIR", str(tmp_path / "log"))
   monkeypatch.setattr(P, "PROFILE_PATH", str(tmp_path / "profile.json"))
   monkeypatch.setattr(P.CarProfile.__init__, "__defaults__", (str(tmp_path / "profile.json"), "", False, P.time.monotonic))
+  import openpilot.starpilot.car.mazda.speed.curve_memory as CM
+  monkeypatch.setattr(CM.CurveMemory.__init__, "__defaults__", (str(tmp_path / "memory.json"), CM.time.time, True))
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)
     Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 1, "enabled": True, "curves": "on"}).encode())

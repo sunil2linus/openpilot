@@ -8,7 +8,8 @@ The curve contributor: the map's curve profiles ahead (from the map view, map_vi
   * target = min over the points still ahead of cruise_model.envelope(v_i, d_i, v_ego): the same braking envelope
     for every point, so a tight entry governs the approach and the target rises by itself once only wider points
     remain. A point counts until KEEP_PAST m after it (GPS lag ~0.7-1.0 s).
-  * (point_speed has the offset rule; the offset itself arrives with the per-curve memory, not in Stage 2.)
+  * Curve memory (curve_memory.py): the offset and a learned cap act on the curve's tight points; each pass through a
+    curve (entered: its first point behind the car; over: its last point KEEP_PAST behind) is recorded.
   * Mid-curve the target only steps UP with GPS trust OK; otherwise it holds the lowest it had in that curve.
   * The camera's veto (camera.py) drops a curve the camera sees straight through its tight points.
   * If the view drops out mid-curve, the last good one is followed by the distance driven (DEAD_RECKON): the set speed
@@ -19,6 +20,7 @@ Pure (tests/test_curve_plan.py).
 import math
 
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
+from openpilot.starpilot.car.mazda.speed.curve_memory import PassRecorder, apply_memory, curve_key
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
 
 MPH = M.MPH
@@ -42,10 +44,12 @@ def point_speed(r, lat, offset=0.0, cap_lat=None, advisory=0.0):
 
 
 class CurvePlan:
-  def __init__(self, cfg, presses=True, metric=False):
+  def __init__(self, cfg, presses=True, metric=False, memory=None):
     self.cfg = cfg
     self.presses = presses
-    self.offset = 0.0            # (the curve speed offset needs the per-curve memory: not in Stage 2)
+    self.memory = memory
+    self.offset = cfg.curve_offset_mph * MPH
+    self.recording = {}          # curve id -> PassRecorder while the car is in it
     self.ti_only = {}            # curve id -> True when LKAS was blocked before it (latched)
     self.held = {}               # curve id -> lowest target while inside without GPS trust OK
     self.last = None             # (target, curve id, why) for the log
@@ -95,7 +99,12 @@ class CurvePlan:
         continue
       seen.add(cid)
       lat = self.curve_lat(cc, ctx.get("lkas_blocked", False))
-      speeds = [point_speed(r, lat, self.offset, None, c.get("adv", 0.0)) for _, r in pts]
+      speeds = [point_speed(r, lat, 0.0, None, c.get("adv", 0.0)) for _, r in pts]
+      key = curve_key(c["way"], cid.rsplit(":", 1)[-1]) if c.get("way") else None
+      if key is not None and (self.memory is not None or self.offset > 0):
+        speeds = apply_memory(pts, speeds, key, cc.get("ramp", False), self.memory, self.offset,
+                              self.cfg.curve_offset_lat, lat)
+      self._record(cid, key, c, pts, ctx)
       target = None
       for (d, _), vp in zip(pts, speeds, strict=True):
         if d < -KEEP_PAST:
@@ -116,8 +125,37 @@ class CurvePlan:
     for cid in list(self.held):
       if cid not in seen:
         del self.held[cid]
+    for cid in list(self.recording):
+      if cid not in seen:
+        self._finish(cid, now)
     for cid in list(self.ti_only):
       if cid not in seen:
         del self.ti_only[cid]
     self.last = (best, best_c, "curve")
     return Contribution("map_curve", best, lkas_floor=floor, presses=self.presses, episode=best_c)
+
+  # ---- curve memory passes ----
+  def _record(self, cid, key, c, pts, ctx):
+    if self.memory is None or key is None:
+      return
+    first, last = min(d for d, _ in pts), max(d for d, _ in pts)
+    rec = self.recording.get(cid)
+    if rec is None and first <= 0 < last:
+      rec = self.recording[cid] = PassRecorder(key, c.get("name", ""), bool(c.get("ramp")),
+                                               ctx.get("plan_reason") == "map_curve")
+    if rec is None:
+      return
+    if last < -KEEP_PAST:
+      self._finish(cid, ctx.get("now", 0.0))
+      return
+    r_min = min(r for _, r in pts)
+    apex_d = next(d for d, r in pts if r == r_min)
+    rec.sample(ctx, before_apex=apex_d > 0)
+
+  def _finish(self, cid, now):
+    rec = self.recording.pop(cid, None)
+    if rec is None:
+      return
+    p = rec.finish(self.memory.clock())
+    if p is not None:
+      self.memory.add_pass(rec.key, rec.name, rec.ramp, p)

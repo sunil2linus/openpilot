@@ -69,11 +69,11 @@ class Sources:
     return False
 
 
-def build(cfg, CP, log=None):
+def build(cfg, CP, log=None, memory=None):
   """(contributors, sources) for this drive."""
   out = []
   if cfg.active("curves"):
-    out.append(CurvePlan(cfg, presses=cfg.presses("curves")))
+    out.append(CurvePlan(cfg, presses=cfg.presses("curves"), memory=memory))
   if cfg.active("camera_curves"):
     out.append(CameraCurve(cfg, presses=cfg.presses("camera_curves")))
   if not out:

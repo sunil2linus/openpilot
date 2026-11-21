@@ -439,5 +439,7 @@
   "mazda_speed:camera_curves",
   "mazda_speed:plan_lat",
   "mazda_speed:ramp_lat",
-  "mazda_speed:ti_only_lat"
+  "mazda_speed:ti_only_lat",
+  "mazda_speed:curve_offset_mph",
+  "mazda_speed:curve_offset_lat"
 ]

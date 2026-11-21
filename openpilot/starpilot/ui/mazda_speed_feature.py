@@ -15,15 +15,20 @@ MODE_VALUES = {v: k for k, v in MODE_LABELS.items()}
 # field, label, reason, step
 SUB_ROWS = (
   ("curves", "Curves from the map",
-   "Lowers the cruise set speed before curves found in the offline map. Test computes and logs, never presses.", 0.),
+   "Lowers the cruise set speed before curves found in the offline map (not yet before exit ramps: slow for those " +
+   "yourself). Test computes and logs, never presses.", 0.),
   ("camera_curves", "Curves from the camera",
    "Lowers the set speed carefully for curves missing from the map, from what the camera sees (about 2 s ahead).", 0.),
+  ("curve_offset_mph", "Curve speed offset",
+   "Plans the tight part of map curves this many mph faster, never above the offset side force. Removed per curve " +
+   "after a hard pass; on ramps only after two clean passes.", 1.),
+  ("curve_offset_lat", "Offset side force", "The most side force (m/s²) the curve speed offset may plan.", .1),
   ("plan_lat", "Road curve side force", "Side force (m/s²) map curves on roads are planned at.", .1),
   ("ramp_lat", "Ramp curve side force", "Side force (m/s²) curves on ramps and links are planned at.", .1),
   ("ti_only_lat", "Interceptor-only side force",
    "Side force (m/s²) used when the stock lane keeping is blocked before a curve and only the interceptor steers.", .1),
 )
-UNITS = {"plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
+UNITS = {"curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
 
 def capable(cp) -> bool:

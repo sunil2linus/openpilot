@@ -16,7 +16,8 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 1
+VERSION = 2                     # 2: + curve_offset_mph / curve_offset_lat (a version 1 document still reads)
+VERSIONS = (1, 2)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -29,7 +30,10 @@ SCHEMA = {
   "plan_lat": ("float", 2.2, (1.8, 3.5)),           # m/s^2: roads
   "ramp_lat": ("float", 2.6, (1.8, 3.5)),           # m/s^2: ramps / links
   "ti_only_lat": ("float", 1.8, (1.8, 3.5)),        # m/s^2: stock LKAS blocked before the curve / camera fault
+  "curve_offset_mph": ("int", 0, (0, 5)),           # (v2) plan map curves' tight points this much faster ...
+  "curve_offset_lat": ("float", 3.0, (2.0, 4.0)),   # (v2) ... never above this side force; removed per curve by memory
 }
+V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 
 
 class ConfigError(ValueError):
@@ -44,6 +48,8 @@ class Config:
   plan_lat: float = 2.2
   ramp_lat: float = 2.6
   ti_only_lat: float = 1.8
+  curve_offset_mph: int = 0
+  curve_offset_lat: float = 3.0
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -92,8 +98,10 @@ def decode(raw):
     raise ConfigError(f"json: {e}") from None
   if type(doc) is not dict:
     raise ConfigError("not an object")
-  if doc.get("version") != VERSION or type(doc.get("version")) is not int:
+  if doc.get("version") not in VERSIONS or type(doc.get("version")) is not int:
     raise ConfigError("version")
+  if doc["version"] < 2 and V2_FIELDS & set(doc):
+    raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():
     if k == "version":

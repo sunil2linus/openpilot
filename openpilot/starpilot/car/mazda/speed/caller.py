@@ -25,7 +25,7 @@ def eligible(CP) -> bool:
 
 
 class SpeedControl:
-  def __init__(self, CP, cfg, params, is_metric, log=None, profile=None, contributors=None, sources=None):
+  def __init__(self, CP, cfg, params, is_metric, log=None, profile=None, contributors=None, sources=None, memory=None):
     self.CP = CP
     self.cfg = cfg
     self.metric = bool(is_metric)
@@ -37,6 +37,8 @@ class SpeedControl:
     self.planner = Planner(self.metric)
     self.contributors = list(contributors or [])
     self.sources = sources
+    self.last_reason = ""
+    self.memory = memory
     self.events = []                 # last frame's actuator events (the planner reads them one frame later)
     self.last_plan = None
     self.last_plan_t = 0.0
@@ -62,11 +64,15 @@ class SpeedControl:
                 "set_plus": bool(ocs.crz_set_plus), "set_minus": bool(ocs.crz_set_minus), "resume": bool(ocs.crz_resume),
                 "cancel": bool(ocs.crz_cancel), "wheel_counter": int(ocs.crz_btns_counter), "other_button": other,
                 "engaged": bool(CC.enabled), "lkas_blocked": bool(getattr(ocs, "lkas_blocked", False)),
-                "blinker": bool(getattr(CS, "leftBlinker", False) or getattr(CS, "rightBlinker", False))}
+                "blinker": bool(getattr(CS, "leftBlinker", False) or getattr(CS, "rightBlinker", False)),
+                "lat_active": bool(CC.latActive), "torque": float(CC.actuators.torque),
+                "steer_alert": str(CC.hudControl.visualAlert).endswith("steerRequired"),
+                "angle": float(CS.steeringAngleDeg), "steering_pressed": bool(CS.steeringPressed)}
 
   def step(self, d, ctx=None, now=None):
     """d: the dict from inputs(); ctx: what contributors get (the car's other signals). Returns (button, counter)."""
     now = time.monotonic() if now is None else now
+    d.setdefault("plan_reason", self.last_reason)
     if ctx is None:
       ctx = self.sources.context(d) if self.sources is not None else dict(d)
     else:
@@ -81,6 +87,7 @@ class SpeedControl:
                                           metric=self.metric))
     for why, before, after in self.planner.changes:
       self._log("anchor", why=why, before=before, after=after)
+    self.last_reason = plan.reason
     command = plan.command if d["engaged"] else None
     act = self.actuator.update(ActInputs(cruise_enabled=d["cruise_enabled"], set_speed=d["set_speed"], v_ego=d["v_ego"],
                                          gas=d["gas"], brake=d["brake"], standstill=d["standstill"],
@@ -102,6 +109,9 @@ class SpeedControl:
   def _learn(self, cruise):
     p = self.profile
     if p is None:
+      if self.memory is not None:
+        self.memory.save_if_due(time.monotonic(), force=self.cruise_was and not cruise)
+      self.cruise_was = cruise
       return
     p.set_latencies(self.actuator.latencies)
     while self.holds_seen < len(self.actuator.holds_learned):
@@ -109,6 +119,8 @@ class SpeedControl:
       p.add_hold(after, driver=driver)
       self.holds_seen += 1
     p.save_if_due(force=self.cruise_was and not cruise)
+    if self.memory is not None:
+      self.memory.save_if_due(time.monotonic(), force=self.cruise_was and not cruise)
     self.cruise_was = cruise
 
   def frame(self, card, button, counter):
@@ -130,9 +142,13 @@ def make(card):
     log = EventLog()
     profile = CarProfile(fingerprint=str(card.CP.carFingerprint), ti=bool(int(card.CP.flags) & int(MazdaFlags.TORQUE_INTERCEPTOR)))
     from openpilot.starpilot.car.mazda.speed.contributors import build
-    contributors, sources = build(cfg, card.CP, log)
+    memory = None
+    if cfg.active("curves"):
+      from openpilot.starpilot.car.mazda.speed.curve_memory import CurveMemory
+      memory = CurveMemory()
+    contributors, sources = build(cfg, card.CP, log, memory=memory)
     return SpeedControl(card.CP, cfg, card.params, getattr(card, "is_metric", False), log=log, profile=profile,
-                        contributors=contributors, sources=sources)
+                        contributors=contributors, sources=sources, memory=memory)
   except Exception:
     try:
       from openpilot.common.swaglog import cloudlog

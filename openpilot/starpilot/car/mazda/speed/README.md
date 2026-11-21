@@ -20,11 +20,16 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `curve_mapd.py` | parked daemon `mazda_curve_mapd`: builds curve files from 7.0's selected map generation | ported + 4 fixes |
 | `map_match.py` | GpsTrust, RoadIndex/RoadMatcher, MapCurveStore | ported |
 | `map_view.py` | onroad daemon `mazda_mapviewd`: curves ahead -> view file for card | new (curves-ahead ported) |
+| `curve_memory.py`, `curve_memory_tool.py` | per curve+direction memory (way id key, no positions), cap + offset on the tight points, list/clear tool | simplified port |
 | `events.py` | JSONL feature-event log under `/data/media/0/mazda_speed/` | simplified |
 | `caller.py` | the hook card.py calls; off = returns the frames list untouched | new |
 | `processes.py` | when the manager runs the two daemons | new |
 
-Not in Stage 2 (absent, not half-wired): curve memory + curve speed offset + maintenance tool (e), speed limit
+**Exit ramps are NOT pre-slowed:** a ramp's curves only count once the road match has moved onto the ramp
+(typically 50-150 m after the split), which can mean a late, firm slowdown or none in time (the old fork's 35 mph
+exit entered at 52 mph). The driver must slow for exits himself until the exit plan (part f) exists.
+
+Not in Stage 2 (absent, not half-wired): speed limit
 follow / merge / exit handover (f), stop slowdown (g), on-screen notices (h: log only), exit pre-plan.
 
 ## Data flow (no capnp changes)

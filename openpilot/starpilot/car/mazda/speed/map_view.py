@@ -117,7 +117,8 @@ class CurvesAhead:
         continue
       pts = [[round(d0 + s, 1), r] for s, r in directed_profile(c, increasing)]
       out.append({"id": key, "pts": pts, "ramp": bool(c.get("ramp")) or int(c.get("cls", 0)) in MM.LINK_CLASSES,
-                  "adv": float(c.get("adv", 0.0) or 0.0), "len": length, "r": float(c["r"])})
+                  "adv": float(c.get("adv", 0.0) or 0.0), "len": length, "r": float(c["r"]),
+                  "way": int((c.get("ways") or [0])[0]), "name": str(c.get("name", ""))})
     return out
 
 

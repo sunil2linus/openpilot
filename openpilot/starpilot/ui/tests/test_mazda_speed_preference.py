@@ -93,5 +93,5 @@ def test_invalid_document_is_off_and_repairable():
     request = row_change(shown[0])
     assert not owner.apply(replace(request, value='On'))
     assert owner.apply(request)
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":1}'
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":2}'
     assert [r.key for r in rows(owner)] == [MASTER]
