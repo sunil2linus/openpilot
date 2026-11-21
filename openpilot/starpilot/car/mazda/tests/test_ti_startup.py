@@ -72,8 +72,12 @@ def car_frames(ci, packer):
   return frames
 
 
+from openpilot.cereal import messaging
+from openpilot.starpilot.car.mazda.ti_startup import TorqueInterceptorStartup, panda_ti_configured
+
+
 class Harness:
-  def __init__(self, cp, *, ti_present=True):
+  def __init__(self, cp, *, ti_present=True, ti_needs_wakeup=False, obd_car_traffic=False):
     self.directory = tempfile.TemporaryDirectory()
     self.params = Params(self.directory.name)
     self.cp = cp
@@ -82,12 +86,18 @@ class Harness:
     self.packer = CANPacker("mazda_2017")
     self.frames = car_frames(self.ci, self.packer)
     self.ti_present = ti_present
+    self.ti_needs_wakeup = ti_needs_wakeup
+    self.obd_car_traffic = obd_car_traffic
+    self.ti_awake = not ti_needs_wakeup
+    self.sendcan = []
     self.t = 2 * DT_NS
     self.events = [SimpleNamespace(name=EventName.selfdriveInitializing)]
 
   def can(self):
     frames = list(self.frames)
-    if self.ti_present and self.pandad.obd_can2():
+    if self.obd_car_traffic and self.pandad.obd_can2():
+      frames.append(self.packer.make_can_msg("ENGINE_DATA", 1, {}))
+    if self.ti_present and self.ti_awake and self.pandad.obd_can2():
       frames.append(self.packer.make_can_msg("TI_FEEDBACK", 1, {"STATE": TI_STATE.RUN, "VERSION_NUMBER": 2}))
     self.t += DT_NS
     return self.ci.update([(self.t, frames)])
@@ -103,31 +113,51 @@ class Harness:
     card.ioniq6_long_selected = False
     card.can_callbacks = (lambda wait_for_one=False: [], lambda frames: None)
     card.mazda_ti_startup = startup
-    card.CI = SimpleNamespace(CS=self.ci.CS, CC=SimpleNamespace(), init=Mock(), apply=Mock(return_value=(object(), [])))
+    card.CI = SimpleNamespace(
+      CS=self.ci.CS,
+      CC=self.ci.CC,
+      can_parsers=self.ci.can_parsers,
+      init=Mock(),
+      apply=Mock(side_effect=self.ci.apply),
+    )
     card.params = self.params
-    card.pm = SimpleNamespace(send=lambda service, packet: None)
+    harness = self
+
+    def pm_send(service, packet):
+      if service != 'sendcan':
+        return
+      msg = messaging.log_from_bytes(packet)
+      frames = [(f.address, bytes(f.dat), f.src) for f in msg.sendcan]
+      harness.sendcan.append((msg.valid, frames))
+      if harness.ti_present and not harness.ti_awake and panda_ti_configured(harness.pandad.panda_states()):
+        for addr, dat, src in frames:
+          if src == 1 and addr == 0x249 and len(dat) == 8 and int.from_bytes(dat[4:8], 'big') == 3294744160:
+            harness.ti_awake = True
+            break
+
+    card.pm = SimpleNamespace(send=pm_send)
     card.state_publish = Mock()
     card._deferred_radar_can = None
     card.radar_update = Mock(return_value=None)
     card.radar_publish = Mock()
-    harness = self
 
     def state_update(*, defer_radar=False):
       cs = harness.can()
       harness.cs = cs
+      card.sm.valid['carControl'] = bool(cs.canValid)
       return cs, None
     card.state_update = state_update
-    control = structs.CarControl.new_message().as_reader()
+    card.control = structs.CarControl.new_message().as_reader()
 
     class SubMaster:
-      valid = {'carControl': True}
+      valid = {'carControl': False}
       alive = {'carControl': True}
       seen = {'onroadEvents': True, 'carControl': True, 'pandaStates': True}
       logMonoTime = {'carControl': 0}
       recv_time = {'carControl': 0.0}
 
       def __getitem__(self, key):
-        return {'onroadEvents': harness.events, 'carControl': control, 'pandaStates': harness.pandad.panda_states()}[key]
+        return {'onroadEvents': harness.events, 'carControl': card.control, 'pandaStates': harness.pandad.panda_states()}[key]
 
       def all_alive(self, services):
         return True
@@ -295,3 +325,94 @@ def test_panda_state_check():
   assert not panda_ti_configured([SimpleNamespace(safetyModel='elm327', safetyParam=8)])
   assert not panda_ti_configured([])
   assert not panda_ti_configured(None)
+
+
+def _ti_wakeup_frames(frames):
+  return [(addr, dat, src) for addr, dat, src in frames if src == 1 and addr == 0x249]
+
+
+def _cam_lkas2_raw_torque(dat):
+  return ((dat[0] & 0x0F) << 8) | dat[1]
+
+
+def test_full_startup_sequence_with_ti_wakeup():
+  h = Harness(ti_cp(), ti_present=True, ti_needs_wakeup=True, obd_car_traffic=True)
+  try:
+    startup = TorqueInterceptorStartup(h.params, timeout_s=0.1, sleep=lambda _: h.pandad.loop())
+    startup.request(h.cp)
+    assert h.pandad.obd_can2()
+    card = h.card(startup)
+
+    # Step 1: bus 1 has OBD traffic but no TI_FEEDBACK; card sets ControlsReady early while panda stays elm327
+    h.step(card)
+    assert not h.cs.canValid
+    assert h.params.get_bool("ControlsReady")
+    assert panda_ti_configured(h.pandad.panda_states())
+    assert h.sendcan == []
+    assert not h.ti_awake
+
+    # Step 2: panda is in SAFETY_MAZDA(8); card sends inactive zero-torque 0x249 wakeup with valid=False
+    h.step(card)
+    assert not h.cs.canValid
+    assert len(h.sendcan) == 1
+    valid, frames = h.sendcan[0]
+    assert valid is False
+    ti_frames = _ti_wakeup_frames(frames)
+    assert len(ti_frames) == 1
+    assert _cam_lkas2_raw_torque(ti_frames[0][1]) == 2048
+    assert int.from_bytes(ti_frames[0][1][4:8], 'big') == 3294744160
+    assert h.ti_awake
+    assert not startup.pending
+    assert not h.params.get_bool("ObdMultiplexingEnabled")
+
+    # Step 3: TI is now awake and emitting TI_FEEDBACK, but selfdrived is still initializing -> keepalive with valid=True
+    h.step(card)
+    assert h.cs.canValid
+    assert len(h.sendcan) == 2
+    valid, frames = h.sendcan[1]
+    assert valid is True
+    ti_frames = _ti_wakeup_frames(frames)
+    assert len(ti_frames) == 1
+    assert _cam_lkas2_raw_torque(ti_frames[0][1]) == 2048
+    assert int.from_bytes(ti_frames[0][1][4:8], 'big') == 3294744160
+
+    # Step 4: selfdrived initialization finishes -> normal controls_update takes over
+    h.events = []
+    cc = structs.CarControl.new_message()
+    cc.latActive = True
+    cc.actuators.torque = 0.5
+    card.control = cc.as_reader()
+    h.step(card)
+    assert h.cs.canValid
+    assert len(h.sendcan) == 3
+    assert h.sendcan[2][0] is True
+    assert card.CI.apply.call_args_list[-1].args[0].latActive is True
+  finally:
+    h.directory.cleanup()
+
+
+def test_fail_closed_bus1_traffic_without_ti():
+  h = Harness(ti_cp(), ti_present=False, obd_car_traffic=True)
+  try:
+    startup = TorqueInterceptorStartup(h.params, timeout_s=0.1, sleep=lambda _: h.pandad.loop())
+    startup.request(h.cp)
+    assert h.pandad.obd_can2()
+    card = h.card(startup)
+
+    # Even if onroadEvents lacks selfdriveInitializing and CarControl requests torque, controls_update must not run
+    h.events = []
+    cc = structs.CarControl.new_message()
+    cc.latActive = True
+    cc.actuators.torque = 0.5
+    card.control = cc.as_reader()
+
+    for _ in range(5):
+      h.step(card)
+
+    assert not h.cs.canValid
+    assert len(h.sendcan) >= 1
+    assert all(valid is False for valid, _ in h.sendcan)
+    assert all(_cam_lkas2_raw_torque(dat) == 2048 for _, frames in h.sendcan for _, dat, _ in _ti_wakeup_frames(frames))
+    assert all(not call.args[0].latActive for call in card.CI.apply.call_args_list)
+  finally:
+    h.directory.cleanup()
