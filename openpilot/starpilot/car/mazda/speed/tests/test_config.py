@@ -75,7 +75,7 @@ def test_registry_knows_the_key():
     params = Params(d)
     assert params.check_key(C.KEY)
     assert params.get_type(C.KEY).name == "JSON"
-  assert C.KEY in migration.VEHICLE_PREFERENCE_KEYS and C.KEY in migration.OPERATIONAL_KEYS
+  assert C.KEY in migration.OPERATIONAL_KEYS and C.KEY not in migration.VEHICLE_PREFERENCE_KEYS  # (those are booleans)
 
 
 def manager_start(params, storage):

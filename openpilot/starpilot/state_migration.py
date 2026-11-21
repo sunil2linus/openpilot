@@ -33,7 +33,7 @@ VEHICLE_PREFERENCE_KEYS = frozenset({
   'SubaruSNG', 'SubaruRedneckCruise', 'ToyotaAutoHold',
   'JeepBrakeHold', 'DriveModeProfiles', 'DriveModeAcceleration',
   'DriveModeDeceleration', 'NostalgiaMode', 'RemapCancelToDistance',
-  'FordHandsFreeCluster', 'TorqueInterceptorEnabled', 'MazdaSpeedControlConfig',
+  'FordHandsFreeCluster', 'TorqueInterceptorEnabled',
 })
 OPERATIONAL_KEYS = frozenset({
   'DongleId', 'HardwareSerial', 'GithubSshKeys', 'GithubUsername', 'SshEnabled',
@@ -41,6 +41,7 @@ OPERATIONAL_KEYS = frozenset({
   'IsMetric', 'IsRhdDetected', 'LanguageSetting',
   'CellularDisabled', 'GsmApn', 'GsmMetered', 'GsmRoaming', 'NetworkMetered', 'BluetoothEnabled',
   'ConnectProvider', 'PairingProvider', 'PairingEmail', 'PrimeType', 'AssistNowToken', 'SecOCKey', 'SecOCKeys',
+  'MazdaSpeedControlConfig',  # the Mazda speed control's one JSON setting (VEHICLE_PREFERENCE_KEYS are booleans only)
 }) | VEHICLE_PREFERENCE_KEYS
 
 
