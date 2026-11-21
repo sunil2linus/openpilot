@@ -152,3 +152,19 @@ def test_selected_generation_is_built_and_then_up_to_date(tmp_path):
   assert D.check_folder(FOLDER, folders[FOLDER]["tiles"], curves) is None
   assert D.run_once(folders, curves, log=lines.append) == 0
   assert all("42.3" not in line and "-83.6" not in line for line in lines)
+
+
+def test_the_builder_runs_for_every_option_that_needs_the_map_view(tmp_path):
+  import json
+  from pathlib import Path
+  from openpilot.common.params import Params
+  from openpilot.starpilot.car.mazda.speed import config as C
+  from openpilot.starpilot.car.mazda.speed import processes
+  params = Params(str(tmp_path))
+  cp = type("CP", (), {"brand": "mazda", "notCar": False})()
+  for doc, want in (({"enabled": True, "curves": "on"}, True), ({"enabled": True, "speed_limit": "test"}, True),
+                    ({"enabled": True, "merge": "on"}, True), ({"enabled": True, "exits": "on"}, True),
+                    ({"enabled": True, "camera_curves": "on"}, False), ({"enabled": False, "exits": "on"}, False)):
+    Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, **doc}).encode())
+    assert D.wanted(params, cp) is want, doc
+    assert processes.curve_build(False, params, cp) is want       # the daemon starts by the same rule

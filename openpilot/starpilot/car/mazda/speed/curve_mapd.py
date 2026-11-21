@@ -248,12 +248,13 @@ def parse_position(raw):
 
 
 def wanted(params, CP=None):
-  """Built only for a Mazda with the master switch on and map curves Test or On."""
+  """Built only for a Mazda with the master switch on and an option that needs the map view (map curves, speed
+  limit, merge or exits) Test or On: the same rule processes.py starts this daemon with (config.needs_view)."""
   from openpilot.starpilot.car.mazda.speed import config as C
   try:
     if CP is not None and CP.brand != "mazda":
       return False
-    return C.read(params).active("curves")
+    return C.read(params).needs_view
   except Exception:
     return False
 
