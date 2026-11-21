@@ -1967,7 +1967,21 @@ class Car:
 
     initialized = (not any(e.name == EventName.selfdriveInitializing for e in self.sm['onroadEvents']) and
                    self.sm.seen['onroadEvents'])
-    if not self.CP.passive and initialized:
+    mazda_ti = getattr(self, 'mazda_ti_startup', None)
+    mazda_ti_wake = bool(not self.CP.passive and mazda_ti is not None and mazda_ti.can_wake(self.CI, CS))
+    mazda_ti_keepalive = bool(not self.CP.passive and mazda_ti is not None and not initialized and self.ci_initialized and CS.canValid)
+    if mazda_ti_wake or mazda_ti_keepalive:
+      if not self.ci_initialized:
+        self.CI.init(self.CP, *self.can_callbacks)
+        self.params.put_bool("ControlsReady", True)
+        self.ci_initialized = True
+      panda_states = self.sm['pandaStates'] if self.sm.seen['pandaStates'] else None
+      if mazda_ti.send_wakeup(panda_states):
+        inactive = car.CarControl.new_message().as_reader()
+        self._invalidate_feedback_output(assignment=True)
+        self.last_actuators_output, can_sends = self.CI.apply(inactive, int(time.monotonic() * 1e9))
+        self.publish_sendcan(can_sends, valid=CS.canValid)
+    elif not self.CP.passive and initialized:
       self.controls_update(CS, self.sm['carControl'])
     elif self.ioniq6_startup_keepalive():
       self.controls_update(CS, self.sm['carControl'], initialize_only=True)
