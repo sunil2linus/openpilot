@@ -5,11 +5,26 @@ time, the GPS trust state and the matched road's class. card (curve_plan.py) mov
 drove since that time.
 
 Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename) at the GPS rate (10 Hz):
-  {"v": 1, "t": monotonic s of the position (the GPS sample minus GPS_LAG), "gps": "ok" | "none",
+  {"v": 2, "t": monotonic s of the position (the GPS sample minus GPS_LAG), "gps": "ok" | "none" (no GPS position),
    "trust": GpsTrust status (0 ok ...), "start_ok": bool, "held": bool, "matched": bool, "cls": road class,
-   "link": bool, "data": bool (curve files cover here), "curves": [{"id", "pts": [[d, r], ...], "ramp", "adv",
-   "len"}]}
+   "link": bool, "data": bool (curve files cover here), "chain": matched road (chain id, 0 none), "acc": GPS error m,
+   "curves": [{"id", "pts": [[d, r], ...], "ramp", "adv", "len"}],
+   "ramp": the matched link's ramp record {"id", "hwy": leads to a highway, "spd": m/s of the road it leads to,
+           "from_hwy": leaves a highway} or absent,
+   "exits": [{"id", "d": m to the exit link's start (negative: behind), "side": -1 left / 1 right / 0 unknown,
+              "hwy": the link leads to a highway, "spd": m/s of the road it leads to, "pts": [[d, r], ...] the ramp's
+              curve profile from the car, "m": the match (1 our highway, 2 this link, 0 other), "sh": the map shapes
+              past the split (2 link, 1 highway, 0 no answer), "ly" / "hy": m right of the car where the link / the
+              highway is MODEL_AT m ahead (null unknown)}]}  (at most EXITS_MAX, only while on or just past a highway)
 The reader (read_view) never raises and returns None for a missing, unreadable, other-version or stale view.
+
+Exits ahead (part f, the exit plan in exit_plan.py): a ramp record of type exit / interchange whose start lies on the
+matched highway road (within ON_CHAIN of its shape) ahead within EXIT_LOOK; kept (watched) until EXIT_KEEP behind,
+also once the match has moved onto the link. Its side is where the link's shape lies 40-120 m on from its start,
+relative to the highway's direction there. The shape answer past the split is the old fork's (map_curves.near_shapes /
+shape_verdict): "link" when the car is closer to the link's shape and heads closer to it by SHAPE_LINK_GAP; "highway"
+when closer to the highway and heading closer, or heading SHAPE_HWY_HEADING_GAP closer to the highway within
+SHAPE_HWY_NEAR of it (a car going on in the right lane is near the link's first shape). No navigation is used.
 
 Curves ahead (ported from map_curves.MapCurves._curves_ahead, simplified): the curves of the matched chain in our
 direction within LOOKAHEAD, never one on a later way of the chain driven against its one-way direction; a curve
@@ -25,12 +40,30 @@ import time
 from openpilot.starpilot.car.mazda.speed import map_match as MM
 
 VIEW_PATH = "/dev/shm/mazda_speed_view.json"
-VIEW_VERSION = 1
+VIEW_VERSION = 2
 GPS_LAG = 0.85                # s: the position is this old when it arrives (0.7-1.0 s measured)
 GPS_STALE = 1.5               # s without a new fix: "none"
 LOOKAHEAD = 1000.0            # m
 START_ACC = 15.0              # m: start-of-drive trust on a matched link needs the GPS error at or below this
 IN_CURVE_SLACK = 60.0         # m past an exit a curve still counts as the one we are in (the old value)
+HIGHWAY_CLASSES = (1, 3)      # motorway, trunk
+EXIT_TYPES = ("exit", "interchange")
+EXIT_LOOK = 1500.0            # m: exits watched from this far ahead
+EXIT_KEEP = 600.0             # m behind their start: forgotten
+EXITS_MAX = 2
+ON_CHAIN = 6.0                # m: the link's start lies on the matched highway's shape
+SIDE_FROM, SIDE_TO = 40.0, 120.0   # m along the link from its start: where its side is measured
+SIDE_MIN = 2.0                # m to one side at least (else 0: unknown)
+SHAPE_FROM = 10.0             # m past the split before the shapes answer (at the split itself they may say "highway")
+SHAPE_TO = 400.0
+SHAPE_RANGE = 40.0            # m
+SHAPE_HEADING = 60.0          # deg
+SHAPE_MIN_SPEED = 10.0        # m/s (the GPS heading is noise in a jam)
+SHAPE_LINK_GAP = 1.0          # deg
+SHAPE_HWY_HEADING_GAP, SHAPE_HWY_NEAR, SHAPE_HWY_HEADING_MAX = 3.5, 12.0, 1.0
+MODEL_AT = 60.0               # m ahead of the car (now): where the link / highway laterals are given for the camera check
+LATERAL_FROM, LATERAL_TO = -150.0, 200.0   # m to the split: the laterals are given only here
+COARSE = 50                   # ramp index cells of 1/50 deg (~2.2 km)
 
 
 def directed_profile(c, increasing):
@@ -122,6 +155,222 @@ class CurvesAhead:
     return out
 
 
+def _local(lat0, lon0):
+  kx = math.radians(1.0) * MM.EARTH_R * math.cos(math.radians(lat0))
+  ky = math.radians(1.0) * MM.EARTH_R
+  return lambda la, lo: ((lo - lon0) * kx, (la - lat0) * ky)
+
+
+def chain_segments(store, chain_id, lat, lon, cells=1):
+  """[(lat1, lon1, lat2, lon2, oneway)] of one chain's road shape around a point (the 3 x 3 match cells: +-330 m)."""
+  out = []
+  cla, clo = int(math.floor(lat * MM.MATCH_CELL)), int(math.floor(lon * MM.MATCH_CELL))
+  seen = set()
+  for dla in range(-cells, cells + 1):
+    for dlo in range(-cells, cells + 1):
+      for ri in store.grid:
+        for la1, lo1, la2, lo2, _wid, cid, one, _cls in ri.segments(MM.cell_key(cla + dla, clo + dlo)):
+          if cid != chain_id:
+            continue
+          k = (la1, lo1, la2, lo2)
+          if k not in seen:
+            seen.add(k)
+            out.append((la1, lo1, la2, lo2, one))
+  return out
+
+
+def _nearest(segs, to_xy, heading=None, max_turn=SHAPE_HEADING):
+  """(m, deg off `heading`) of the nearest segment to the origin (either way along it unless one-way), or None."""
+  best = None
+  for la1, lo1, la2, lo2, one in segs:
+    ax, ay = to_xy(la1, lo1)
+    bx, by = to_xy(la2, lo2)
+    dx, dy = bx - ax, by - ay
+    ll = dx * dx + dy * dy
+    if ll < 1e-6:
+      continue
+    t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll))
+    d = math.hypot(ax + t * dx, ay + t * dy)
+    diff = 0.0
+    if heading is not None:
+      diff = abs((math.degrees(math.atan2(dx, dy)) - heading + 180.0) % 360.0 - 180.0)
+      if not one:
+        diff = min(diff, 180.0 - diff)
+      if diff > max_turn:
+        continue
+    if best is None or d < best[0]:
+      best = (d, diff)
+  return best
+
+
+def shape_verdict(a, b, gap=0.0, b_heading=None):
+  """(ported) 1 when shape a is closer AND heads closer (by `gap` deg) than b, -1 when b is closer and heads closer (or
+  b_heading: heads b_heading[0] closer within b_heading[1] m and b_heading[2] deg of ours), 0 neither."""
+  if a is None and b is None:
+    return 0
+  if b is None:
+    return 1
+  if a is None:
+    return -1
+  if a[0] < b[0] and a[1] + gap <= b[1]:
+    return 1
+  if b[0] < a[0] and b[1] < a[1]:
+    return -1
+  if b_heading is not None and b[1] + b_heading[0] <= a[1] and b[0] <= b_heading[1] and b[1] <= b_heading[2]:
+    return -1
+  return 0
+
+
+def lateral_at(segs, to_xy, bearing, along):
+  """m right of the car where the shape crosses the line `along` m ahead (the crossing nearest the car's line), or
+  None. to_xy: the car's local frame (x east, y north)."""
+  h = math.radians(bearing)
+  fx, fy = math.sin(h), math.cos(h)        # forward
+  rx, ry = math.cos(h), -math.sin(h)       # right
+  best = None
+  for la1, lo1, la2, lo2, _one in segs:
+    ax, ay = to_xy(la1, lo1)
+    bx, by = to_xy(la2, lo2)
+    fa, fb = ax * fx + ay * fy, bx * fx + by * fy
+    if (fa - along) * (fb - along) > 0 or abs(fb - fa) < 1e-6:
+      continue
+    f = (along - fa) / (fb - fa)
+    x = (ax * rx + ay * ry) + f * ((bx * rx + by * ry) - (ax * rx + ay * ry))
+    if best is None or abs(x) < abs(best):
+      best = x
+  return best
+
+
+class ExitsAhead:
+  """The exits ahead on the matched highway, watched past their split (see the module doc)."""
+
+  def __init__(self, store):
+    self.store = store
+    self.watch = {}             # ramp chain -> {"rec", "hwy": highway chain, "side", "pts": [(s, r)]}
+    self._idx = None
+    self._no = set()            # (ramp chain, highway chain) checked: not on that highway
+
+  def _index(self):
+    key = id(self.store.ramps_all)
+    if self._idx is None or self._idx[0] != key:
+      cells = {}
+      for r in self.store.ramps_all:
+        if r.get("type") in EXIT_TYPES and r.get("start"):
+          la, lo = r["start"]
+          cells.setdefault((int(math.floor(la * COARSE)), int(math.floor(lo * COARSE))), []).append(r)
+      self._idx = (key, cells)
+      self._no = set()
+    return self._idx[1]
+
+  def _profile(self, r):
+    ch = self.store.chains.get(r.get("chain"))
+    length = float(ch["len"]) if ch else 0.0
+    increasing = r.get("travel") != "ba"
+    pts = []
+    for c in self.store.curves.get(r.get("chain"), []):
+      s_entry = c["s_a"] if increasing else length - c["s_b"]
+      if s_entry < -1.0:
+        continue
+      pts += [(s_entry + s, rr) for s, rr in directed_profile(c, increasing)]
+    pts.sort()
+    return pts
+
+  def _side(self, r, hwy_segs, bearing):
+    """-1 / 1: the link lies left / right of the highway's direction SIDE_FROM-SIDE_TO m on (0: unknown); and the
+    link's own departure heading at its start (deg, None unknown)."""
+    la0, lo0 = r["start"]
+    to_xy = _local(la0, lo0)
+    best, heading = None, None
+    for la1, lo1, la2, lo2, _one in hwy_segs:
+      ax, ay = to_xy(la1, lo1)
+      bx, by = to_xy(la2, lo2)
+      dx, dy = bx - ax, by - ay
+      ll = dx * dx + dy * dy
+      if ll < 1e-6:
+        continue
+      t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll))
+      d = math.hypot(ax + t * dx, ay + t * dy)
+      if best is None or d < best:
+        best, heading = d, math.degrees(math.atan2(dx, dy))
+    link = chain_segments(self.store, r.get("chain"), la0, lo0)
+    depart = None
+    for la1, lo1, la2, lo2, _one in link:
+      (ax, ay), (bx, by) = to_xy(la1, lo1), to_xy(la2, lo2)
+      if math.hypot(ax, ay) <= ON_CHAIN:
+        depart = math.degrees(math.atan2(bx - ax, by - ay))
+      elif math.hypot(bx, by) <= ON_CHAIN and depart is None:
+        depart = math.degrees(math.atan2(ax - bx, ay - by))
+    if heading is None:
+      return 0, depart
+    if abs((heading - bearing + 180.0) % 360.0 - 180.0) > 90.0:
+      heading += 180.0             # the shape's node order runs against our travel
+    lats = [x for x in (lateral_at(link, to_xy, heading, a) for a in range(int(SIDE_FROM), int(SIDE_TO) + 1, 20))
+            if x is not None]
+    if not lats:
+      return 0, depart
+    m = sum(lats) / len(lats)
+    return (0 if abs(m) < SIDE_MIN else (1 if m > 0 else -1)), depart
+
+  def _find(self, lat, lon, bearing, hwy_chain):
+    cells = self._index()
+    cla, clo = int(math.floor(lat * COARSE)), int(math.floor(lon * COARSE))
+    for dla in (-1, 0, 1):
+      for dlo in (-1, 0, 1):
+        for r in cells.get((cla + dla, clo + dlo), []):
+          rid = r.get("chain")
+          if rid in self.watch or (rid, hwy_chain) in self._no:
+            continue
+          ahead, dist = MM.ahead(lat, lon, bearing, *r["start"])
+          if not ahead or dist > EXIT_LOOK:
+            continue
+          la0, lo0 = r["start"]
+          hwy = chain_segments(self.store, hwy_chain, la0, lo0)
+          near = _nearest(hwy, _local(la0, lo0))
+          if near is None or near[0] > ON_CHAIN:
+            self._no.add((rid, hwy_chain))
+            continue
+          # the link must leave in our direction (a two-way trunk road: the other direction's ramp)
+          side, depart = self._side(r, hwy, bearing)
+          if depart is not None and abs((depart - bearing + 180.0) % 360.0 - 180.0) > 60.0:
+            self._no.add((rid, hwy_chain))
+            continue
+          self.watch[rid] = {"rec": r, "hwy": hwy_chain, "side": side, "pts": self._profile(r)}
+
+  def update(self, lat, lon, bearing, speed, chain_id, road_class):
+    if chain_id and road_class in HIGHWAY_CLASSES and self.store.grid:
+      self._find(lat, lon, bearing, chain_id)
+    out = []
+    for rid, w in list(self.watch.items()):
+      r = w["rec"]
+      ahead, dist = MM.ahead(lat, lon, bearing, *r["start"])
+      d = dist if ahead else -dist
+      if d < -EXIT_KEEP or d > EXIT_LOOK + 200.0 or (d > 0 and chain_id and chain_id != w["hwy"]):
+        del self.watch[rid]          # (an exit ahead on a highway the car has left; found again when back on it)
+        continue
+      to = r.get("to") or {}
+      e = {"id": f"x{rid}", "d": round(d, 1), "side": w["side"], "hwy": int(to.get("cls", 0) or 0) in HIGHWAY_CLASSES,
+           "spd": float(to.get("speed", 0.0) or 0.0), "pts": [[round(d + s, 1), rr] for s, rr in w["pts"]],
+           "m": 1 if chain_id == w["hwy"] else (2 if chain_id == rid else 0), "sh": 0, "ly": None, "hy": None}
+      to_xy = _local(lat, lon)
+      link = hwy = None
+      if -SHAPE_TO <= d <= LATERAL_TO:
+        link = chain_segments(self.store, rid, lat, lon)
+        hwy = chain_segments(self.store, w["hwy"], lat, lon)
+      if -SHAPE_TO <= d <= -SHAPE_FROM and speed >= SHAPE_MIN_SPEED:
+        v = shape_verdict(_nearest(link, to_xy, bearing) if link else None, _nearest(hwy, to_xy, bearing) if hwy else None,
+                          SHAPE_LINK_GAP, (SHAPE_HWY_HEADING_GAP, SHAPE_HWY_NEAR, SHAPE_HWY_HEADING_MAX))
+        e["sh"] = 2 if v > 0 else (1 if v < 0 else 0)
+      if LATERAL_FROM <= d <= LATERAL_TO:
+        along = MODEL_AT + max(speed, 0.0) * GPS_LAG
+        ly = lateral_at(link, to_xy, bearing, along) if link else None
+        hy = lateral_at(hwy, to_xy, bearing, along) if hwy else None
+        e["ly"] = None if ly is None else round(ly, 2)
+        e["hy"] = None if hy is None else round(hy, 2)
+      out.append(e)
+    out.sort(key=lambda e: (e["d"] < -SHAPE_TO, abs(e["d"])))
+    return out[:EXITS_MAX]
+
+
 def write_view(view, path=VIEW_PATH):
   tmp = path + ".tmp"
   with open(tmp, "w") as f:
@@ -148,6 +397,7 @@ class MapView:
     self.matcher = MM.RoadMatcher(store)
     self.trust = MM.GpsTrust()
     self.ahead = CurvesAhead(store)
+    self.exits = ExitsAhead(store)
     self.last_t = None
 
   def update(self, t, gps):
@@ -168,7 +418,14 @@ class MapView:
     matched = bool(way_id)
     self.trust.update(dt, speed, acc if MM.USE_GPS_ACCURACY else 0.0, 0, data, matched, self.matcher.ambiguous)
     view.update(gps="ok", trust=self.trust.status, matched=matched, cls=self.matcher.road_class,
-                link=bool(self.matcher.on_link), data=data)
+                link=bool(self.matcher.on_link), data=data, chain=int(self.matcher.chain_id) if matched else 0,
+                acc=round(acc, 1))
+    ramp = self.store.ramps.get(self.matcher.chain_id) if matched and self.matcher.on_link else None
+    if ramp is not None:
+      to, frm = ramp.get("to") or {}, ramp.get("from") or {}
+      view["ramp"] = {"id": int(self.matcher.chain_id), "hwy": int(to.get("cls", 0) or 0) in HIGHWAY_CLASSES,
+                      "spd": float(to.get("speed", 0.0) or 0.0),
+                      "from_hwy": int(frm.get("cls", 0) or 0) in HIGHWAY_CLASSES}
     # start of the drive: a matched highway link with a good fix is trusted for stepping up in its curves
     view["start_ok"] = bool(self.trust.status == MM.TRUST_SHAKY and self.trust.shaky_why == MM.SHAKY_START and
                             matched and self.matcher.on_link and 0.0 < acc <= START_ACC)
@@ -179,6 +436,10 @@ class MapView:
     if self.trust.low and curves:
       view["held"] = True        # another road this close may be ours: logged, not slowed for
     view["curves"] = curves
+    exits = self.exits.update(lat, lon, bearing, speed, self.matcher.chain_id if matched else 0,
+                              self.matcher.road_class if matched else 0)
+    if exits:
+      view["exits"] = exits
     return view
 
 
@@ -191,7 +452,7 @@ def main():
     os.nice(5)
   except OSError:
     pass
-  if not C.read(Params()).active("curves"):
+  if not C.read(Params()).needs_view:
     while True:                  # (the manager only starts it with the setting on; settings apply per drive)
       time.sleep(60)
   store = MM.MapCurveStore()

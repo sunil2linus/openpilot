@@ -122,9 +122,9 @@ def test_no_fix_and_far_off_gps(tmp_path):
 def test_view_file_roundtrip(tmp_path):
   p = str(tmp_path / "view.json")
   assert V.read_view(p) is None
-  V.write_view({"v": 1, "t": 5.0, "gps": "none", "curves": []}, p)
+  V.write_view({"v": 2, "t": 5.0, "gps": "none", "curves": []}, p)
   assert V.read_view(p)["t"] == 5.0
-  V.write_view({"v": 2, "t": 5.0}, p)
+  V.write_view({"v": 1, "t": 5.0}, p)                  # (the version before part f's exits)
   assert V.read_view(p) is None
   with open(p, "w") as f:
     f.write("{")
