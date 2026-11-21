@@ -59,15 +59,40 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   reach profile taking over, else the split). Released at once on "highway" (shapes, trusted match, model path), his
   gas held 1.5 s, any button; a confirmation is overturned by the same highway evidence or his gas held (unless the
   car is matched on the ramp with trust 0), and our handover then gives his speed back. His blinker to the other
-  side cancels the exit blinker. **That 12 mph bound wins over the reach profile: from highway speed a tight exit
-  curve is NOT reached by the cruise alone** (the unit "exit 48" case: 72 set, 70 mph, his blinker 370 m out,
-  35 mph curve 250 m past the split: ~61 mph at the split, ~52 mph at the curve; he must brake ~1.4 m/s^2 over the
-  last ~180 m).
+  side cancels the exit blinker. **Trust a blinker that is still on**: while his signal toward the exit is on (1.0 s grace for the lamp's
+  flash gaps / a self-cancel), or it was on for this exit and the camera says the car is in the lane next to the road
+  edge on that side, the reach profile slows as much as the ramp needs (no 12 mph bound). Once it is off without the
+  ramp confirmed, the 12 mph bound applies again and the set is held where it is (no SET+ back up inside the exit
+  area) until the exit is resolved. Unit numbers (72 set, 70 mph, 35 mph curve 250 m past the split): blinker on
+  370 m -> split ~56 / curve ~38 mph; 320-270 m + edge lane ~57 / ~38; 370-300 m (or 320-270 m) without the edge
+  lane ~60 / ~48: **he must brake**; a lane-change blink 150-60 m that stays on the highway dips ~10 mph; a blinker
+  held 350 m to the split that stays on dips ~21 mph (the price of trusting it), then his speed comes back.
   **Without his blinker an exit is only slowed for from the split, mostly once the ramp is confirmed (about 2-3 s past
-  it)**: signal early and brake for a tight exit. Exit handover to the street's limit + offset on a trust-0 match, never
+  it)**: keep the signal on to the split for a tight exit. Exit handover to the street's limit + offset on a trust-0 match, never
   more than 10 mph under the car until the street is matched; his gas / buttons / brake cancel it.
 * **No GPS**: the view says "none"; the camera-only curve uses its more careful side force; an unconfirmed exit plan
   is dropped.
+
+### What must be on in 7.0 (and what degrades without it)
+
+* **Map speed limits and the map's preview limit** come from 7.0's map service (the packaged `mapd`, manager process
+  `mapd_shadow`). It starts on a drive (maps/shadow_lifecycle.py `enabled` + `preflight`) when:
+  1. **Show Speed Limits** is on (`ShowSpeedLimits`, default on);
+  2. **Map Data** is one of the speed limit sources (`SLCPriority1..3`; the defaults are Vision, Map Data, Off);
+  3. an **offline map is downloaded** in Maps settings (parked; `map_snapshot_operations` writes it and selects it:
+     `/data/media/0/starpilot/maps/offline/current.json`).
+
+  Check over ssh: `cat /data/params/d/ShowSpeedLimits; for k in 1 2 3; do cat /data/params/d/SLCPriority$k; echo; done`
+  (a missing file is the default), `ls -l /data/media/0/starpilot/maps/offline/current.json`, and on a drive
+  `ps aux | grep -c "[m]apd --shadow"`. The settings rows for speed limit / merge / exits say "Now: ..." with what to
+  turn on when it will not run.
+* Without the map service running (items 1 or 2 off): **speed limit follow** has no map limit (only a dash reading
+  if 7.0 has one for this car; vision is not followed), so it does nothing; the **merge** uses the ramp's
+  destination speed from our curve files (no preview); the **exit handover** uses the ramp's destination speed (no
+  posted street limit). **Map curves, the exit plan and the merge's curve guard still work**: our curve files are built
+  by our own parked daemon (`mazda_curve_mapd`) straight from the downloaded offline tiles of the selected region; they
+  need the download (item 3), not a running map service. Without the download (item 3) nothing map-based works: only
+  the camera-only curves remain.
 
 Not in Stage 2 (absent, not half-wired): stop slowdown (g), on-screen notices (h: log only).
 

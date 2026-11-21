@@ -37,12 +37,42 @@ SUB_ROWS = (
    "On a ramp onto a highway, once its curves are behind, raises the set speed (a boost) to reach the highway's " +
    "limit plus the offset. Waits for a stop, a slow car ahead or blocked lane keeping.", 0.),
   ("exits", "Exit ramps",
-   "Slows before an exit ramp's curves when you signal toward the exit within about 400 m of it, and hands the " +
-   "speed to the street's limit after. Lets go at once if you stay on the highway, press a button or hold the gas. " +
-   "It slows at most 12 mph before the ramp is confirmed: brake yourself for a tight exit curve. Without your " +
-   "signal it only slows once the ramp is confirmed, past the split.", 0.),
+   "Slows as much as the ramp needs while your signal toward the exit is on (within about 400 m); a short signal " +
+   "slows at most 12 mph, so keep it on to the split for a tight exit or brake yourself. Hands the speed to the " +
+   "street's limit after; lets go at once if you stay on the highway, press a button or hold the gas.", 0.),
 )
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
+
+
+MAP_ROWS = ("speed_limit", "merge", "exits")
+MAP_STATUS_CACHE = 5.0          # s
+
+
+def map_service_status(params, cp):
+  """"" when 7.0's map service (the mapd provider: map speed limits and the map's preview limit) will run on a drive,
+  else what to do, in plain words. The checks 7.0 itself uses (maps/shadow_lifecycle.enabled and the offline-map
+  part of preflight): Show Speed Limits (or the SLC) on, Map Data in the speed limit sources (or Highest / Lowest),
+  and a downloaded, selected offline map. Never raises."""
+  try:
+    from openpilot.starpilot.maps import shadow_lifecycle as S
+    from openpilot.starpilot.speed_limits.runtime_settings import read_params
+    from openpilot.starpilot.speed_limits.selection import SelectionMode, Source
+    todo = []
+    settings = read_params(params)
+    if settings.errors:
+      todo.append("fix the speed limit settings")
+    else:
+      if not (settings.enabled or settings.display):
+        todo.append("turn on Show Speed Limits")
+      if not (Source.MAP in settings.selection.slots or settings.selection.mode is not SelectionMode.ORDERED):
+        todo.append("add Map Data to the speed limit sources")
+    if not (S._owned_root(S.OFFLINE_ROOT, S.STORAGE_ANCHOR) and S._selected_snapshot(S.OFFLINE_ROOT)):
+      todo.append("download offline maps in Maps settings")
+    if not todo:
+      return ""
+    return "no map speed limits: " + ", ".join(todo) + "."
+  except Exception:
+    return "the map service's state cannot be read."
 
 
 def capable(cp) -> bool:
@@ -88,6 +118,14 @@ class MazdaSpeedFeature:
     self.authority = owner.authority
     self.vehicle_params = owner.vehicle_params
     self.vehicle_fingerprint = owner.vehicle_fingerprint
+    self._map_status = None         # (monotonic s, text)
+
+  def map_status(self, cp):
+    import time
+    now = time.monotonic()
+    if self._map_status is None or now - self._map_status[0] > MAP_STATUS_CACHE:
+      self._map_status = (now, map_service_status(self.params, cp))
+    return self._map_status[1]
 
   def capability(self):
     cp = self.vehicle_params()
@@ -124,6 +162,9 @@ class MazdaSpeedFeature:
     for field, label, reason, step in SUB_ROWS:
       kind, default, lim = C.SCHEMA[field]
       value = getattr(cfg, field)
+      if field in MAP_ROWS:
+        status = self.map_status(self.vehicle_params())
+        reason = reason + (" Now: " + status if status else "")
       if kind == "mode":
         rows.append(FeatureRow(PREFIX + field, label, _shown(value), choices=tuple(MODE_LABELS.values()),
                                default_value=_shown(default), reason=reason + " Applies at the next drive.", **common))

@@ -29,7 +29,7 @@ DESCRIPTIONS = {
   'mazda_speed:speed_limit': 'Moves a speed StarPilot set, or one you set at the limit, to the posted limit plus the offset; a higher speed you chose stays yours. Needs Show Speed Limits and Map Data.',
   'mazda_speed:limit_offset_mph': 'Sets how many mph above the posted limit the limit follow, the merge and the exit street speed aim for.',
   'mazda_speed:merge': 'On a ramp onto a highway, raises the set speed to reach the highway limit plus the offset once the ramp curves are behind.',
-  'mazda_speed:exits': 'Slows up to 12 mph before an exit ramp curve when you signal toward the exit (brake yourself for a tight curve), lets go if you stay on the highway, then uses the street limit.',
+  'mazda_speed:exits': 'Slows as much as the exit ramp needs while your signal toward the exit is on; a short signal slows at most 12 mph. Lets go if you stay on the highway, then uses the street limit.',
   'TorqueInterceptorEnabled': 'For a Gen1 Mazda with a MoreTorque Torque Interceptor installed: StarPilot also steers below 28 mph. Turn on only with the interceptor fitted; applies after the next startup.',
   'FordRearFogIndicator': 'Shows a movable amber telltale while the Ford rear fog light is on, using read-only vehicle status.',
   'DisengageOnAccelerator': 'When enabled, pressing the accelerator pedal will disengage openpilot.',

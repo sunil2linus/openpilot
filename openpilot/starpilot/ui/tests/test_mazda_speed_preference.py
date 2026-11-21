@@ -95,3 +95,32 @@ def test_invalid_document_is_off_and_repairable():
     assert owner.apply(request)
     assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":3}'
     assert [r.key for r in rows(owner)] == [MASTER]
+
+
+def test_speed_limit_merge_and_exit_rows_say_when_the_map_service_will_not_run(monkeypatch):
+  import openpilot.starpilot.ui.mazda_speed_feature as F
+  from openpilot.starpilot.maps import shadow_lifecycle as S
+
+  def reasons(saved):
+    owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
+    return {r.key: r.reason for r in rows(owner)}
+  with tempfile.TemporaryDirectory() as d:
+    saved = Params(d)
+    Path(saved.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, "enabled": True}).encode())
+    monkeypatch.setattr(S, "_owned_root", lambda root, anchor: True)
+    monkeypatch.setattr(S, "_selected_snapshot", lambda root: False)
+    got = reasons(saved)                                  # 7.0's defaults: Show Speed Limits on, Map Data a source
+    for k in F.MAP_ROWS:
+      assert "Now: no map speed limits: download offline maps in Maps settings." in got[PREFIX + k], got[PREFIX + k]
+    assert "Now:" not in got[PREFIX + "curves"]
+    monkeypatch.setattr(S, "_selected_snapshot", lambda root: True)
+    assert "Now:" not in reasons(saved)[PREFIX + "merge"]
+    put = lambda key, raw: Path(saved.get_param_path(key)).write_bytes(raw)  # noqa: E731
+    put("ShowSpeedLimits", b"0")
+    assert "turn on Show Speed Limits" in reasons(saved)[PREFIX + "speed_limit"]
+    put("ShowSpeedLimits", b"1")
+    for key, value in (("SLCPriority1", b"Vision"), ("SLCPriority2", b"Off"), ("SLCPriority3", b"Off")):
+      put(key, value)
+    got = reasons(saved)[PREFIX + "exits"]
+    assert "add Map Data to the speed limit sources" in got and "Show Speed Limits" not in got
+    assert all("MapdShadow" not in r for r in reasons(saved).values())
