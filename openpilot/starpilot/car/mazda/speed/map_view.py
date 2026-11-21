@@ -38,6 +38,7 @@ import os
 import time
 
 from openpilot.starpilot.car.mazda.speed import map_match as MM
+from openpilot.starpilot.car.mazda.speed.curve_memory import way_place
 
 VIEW_PATH = "/dev/shm/mazda_speed_view.json"
 VIEW_VERSION = 2
@@ -94,6 +95,21 @@ class CurvesAhead:
     ow = self.oneway_ways()
     return any(int(w) in ow and bool(fwd) != bool(increasing) for w, fwd in c.get("wdir", []))
 
+  def way_place(self, cid, c, increasing):
+    """(curve_memory.way_place of the curve's start along its first way, our direction along that way's node order)
+    from the chain's way distances; (None, None) unknown."""
+    ways = c.get("ways") or []
+    ch = self.store.chains.get(cid)
+    if not ways or ch is None:
+      return None, None
+    w = ch["w"]
+    for k, (wid, fwd, s0) in enumerate(w):
+      if int(wid) == int(ways[0]):
+        s1 = w[k + 1][2] if k + 1 < len(w) else ch["len"]
+        off = (c["s_a"] - s0) if fwd else (s1 - c["s_b"])
+        return way_place(off), ("ab" if bool(fwd) == bool(increasing) else "ba")
+    return None, None
+
   def road(self, way_id, is_forward):
     hit = self.store.way_chain.get(way_id)
     if hit is None:
@@ -149,9 +165,11 @@ class CurvesAhead:
       else:
         continue
       pts = [[round(d0 + s, 1), r] for s, r in directed_profile(c, increasing)]
+      place, wdir = self.way_place(cid, c, increasing)
       out.append({"id": key, "pts": pts, "ramp": bool(c.get("ramp")) or int(c.get("cls", 0)) in MM.LINK_CLASSES,
                   "adv": float(c.get("adv", 0.0) or 0.0), "len": length, "r": float(c["r"]),
-                  "way": int((c.get("ways") or [0])[0]), "name": str(c.get("name", ""))})
+                  "way": int((c.get("ways") or [0])[0]), "name": str(c.get("name", "")),
+                  **({"place": place, "wdir": wdir} if place is not None else {})})
     return out
 
 

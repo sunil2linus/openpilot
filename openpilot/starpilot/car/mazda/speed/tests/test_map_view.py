@@ -129,3 +129,13 @@ def test_view_file_roundtrip(tmp_path):
   with open(p, "w") as f:
     f.write("{")
   assert V.read_view(p) is None
+
+
+def test_curves_carry_their_place_along_their_way(tmp_path):
+  mv, _ = make_view(tmp_path, {1: way(1, loop_road(), speed_mph=45)})
+  out = None
+  for k, y in enumerate(range(-380, -150, 2)):
+    out = mv.update(k * 0.1, gps_at(0.0, float(y), 0.0))
+  c = out["curves"][0]
+  assert c["way"] == 1 and c["wdir"] == "ab" and 8 <= c["place"] <= 11, c     # its start ~400 m along the way (40 m buckets)
+  assert "lat" not in c and "lon" not in c

@@ -20,7 +20,7 @@ Pure (tests/test_curve_plan.py).
 import math
 
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
-from openpilot.starpilot.car.mazda.speed.curve_memory import PassRecorder, apply_memory, curve_key
+from openpilot.starpilot.car.mazda.speed.curve_memory import MARK_OVER, PassRecorder, apply_memory, curve_key, offset_on
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
 
 MPH = M.MPH
@@ -100,7 +100,7 @@ class CurvePlan:
       seen.add(cid)
       lat = self.curve_lat(cc, ctx.get("lkas_blocked", False))
       speeds = [point_speed(r, lat, 0.0, None, c.get("adv", 0.0)) for _, r in pts]
-      key = curve_key(c["way"], cid.rsplit(":", 1)[-1]) if c.get("way") else None
+      key = curve_key(c["way"], c["place"], c["wdir"]) if c.get("way") and "place" in c else None
       if key is not None and (self.memory is not None or self.offset > 0):
         speeds = apply_memory(pts, speeds, key, cc.get("ramp", False), self.memory, self.offset,
                               self.cfg.curve_offset_lat, lat)
@@ -141,8 +141,9 @@ class CurvePlan:
     first, last = min(d for d, _ in pts), max(d for d, _ in pts)
     rec = self.recording.get(cid)
     if rec is None and first <= 0 < last:
-      rec = self.recording[cid] = PassRecorder(key, c.get("name", ""), bool(c.get("ramp")),
-                                               ctx.get("plan_reason") == "map_curve")
+      ramp = bool(c.get("ramp"))
+      rec = self.recording[cid] = PassRecorder(key, c.get("name", ""), ramp, ctx.get("plan_reason") == "map_curve",
+                                               offset_on=offset_on(key, ramp, self.memory, self.offset))
     if rec is None:
       return
     if last < -KEEP_PAST:
@@ -158,4 +159,4 @@ class CurvePlan:
       return
     p = rec.finish(self.memory.clock())
     if p is not None:
-      self.memory.add_pass(rec.key, rec.name, rec.ramp, p)
+      self.memory.add_pass(rec.key, rec.name, rec.ramp, p, mark_lat=self.cfg.curve_offset_lat + MARK_OVER)

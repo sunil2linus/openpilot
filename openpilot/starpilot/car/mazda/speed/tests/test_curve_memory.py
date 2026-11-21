@@ -58,15 +58,49 @@ def test_cap_never_below_the_fastest_clean_pass_and_expires(tmp_path):
   m, clock = mem(tmp_path)
   key = "7:ab"
   m.add_pass(key, "Test Rd", False, {"t": clock[0], "v": 17.0, "lat": 2.0, "clean": True, "teach": False})
-  m.add_pass(key, "Test Rd", False, {"t": clock[0], "v": 16.0, "lat": 2.0, "clean": False, "teach": True})
+  m.add_pass(key, "Test Rd", False, {"t": clock[0], "v": 16.0, "lat": 2.0, "clean": False, "teach": True,
+                                     "offset": True})
   assert m.cap(key) == 17.0                                           # 0.9 x 16 would be under the clean 17
   assert not m.offset_allowed(key, False)
   m.add_pass(key, "Test Rd", False, {"t": clock[0], "v": 18.5, "lat": 2.0, "clean": True, "teach": False})
   assert m.cap(key) == 18.5
   clock[0] += 31 * DAY
   assert m.cap(key) is None and m.offset_allowed(key, False)
-  m.add_pass("9:ba", "Hard Rd", False, {"t": clock[0], "v": 20.0, "lat": 2.8, "clean": True, "teach": False})
-  assert not m.offset_allowed("9:ba", False) and m.cap("9:ba") is None    # a hard clean pass: no offset there
+  m.add_pass("9:ba", "Hard Rd", False, {"t": clock[0], "v": 20.0, "lat": 3.4, "clean": True, "teach": False,
+                                         "offset": True})
+  assert not m.offset_allowed("9:ba", False) and m.cap("9:ba") is None    # a hard clean pass with the offset: none there
+
+
+def test_no_offset_is_marked_only_by_a_pass_with_the_offset_and_trouble_or_hard():
+  import tempfile
+  with tempfile.TemporaryDirectory() as d:
+    m = CM.CurveMemory(path=d + "/m.json", clock=lambda: 1_700_000_000.0, background=False)
+    t = 1_700_000_000.0
+    # an ordinary clean ramp pass at the ramp side force (2.6): never marks itself (the old rule did)
+    m.add_pass("5@0:ab", "Ramp", True, {"t": t, "v": 12.0, "lat": 2.7, "clean": True, "teach": False, "offset": True})
+    assert m.curves["5@0:ab"]["no_offset"] is None
+    # trouble or a lateral at offset_lat + 0.3, but no offset applied (offset 0 / cruise off): no mark
+    m.add_pass("6@0:ab", "Rd", False, {"t": t, "v": 12.0, "lat": 3.5, "clean": False, "teach": False, "offset": False})
+    assert m.curves["6@0:ab"]["no_offset"] is None
+    # with the offset applied: trouble marks, a pass past offset_lat + 0.3 marks
+    m.add_pass("7@0:ab", "Rd", False, {"t": t, "v": 12.0, "lat": 2.0, "clean": False, "teach": False, "offset": True})
+    m.add_pass("8@0:ab", "Rd", False, {"t": t, "v": 12.0, "lat": 3.3, "clean": True, "teach": False, "offset": True},
+               mark_lat=3.3)
+    assert m.curves["7@0:ab"]["no_offset"] and m.curves["8@0:ab"]["no_offset"]
+
+
+def test_curves_on_one_way_have_their_own_records_and_old_files_are_ignored(tmp_path):
+  assert CM.curve_key(7, CM.way_place(10.0), "ab") != CM.curve_key(7, CM.way_place(300.0), "ab")
+  assert CM.curve_key(7, CM.way_place(10.0), "ab") != CM.curve_key(7, CM.way_place(10.0), "ba")
+  m, clock = mem(tmp_path)
+  tight, gentle = CM.curve_key(7, CM.way_place(30.0), "ab"), CM.curve_key(7, CM.way_place(400.0), "ab")
+  m.add_pass(tight, "Rd", False, {"t": clock[0], "v": 14.0, "lat": 2.0, "clean": False, "teach": True, "offset": True})
+  m.add_pass(gentle, "Rd", False, {"t": clock[0], "v": 25.0, "lat": 2.0, "clean": True, "teach": False})
+  assert m.cap(tight) is not None and m.cap(tight) < 20.0 and m.cap(gentle) is None and m.offset_allowed(gentle, False)
+  # a version 1 file (way + direction keys) is ignored, never applied to the wrong curve
+  (tmp_path / "old.json").write_text(json.dumps({"version": 1, "curves": {"7:ab": {"cap": {"v": 10.0, "t": clock[0]}}}}))
+  old = CM.CurveMemory(path=str(tmp_path / "old.json"), clock=lambda: clock[0], background=False)
+  assert old.curves == {} and CM.VERSION == 2
 
 
 def test_ramp_offset_needs_two_clean_passes(tmp_path):
@@ -77,15 +111,17 @@ def test_ramp_offset_needs_two_clean_passes(tmp_path):
   assert m.offset_allowed("5:ab", True)
 
 
-def test_cap_and_offset_act_on_the_tight_points_only(tmp_path):
+def test_the_cap_acts_on_the_tight_points_and_the_offset_on_all(tmp_path):
   m, clock = mem(tmp_path)
   pts = [(50.0, 72.0), (100.0, 85.0), (160.0, 200.0)]
   base = [math.sqrt(2.2 * r) for _, r in pts]
-  got = CM.apply_memory(pts, base, "7:ab", False, m, 3 * MPH, 3.0, 2.2)
-  assert got[0] == min(base[0] + 3 * MPH, math.sqrt(3.0 * 72)) and got[1] > base[1] and got[2] == base[2]
-  m.add_pass("7:ab", "Test Rd", False, {"t": clock[0], "v": 14.0, "lat": 2.0, "clean": False, "teach": True})
-  got = CM.apply_memory(pts, base, "7:ab", False, m, 3 * MPH, 3.0, 2.2)
-  cap = m.cap("7:ab")
+  got = CM.apply_memory(pts, base, "7@0:ab", False, m, 3 * MPH, 3.0, 2.2)
+  assert got[0] == min(base[0] + 3 * MPH, math.sqrt(3.0 * 72)) and got[1] > base[1]
+  assert got[2] == min(base[2] + 3 * MPH, math.sqrt(3.0 * 200)) and got[2] >= got[0]   # the wider body never slower
+  m.add_pass("7@0:ab", "Test Rd", False, {"t": clock[0], "v": 14.0, "lat": 2.0, "clean": False, "teach": True,
+                                          "offset": True})
+  got = CM.apply_memory(pts, base, "7@0:ab", False, m, 3 * MPH, 3.0, 2.2)
+  cap = m.cap("7@0:ab")
   assert got[0] == min(base[0], cap) and got[2] == base[2]           # capped, offset removed, wide point untouched
 
 
@@ -118,9 +154,11 @@ def test_passes_are_recorded_through_the_curve_contributor(tmp_path):
   for k in range(int(200 / v / 0.01)):
     driven = v * 0.01 * k
     view = {"v": 1, "t": 0.0, "gps": "ok", "trust": 0,
-            "curves": [{"id": "1:0:ab", "way": 7, "name": "Test Rd", "ramp": False, "pts": [[d - driven, r] for d, r in pts0]}]}
+            "curves": [{"id": "1:0:ab", "way": 7, "place": 0, "wdir": "ab", "name": "Test Rd", "ramp": False,
+                        "pts": [[d - driven, r] for d, r in pts0]}]}
     plan({"view": view, "now": 0.0, "v_ego": v, "lat_active": True, "angle": 15.0, "torque": 0.4, "cruise_enabled": True,
           "plan_reason": "map_curve"})
   plan({"view": {"v": 1, "t": 0.0, "gps": "ok", "trust": 0, "curves": []}, "now": 0.0, "v_ego": v})
-  e = m.curves["7:ab"]
+  e = m.curves["7@0:ab"]
   assert e["name"] == "Test Rd" and len(e["passes"]) == 1 and e["passes"][0]["clean"]
+  assert e["passes"][0]["offset"] is True                            # the offset was applied on this pass
