@@ -22,8 +22,8 @@ whole steps, no margin: Contribution.anchor); the planner takes it only by these
   * "limit": when the anchor is ours (raise or lower, any band), or he engaged at a speed within the proposal's band
     (the limit's band); never when his SET+/SET- made it his; never his own higher speed out of the band;
   * "fallback" (43 mph with the limit unknown): only up, only an engaged or our anchor;
-  * "merge": up from an anchor that is ours or a street's (MERGE_SURFACE_MAX); down (the taper, the end) only from
-    our merge anchor;
+  * "merge": up from an anchor that is ours, a street's (MERGE_SURFACE_MAX), or his curve speed on that link (the
+    proposal's band: his SET- in a ramp curve); down (the taper, the end) only from our merge anchor;
   * "handover" (exit onto a street): only down, any owner (the contributor ends it for good on his gas / buttons);
   * never in a frame with his own change (his buttons win), never with the cruise off.
 The first proposal in the order handover, merge, limit, fallback that passes is taken.
@@ -114,7 +114,8 @@ class Planner:
       return c.anchor < a
     if c.kind == "merge":
       if c.anchor > a:
-        return self.owner == OURS or a <= MERGE_SURFACE_MAX[1 if self.metric else 0] + half
+        his_curve = c.band is not None and c.band[0] - half <= a <= c.band[1] + half   # his curve speed on the link
+        return self.owner == OURS or a <= MERGE_SURFACE_MAX[1 if self.metric else 0] + half or his_curve
       return self.owner == OURS and self.ours_why == "merge"
     if c.kind == "limit":
       if self.owner == OURS:

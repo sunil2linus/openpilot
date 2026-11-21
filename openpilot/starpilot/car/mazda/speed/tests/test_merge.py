@@ -144,3 +144,49 @@ def test_with_map_curves_off_the_merge_still_waits_for_the_ramp_curve():
   assert r.anchor_mph == 45                 # the loop ahead (a log-only curve plan): no boost
   on_link(r, 3.0, 40)                       # the loop behind the car
   assert r.anchor_mph == 90
+
+
+def test_a_stale_view_keeps_the_episode_he_declined():
+  r = merge_rig()
+  r.step(v_mph=40, set_mph=45, events=[engaged(45)])
+  on_link(r, 0.5, 40)
+  on_link(r, 0.1, 40, events=[driver("SET_MINUS", 40)])
+  r.step(v_mph=40, n=300, slc=None, view=None, path=PATH, model_age=0.0)     # 3 s without a view
+  on_link(r, 5.0, 40)
+  assert r.anchor_mph == 40                 # still declined: not a new merge
+  # another link: a new episode
+  r.step(v_mph=40, n=500, slc={"limit": 45 * MPH, "upcoming": 0.0, "t": 0.0}, view=link_view(rid=8), path=PATH,
+         model_age=0.0)
+  assert r.anchor_mph == 90
+
+
+def test_the_end_anchor_is_a_whole_step_and_survives_his_change_in_that_frame():
+  m = Merge(CFG)
+  assert abs(m.whole(47.3 * MPH) / MPH - 47) < 1e-6
+  r = merge_rig()
+  r.step(v_mph=40, set_mph=45, events=[engaged(45)])
+  on_link(r, 2.5, 40)
+  assert r.anchor_mph == 90
+  # the car reaches the target in a frame with his own change that keeps our anchor (his SET+ under our lowering:
+  # the planner takes no proposal in that frame): the one-shot end is proposed again and taken next frame
+  r.p.lowered = True
+  on_link(r, 0.01, 72, events=[driver("SET_PLUS", 80)])
+  assert r.anchor_mph == 90 and r.p.owner == "ours"
+  on_link(r, 0.1, 72)
+  assert r.anchor_mph == 73
+
+
+def test_his_set_minus_in_an_interchange_loop_above_street_speed_is_a_curve_speed():
+  curve_target = {"v": 30 * MPH}
+
+  def curve(ctx):
+    return Contribution("map_curve", curve_target["v"])
+  r = merge_rig(extra=[curve])
+  r.step(v_mph=60, set_mph=75, events=[engaged(75)])
+  on_link(r, 0.5, 60, limit=70, spd=70)
+  on_link(r, 0.1, 58, events=[driver("SET_MINUS", 60)], limit=70, spd=70)
+  on_link(r, 3.0, 55, limit=70, spd=70)
+  assert r.anchor_mph == 60 and r.p.owner == "his"
+  curve_target["v"] = None                  # the loop is behind
+  on_link(r, 0.2, 55, limit=70, spd=70)
+  assert r.anchor_mph == 90                 # his 60 was a curve speed: the merge raises it

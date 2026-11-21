@@ -21,11 +21,19 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
     curves Off the merge gets a log-only curve plan for this, contributors.build), the
     model's path is short (a stop, a queue: shorter than v x SHORT_T), a radar lead that is slow, closing or of
     unknown speed, the stock LKAS blocked.
-  * His SET- on the link while a curve holds the merge is a curve speed (it opens again after the curve, from his
-    speed); his SET- otherwise declines the merge for this link. His SET+ / RES / SET: decided again from his speed
+  * His SET- on the link while a curve holds the merge is a curve speed at any speed (it opens again after the
+    curve from that speed: the proposal carries it as its band, the planner raises it even above a street's speed,
+    e.g. after an interchange loop); his SET- otherwise declines the merge for this link.
+  * The episode (declined, done, his curve speed) is kept across a stale or missing view on the same link for up to
+    STALE_KEEP / STALE_KEEP_M; it starts over only on another link or after really leaving (the highway HWY_KEEP,
+    a street STREET_END, or a longer gap). A one-shot anchor (the end at T, a boost dropped to T, the way down at a
+    street) is proposed again until the planner has it (PENDING_MAX), so his change in that frame cannot lose it;
+    anchors are whole dash steps (down). His SET+ / RES / SET: decided again from his speed
     (the planner raises only a street's speed, not his own highway speed).
 Pure (tests/test_merge.py).
 """
+import math
+
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
 from openpilot.starpilot.car.mazda.speed.limits import whole_limit
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
@@ -49,6 +57,9 @@ LEAD_MIN_SPEED = 13.0            # m/s
 LEAD_CLOSING = 3.0               # m/s
 LEAD_STALE = 0.5                 # s
 TARGET_MAX = (85, 140)
+STALE_KEEP = 15.0                # s without a fresh view on the link: the episode is kept this long ...
+STALE_KEEP_M = 400.0             # m ... or this far
+PENDING_MAX = 2.0                # s a one-shot anchor is proposed again
 
 
 class Merge:
@@ -66,6 +77,9 @@ class Merge:
 
   def reset_episode(self):
     self.declined = self.done = False
+    self.curve_speed = None        # his SET- in a ramp curve on this link (dash m/s)
+    self.stale_t = self.stale_m = 0.0
+    self.pending = None            # (anchor, until) a one-shot anchor proposed until the planner has it
     self.h, self.h_t = None, 0.0
     self.boost_t = 0.0
     self.boosting = False
@@ -104,6 +118,29 @@ class Merge:
       return h, "map"
     return None, ""
 
+  def whole(self, mps):
+    return math.floor(mps / self.unit + 1e-6) * self.unit
+
+  def _once(self, value, now):
+    self.pending = (self.whole(value), now + PENDING_MAX)
+
+  def _propose(self, out, value, ctx):
+    out.anchor = self.whole(value)
+    if self.curve_speed is not None:
+      out.band = (self.curve_speed, self.curve_speed)   # his curve speed on this link: the planner may raise it
+    return out
+
+  def _pending(self, out, ctx, now):
+    if self.pending is None:
+      return out
+    value, until = self.pending
+    anchor = ctx.get("anchor")
+    if now > until or (anchor is not None and anchor <= value + 0.5 * self.unit):
+      self.pending = None
+      return out
+    out.anchor = value
+    return out
+
   def __call__(self, ctx):
     now, v = ctx.get("now", 0.0), ctx.get("v_ego", 0.0)
     dt = 0.0 if self.t is None else min(max(now - self.t, 0.0), 0.5)
@@ -114,11 +151,22 @@ class Merge:
     ramp = (view.get("ramp") or {}) if fresh else {}
     on_link = bool(fresh and view.get("link") and ramp.get("hwy"))
     if on_link and ramp.get("id") != self.link:
+      pending = self.pending
       self.link = ramp.get("id")
       self.reset_episode()
+      self.pending = pending
     if self.link is None:
       self.last = ("idle", None)
-      return out
+      return self._pending(out, ctx, now)
+    if not fresh:
+      self.stale_t += dt
+      self.stale_m += max(v, 0.0) * dt
+      if self.stale_t <= STALE_KEEP and self.stale_m <= STALE_KEEP_M:
+        ctx["merge_busy"] = True
+        self.last = ("stale", self.h)
+        return self._pending(out, ctx, now)     # the episode is kept (declined, done, his curve speed)
+    else:
+      self.stale_t = self.stale_m = 0.0
     if not on_link:
       if fresh and view.get("cls") in (1, 3) and not view.get("link"):
         self.hwy_t = (self.hwy_t or 0.0) + dt
@@ -130,51 +178,55 @@ class Merge:
         self.link = None
         self.last = ("ended", None)
         if end and self.h is not None:
-          out.anchor = min(self.target(self.h), max(v / self.unit + M.DASH_OFFSET / self.unit, 0) * self.unit) \
-            if self.street_t >= STREET_END else self.target(self.h)
-        return out
+          street = self.street_t >= STREET_END
+          self._once(min(self.target(self.h), v + M.DASH_OFFSET) if street else self.target(self.h), now)
+        return self._pending(out, ctx, now)
     ctx["merge_busy"] = True
     trust = bool(fresh and (view.get("trust") == TRUST_OK or view.get("start_ok")))
     guards = self.guards(ctx)
     for e in ctx.get("act_events", ()):
       if e.get("kind") == "driver" and e.get("direction") == "SET_MINUS" and on_link:
-        if "curve" not in guards:
+        if "curve" in guards:
+          self.curve_speed = e.get("after")    # a curve speed, not a merge decision (at any speed)
+        else:
           self.declined = True     # his own lower speed on the link, no curve: his decision for this link
+      elif e.get("kind") == "driver" and e.get("direction") == "SET_PLUS":
+        self.curve_speed = None
     if self.declined or self.done:
       self.last = ("declined" if self.declined else "done", self.h)
-      return out
+      return self._pending(out, ctx, now)
     h, src = self.highway_limit(ctx, view) if fresh else (None, "")
     if h != self.h:
       if self.h is not None and self.boosting:
-        out.anchor = self.target(self.h)       # the target moved: start from the old one
+        self._once(self.target(self.h), now)     # the target moved: start from the old one
       self.h, self.h_t = h, 0.0
       self.boosting = False
     elif h is not None:
       self.h_t = self.h_t + dt if trust else 0.0
     if self.h is None or self.h_t < H_STEADY - 1e-6:
       self.last = ("wait limit", self.h)
-      return out
+      return self._pending(out, ctx, now)
     t_dash = self.target(self.h)
     car_dash = v + M.DASH_OFFSET
     if guards:
       self.last = ("wait " + ",".join(guards), self.h)
       if self.boosting:
-        out.anchor = t_dash
+        self._once(t_dash, now)
         self.boosting = False
-      return out
+      return self._pending(out, ctx, now)
     if car_dash >= t_dash - END_GAP[self.k] * self.unit or self.boost_t >= BOOST_MAX:
-      out.anchor, self.done, self.boosting = t_dash, True, False
+      self.done, self.boosting = True, False
+      self._once(t_dash, now)
       self.last = ("end", self.h)
-      return out
+      return self._pending(out, ctx, now)
+    self.pending = None
     self.boost_t += dt
     self.boosting = True
     if car_dash >= t_dash - TAPER_GAP[self.k] * self.unit:
-      out.anchor = min(t_dash + TAPER_OVER[self.k] * self.unit, CAR_MAX[self.k] * self.unit)
       self.last = ("taper", self.h)
-    else:
-      out.anchor = min(t_dash + BOOST[self.k] * self.unit, CAR_MAX[self.k] * self.unit)
-      self.last = ("boost " + src, self.h)
-    return out
+      return self._propose(out, min(t_dash + TAPER_OVER[self.k] * self.unit, CAR_MAX[self.k] * self.unit), ctx)
+    self.last = ("boost " + src, self.h)
+    return self._propose(out, min(t_dash + BOOST[self.k] * self.unit, CAR_MAX[self.k] * self.unit), ctx)
 
   def target(self, h):
     return min(h + self.offset, TARGET_MAX[self.k]) * self.unit
