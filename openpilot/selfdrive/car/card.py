@@ -354,6 +354,14 @@ class Car:
       safety_config = structs.CarParams.SafetyConfig()
       safety_config.safetyModel = structs.CarParams.SafetyModel.noOutput
       self.CP.safetyConfigs = [safety_config]
+    self.mazda_ti_startup = None
+    if CI is None and not REPLAY:
+      from openpilot.starpilot.car.mazda.ti_startup import TorqueInterceptorStartup, required as mazda_ti_required
+      if mazda_ti_required(self.CP):
+        # bus 1 to the OBD-II pins before ControlsReady, so TI_FEEDBACK can make carState valid
+        self.mazda_ti_startup = TorqueInterceptorStartup(self.params)
+        self.sm.update(0)
+        self.mazda_ti_startup.request(self.CP, self.sm['pandaStates'] if self.sm.seen['pandaStates'] else None)
 
     startup_preferences.finalize(self.CP)
     from opendbc.car.gm.cancel_remap import migrate_assignments as migrate_gm_cancel_assignments
@@ -1942,6 +1950,8 @@ class Car:
 
   def step(self):
     CS, RD = self.state_update(defer_radar=True)
+    if getattr(self, 'mazda_ti_startup', None) is not None:
+      self.mazda_ti_startup.maintain(self.sm['pandaStates'] if self.sm.seen['pandaStates'] else None)
 
     if self.vehicle_startup.owner is not None:
       self.vehicle_startup.maintain(configured=self.startup_panda_configured())
