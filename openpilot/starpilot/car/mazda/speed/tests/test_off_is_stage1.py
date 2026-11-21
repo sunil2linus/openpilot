@@ -51,7 +51,11 @@ def no_files(monkeypatch):
 
 @pytest.mark.parametrize("raw", [None, b'{"version":1}', b'{"version":1,"enabled":false,"curves":"on"}',
                                  b'{"version":1,"enabled":true}', b'{"version":1,"enabled":true,"curves":"bad"}',
-                                 b'not json'])
+                                 b'not json', b'{"version":3}',
+                                 b'{"version":3,"enabled":false,"speed_limit":"on","merge":"on","exits":"on"}',
+                                 b'{"version":3,"enabled":true,"limit_offset_mph":5}',
+                                 b'{"version":2,"enabled":true,"exits":"on"}',
+                                 b'{"version":3,"enabled":true,"stops":"on"}'])
 def test_off_returns_the_same_frames_and_makes_nothing(raw, no_files):
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)
@@ -76,6 +80,35 @@ def test_not_for_passive_or_long_cars(no_files):
       frames = []
       assert caller.update(card, cs(), cc(), frames, 0) is frames and card.mazda_speed is False
     assert no_files == []
+
+
+def _files_to(tmp_path, monkeypatch):
+  import openpilot.starpilot.car.mazda.speed.events as E
+  import openpilot.starpilot.car.mazda.speed.car_profile as P
+  import openpilot.starpilot.car.mazda.speed.curve_memory as CM
+  monkeypatch.setattr(E, "LOG_DIR", str(tmp_path / "log"))
+  monkeypatch.setattr(P, "PROFILE_PATH", str(tmp_path / "profile.json"))
+  monkeypatch.setattr(P.CarProfile.__init__, "__defaults__", (str(tmp_path / "profile.json"), "", False, P.time.monotonic))
+  monkeypatch.setattr(CM.CurveMemory.__init__, "__defaults__", (str(tmp_path / "memory.json"), CM.time.time, True))
+
+
+@pytest.mark.parametrize("doc", [{"speed_limit": "test"}, {"merge": "test"}, {"exits": "test"},
+                                 {"speed_limit": "on"}, {"merge": "on"}, {"exits": "on"},
+                                 {"speed_limit": "test", "merge": "test", "exits": "test", "curves": "test"}])
+def test_the_part_f_options_without_a_map_or_a_limit_never_press(doc, tmp_path, monkeypatch):
+  _files_to(tmp_path, monkeypatch)
+  with tempfile.TemporaryDirectory() as d:
+    params = Params(d)
+    Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, "enabled": True, **doc}).encode())
+    card = fake_card(params)
+    for k in range(600):
+      frames = []
+      out = caller.update(card, cs(speed=25.0 + (k > 200) * 0.44704, v=24.0 + (k > 300) * 3.0), cc(), frames, 0)
+      assert out is frames
+    assert card.mazda_speed is not False
+    names = {type(c).__name__ for c in card.mazda_speed.contributors}
+    want = {"speed_limit": "SpeedLimit", "merge": "Merge", "exits": "ExitPlan", "curves": "CurvePlan"}
+    assert names == {want[k] for k in doc}
 
 
 def test_on_without_a_map_never_presses(tmp_path, monkeypatch):
