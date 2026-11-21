@@ -122,6 +122,8 @@ def build(cfg, CP, log=None, memory=None, metric=False):
   out = []
   if cfg.active("curves"):
     out.append(CurvePlan(cfg, presses=cfg.presses("curves"), memory=memory))
+  elif cfg.active("merge"):
+    out.append(CurvePlan(cfg, presses=False))   # map curves off: a log-only curve plan, the merge's curve guard
   if cfg.active("camera_curves"):
     out.append(CameraCurve(cfg, presses=cfg.presses("camera_curves")))
   if cfg.active("exits"):

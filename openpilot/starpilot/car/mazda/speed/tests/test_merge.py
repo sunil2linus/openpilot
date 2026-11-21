@@ -126,3 +126,20 @@ def test_test_mode_never_moves_the_anchor():
   r.step(v_mph=40, set_mph=45, events=[engaged(45)])
   out = on_link(r, 3.0, 40)
   assert r.anchor_mph == 45 and abs(out.dry_anchor / MPH - 90) < 1e-6
+
+
+def test_with_map_curves_off_the_merge_still_waits_for_the_ramp_curve():
+  from openpilot.starpilot.car.mazda.speed.contributors import build
+  contributors, _ = build(CFG, None)
+  r = Rig(contributors)
+  r.step(v_mph=40, set_mph=45, events=[engaged(45)])
+  loop = [{"id": "c", "pts": [[150.0, 40.0], [200.0, 40.0]], "ramp": True, "adv": 0.0}]
+
+  def v_loop(t):
+    v = link_view()(t)
+    v["curves"] = loop
+    return v
+  r.step(v_mph=40, n=300, slc={"limit": 45 * MPH, "upcoming": 0.0, "t": 0.0}, view=v_loop, path=PATH, model_age=0.0)
+  assert r.anchor_mph == 45                 # the loop ahead (a log-only curve plan): no boost
+  on_link(r, 3.0, 40)                       # the loop behind the car
+  assert r.anchor_mph == 90

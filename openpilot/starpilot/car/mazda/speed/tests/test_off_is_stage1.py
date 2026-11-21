@@ -108,7 +108,10 @@ def test_the_part_f_options_without_a_map_or_a_limit_never_press(doc, tmp_path, 
     assert card.mazda_speed is not False
     names = {type(c).__name__ for c in card.mazda_speed.contributors}
     want = {"speed_limit": "SpeedLimit", "merge": "Merge", "exits": "ExitPlan", "curves": "CurvePlan"}
-    assert names == {want[k] for k in doc}
+    assert names == {want[k] for k in doc} | ({"CurvePlan"} if "merge" in doc else set())
+    for c in card.mazda_speed.contributors:
+      if type(c).__name__ == "CurvePlan" and "curves" not in doc:
+        assert c.presses is False             # the merge's curve guard only: never pressed for
 
 
 def test_on_without_a_map_never_presses(tmp_path, monkeypatch):

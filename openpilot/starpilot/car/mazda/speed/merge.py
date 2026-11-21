@@ -16,7 +16,8 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
     car is within TAPER_GAP of T; then T once within END_GAP (the merge is done: the anchor stays ours at T, so the
     limit follow carries on from there). At most BOOST_MAX in the boost.
   * Waits (no raise; a running boost drops to T) while: a mapped / camera curve ahead plans below the car's speed +
-    CURVE_NEAR (the ramp curve is not behind the car yet: the curve contributor says when its target rises), the
+    CURVE_NEAR (the ramp curve is not behind the car yet: the curve contributor says when its target rises; with map
+    curves Off the merge gets a log-only curve plan for this, contributors.build), the
     model's path is short (a stop, a queue: shorter than v x SHORT_T), a radar lead that is slow, closing or of
     unknown speed, the stock LKAS blocked.
   * His SET- on the link while a curve holds the merge is a curve speed (it opens again after the curve, from his
