@@ -7,8 +7,9 @@ Rules:
   * Every field is optional; a missing field takes its default. Defaults are all off.
   * Sub-features only run with `enabled` (the master switch) on.
   * Modes: "off" / "test" (computes and logs, never presses) / "on".
-  * Stage 2 has only what is built and tested: the curve speed offset (with its per-curve memory), speed limit
-    follow and stop slowdown come with their own fields later (unknown fields are invalid until then).
+  * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
+    version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan. A field of a later version
+    in an older document is invalid; stop slowdown has no field yet (unknown fields are invalid).
 No openpilot imports beyond the saved-value reader, so it is unit tested offline.
 """
 import json
@@ -16,8 +17,8 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 2                     # 2: + curve_offset_mph / curve_offset_lat (a version 1 document still reads)
-VERSIONS = (1, 2)
+VERSION = 3                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3)            #    merge / exits (version 1 and 2 documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -32,8 +33,13 @@ SCHEMA = {
   "ti_only_lat": ("float", 1.8, (1.8, 3.5)),        # m/s^2: stock LKAS blocked before the curve / camera fault
   "curve_offset_mph": ("int", 0, (0, 5)),           # (v2) plan map curves' tight points this much faster ...
   "curve_offset_lat": ("float", 3.0, (2.0, 4.0)),   # (v2) ... never above this side force; removed per curve by memory
+  "speed_limit": ("mode", "off", MODES),            # (v3) follow the posted limit (7.0's display-only reading)
+  "limit_offset_mph": ("int", 3, (0, 10)),          # (v3) ... at the limit + this (dash mph; km/h dash: the same number)
+  "merge": ("mode", "off", MODES),                  # (v3) on-ramp merge: up to the highway's limit + offset
+  "exits": ("mode", "off", MODES),                  # (v3) exit plan: pre-slow for an exit ramp's curves before the split
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
+V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
 
 
 class ConfigError(ValueError):
@@ -50,6 +56,10 @@ class Config:
   ti_only_lat: float = 1.8
   curve_offset_mph: int = 0
   curve_offset_lat: float = 3.0
+  speed_limit: str = "off"
+  limit_offset_mph: int = 3
+  merge: str = "off"
+  exits: str = "off"
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -67,6 +77,11 @@ class Config:
 
   def presses(self, name):
     return self.mode(name) == "on"
+
+  @property
+  def needs_view(self):
+    """The map view daemon (and its curve files) are needed: map curves, the limit (road / GPS trust), merge, exits."""
+    return self.enabled and any(self.mode(n) != "off" for n in ("curves", "speed_limit", "merge", "exits"))
 
   @property
   def any_active(self):
@@ -100,7 +115,7 @@ def decode(raw):
     raise ConfigError("not an object")
   if doc.get("version") not in VERSIONS or type(doc.get("version")) is not int:
     raise ConfigError("version")
-  if doc["version"] < 2 and V2_FIELDS & set(doc):
+  if (doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():
