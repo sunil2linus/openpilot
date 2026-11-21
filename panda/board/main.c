@@ -84,6 +84,19 @@ void set_safety_mode(uint16_t mode, uint16_t param) {
       }
       can_silent = false;
       break;
+    case SAFETY_MAZDA:
+      set_intercept_relay(true, false);
+      heartbeat_counter = 0U;
+      heartbeat_lost = false;
+      // Gen1 + Torque Interceptor: the TI talks on the OBD-II CAN pins, so route CAN2 (bus 1) there.
+      // MAZDA_PARAM_TORQUE_INTERCEPTOR comes from opendbc/safety/modes/mazda.h. Without it: same as default.
+      if (GET_FLAG(param, MAZDA_PARAM_TORQUE_INTERCEPTOR)) {
+        current_board->set_can_mode(CAN_MODE_OBD_CAN2);
+      } else {
+        current_board->set_can_mode(CAN_MODE_NORMAL);
+      }
+      can_silent = false;
+      break;
     default:
       set_intercept_relay(true, false);
       heartbeat_counter = 0U;
