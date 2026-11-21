@@ -53,6 +53,7 @@ class Contribution:
   anchor: float | None = None     # a proposed new anchor (dash units m/s, a whole step), see the rules above
   kind: str = ""                  # its rule: one of KINDS
   band: tuple | None = None       # "limit": (low, high) dash m/s, an engaged anchor in it follows the proposal
+  no_raise: bool = False          # while it governs, the command never goes above the current set (an unresolved exit)
 
 
 @dataclass
@@ -147,6 +148,8 @@ class Planner:
     if best is None:
       return self.anchor, "", None
     cmd = M.set_command(best.target, i.v_ego, self.metric, best.lkas_floor)
+    if best.no_raise and not dry:
+      cmd = min(cmd, i.set_speed)
     if cmd >= self.anchor - 0.5 * self.step:
       return self.anchor, "", best.target
     return cmd, best.name, best.target

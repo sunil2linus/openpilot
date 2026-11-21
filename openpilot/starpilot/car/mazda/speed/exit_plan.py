@@ -40,9 +40,15 @@ more than SAME_EXIT, starts with nothing; a stale view is followed by the distan
   * The split's place is refreshed from every new view of the same exit (the straight distance shortens toward the
     road distance as the car gets close; a moved link start beyond SAME_EXIT is another exit: a fresh plan). The map
     view gives no along-road distance (the matcher has no position along the road): straight, so never late.
-  * Bounds until confirmed: the cruise's set (true speed) never more than DIP_MAX under the speed where OUR slowing
-    began (the reach profile taking over, else the split), so the car does not go lower either; firm slowing at most
-    FIRM_MAX. Before the split only the reach bound slows (his blinker, once the car is on it), never deeper.
+  * Trust a blinker that is still on: while his exit-side blinker is on (BLINKER_GRACE after its last on-frame)
+    before the split, or it was on for this exit and the camera says the car is in the lane next to the road edge
+    on that side right now, the reach profile slows as much as the ramp's first tight point needs: no DIP_MAX bound.
+  * Otherwise, until confirmed: the cruise's set (true speed) never more than DIP_MAX under the speed where OUR
+    slowing began (the reach profile taking over, else the split), so the car does not go lower either. The bound
+    never RAISES the plan: when the blinker goes off with the plan already deeper than the bound, the plan holds
+    where it is (no further lowering, no SET+ burst back toward the highway speed inside the exit area) until the
+    exit is resolved (confirmed: the ramp plan; released: his speed back by the release). Firm slowing past the
+    split at most FIRM_MAX. Before the split only the reach profile slows (his blinker, once the car is on it).
   * Exit handover (an exit onto a street, after the exit was confirmed): with a confident (trust 0) match of the ramp
     or the street, the anchor is proposed down ("handover") to the street's limit + offset (7.0's reading once the
     street is matched, else the ramp's destination speed from the map, at most STREET_MAX), never more than
@@ -85,6 +91,8 @@ SHAPE_QUIET_T = 0.75        # s / ...
 SHAPE_QUIET_M = 40.0        # m of the shapes silent after a "link": that "link" is forgotten (old GAS_QUIET_LINK)
 AT_GAIN = 0.3               # per new view: the split's place follows the view's fresh distance (same exit)
 RESTORE_MAX = 2.0           # s the restore of his speed is proposed after a handover was overturned
+BLINKER_GRACE = 1.0         # s his blinker counts as still on after its last on-frame (carState's blinker on this car
+                            # is the flashing lamp held 0.4 s: flash gaps, a self-cancel at the lane change)
 PASSED = 400.0              # m past the split unresolved: released
 HANDOVER_MAX = 3000.0       # m past the split: a handover not done by then is given up
 DEAD_RECKON = 5.0           # s a plan is followed by the distance driven without a fresh view
@@ -198,6 +206,8 @@ class Plan:
     self.view_t = None          # the last view the split's place was refreshed from
     self.before = None          # his anchor before the handover lowered it (a restore when overturned)
     self.restore = None         # (anchor, until)
+    self.blink_t = None         # s of his last exit-side blinker frame before the split (BLINKER_GRACE)
+    self.last_target = None     # the plan's target of the frame before (the bound never raises it)
     self.pts = []               # [(odometer m, radius)] of the ramp's profile
     self.hwy = False
     self.spd = 0.0
@@ -350,8 +360,10 @@ class ExitPlan:
     # ---- evidence ----
     if 0.0 < d <= SIGNAL_REACH and p.side and (ctx.get("right_blinker") if p.side > 0 else ctx.get("left_blinker")):
       p.signal = True
+      p.blink_t = now
     if p.side and not p.confirmed and (ctx.get("left_blinker") if p.side > 0 else ctx.get("right_blinker")):
       p.signal = p.reach_on = False            # his blinker to the other side: not this exit
+      p.blink_t = None
       if d > 0.0:
         p.v_ref = None
     if 0.0 < d <= DECIDE_NEAR and p.side and self.lanes.edge.get(p.side):
@@ -420,8 +432,12 @@ class ExitPlan:
       target, why = full, "confirmed"
     elif d > 0.0:
       if p.reach_on and reach is not None:
-        target, why = reach, "reach"
-        target = max(target, p.v_ref - DIP_MAX + M.UNDERSHOOT)
+        blink_on = p.blink_t is not None and now - p.blink_t <= BLINKER_GRACE + 1e-6
+        edge_lane = bool(p.signal and p.side and self.lanes.edge.get(p.side))
+        if blink_on or edge_lane:
+          target, why = reach, ("reach signal" if blink_on else "reach edge lane")   # as deep as the ramp needs
+        else:
+          target, why = self._bounded(p, reach), "reach"
     else:
       evidence = p.signal or p.lane or p.model
       firm_ok = p.signal or (p.lane and p.model)     # the edge lane alone is also the ordinary right lane
@@ -437,18 +453,30 @@ class ExitPlan:
           p.hold = v
         target, why = p.hold, "hold"
       if target is not None:
-        # the set (true) never more than DIP_MAX under where our slowing began (the reach profile, else the split):
-        # the planner's undershoot taken into account
-        ref = p.v_ref if p.v_ref is not None else p.v_split
-        target = max(target, ref - DIP_MAX + M.UNDERSHOOT)
+        target = self._bounded(p, target)
     if target is not None and full is not None and p.confirmed:
       target = full
+    p.last_target = target
     out.target = target
     out.episode = p.id
+    out.no_raise = bool(target is not None and not p.confirmed)   # unresolved: no SET+ inside the exit area
     self.last = (why, target)
     if p.confirmed and not p.hwy and not p.cancelled:
       p.handover = True
     return self._handover(ctx, out) if p.handover else out
+
+  def _bounded(self, p, target):
+    """The target with the DIP_MAX bound (the set, true, never more than DIP_MAX under where our slowing began; the
+    planner's undershoot taken into account). The bound never raises the plan above its last target: deeper already
+    (his blinker was on), it holds there."""
+    ref = p.v_ref if p.v_ref is not None else p.v_split
+    if ref is None:
+      return target
+    bound = ref - DIP_MAX + M.UNDERSHOOT
+    if target >= bound:
+      return target
+    hold = p.last_target if p.last_target is not None else bound
+    return max(target, min(bound, hold))
 
   def _model_verdict(self, ctx, ex):
     """2 the model path follows the link, 1 the highway, 0 no answer, None not available."""

@@ -65,6 +65,9 @@ def run(road, cfg=None, frames=None, every=None, extra=()):
   plan = E.ExitPlan(cfg, presses=cfg.presses("exits"))
   contribs = [CurvePlan(cfg, presses=cfg.presses("curves")), plan] if cfg.active("curves") else [plan]
   contribs += list(extra)
+  lane = getattr(road, "lane", None)
+  if lane is not None:
+    plan.lanes.update = lambda dt, lanes: None    # the camera's edge lane given by the scenario
   src = Sources(want_model=False, sm=None, read_view=road.view, clock=lambda: road.t)
   ctl = SpeedControl(None, cfg, None, False, contributors=contribs, sources=src)
   trace = []
@@ -78,6 +81,8 @@ def run(road, cfg=None, frames=None, every=None, extra=()):
          "blinker": road.blink(road.s), "right_blinker": road.blink(road.s), "left_blinker": False}
     if slc_at(road.s) is not None:
       src.slc = {"limit": slc_at(road.s) * MPH, "upcoming": 0.0, "t": road.t}
+    if lane is not None:
+      plan.lanes.edge[1] = bool(lane(road.s))
     if every is not None:
       every(k, d, road)
     r = ctl.step(d)
@@ -104,13 +109,15 @@ def test_exit_48_his_blinker_before_the_split_arrives_at_the_curve_speed():
   _, v_curve, _, _ = at(trace, SPLIT + 250)
   whys = {w for s, _, _, w in trace if SPLIT - 300 <= s < SPLIT}
   assert "reach" in whys
-  # The false-exit bound holds from where our slowing began (review #3b): until the exit is confirmed the cruise's
-  # set (true) is never more than 12 mph under the speed then (70 here). That bound wins over the reach profile:
-  # the car is ~61 mph at the split (the reach bound wanted ~55) and ~52 mph at the 35 mph curve, so the DRIVER
-  # MUST BRAKE (about 1.4 m/s^2 over the last ~180 m after the confirmation). Documented in the README / settings.
+  # His blinker 370-300 m, then off (beyond BLINKER_GRACE) with the ramp not confirmed: the 12 mph bound from where
+  # our slowing began applies again (70 here) and the plan holds where it is (no SET+ back up in the exit area).
+  # The car is ~60 mph at the split and ~48 mph at the 35 mph curve: the DRIVER MUST BRAKE. (README / settings.)
   conf = next(x for x in trace if x[3] == "confirmed")
   assert min(x[2] for x in trace if x[0] < conf[0]) - 2.0 >= 70.0 - 12.0 - 0.5          # set (dash - 2) vs the bound
-  assert 50.0 <= v_split / MPH <= 63.0 and v_curve / MPH <= 54.0, (v_split / MPH, v_curve / MPH)
+  off = SPLIT - 300 + 32.0                                                                # off + the grace
+  held = [x[2] for x in trace if off <= x[0] < conf[0]]
+  assert all(b <= a + 1e-6 for a, b in zip(held, held[1:], strict=False))                 # never raised in the area
+  assert 50.0 <= v_split / MPH <= 63.0 and v_curve / MPH <= 50.0, (v_split / MPH, v_curve / MPH)
   # without his blinker (the same exit, taken): no slowing before the split, and it comes in faster
   road0 = ExitRoad(set_mph=72)
   trace0, _, _ = run(road0)
@@ -417,3 +424,66 @@ def test_review_4_a_handover_onto_a_faster_street_is_done_and_frees_the_limit():
   ctx2 = {}
   plan._handover(ctx2, E.Contribution("exit", None, kind="handover"))
   assert "exit_busy" not in ctx2
+
+
+
+# ---- trust a blinker that is still on (owner's decision after review #3b) ----
+
+def peak_decel(trace):
+  return max((trace[k - 100][1] - trace[k][1]) for k in range(100, len(trace)))
+
+
+def test_blinker_1_kept_on_through_the_split_slows_as_much_as_the_ramp_needs():
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT + 20)
+  trace, _, plan = run(road)
+  v_split, v_curve = at(trace, SPLIT)[1] / MPH, at(trace, SPLIT + 250)[1] / MPH
+  assert v_curve <= 38.5 and v_split <= 57.5, (v_split, v_curve)          # ~56 / ~38
+  assert peak_decel(trace) <= E.REACH_CHECK + 0.05                       # ~0.8 m/s^2
+  assert any(x[3] == "reach signal" for x in trace)
+  assert min(x[1] for x in trace if x[0] < SPLIT) / MPH < 70 - 12         # deeper than the bound: allowed while on
+
+
+def test_blinker_2_his_habit_320_270_with_the_camera_edge_lane_still_counts():
+  # (drive 75 as driven: his blinker 320-270 m, the car in the lane next to the right edge = the exit lane)
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 320 <= s < SPLIT - 270)
+  road.lane = lambda s: SPLIT - 450 <= s < SPLIT + 60
+  trace, _, plan = run(road)
+  assert at(trace, SPLIT + 250)[1] / MPH <= 40.0                          # ~38
+  assert any(x[3] == "reach edge lane" for x in trace)
+  # the same blink without the edge lane: bounded (~48 mph at the curve: he must brake)
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 320 <= s < SPLIT - 270)
+  trace, _, _ = run(road)
+  assert at(trace, SPLIT + 250)[1] / MPH > 44.0
+  # the false cost of the edge-lane rule: he signals into the right lane near an exit and stays in it
+  road = ExitRoad(set_mph=72, take=False, blink=lambda s: SPLIT - 320 <= s < SPLIT - 270)
+  road.lane = lambda s: SPLIT - 450 <= s < SPLIT + 300
+  trace, _, plan = run(road, frames=int(3600 / 32 / 0.01))
+  low = min(x[1] for x in trace) / MPH
+  assert 45.0 <= low and plan.ended.released == "highway" and abs(trace[-1][2] - 72) < 1e-6, low   # ~48 (-22 mph)
+
+
+def test_blinker_3_a_quick_lane_change_blink_stays_within_12_mph():
+  road = ExitRoad(set_mph=72, take=False, blink=lambda s: SPLIT - 150 <= s < SPLIT - 60)
+  trace, _, plan = run(road, frames=int(3600 / 32 / 0.01))
+  assert min(x[1] for x in trace) / MPH >= 70 - 12 and plan.ended.released == "highway"
+  assert abs(trace[-1][2] - 72) < 1e-6
+
+
+def test_blinker_4_held_to_the_split_for_a_lane_change_then_stays_on():
+  road = ExitRoad(set_mph=72, take=False, blink=lambda s: SPLIT - 350 <= s < SPLIT)
+  trace, _, plan = run(road, frames=int(3600 / 32 / 0.01))
+  low = min(x[1] for x in trace) / MPH
+  assert 70 - 23 <= low < 70 - 12, low                                    # the price of trusting it: ~21 mph
+  assert plan.ended.released == "highway" and abs(trace[-1][2] - 72) < 1e-6
+
+
+def test_blinker_grace_bridges_flash_gaps_and_a_blinker_back_on_deepens_again():
+  # flashing: on 0.35 s, off 0.35 s (the lamp) -> one continuous "on" for the plan
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT and int((s - SPLIT) / 11.0) % 2 == 0)
+  trace, _, _ = run(road)
+  assert all(x[3] == "reach signal" for x in trace if SPLIT - 340 <= x[0] < SPLIT - 40)
+  assert at(trace, SPLIT + 250)[1] / MPH <= 38.5
+  # off at 300 m, back on from 150 m: deep again
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT - 300 or SPLIT - 150 <= s < SPLIT)
+  trace, _, _ = run(road)
+  assert any(x[3] == "reach signal" for x in trace if SPLIT - 140 <= x[0] < SPLIT)
