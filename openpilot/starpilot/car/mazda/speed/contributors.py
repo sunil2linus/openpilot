@@ -16,8 +16,9 @@ class Sources:
   """modelV2 through a private SubMaster (created only when a contributor needs it; card's own subscriptions are
   unchanged) and the map view file. Fills the ctx every contributor reads."""
 
-  def __init__(self, want_model=True, want_view=True, sm=None, read_view=None, clock=time.monotonic):
+  def __init__(self, want_model=True, want_view=True, sm=None, read_view=None, clock=time.monotonic, map_presses=True):
     self.want_model, self.want_view = want_model, want_view
+    self.map_presses = map_presses   # the camera only steps aside for map curves that are really pressed for
     self.sm = sm
     if self.sm is None and want_model:
       from openpilot.cereal import messaging
@@ -52,7 +53,7 @@ class Sources:
     ctx["gps_ok"] = view_ok if self.want_view else True
     ctx["veto"] = self.veto
     self.veto.update(ctx)
-    ctx["map_covers_camera"] = bool(view_ok and not self.view.get("held") and self._covers(ctx))
+    ctx["map_covers_camera"] = bool(self.map_presses and view_ok and not self.view.get("held") and self._covers(ctx))
     return ctx
 
   def _covers(self, ctx):
@@ -77,4 +78,4 @@ def build(cfg, CP, log=None):
     out.append(CameraCurve(cfg, presses=cfg.presses("camera_curves")))
   if not out:
     return [], None
-  return out, Sources(want_model=True, want_view=cfg.active("curves"))
+  return out, Sources(want_model=True, want_view=cfg.active("curves"), map_presses=cfg.presses("curves"))

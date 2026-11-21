@@ -175,3 +175,15 @@ def test_camera_curve_needs_a_steady_view_and_steps_aside_for_the_map():
   assert CameraCurve(CFG).raw_target(dict(ctx, blinker=True)) is None
   careful = CameraCurve(CFG).raw_target(dict(ctx, gps_ok=False))
   assert careful < CameraCurve(CFG).raw_target(ctx)
+
+
+def test_sources_camera_steps_aside_only_for_pressed_map_curves():
+  from openpilot.starpilot.car.mazda.speed.contributors import Sources
+  vw = view([[30.0, 80.0], [80.0, 80.0]])
+  for presses, covers in ((True, True), (False, False)):
+    src = Sources(want_model=False, sm=None, read_view=lambda: vw, clock=lambda: 0.0, map_presses=presses)
+    ctx = src.context({"v_ego": 25.0})
+    assert ctx["map_covers_camera"] is covers and ctx["gps_ok"]
+  far = view([[400.0, 80.0]])
+  src = Sources(want_model=False, sm=None, read_view=lambda: far, clock=lambda: 0.0)
+  assert not src.context({"v_ego": 25.0})["map_covers_camera"]        # beyond the camera's range: the camera acts
