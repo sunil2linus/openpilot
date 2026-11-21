@@ -127,6 +127,7 @@
   "TeslaAOLDisengageOnBrake",
   "TeslaAOLScreenTap",
   "TeslaWakeOnCAN",
+  "TorqueInterceptorEnabled",
   "ToyotaAutoHold",
   "TrafficFollow",
   "TrafficJerkAcceleration",
