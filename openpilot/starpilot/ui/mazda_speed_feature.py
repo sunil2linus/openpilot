@@ -15,8 +15,8 @@ MODE_VALUES = {v: k for k, v in MODE_LABELS.items()}
 # field, label, reason, step
 SUB_ROWS = (
   ("curves", "Curves from the map",
-   "Lowers the cruise set speed before curves found in the offline map (not yet before exit ramps: slow for those " +
-   "yourself). Test computes and logs, never presses.", 0.),
+   "Lowers the cruise set speed before curves found in the offline map. Exit ramp curves before the split need " +
+   "Exit ramps. Test computes and logs, never presses.", 0.),
   ("camera_curves", "Curves from the camera",
    "Lowers the set speed carefully for curves missing from the map, from what the camera sees (about 2 s ahead).", 0.),
   ("curve_offset_mph", "Curve speed offset",
@@ -27,8 +27,21 @@ SUB_ROWS = (
   ("ramp_lat", "Ramp curve side force", "Side force (m/s²) curves on ramps and links are planned at.", .1),
   ("ti_only_lat", "Interceptor-only side force",
    "Side force (m/s²) used when the stock lane keeping is blocked before a curve and only the interceptor steers.", .1),
+  ("speed_limit", "Follow the speed limit",
+   "Moves a speed we set (or one you set at the limit) to the posted limit plus the offset; never lowers a higher " +
+   "speed you chose yourself, and your SET+/SET- make the speed yours. Needs Show Speed Limits on and Map Data in " +
+   "the speed limit sources (offline maps).", 0.),
+  ("limit_offset_mph", "Speed limit offset", "Follow the limit at the limit plus this many mph (also the merge's " +
+   "and the exit street's target).", 1.),
+  ("merge", "On-ramp merge",
+   "On a ramp onto a highway, once its curves are behind, raises the set speed (a boost) to reach the highway's " +
+   "limit plus the offset. Waits for a stop, a slow car ahead or blocked lane keeping.", 0.),
+  ("exits", "Exit ramps",
+   "Slows before an exit ramp's curves when you signal toward the exit within about 400 m of it, and hands the " +
+   "speed to the street's limit after. Lets go at once if you stay on the highway, press a button or hold the gas. " +
+   "Without your signal it only slows once the ramp is confirmed, past the split.", 0.),
 )
-UNITS = {"curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
+UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
 
 def capable(cp) -> bool:
@@ -102,7 +115,8 @@ class MazdaSpeedFeature:
                          if readable else "Saved settings cannot be read.", **common),)
     rows = [FeatureRow(MASTER, "Mazda speed control (buttons)", _shown(cfg.enabled), choices=("Off", "On"),
                        default_value="Off",
-                       reason="Presses the cruise SET+/SET- buttons for curves. Off by default; applies at the next drive.",
+                       reason="Presses the cruise SET+/SET- buttons for curves, speed limits, merges and exits. Off by " +
+                       "default; applies at the next drive.",
                        **common)]
     if not cfg.enabled:
       return tuple(rows)

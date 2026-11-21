@@ -441,5 +441,9 @@
   "mazda_speed:ramp_lat",
   "mazda_speed:ti_only_lat",
   "mazda_speed:curve_offset_mph",
-  "mazda_speed:curve_offset_lat"
+  "mazda_speed:curve_offset_lat",
+  "mazda_speed:speed_limit",
+  "mazda_speed:limit_offset_mph",
+  "mazda_speed:merge",
+  "mazda_speed:exits"
 ]
