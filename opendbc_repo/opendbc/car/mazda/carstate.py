@@ -2,12 +2,14 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS, MazdaFlags
+from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS, MazdaFlags, TI_STATE
 from opendbc.car.mazda.stock_aol import qualified
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
 DASHBOARD_CARS = frozenset(CAR)
+# Gen1 alone (stock) or Gen1 with a Torque Interceptor: both have the same camera.
+DASHBOARD_FLAGS = (int(MazdaFlags.GEN1), int(MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR))
 
 
 class DashboardCameraParser(CANParser):
@@ -43,6 +45,15 @@ class CarState(CarStateBase):
     self.cancel_button = 0
     self.dashboard_stop_sign = None
 
+    # Torque Interceptor (TI) state, from TI_FEEDBACK on bus 1
+    self.torque_interceptor = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
+    self.ti_version = 1
+    self.ti_state = TI_STATE.RUN
+    self.ti_violation = 0
+    self.ti_error = 0
+    self.ti_ramp_down = False
+    self.ti_lkas_allowed = False
+
   def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -70,8 +81,24 @@ class CarState(CarStateBase):
                                                                       cp.vl["BLINK_INFO"]["RIGHT_BLINK"] == 1)
 
     ret.steeringAngleDeg = cp.vl["STEER"]["STEER_ANGLE"]
-    ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
-    ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
+    if self.torque_interceptor:
+      # Driver torque comes from the TI's own sensor. The panda safety (mazda.h) uses this same
+      # signal (0x24A on bus 1) for its driver-torque limit, so the carcontroller limits use it too.
+      cp_body = can_parsers[Bus.body]
+      ti = cp_body.vl["TI_FEEDBACK"]
+      ret.steeringTorque = ti["TI_TORQUE_SENSOR"]
+      ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.TI_STEER_THRESHOLD
+
+      self.ti_version = ti["VERSION_NUMBER"]
+      self.ti_state = ti["STATE"]  # DISCOVER = 0, OFF = 1, DRIVER_OVER = 2, RUN = 3
+      self.ti_violation = ti["VIOL"]  # 0 = no violation
+      self.ti_error = ti["ERROR"]  # 0 = no error
+      if self.ti_version > 1:
+        self.ti_ramp_down = ti["RAMP_DOWN"] == 1
+      self.ti_lkas_allowed = not self.ti_ramp_down and self.ti_state == TI_STATE.RUN
+    else:
+      ret.steeringTorque = cp.vl["STEER_TORQUE"]["STEER_TORQUE_SENSOR"]
+      ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
 
     ret.steeringTorqueEps = cp.vl["STEER_TORQUE"]["STEER_TORQUE_MOTOR"]
     ret.steeringRateDeg = cp.vl["STEER_RATE"]["STEER_ANGLE_RATE"]
@@ -107,19 +134,23 @@ class CarState(CarStateBase):
 
     # stock lkas should be on
     # TODO: is this needed?
-    ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0
+    # With a TI the stock LKAS state does not matter (mazda-frogpilot-dev ignores it and the TI steers down to
+    # 0 mph; LANE_LINES == 0 was seen below ~28 mph), so "Invalid LKAS setting" is only raised without a TI.
+    ret.invalidLkasSetting = cp_cam.vl["CAM_LANEINFO"]["LANE_LINES"] == 0 and not self.torque_interceptor
 
-    if ret.cruiseState.enabled:
-      if not self.lkas_allowed_speed and self.acc_active_last:
-        self.low_speed_alert = True
-      else:
-        self.low_speed_alert = False
-    ret.lowSpeedAlert = self.low_speed_alert
+    if not self.torque_interceptor:
+      if ret.cruiseState.enabled:
+        if not self.lkas_allowed_speed and self.acc_active_last:
+          self.low_speed_alert = True
+        else:
+          self.low_speed_alert = False
+      ret.lowSpeedAlert = self.low_speed_alert
 
     # Check if LKAS is disabled due to lack of driver torque when all other states indicate
     # it should be enabled (steer lockout). Don't warn until we actually get lkas active
-    # and lose it again, i.e, after initial lkas activation
-    ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked
+    # and lose it again, i.e, after initial lkas activation.
+    # With a TI, the EPS blocking stock LKAS (LKAS_BLOCK) is not a fault while the TI is running.
+    ret.steerFaultTemporary = self.lkas_allowed_speed and lkas_blocked and not self.ti_lkas_allowed
 
     self.acc_active_last = ret.cruiseState.enabled
 
@@ -128,7 +159,9 @@ class CarState(CarStateBase):
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
     self.cam_laneinfo = cp_cam.vl["CAM_LANEINFO"]
-    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1
+    # As on the owner's previous TI fork (mazda-frogpilot-dev): with a TI the camera's LKAS error bit is not a
+    # permanent steering fault, the TI keeps steering.
+    ret.steerFaultPermanent = cp_cam.vl["CAM_LKAS"]["ERR_BIT_1"] == 1 and not self.torque_interceptor
 
     # cruise control button events: distance, inc, and dec
     prev_cancel_button = self.cancel_button
@@ -158,10 +191,14 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
-    return {
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
       Bus.cam: (DashboardCameraParser(DBC[CP.carFingerprint][Bus.pt])
                 if CP.brand == 'mazda' and CP.carFingerprint in DASHBOARD_CARS and
-                int(CP.flags) == int(MazdaFlags.GEN1) and not CP.notCar
+                int(CP.flags) in DASHBOARD_FLAGS and not CP.notCar
                 else CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2)),
     }
+    if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      # TI_FEEDBACK (0x24A) from the Torque Interceptor on bus 1 (the panda routes bus 1 to the OBD-II CAN pins)
+      parsers[Bus.body] = CANParser(DBC[CP.carFingerprint][Bus.pt], [("TI_FEEDBACK", 50)], 1)
+    return parsers

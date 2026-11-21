@@ -21,8 +21,16 @@ class CarControllerParams:
   STEER_DRIVER_FACTOR = 1         # from dbc
   STEER_STEP = 1  # 100 Hz
 
+  # Gen1 + MoreTorque Torque Interceptor (TI): the same command is also sent to the TI (CAM_LKAS2), so it uses the
+  # proven mazda-frogpilot-dev limit of 600. The panda safety (mazda.h, MAZDA_TI_STEERING_LIMITS) uses the same limit.
+  TI_STEER_MAX = 600
+  TI_STEER_DRIVER_MULTIPLIER = 40  # weight driver torque (the TI's own sensor, see carstate)
+
   def __init__(self, CP):
-    pass
+    # Without a TI the class values above are used unchanged (stock StarPilot).
+    if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
+      self.STEER_MAX = self.TI_STEER_MAX
+      self.STEER_DRIVER_MULTIPLIER = self.TI_STEER_DRIVER_MULTIPLIER
 
 
 @dataclass
@@ -48,6 +56,16 @@ class MazdaFlags(IntFlag):
   # Static flags
   # Gen 1 hardware: same CAN messages and same camera
   GEN1 = 1
+
+  # Dynamic flags
+  # Gen1 with a MoreTorque Torque Interceptor installed (set only by the TorqueInterceptorEnabled setting,
+  # see torque_interceptor.py). Same bit as MazdaSafetyFlags.TORQUE_INTERCEPTOR.
+  TORQUE_INTERCEPTOR = 8
+
+
+class MazdaSafetyFlags(IntFlag):
+  # panda safety param bits (opendbc/safety/modes/mazda.h). 0 is stock StarPilot.
+  TORQUE_INTERCEPTOR = 8
 
 
 @dataclass
@@ -87,6 +105,15 @@ class LKAS_LIMITS:
   STEER_THRESHOLD = 15
   DISABLE_SPEED = 45    # kph
   ENABLE_SPEED = 52     # kph
+  TI_STEER_THRESHOLD = 6  # steeringPressed threshold on the TI's driver torque sensor
+
+
+class TI_STATE:
+  # TI_FEEDBACK.STATE
+  DISCOVER = 0
+  OFF = 1
+  DRIVER_OVER = 2
+  RUN = 3
 
 
 class Buttons:

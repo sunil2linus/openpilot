@@ -3,7 +3,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.mazda import mazdacan
-from opendbc.car.mazda.values import CarControllerParams, Buttons
+from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 
@@ -14,6 +14,8 @@ class CarController(CarControllerBase):
     self.apply_torque_last = 0
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.brake_counter = 0
+    self.params = CarControllerParams(CP)
+    self.torque_interceptor = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
 
   def update(self, CC, CS, now_nanos):
     _projection = self.learning_projection_observer
@@ -25,11 +27,11 @@ class CarController(CarControllerBase):
 
     if CC.latActive:
       # calculate steer and also set limits due to driver torque
-      new_torque = int(round(CC.actuators.torque * CarControllerParams.STEER_MAX))
+      new_torque = int(round(CC.actuators.torque * self.params.STEER_MAX))
       if _projection is not None:
-        _projection.input(new_torque, CarControllerParams.STEER_MAX, self.apply_torque_last, CS.out.steeringTorque, CarControllerParams, limiter='driver')
+        _projection.input(new_torque, self.params.STEER_MAX, self.apply_torque_last, CS.out.steeringTorque, self.params, limiter='driver')
       apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last,
-                                                      CS.out.steeringTorque, CarControllerParams)
+                                                      CS.out.steeringTorque, self.params)
 
     if CC.cruiseControl.cancel:
       # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
@@ -64,8 +66,15 @@ class CarController(CarControllerBase):
     if _projection is not None:
       _projection.emit('mazda.CAM_LKAS', apply_torque, CC.latActive, can_sends[-1])
 
+    if self.torque_interceptor:
+      # Gen1 + Torque Interceptor: like mazda-frogpilot-dev, the TI (CAM_LKAS2, bus 1) gets the very same command
+      # as CAM_LKAS on bus 0, every frame. Below the stock LKAS speed (~28 mph) the EPS ignores CAM_LKAS, so the
+      # TI is the only actuator there; gating this on the TI's RUN state left it at zero (the low-speed dropout).
+      # The panda checks both messages against the same limits (opendbc/safety/modes/mazda.h).
+      can_sends.append(mazdacan.create_ti_steering_control(self.packer, apply_torque))
+
     new_actuators = CC.actuators.as_builder()
-    new_actuators.torque = apply_torque / CarControllerParams.STEER_MAX
+    new_actuators.torque = apply_torque / self.params.STEER_MAX
     new_actuators.torqueOutputCan = apply_torque
 
     self.frame += 1

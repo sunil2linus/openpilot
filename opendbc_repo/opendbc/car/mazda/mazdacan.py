@@ -62,6 +62,17 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
   return packer.make_can_msg("CAM_LKAS", 0, values)
 
 
+def create_ti_steering_control(packer, apply_torque):
+  # Gen1 Torque Interceptor command (DBC CAM_LKAS2, 0x249) on bus 1. LKAS_REQUEST uses the same 12-bit,
+  # offset 2048 encoding as CAM_LKAS; the TI expects CHKSUM to repeat the request and a fixed KEY.
+  values = {
+    "LKAS_REQUEST": apply_torque,
+    "CHKSUM": apply_torque,
+    "KEY": 3294744160,
+  }
+  return packer.make_can_msg("CAM_LKAS2", 1, values)
+
+
 def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool):
   values = {s: cam_msg[s] for s in [
     "LINE_VISIBLE",
