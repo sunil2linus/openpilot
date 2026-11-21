@@ -87,6 +87,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TeslaAOLScreenTap", {PERSISTENT, BOOL, "0"}},
     {"TeslaAOLDisengageOnBrake", {PERSISTENT, BOOL, "0"}},
     {"TorqueInterceptorEnabled", {PERSISTENT, BOOL, "0"}},
+    {"MazdaSpeedControlConfig", {PERSISTENT | DONT_LOG, JSON}},
     {"ForceStopDistanceOffset", {PERSISTENT, INT, "0"}},
     {"LeadApproachBuffer", {PERSISTENT, BOOL, "0"}},
     {"FasterLeadTakeoff", {PERSISTENT, BOOL, "0"}},

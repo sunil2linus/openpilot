@@ -62,6 +62,7 @@ from openpilot.starpilot.ui.wheel_feature import WheelFeature, PREFIX as WHEEL_P
 from openpilot.starpilot.longitudinal.output_max import KEY as OUTPUT_MAX_KEY
 from openpilot.starpilot.ui.tesla_coop_feature import TeslaCoopFeature
 from openpilot.starpilot.ui.mazda_ti_feature import MazdaTorqueInterceptorFeature
+from openpilot.starpilot.ui.mazda_speed_feature import MazdaSpeedFeature, PREFIX as MAZDA_SPEED_PREFIX
 from openpilot.starpilot.ui.tesla_screen_feature import TeslaScreenFeature, KEYS as TESLA_SCREEN_KEYS
 from openpilot.starpilot.ui.ford_bluepilot_feature import FordBluePilotFeature, KEYS as FORD_BLUEPILOT_KEYS
 from openpilot.starpilot.ui.ford_cluster_feature import FordClusterFeature
@@ -186,6 +187,7 @@ class FeatureSettingsOwner:
     self.tesla_screen = TeslaScreenFeature(self)
     self.tesla_coop = TeslaCoopFeature(self)
     self.mazda_ti = MazdaTorqueInterceptorFeature(self)
+    self.mazda_speed = MazdaSpeedFeature(self)
     from openpilot.starpilot.ui.gm_cancel_remap_feature import GmCancelRemapFeature
     self.gm_cancel_remap = GmCancelRemapFeature(self)
 
@@ -964,6 +966,7 @@ class FeatureSettingsOwner:
       rows.extend(self.tesla_screen.rows(parked))
       rows.extend(self.tesla_coop.rows(parked))
       rows.extend(self.mazda_ti.rows(parked))
+      rows.extend(self.mazda_speed.rows(parked))
       rows.extend(self.gm_cancel_remap.rows(parked))
 
       rows.extend(self.preap_radar.rows())
@@ -1496,6 +1499,8 @@ class FeatureSettingsOwner:
       return self.tesla_coop.apply(request)
     if key == "TorqueInterceptorEnabled":
       return self.mazda_ti.apply(request)
+    if key.startswith(MAZDA_SPEED_PREFIX):
+      return self.mazda_speed.apply(request)
     if key in TESLA_SCREEN_KEYS:
       return self.tesla_screen.apply(request)
     if key == GM_TUNE_KEY:

@@ -3,6 +3,7 @@
 VEHICLE_BOOL_KEYS = frozenset(("AlphaLongitudinalEnabled", "SubaruAvhStartup", "SubaruStopStartOff", "SubaruSNG", "SubaruRedneckCruise",
                               "GMPedalLongitudinal", "DisableOpenpilotLongitudinal", "LongPitch", "VoltSNG", "SNGHack", "GMAutoHold", "VoltOnePedalMode",
                               "TeslaCoopSteering", "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake", "TorqueInterceptorEnabled",
+                              "mazda_speed:enabled",
                               "RemoteStartBootsComma", "HKGRemoteStartBootsComma", "IgnoreIgnitionLine", "TeslaWakeOnCAN"))
 
 
@@ -45,6 +46,9 @@ def confirmation_question(request):
   if request.key == "TorqueInterceptorEnabled":
     return (f"{verb} the Mazda Torque Interceptor after the next startup? Turn this on only if a MoreTorque " +
             "Torque Interceptor is installed.")
+  if request.key == "mazda_speed:enabled":
+    return (f"{verb} Mazda speed control at the next drive? StarPilot then presses the cruise SET+ and SET- buttons " +
+            "to slow for curves. Your own button presses, the brake and the gas always win.")
   if request.key == "TeslaCoopSteering":
     return f"{verb} Tesla cooperative steering after the next startup? Light steering input adjusts the assisted steering angle within its limits."
   if request.key == "TeslaAOLScreenTap":

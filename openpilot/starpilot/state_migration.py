@@ -33,7 +33,7 @@ VEHICLE_PREFERENCE_KEYS = frozenset({
   'SubaruSNG', 'SubaruRedneckCruise', 'ToyotaAutoHold',
   'JeepBrakeHold', 'DriveModeProfiles', 'DriveModeAcceleration',
   'DriveModeDeceleration', 'NostalgiaMode', 'RemapCancelToDistance',
-  'FordHandsFreeCluster', 'TorqueInterceptorEnabled',
+  'FordHandsFreeCluster', 'TorqueInterceptorEnabled', 'MazdaSpeedControlConfig',
 })
 OPERATIONAL_KEYS = frozenset({
   'DongleId', 'HardwareSerial', 'GithubSshKeys', 'GithubUsername', 'SshEnabled',
