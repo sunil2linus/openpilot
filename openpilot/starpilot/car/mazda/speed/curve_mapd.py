@@ -169,7 +169,7 @@ def build_folder(folder, info, curve_root=CURVE_ROOT, log=print, builder=B.build
                                  "signature": signature(info["tiles"]), "files": sorted(written),
                                  "curves": stats["curves"], "ramps": stats["ramps"],
                                  "seconds": round(time.monotonic() - t0, 1)})
-  log(f"built {folder}: {stats['curves']} curves, {stats['ramps']} ramps, {len(written)} files, "
+  log(f"built {folder}: {stats['curves']} curves, {stats['ramps']} ramps, {len(written)} files, " +
       f"{stats.get('outside', 0)} squares left to their own folder, {time.monotonic() - t0:.0f} s")
   return stats
 

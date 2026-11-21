@@ -21,8 +21,6 @@ DESCRIPTIONS = {
   'mazda_speed:reset': 'Replaces invalid Mazda speed control settings with the defaults (everything off).',
   'mazda_speed:curves': 'Lowers the cruise set speed before curves found in the offline map; Test computes and logs without pressing.',
   'mazda_speed:camera_curves': 'Lowers the cruise set speed carefully for curves missing from the map, from what the camera sees.',
-  'mazda_speed:curve_offset_mph': 'Plans map curves a few mph faster, never above the side-force cap.',
-  'mazda_speed:side_force_cap': 'Limits the side force the curve speed offset may plan.',
   'mazda_speed:plan_lat': 'Sets the side force map curves on ordinary roads are planned at.',
   'mazda_speed:ramp_lat': 'Sets the side force curves on ramps and links are planned at.',
   'mazda_speed:ti_only_lat': 'Sets the side force used when only the Torque Interceptor steers before a curve.',

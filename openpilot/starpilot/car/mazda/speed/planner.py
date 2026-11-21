@@ -31,6 +31,7 @@ class Contribution:
   target: float | None            # m/s true speed, None: no wish
   lkas_floor: bool = False        # a curve whose own target allows the LKAS floor
   presses: bool = True            # False: test mode (logged, never pressed for)
+  episode: str | None = None      # what it is slowing for (a curve id): his overrule lasts for that episode
 
 
 @dataclass
@@ -59,7 +60,7 @@ class Planner:
     self.metric = metric
     self.step = M.KPH if metric else M.MPH
     self.anchor = None
-    self.blocked = set()            # reasons he overruled this episode
+    self.blocked = {}               # reason -> the episode he overruled (None: until it wants nothing below him)
     self.lowered = False            # our command was below his anchor at some point this episode
     self.changes = []               # anchor changes for the log: (why, before, after)
 
@@ -73,11 +74,11 @@ class Planner:
     if after is None:
       return
     if d == SET_PLUS and self.anchor is not None and self.lowered and after < self.anchor - 0.5 * self.step:
-      self.blocked |= active_reasons          # he takes back part of our lowering: no more lowering this episode
+      self.blocked.update(active_reasons)     # he takes back part of our lowering: no more lowering this episode
       self.changes.append(("his SET+ under the anchor", self.anchor, self.anchor))
       return
     self._set_anchor(after, "driver " + str(d))
-    self.blocked |= active_reasons
+    self.blocked.update(active_reasons)
 
   def _command(self, contributions, i, dry):
     best = None
@@ -101,23 +102,34 @@ class Planner:
     if not i.main_on:
       if self.anchor is not None:
         self.changes.append(("main off", self.anchor, None))
-      self.anchor, self.blocked, self.lowered = None, set(), False
+      self.anchor, self.blocked, self.lowered = None, {}, False
       return out
-    anchor_wish = {c.name for c in i.contributions if c.target is not None and c.presses and self.anchor is not None and
+    anchor_wish = {c.name: c.episode for c in i.contributions if c.target is not None and c.presses and
+                   self.anchor is not None and
                    M.set_command(c.target, i.v_ego, self.metric, c.lkas_floor) < self.anchor - 0.5 * self.step}
     for e in i.events:
       k = e["kind"]
       if k == "engaged" and (e.get("before") is None or e.get("changed") or self.anchor is None):
         self._set_anchor(e["after"], "engaged")
-        self.blocked, self.lowered = set(), False
+        self.blocked, self.lowered = {}, False
       elif k == "resumed" and self.anchor is None:
         self._set_anchor(e["after"], "resumed")
       elif k == "driver":
         self._driver(e, anchor_wish)
     if self.anchor is None or not i.cruise_enabled:
       return out
-    # a reason he overruled stays blocked until it no longer wants anything below the anchor
-    self.blocked &= anchor_wish
+    # a reason he overruled stays blocked for the episode (curve) he overruled; without an episode, until it no longer
+    # wants anything below his anchor
+    current = {c.name: c for c in i.contributions if c.presses}
+    for name, episode in list(self.blocked.items()):
+      c = current.get(name)
+      if c is None or c.target is None:
+        del self.blocked[name]
+      elif episode is not None:
+        if c.episode != episode:
+          del self.blocked[name]
+      elif name not in anchor_wish:
+        del self.blocked[name]
     cmd, reason, target = self._command(i.contributions, i, dry=False)
     if self.blocked:
       # a reason he overruled is still on: the set speed stays where he put it (no raise either), unless another

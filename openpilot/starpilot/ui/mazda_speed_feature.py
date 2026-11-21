@@ -18,16 +18,12 @@ SUB_ROWS = (
    "Lowers the cruise set speed before curves found in the offline map. Test computes and logs, never presses.", 0.),
   ("camera_curves", "Curves from the camera",
    "Lowers the set speed carefully for curves missing from the map, from what the camera sees (about 2 s ahead).", 0.),
-  ("curve_offset_mph", "Curve speed offset",
-   "Plans map curves this many mph faster, never above the side-force cap. Removed per curve after a hard pass.", 1.),
-  ("side_force_cap", "Side-force cap",
-   "The most side force (m/s²) the curve speed offset may plan.", .1),
   ("plan_lat", "Road curve side force", "Side force (m/s²) map curves on roads are planned at.", .1),
   ("ramp_lat", "Ramp curve side force", "Side force (m/s²) curves on ramps and links are planned at.", .1),
   ("ti_only_lat", "Interceptor-only side force",
    "Side force (m/s²) used when the stock lane keeping is blocked before a curve and only the interceptor steers.", .1),
 )
-UNITS = {"curve_offset_mph": "mph", "side_force_cap": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
+UNITS = {"plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
 
 def capable(cp) -> bool:
@@ -94,7 +90,7 @@ class MazdaSpeedFeature:
       return ()
     raw, readable, cfg = self._source()
     available = bool(parked and readable and self.authority('parked_preferences'))
-    common = dict(source=raw, available=available, capability=capability, vehicle_fingerprint=self.vehicle_fingerprint())
+    common = {"source": raw, "available": available, "capability": capability, "vehicle_fingerprint": self.vehicle_fingerprint()}
     if cfg is None:
       return (FeatureRow(RESET, "Mazda speed control (buttons)", "Invalid saved settings", repair_value="Off",
                          reason="Invalid saved settings: everything is off. Reset turns it off with default options."

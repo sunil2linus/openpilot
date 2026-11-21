@@ -36,7 +36,7 @@ def test_sub_features_need_the_master_switch():
 @pytest.mark.parametrize("raw", [
   b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 2}).encode(), json.dumps({"version": "1"}).encode(),
   json.dumps({"version": True}).encode(), doc(enabled=1), doc(enabled="true"), doc(curves="yes"), doc(nope=1),
-  doc(curve_offset_mph=6), doc(curve_offset_mph=-1), doc(curve_offset_mph=2.0), doc(side_force_cap=4.5),
+  doc(curve_offset_mph=2), doc(side_force_cap=3.0), doc(speed_limit_follow="on"), doc(plan_lat=3.6), doc(ti_only_lat=1.79),
   doc(plan_lat=1.7), doc(ramp_lat=3.6), doc(ti_only_lat="2"), b'{"version":1,"plan_lat":NaN}',
   b'{"version":1,"enabled":true,"enabled":false}', b"\xff", b"x" * 5000,
 ])

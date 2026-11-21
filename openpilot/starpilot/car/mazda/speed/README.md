@@ -8,19 +8,24 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 
 | module | job | origin |
 |---|---|---|
-| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 1): decode, bounds, defaults | new |
-| `cruise_model.py` | measured MRCC response (gap -> accel/decel, lag) and the braking envelope | new, from the owner's measurements |
-| `car_profile.py` | per-car learned button latency, hold overrun, coast decel (JSON file) | ported (old `car_profile.py`) |
-| `actuator.py` | ONE button actuator: moves the set speed toward the planner's command | rewritten, old rules kept |
-| `planner.py` | ONE target arbitrator: `min(driver/limit, curve, stop)` + modes | new (replaces the old 7-layer stack) |
-| `curve_plan.py` | curve contributor: profile points ahead -> target (braking envelope, lateral limits, LKAS floor) | new |
-| `camera.py` | modelV2 helpers: phantom veto of map curves, camera-only target for unmapped curves | rewritten (old `camera_curve.py`/veto) |
-| `curve_builder.py` | map builder: chains, Catmull-Rom spline, curvature, RDP profiles, `split_doublets`, ramps, road shapes | ported + rewritten geometry |
-| `curve_mapd.py` | parked-only daemon that builds curve files on the device | ported (old `starpilot/system/curve_mapd.py`) |
-| `curve_store.py`, `road_match.py`, `gps_trust.py` | onroad: load curve files around the car, match the road, GPS trust | ported (old `map_curves.py` parts) |
-| `map_view.py` | the onroad map daemon `mazda_mapviewd` + the small file protocol to card | new |
-| `events.py` | JSONL feature-event log under `/data/media/0/mazda_speed/` | simplified port |
-| `caller.py` | the hook card.py calls; reads CarState/sockets, runs planner + actuator, returns CAN frames | new |
+| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 1): strict decode, bounds, defaults (all off) | new |
+| `cruise_model.py` | measured MRCC response, dash offset, the one braking envelope, undershoot, LKAS floor | new |
+| `car_profile.py` | per-car learned button latency + hold overrun (same file as the old fork) | ported |
+| `actuator.py` | ONE button actuator: taps, phase-locked holds, attribution, "his buttons win" | rewritten, old rules |
+| `planner.py` | ONE arbitrator: `min(his anchor, contributors)`, anchor rules, test mode | new |
+| `curve_plan.py` | map curve contributor: profile points -> envelope target, lateral limits, TI-only latch | new |
+| `camera.py` | phantom veto of map curves; camera-only curve target | rewritten |
+| `contributors.py` | builds the contributors for the drive; private modelV2 SubMaster + view reader | new |
+| `curve_builder.py` + `offline_tiles.capnp` | map builder: spline, profiles, doublets, ramps, road shapes | ported, geometry rewritten |
+| `curve_mapd.py` | parked daemon `mazda_curve_mapd`: builds curve files from 7.0's selected map generation | ported + 4 fixes |
+| `map_match.py` | GpsTrust, RoadIndex/RoadMatcher, MapCurveStore | ported |
+| `map_view.py` | onroad daemon `mazda_mapviewd`: curves ahead -> view file for card | new (curves-ahead ported) |
+| `events.py` | JSONL feature-event log under `/data/media/0/mazda_speed/` | simplified |
+| `caller.py` | the hook card.py calls; off = returns the frames list untouched | new |
+| `processes.py` | when the manager runs the two daemons | new |
+
+Not in Stage 2 (absent, not half-wired): curve memory + curve speed offset + maintenance tool (e), speed limit
+follow / merge / exit handover (f), stop slowdown (g), on-screen notices (h: log only), exit pre-plan.
 
 ## Data flow (no capnp changes)
 
@@ -45,15 +50,15 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 * `opendbc/car/mazda/carstate.py`: stores the raw CRZ_BTNS buttons (SET_P/SET_M/RES/CAN_OFF), LKAS_BLOCK and the
   radar lead bit as attributes (the CarState message is unchanged). `mazdacan.create_button_cmd` learns SET+/SET-.
 * `system/manager/process_config.py`: `mazda_curve_mapd` (offroad) and `mazda_mapviewd` (onroad), both only on a
-  Mazda with the master switch and map curves on.
+  Mazda (the manager's CarParams) with the master switch on and map curves Test or On.
 * Settings: `common/params_keys.h` (+ rebuilt libparams), `state_migration.VEHICLE_PREFERENCE_KEYS`,
   `ui/mazda_speed_feature.py` wired into FeatureSettingsOwner like `mazda_ti_feature.py`, Galaxy description.
 
 ## Ported / rewritten / dropped
 
-* Ported: car_profile, GpsTrust, road matcher, curve store, split_doublets, one-way rule, ramp records, the
-  builder's chain joining, curve_mapd (+ the four review fixes: version bump, fsync, MemoryError back-off,
-  in-folder squares only).
+* Ported: car_profile, GpsTrust, road matcher, curve store, curves-ahead, split_doublets, one-way rule, ramp
+  records, the builder's chain joining, curve_mapd (+ the four review fixes: version bump, fsync + broken-file
+  rebuild, MemoryError back-off, in-folder squares only). Old-format curve files are ignored until rebuilt.
 * Rewritten: the actuator (one class, not the old 4,700-line controller), the planner, curve geometry (spline +
   distance profiles), the camera's role (veto + camera-only target only).
 * Dropped on purpose: curve_learner, model_follow, in-curve camera taps/keep, post-apex taps, RampTail,

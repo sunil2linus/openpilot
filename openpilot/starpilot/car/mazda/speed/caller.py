@@ -25,7 +25,7 @@ def eligible(CP) -> bool:
 
 
 class SpeedControl:
-  def __init__(self, CP, cfg, params, is_metric, log=None, profile=None, contributors=None):
+  def __init__(self, CP, cfg, params, is_metric, log=None, profile=None, contributors=None, sources=None):
     self.CP = CP
     self.cfg = cfg
     self.metric = bool(is_metric)
@@ -36,6 +36,7 @@ class SpeedControl:
     self.actuator = Actuator(self.metric, latencies=lat, overrun_up=up, overrun_down=down)
     self.planner = Planner(self.metric)
     self.contributors = list(contributors or [])
+    self.sources = sources
     self.events = []                 # last frame's actuator events (the planner reads them one frame later)
     self.last_plan = None
     self.last_plan_t = 0.0
@@ -60,13 +61,16 @@ class SpeedControl:
                 "brake": bool(CS.brakePressed), "standstill": bool(CS.standstill or CS.cruiseState.standstill),
                 "set_plus": bool(ocs.crz_set_plus), "set_minus": bool(ocs.crz_set_minus), "resume": bool(ocs.crz_resume),
                 "cancel": bool(ocs.crz_cancel), "wheel_counter": int(ocs.crz_btns_counter), "other_button": other,
-                "engaged": bool(CC.enabled), "lkas_blocked": bool(getattr(ocs, "lkas_blocked", False))}
+                "engaged": bool(CC.enabled), "lkas_blocked": bool(getattr(ocs, "lkas_blocked", False)),
+                "blinker": bool(getattr(CS, "leftBlinker", False) or getattr(CS, "rightBlinker", False))}
 
   def step(self, d, ctx=None, now=None):
     """d: the dict from inputs(); ctx: what contributors get (the car's other signals). Returns (button, counter)."""
     now = time.monotonic() if now is None else now
-    ctx = ctx if ctx is not None else {}
-    ctx.update(d)
+    if ctx is None:
+      ctx = self.sources.context(d) if self.sources is not None else dict(d)
+    else:
+      ctx.update(d)
     contributions = []
     for c in self.contributors:
       got = c(ctx)
@@ -126,9 +130,9 @@ def make(card):
     log = EventLog()
     profile = CarProfile(fingerprint=str(card.CP.carFingerprint), ti=bool(int(card.CP.flags) & int(MazdaFlags.TORQUE_INTERCEPTOR)))
     from openpilot.starpilot.car.mazda.speed.contributors import build
-    contributors = build(cfg, card.CP, log)
+    contributors, sources = build(cfg, card.CP, log)
     return SpeedControl(card.CP, cfg, card.params, getattr(card, "is_metric", False), log=log, profile=profile,
-                        contributors=contributors)
+                        contributors=contributors, sources=sources)
   except Exception:
     try:
       from openpilot.common.swaglog import cloudlog

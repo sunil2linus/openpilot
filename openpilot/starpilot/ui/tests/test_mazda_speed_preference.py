@@ -60,13 +60,11 @@ def test_master_off_by_default_confirmed_on_and_sub_options():
     assert owner.apply(row_change(curves))
     assert C.read(saved).mode('curves') == 'test'
     # a number row steps and stays in bounds
-    cap = {r.key: r for r in rows(owner)}[PREFIX + 'side_force_cap']
-    assert cap.value == '3.0'
-    assert owner.apply(row_change(cap, 1)) and C.read(saved).side_force_cap == 3.1
-    offset = {r.key: r for r in rows(owner)}[PREFIX + 'curve_offset_mph']
-    assert owner.apply(row_change(offset, 1)) and C.read(saved).curve_offset_mph == 1
+    lat = {r.key: r for r in rows(owner)}[PREFIX + 'plan_lat']
+    assert lat.value == '2.2' and lat.minimum == 1.8 and lat.maximum == 3.5
+    assert owner.apply(row_change(lat, 1)) and C.read(saved).plan_lat == 2.3
     # a stale source is refused
-    assert not owner.apply(row_change(offset, 1))
+    assert not owner.apply(row_change(lat, 1))
     # off again: the sub-options keep their values but are hidden and inactive
     master = {r.key: r for r in rows(owner)}[MASTER]
     assert owner.apply(replace(row_change(master), confirmation=True))

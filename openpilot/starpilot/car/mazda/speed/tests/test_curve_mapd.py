@@ -43,7 +43,7 @@ def test_changed_tiles_missing_state_and_broken_files_are_rebuilt(tmp_path):
   root = str(tmp_path)
   assert D.check_folder(FOLDER, TILES, root) == "no state"
   d, name = built_state(root)
-  assert D.check_folder(FOLDER, {k: "cd" * 32 for k in TILES}, root) == "map tiles changed"
+  assert D.check_folder(FOLDER, dict.fromkeys(TILES, "cd" * 32), root) == "map tiles changed"
   open(os.path.join(d, name + ".json"), "w").close()            # 0 bytes after a power cut
   assert "missing or broken" in D.check_folder(FOLDER, TILES, root)
   with open(os.path.join(d, name + ".json"), "w") as f:

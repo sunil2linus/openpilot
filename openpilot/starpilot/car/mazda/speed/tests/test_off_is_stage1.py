@@ -76,7 +76,7 @@ def test_not_for_passive_or_long_cars(no_files):
     assert no_files == []
 
 
-def test_on_without_contributors_never_presses(tmp_path, monkeypatch):
+def test_on_without_a_map_never_presses(tmp_path, monkeypatch):
   import openpilot.starpilot.car.mazda.speed.events as E
   import openpilot.starpilot.car.mazda.speed.car_profile as P
   monkeypatch.setattr(E, "LOG_DIR", str(tmp_path / "log"))

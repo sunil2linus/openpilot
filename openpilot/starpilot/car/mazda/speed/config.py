@@ -7,6 +7,8 @@ Rules:
   * Every field is optional; a missing field takes its default. Defaults are all off.
   * Sub-features only run with `enabled` (the master switch) on.
   * Modes: "off" / "test" (computes and logs, never presses) / "on".
+  * Stage 2 has only what is built and tested: the curve speed offset (with its per-curve memory), speed limit
+    follow and stop slowdown come with their own fields later (unknown fields are invalid until then).
 No openpilot imports beyond the saved-value reader, so it is unit tested offline.
 """
 import json
@@ -24,8 +26,6 @@ SCHEMA = {
   "enabled": ("bool", False, None),
   "curves": ("mode", "off", MODES),                 # curves from the map (+ camera veto / camera-only curves)
   "camera_curves": ("mode", "off", MODES),          # camera-only target for curves the map does not have
-  "curve_offset_mph": ("int", 0, (0, 5)),           # plan curves this much faster ...
-  "side_force_cap": ("float", 3.0, (2.0, 4.0)),     # ... but never above this lateral accel (m/s^2)
   "plan_lat": ("float", 2.2, (1.8, 3.5)),           # m/s^2: roads
   "ramp_lat": ("float", 2.6, (1.8, 3.5)),           # m/s^2: ramps / links
   "ti_only_lat": ("float", 1.8, (1.8, 3.5)),        # m/s^2: stock LKAS blocked before the curve / camera fault
@@ -41,8 +41,6 @@ class Config:
   enabled: bool = False
   curves: str = "off"
   camera_curves: str = "off"
-  curve_offset_mph: int = 0
-  side_force_cap: float = 3.0
   plan_lat: float = 2.2
   ramp_lat: float = 2.6
   ti_only_lat: float = 1.8

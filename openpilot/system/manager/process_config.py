@@ -13,6 +13,7 @@ from openpilot.starpilot.sentry_mode.preferences import enabled as sentry_enable
 from openpilot.starpilot.galaxy.camera_request import requested as camera_requested
 from openpilot.starpilot.spot_monitor.preferences import enabled as vasm_enabled
 from openpilot.starpilot.spot_monitor.inference import DEFAULT_MODEL_PATH
+from openpilot.starpilot.car.mazda.speed import processes as mazda_speed
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
@@ -211,6 +212,9 @@ procs = [
   PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
   MapdShadowProcess(),
   PythonProcess("map_snapshot_operations", "openpilot.starpilot.maps.operation_owner", only_offroad, enabled=platform.system() == "Linux"),
+  # optional Mazda speed control (buttons): only on a Mazda with its map curves setting on
+  PythonProcess("mazda_mapviewd", "openpilot.starpilot.car.mazda.speed.map_view", mazda_speed.mapview),
+  PythonProcess("mazda_curve_mapd", "openpilot.starpilot.car.mazda.speed.curve_mapd", mazda_speed.curve_build),
   NativeProcess("_pandad", "openpilot/selfdrive/pandad", ["./pandad"], always_run, enabled=False),
   PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
   PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
