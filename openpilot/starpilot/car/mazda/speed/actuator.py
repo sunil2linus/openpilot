@@ -405,6 +405,8 @@ class Actuator:
       return out
     if self.last_set is None or not i.cruise_enabled:
       return out
+    if any(e["kind"] in ("driver", "engaged", "disabled") for e in out.events):
+      return out                           # the planner hears about his change first (next frame)
     cur = self.steps(i.set_speed)
     cmd = None if i.command is None else self.steps(min(i.command, self.top()))
     if cmd is not None and cmd < self.steps(CAR_MIN_SET):

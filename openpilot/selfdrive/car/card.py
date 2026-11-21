@@ -1932,6 +1932,9 @@ class Car:
         from openpilot.starpilot.car.subaru.stop_start_caller import update as update_subaru_startup
         update_subaru_startup(self, now_nanos)
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
+      if self.CP.brand == "mazda":
+        from openpilot.starpilot.car.mazda.speed.caller import update as update_mazda_speed
+        can_sends = update_mazda_speed(self, CS, CC, can_sends, now_nanos)
       self.publish_sendcan(can_sends, valid=CS.canValid)
       if learning_snapshot is not None and self.learning_send_committed_mono_ns:
         try:
