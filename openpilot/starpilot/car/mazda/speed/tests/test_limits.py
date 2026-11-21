@@ -20,8 +20,8 @@ def rig(cfg=CFG):
 
 def drive(r, seconds, limit, v=60.0, trust=0, chain=1, upcoming=0.0, events=(), **kw):
   n = int(round(seconds / r.dt))
-  return r.step(v_mph=v, n=n, events=events, slc=slc(limit, upcoming), view=lambda t: view(t, trust=trust, chain=chain),
-                **kw)
+  kw.setdefault("preview", {"speed": upcoming * MPH, "dist": 200.0, "t": 0.0} if upcoming else None)
+  return r.step(v_mph=v, n=n, events=events, slc=slc(limit), view=lambda t: view(t, trust=trust, chain=chain), **kw)
 
 
 def test_the_reading_from_slcstate():
@@ -69,12 +69,21 @@ def test_engaged_in_the_band_follows_a_change_and_then_it_is_ours():
   assert r.anchor_mph == 70
 
 
-def test_engaging_within_the_band_alone_does_not_move_him():
-  r = rig()
-  drive(r, 6, 70, v=70)
-  r.step(set_mph=75, events=[engaged(75)])
-  drive(r, 5, 70, v=73)
-  assert r.anchor_mph == 75                  # the same limit: his choice in the band stays
+def test_match_on_engage_inside_the_band_of_a_known_limit_whatever_the_timing():
+  # SET at 45 on a 45 road after the limit was steady, or 1 s before its steady time finished: both 48
+  for pre in (6.0, 4.0):
+    r = rig()
+    drive(r, pre, 45, v=45)
+    drive(r, 0.01, 45, v=45, set_mph=45, events=[engaged(45)])
+    drive(r, 3.0, 45, v=45)
+    assert r.anchor_mph == 48 and r.p.ours_why == "limit", (pre, r.anchor_mph)
+  # in the band (70-75) on a 70 road: 73; above it (his 80) or under the limit (65): his
+  for his, want in ((75, 73), (80, 80), (65, 65)):
+    r = rig()
+    drive(r, 6, 70, v=70)
+    r.step(set_mph=his, events=[engaged(his)])
+    drive(r, 2, 70, v=70)
+    assert r.anchor_mph == want, (his, r.anchor_mph)
 
 
 def test_a_bad_trust_frame_restarts_the_steady_time():
@@ -133,25 +142,30 @@ def test_nothing_on_a_link_or_while_the_merge_or_exit_is_busy():
 def test_the_43_mph_fallback_only_unknown_soon_after_engaging_and_up():
   r = rig()
   r.step(v_mph=30, set_mph=25, events=[engaged(25)])
-  drive(r, 2.5, None, v=36)
+  drive(r, 2.5, None, v=36, no_gps=True)
   assert r.anchor_mph == 25
-  drive(r, 0.6, None, v=36)
+  drive(r, 0.6, None, v=36, no_gps=True)
   assert r.anchor_mph == 43 and r.p.ours_why == "fallback"
+  # with a GPS position an untagged street keeps his speed (engaged at 36 on a 30-35 street)
+  r = rig()
+  r.step(v_mph=36, set_mph=36, events=[engaged(36)])
+  drive(r, 10, None, v=37)
+  assert r.anchor_mph == 36
   # not after 120 s
   r = rig()
   r.step(v_mph=30, set_mph=25, events=[engaged(25)])
-  drive(r, 121, None, v=30)
-  drive(r, 4, None, v=40)
+  drive(r, 121, None, v=30, no_gps=True)
+  drive(r, 4, None, v=40, no_gps=True)
   assert r.anchor_mph == 25
   # never down, never his own (SET+) speed
   r = rig()
   r.step(v_mph=50, set_mph=50, events=[engaged(50)])
-  drive(r, 4, None, v=50)
+  drive(r, 4, None, v=50, no_gps=True)
   assert r.anchor_mph == 50
   r = rig()
   r.step(v_mph=30, set_mph=25, events=[engaged(25)])
   r.step(v_mph=30, events=[driver("SET_PLUS", 28)])
-  drive(r, 4, None, v=40)
+  drive(r, 4, None, v=40, no_gps=True)
   assert r.anchor_mph == 28
   # a known limit: no fallback (the first limit after he engaged in its band is followed: 25 + 3)
   r = rig()
@@ -197,3 +211,45 @@ def test_planner_rules_for_proposals():
   p.update(PlanInputs(v_ego=20.0, set_speed=70 * MPH, cruise_enabled=False, main_on=True, events=[],
                       contributions=[Contribution("exit", None, anchor=40 * MPH, kind="handover")]))
   assert abs(p.anchor - 70 * MPH) < 1e-6
+
+
+def test_the_preview_comes_from_mapdout_as_map_observation_checks_it():
+  road = lambda **kw: N(**{"sampleVersion": 2, "previewSpeedLimit": 40 * MPH, "previewDistance": 250.0,  # noqa: E731
+                           "previewWayId": 9, "speedLimit": 55 * MPH, **kw})
+  pv = L.map_preview(road())
+  assert abs(pv["speed"] - 40 * MPH) < 0.01 and pv["dist"] == 250.0
+  for bad in ({"sampleVersion": 1}, {"previewDistance": 0.0}, {"previewDistance": 600.0}, {"previewWayId": 0},
+              {"previewSpeedLimit": 0.0}, {"previewSpeedLimit": float("nan")}, {"previewSpeedLimit": 55 * MPH}):
+    assert L.map_preview(road(**bad)) is None, bad
+  assert L.map_preview(road(), valid=False) is None and L.map_preview(object()) is None
+  # slcState's upcoming value alone (never filled on this car) holds nothing
+  r = rig()
+  r.step(set_mph=48, events=[engaged(48)])
+  r.p.owner, r.p.ours_why = OURS, "limit"
+  drive(r, 6, 45, v=48)
+  r.step(v_mph=48, n=600, slc={"limit": 55 * MPH, "upcoming": 40 * MPH, "t": 0.0}, view=lambda t: view(t))
+  assert r.anchor_mph == 58
+
+
+def test_sources_read_slcstate_and_mapdout_through_the_private_submaster():
+  from openpilot.starpilot.car.mazda.speed.contributors import Sources
+  msgs = {"slcState": N(observationKind="valid", source="map", speedLimit=55 * MPH, upcomingSpeedLimit=0.0,
+                        sourceReadings=[]),
+          "mapdOut": N(sampleVersion=2, previewSpeedLimit=40 * MPH, previewDistance=250.0, previewWayId=9,
+                       speedLimit=55 * MPH)}
+
+  class SM(dict):
+    updated = {"slcState": True, "mapdOut": True}
+    valid = {"slcState": True, "mapdOut": True}
+
+    def update(self, timeout):
+      pass
+  t = [0.0]
+  src = Sources(want_model=False, want_view=False, sm=SM(msgs), read_view=lambda: None, clock=lambda: t[0],
+                want_slc=True)
+  ctx = src.context({"v_ego": 20.0})
+  assert abs(ctx["slc"]["limit"] - 55 * MPH) < 1e-6 and abs(ctx["preview"]["speed"] - 40 * MPH) < 0.01
+  SM.updated = {"slcState": False, "mapdOut": False}
+  t[0] = 1.0
+  ctx = src.context({"v_ego": 20.0})
+  assert ctx["slc"] is None and ctx["preview"] is None           # older than 0.5 s: no reading

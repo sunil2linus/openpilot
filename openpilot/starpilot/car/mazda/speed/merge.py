@@ -8,7 +8,8 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
   * Where: the map view matched a link whose ramp record leads to a highway, with GPS trust 0, or the start of the
     drive's trust on that link with the GPS error at most START_ACC (the view's start_ok); kept HWY_KEEP after the
     car is on the highway; a street matched for STREET_END ends it.
-  * The highway's limit H (whole multiple, at least H_MIN): 7.0's upcoming (preview) limit, else the current reading
+  * The highway's limit H (whole multiple, at least H_MIN): the map's preview limit ahead (mapdOut previewSpeedLimit,
+    limits.map_preview; 7.0's slcState upcoming value is never filled on this car), else the current reading
     when it already is a highway's, else the ramp's destination speed from the map (the next limit is often missing
     or still the street's at the link's start: it keeps waiting on the link, never gives up on a street limit). H must
     stay the same for H_STEADY with that trust.
@@ -92,8 +93,8 @@ class Merge:
     return why
 
   def highway_limit(self, ctx, view):
-    slc = ctx.get("slc")
-    for mps in ((slc["upcoming"], slc["limit"]) if slc else ()):
+    slc, pv = ctx.get("slc"), ctx.get("preview")
+    for mps in ((pv["speed"] if pv else 0.0), (slc["limit"] if slc else 0.0)):
       h = whole_limit(mps, self.metric) if mps else None
       if h is not None and h >= H_MIN[self.k]:
         return h, "slc"

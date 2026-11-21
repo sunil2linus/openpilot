@@ -21,7 +21,8 @@ def link_view(spd_mph=70.0, trust=0, start_ok=False, rid=7):
 def on_link(r, seconds, v, limit=45, upcoming=0.0, spd=70.0, trust=0, start_ok=False, events=(), **kw):
   kw.setdefault("path", PATH)
   kw.setdefault("model_age", 0.0)
-  slc = {"limit": None if limit is None else limit * MPH, "upcoming": upcoming * MPH, "t": 0.0}
+  slc = {"limit": None if limit is None else limit * MPH, "upcoming": 0.0, "t": 0.0}
+  kw.setdefault("preview", {"speed": upcoming * MPH, "dist": 300.0, "t": 0.0} if upcoming else None)
   return r.step(v_mph=v, n=int(round(seconds / r.dt)), events=events, slc=slc,
                 view=link_view(spd, trust, start_ok), **kw)
 
@@ -44,7 +45,7 @@ def test_without_any_highway_limit_it_keeps_waiting_on_the_link():
   r.step(v_mph=40, set_mph=45, events=[engaged(45)])
   on_link(r, 10, 40, limit=45, spd=45)      # only the street's 45 known: wait, never give up
   assert r.anchor_mph == 45 and r.p.owner != OURS
-  on_link(r, 2.5, 42, limit=45, upcoming=65, spd=45)   # 7.0's upcoming highway limit arrives
+  on_link(r, 2.5, 42, limit=45, upcoming=65, spd=45)   # the map's preview (mapdOut) shows the highway's 65
   assert r.anchor_mph == 88                 # 65 + 3 + 20
 
 

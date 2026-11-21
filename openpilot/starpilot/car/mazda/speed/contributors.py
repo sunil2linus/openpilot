@@ -48,7 +48,7 @@ class Sources:
     self.want_slc, self.want_radar = want_slc, want_radar
     self.map_presses = map_presses   # the camera only steps aside for map curves that are really pressed for
     self.sm = sm
-    services = (["modelV2"] if want_model else []) + (["slcState"] if want_slc else []) + \
+    services = (["modelV2"] if want_model else []) + (["slcState", "mapdOut"] if want_slc else []) + \
                (["radarState"] if want_radar else [])
     if self.sm is None and services:
       from openpilot.cereal import messaging
@@ -64,6 +64,7 @@ class Sources:
     self.path_y = None
     self.lanes = None
     self.slc = None
+    self.preview = None
     self.lead = None
     self.veto = CameraVeto(MODEL_DT)
 
@@ -88,6 +89,10 @@ class Sources:
         from openpilot.starpilot.car.mazda.speed.limits import reading
         limit, upcoming = reading(self.sm["slcState"]) if self.sm.valid["slcState"] else (None, 0.0)
         self.slc = {"limit": limit, "upcoming": upcoming, "t": now}
+      if self.want_slc and self.sm.updated["mapdOut"]:
+        from openpilot.starpilot.car.mazda.speed.limits import map_preview
+        pv = map_preview(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]))
+        self.preview = None if pv is None else dict(pv, t=now)
       if self.want_radar and self.sm.updated["radarState"]:
         lead = radar_lead(self.sm["radarState"])
         self.lead = None if lead is None else dict(lead, t=now)
@@ -95,7 +100,8 @@ class Sources:
       self.view = self.read_view()
     ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t,
                path_y=self.path_y, lanes=self.lanes, lead=self.lead,
-               slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None)
+               slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
+               preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None)
     view_ok = self.view is not None and self.view.get("gps") == "ok" and now - self.view.get("t", -1e9) <= VIEW_STALE
     ctx["gps_ok"] = view_ok if self.want_view else True
     ctx["no_gps"] = bool(self.want_view and not view_ok)   # F5: no GPS position (the camera-only curve is more careful)

@@ -5,7 +5,7 @@ its anchor rules). It never gives a slowing target and never presses.
 Where the limit comes from (F1): 7.0's Speed Limit Controller runs DISPLAY-ONLY on this car (feature_runtime.
 slc_runtime_settings: no openpilot longitudinal) and plannerd publishes its arbitration as `slcState` (20 Hz):
 `speedLimit` with `observationKind` "valid" and `source`, each source's own reading in `sourceReadings`, and
-`upcomingSpeedLimit` (an accepted early preview). It runs with "Show Speed Limits" on (the default) and a map / dash
+(`upcomingSpeedLimit` is NOT used: on this car's display-only SLC it is never filled). It runs with "Show Speed Limits" on (the default) and a map / dash
 source in the SLC source priority ("Map Data": the offline maps provider must be running). card reads slcState
 through the speed control's private SubMaster (contributors.Sources), only when an option that needs it is on.
 Only "map" and "dashboard" readings count (LIMIT_SOURCES): vision sign readings were never checked on this car (the
@@ -22,10 +22,15 @@ Rules (ported from the old fork's speed_limit_follow, written as one contributor
     + max(LIMIT_BAND, offset); at a first limit: the new limit's band). His SET+ / SET- make the speed his: no more
     proposals take. His own higher speed (80 on a 70 road) is out of the band: never pressed down.
   * Only on roads: nothing on a link (the merge / exit own it) nor while the merge or the exit plan are busy.
-  * A raise waits while 7.0's upcoming (preview) limit is lower, but only a preview seen on the current road (a
-    road change, the matched chain, drops it); a preview never holds a lowering.
-  * F5 fallback: the limit unknown (no reading and no steady limit), the car at FALLBACK_FROM or more for
-    FALLBACK_AFTER, within FALLBACK_WINDOW of engaging: FALLBACK (43 mph) as a "fallback" proposal (up only).
+  * Match on engage: he engages (SET / RES) with the set inside the band of an already-known steady limit -> the
+    limit + offset is proposed at once (the old fork's "match on engage"; owner: limit + 3), whether the limit became
+    steady before or after the press; outside the band his speed stays his.
+  * A raise waits while the map's preview limit ahead is lower (mapdOut previewSpeedLimit / previewDistance, read
+    directly: published whenever 7.0's map provider runs, checked as map_observation does), but only a preview
+    seen on the current road (a road change, the matched chain, drops it); a preview never holds a lowering.
+  * F5 fallback: no GPS position (the map view's "none": ctx no_gps) and the limit unknown, the car at
+    FALLBACK_FROM or more for FALLBACK_AFTER, within FALLBACK_WINDOW of engaging: FALLBACK (43 mph) as a "fallback"
+    proposal (up only). With GPS an untagged street keeps his speed.
 Pure (tests/test_limits.py).
 """
 import math
@@ -52,8 +57,27 @@ FALLBACK_WINDOW = 120.0              # s after engaging
 SLC_STALE = 0.5                      # s
 
 
+def map_preview(road, valid=True):
+  """{"speed": m/s, "dist": m} of the map's next limit ahead from a mapdOut reader (v2, as
+  speed_limits.map_observation checks it: finite >= 1 m/s, 0 < distance <= 500 m, a way, not the current limit),
+  or None; never raises."""
+  try:
+    from openpilot.starpilot.speed_limits.map_observation import repair_legacy_map_speed
+    if not valid or int(road.sampleVersion) != 2:
+      return None
+    speed = repair_legacy_map_speed(float(road.previewSpeedLimit))
+    dist, way, cur = float(road.previewDistance), int(road.previewWayId), float(road.speedLimit)
+  except (AttributeError, TypeError, ValueError, ImportError):
+    return None
+  if not (math.isfinite(speed) and speed >= 1.0 and math.isfinite(dist) and 0 < dist <= 500 and way > 0 and
+          abs(speed - cur) > 0.02):
+    return None
+  return {"speed": speed, "dist": dist}
+
+
 def reading(state):
-  """(limit m/s or None, upcoming m/s or 0.0) from an slcState reader; never raises."""
+  """(limit m/s or None, upcoming m/s or 0.0) from an slcState reader; never raises. (The upcoming value is
+  always 0 on this car's display-only SLC; it is not used.)"""
   try:
     limit = None
     if str(state.observationKind) == "valid" and str(state.source) in LIMIT_SOURCES:
@@ -120,11 +144,15 @@ class SpeedLimit:
     chain = view.get("chain", 0) if fresh else None
     for e in ctx.get("act_events", ()):
       if e.get("kind") in ("engaged", "resumed"):
-        self.engaged_t, self.fast_t, self.change_band = now, 0.0, None
+        # match on engage: the band of the steady limit already known (none known: the first one's band, below)
+        self.engaged_t, self.fast_t = now, 0.0
+        self.change_band = self.band(self.steady) if self.steady is not None else None
     if not ctx.get("cruise_enabled", False):
       self.engaged_t = None
     slc = ctx.get("slc")
-    limit_mps, up_mps = (slc["limit"], slc["upcoming"]) if slc else (None, 0.0)
+    limit_mps = slc["limit"] if slc else None
+    pv = ctx.get("preview")
+    up_mps = pv["speed"] if pv else 0.0
     raw = whole_limit(limit_mps, self.metric)
     if raw is not None:
       self.last_seen = now
@@ -162,7 +190,8 @@ class SpeedLimit:
       self.last = ("limit", self.steady)
       return out
     # F5: the limit unknown
-    if raw is None and self.engaged_t is not None and now - self.engaged_t <= FALLBACK_WINDOW and not busy:
+    if (raw is None and ctx.get("no_gps") and self.engaged_t is not None and now - self.engaged_t <= FALLBACK_WINDOW
+        and not busy):
       self.fast_t = self.fast_t + dt if v >= FALLBACK_FROM else 0.0
       if self.fast_t >= FALLBACK_AFTER - 1e-6:
         out.anchor, out.kind = FALLBACK[self.k] * self.unit, "fallback"
