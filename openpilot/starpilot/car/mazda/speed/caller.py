@@ -13,6 +13,7 @@ from openpilot.starpilot.car.mazda.speed.planner import Planner, PlanInputs
 
 CRZ_BTNS = 0x09D
 PLAN_LOG_GAP = 0.2            # s: a changed plan is logged at most this often
+GPS_LOG_STALE = 5.0           # s: an older map view is logged as "stale" (mazda_mapviewd stopped writing)
 
 
 def _plain(v):
@@ -51,6 +52,7 @@ class SpeedControl:
     self.holds_seen = 0
     self.cruise_was = False
     self.packer = None
+    self.gps_key = None
     if profile is not None:
       profile.note_drive()
     self._log("start", config=C.encode(cfg).decode(), metric=self.metric,
@@ -87,6 +89,8 @@ class SpeedControl:
       ctx.update(d)
     ctx.update(anchor=self.planner.anchor, owner=self.planner.owner, ours_why=self.planner.ours_why,
                act_events=self.events, contribs={})
+    if self.sources is not None and getattr(self.sources, "want_view", False):
+      self._note_gps(ctx, now)
     contributions = []
     for c in self.contributors:
       got = c(ctx)
@@ -122,6 +126,20 @@ class SpeedControl:
                 states={k: _plain(v) for k, v in states.items() if k != "CurvePlan"})
     self._learn(d["cruise_enabled"])
     return (act.button, act.counter) if act.button is not None else None
+
+  def _note_gps(self, ctx, now):
+    """One "gps" line whenever the map view's GPS state changes: "ok" with the service it came from, or why there is
+    no position ("no_messages" / "no_fix" / "stale" from mazda_mapviewd, "no_view": its file is missing). Never a
+    position."""
+    view = ctx.get("view")
+    if view is None:
+      key = ("none", "no_view", "", False)
+    else:
+      stale = ctx.get("now", now) - float(view.get("t", -1e9)) > GPS_LOG_STALE
+      key = (str(view.get("gps", "none")), str(view.get("why", "")), str(view.get("src", "")), bool(stale))
+    if key != self.gps_key:
+      self.gps_key = key
+      self._log("gps", state=key[0], why=key[1], src=key[2], view_stale=key[3])
 
   def _learn(self, cruise):
     p = self.profile

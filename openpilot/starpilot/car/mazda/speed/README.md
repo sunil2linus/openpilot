@@ -26,7 +26,8 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `curve_memory.py`, `curve_memory_tool.py` | per curve+direction memory (way id key, no positions), cap + offset on the tight points, list/clear tool | simplified port |
 | `events.py` | JSONL feature-event log under `/data/media/0/mazda_speed/` | simplified |
 | `caller.py` | the hook card.py calls; off = returns the frames list untouched | new |
-| `processes.py` | when the manager runs the two daemons | new |
+| `processes.py` | when the manager runs the two daemons (CarParamsPersistent before the first drive) | new |
+| `status.py` | the two helpers' status files the settings rows read (curve-map build, last drive's GPS) | new |
 
 ## Part (f): speed limit, merge, exits (each off / test / on; test computes and logs, never presses)
 
@@ -100,10 +101,25 @@ Not in Stage 2 (absent, not half-wired): stop slowdown (g), on-screen notices (h
 
 ```
  parked:   7.0 offline tiles (selected generation)  --curve_mapd-->  /data/media/0/mazda_curve_map/<lat>/<lon>/*.json
- onroad:   gpsLocationExternal + curve files --mazda_mapviewd (map_view.py, 10 Hz)--> /dev/shm/mazda_speed_view.json
+ onroad:   gpsLocation | gpsLocationExternal + curve files --mazda_mapviewd (map_view.py, 10 Hz)--> /dev/shm/mazda_speed_view.json
  card:     CarState + CRZ_BTNS + modelV2 + slcState + radarState + the view file --caller.py--> planner -> actuator -> CRZ_BTNS
 ```
 
+* **GPS**: 7.0 runs one GPS daemon per device: `qcomgpsd` publishes `gpsLocation` (comma 3X / tizi, e.g. the Konik
+  A1M), `ubloxd` publishes `gpsLocationExternal`. mazda_mapviewd reads both and uses the newest valid fix (7.0's rule
+  in starpilot/gps/source.py, without its 25 m accuracy cut: GpsTrust pauses on a bad accuracy itself). The first Stage 2
+  drives read only `gpsLocationExternal`, so on the A1M every map feature had "no GPS" (only the camera curve worked).
+  The parked builder's nearest-first order uses `LastGPSPosition` (either service) or, on a tizi where only ubloxd would
+  write that param, 7.0's navigation last-position store.
+* **Status the owner can see** (no Params key; `status.py`, files in `/data/media/0/mazda_speed/`, never a position):
+  `curve_build_status.json` (mazda_curve_mapd: "curve maps: 3 of 5 folders built", "building…", "up to date", "no
+  offline map downloaded") and `gps_status.json` (mazda_mapviewd: "last drive: no GPS position: no message from the
+  GPS" / "the GPS has no fix" / "the GPS messages stopped"). The settings rows for map curves, speed limit, merge and
+  exits add them after "Now:". The event log gets a `gps` line whenever the view's GPS state changes (ok + service,
+  or why: no_messages / no_fix / stale / no_view = the view file is missing).
+* **Which car before the first drive**: the manager's `carParams` is empty (brand "") until card runs, so parked on
+  power after a reboot the builder did not start. processes.py then uses CarParamsPersistent (7.0's checked cache),
+  re-read at most every 30 s and decoded only when its bytes change.
 * The view file is a small JSON (curve profile points as distance-ahead + radius at a monotonic timestamp, road
   class, ramp flags, GPS trust state). It is written atomically (tmp + rename) on tmpfs. card reads it at 10 Hz and
   moves the points by the distance driven since the timestamp; a view older than 0.5 s is "no map".
@@ -119,7 +135,7 @@ Not in Stage 2 (absent, not half-wired): stop slowdown (g), on-screen notices (h
 * `opendbc/car/mazda/carstate.py`: stores the raw CRZ_BTNS buttons (SET_P/SET_M/RES/CAN_OFF), LKAS_BLOCK and the
   radar lead bit as attributes (the CarState message is unchanged). `mazdacan.create_button_cmd` learns SET+/SET-.
 * `system/manager/process_config.py`: `mazda_curve_mapd` (offroad) and `mazda_mapviewd` (onroad), both only on a
-  Mazda (the manager's CarParams) with the master switch on and map curves, speed limit, merge or exits Test or On.
+  Mazda (the manager's CarParams, else CarParamsPersistent) with the master switch on and map curves, speed limit, merge or exits Test or On.
 * Settings: `common/params_keys.h` (+ rebuilt libparams), `state_migration.VEHICLE_PREFERENCE_KEYS`,
   `ui/mazda_speed_feature.py` wired into FeatureSettingsOwner like `mazda_ti_feature.py`, Galaxy description.
 

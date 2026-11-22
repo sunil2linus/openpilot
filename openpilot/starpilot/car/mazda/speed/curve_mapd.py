@@ -13,8 +13,11 @@ starpilot/system/curve_mapd.py, pointed at 7.0's offline maps).
     JSON, its tiles changed (their SHA-256 in the receipt), or it was built by an older BUILDER_VERSION or
     FORMAT_VERSION (curve_builder.py: bumped on every geometry change). Files are written with fsync and the state
     last, so a folder killed half way is simply built again.
-  * Which folders: those within RANGE_MILES of the last known position (LastGPSPosition), nearest first; with no
-    position yet, every folder of the selection.
+  * Which folders: those within RANGE_MILES of the last known position (LastGPSPosition from either GPS service,
+    else 7.0's navigation last-position store: on a comma 3X / tizi only ubloxd writes LastGPSPosition, and those
+    devices run qcomgpsd), nearest first; with no position yet, every folder of the selection.
+  * Status: <mazda_speed>/curve_build_status.json (status.py: "3 of 5 folders built", "building", "up to date",
+    "no offline map downloaded"), read by the settings rows; folder counts only.
   * A MemoryError on a dense folder: gc.collect() and one retry; a second failure skips that folder for the rest of
     this parked session (logged) instead of retrying it forever. gc.collect() between folders.
   * Log: <curve root>/build_log.txt (size capped), never a GPS position.
@@ -175,14 +178,21 @@ def build_folder(folder, info, curve_root=CURVE_ROOT, log=print, builder=B.build
 
 
 def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=lambda: False, failed=None,
-             builder=B.build):
-  """One pass over the folders in scope. failed: {folder: tries} kept by the caller for the parked session."""
+             builder=B.build, report=None):
+  """One pass over the folders in scope. failed: {folder: tries} kept by the caller for the parked session.
+  report(status dict): told before each folder and after the pass (the settings rows' status file)."""
   failed = {} if failed is None else failed
-  todo = plan(folders, curve_root, near, failed={f for f, n in failed.items() if n >= 2})
+  skip = {f for f, n in failed.items() if n >= 2}
+  stale = plan(folders, curve_root, near)                 # every folder in scope that is not up to date
+  todo = [(f, w) for f, w in stale if f not in skip]
+  total = sum(near is None or folder_box_distance_miles(near, f) <= RANGE_MILES for f in folders)
+  built = total - len(stale)
   done = 0
   for folder, why in todo:
     if should_stop():
       break
+    if report is not None:
+      report(build_status(built + done, total, building=True, failed=len(stale) - len(todo)))
     log(f"building {folder} ({why})")
     for attempt in (1, 2):
       try:
@@ -199,6 +209,8 @@ def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=l
         log(f"{folder}: {e}")
         break
     gc.collect()
+  if report is not None:
+    report(build_status(built + done, total, failed=sum(f in failed and failed[f] >= 2 for f, _ in stale)))
   return done
 
 
@@ -224,39 +236,85 @@ class BuildLog:
         pass
 
 
-def parse_position(raw):
-  """(lat, lon) from LastGPSPosition (7.0: an Event with gpsLocationExternal; older: JSON), or None."""
-  if not raw:
-    return None
-  lat = lon = None
-  try:
-    from openpilot.cereal import log as capnp_log
-    with capnp_log.Event.from_bytes(raw) as ev:
-      g = ev.gpsLocationExternal
-      if not g.hasFix:
-        return None
-      lat, lon = float(g.latitude), float(g.longitude)
-  except Exception:
-    try:
-      g = json.loads(raw)
-      lat, lon = float(g["latitude"]), float(g["longitude"])
-    except (TypeError, ValueError, KeyError):
-      return None
+GPS_EVENTS = ("gpsLocationExternal", "gpsLocation")
+
+
+def _position(lat, lon):
+  lat, lon = float(lat), float(lon)
   if not (math.isfinite(lat) and math.isfinite(lon)) or (lat == 0.0 and lon == 0.0) or abs(lat) > 90 or abs(lon) > 180:
     return None
   return lat, lon
+
+
+def parse_position(raw):
+  """(lat, lon) from LastGPSPosition, or None. 7.0's ubloxd stores an Event holding gpsLocationExternal; an Event
+  holding gpsLocation (qcomgpsd's service) is read the same way; older versions stored JSON."""
+  if not raw:
+    return None
+  try:
+    from openpilot.cereal import log as capnp_log
+    with capnp_log.Event.from_bytes(raw) as ev:
+      which = ev.which()
+      if which not in GPS_EVENTS:
+        return None
+      g = getattr(ev, which)
+      if not g.hasFix:
+        return None
+      return _position(g.latitude, g.longitude)
+  except Exception:
+    try:
+      g = json.loads(raw)
+      return _position(g["latitude"], g["longitude"])
+    except (TypeError, ValueError, KeyError):
+      return None
+
+
+def navigation_position(root=None):
+  """(lat, lon) from 7.0's own last known position (starpilot/navigation/position.LastPositionStore, written by
+  navigationd from either GPS service), or None. On a comma 3X / tizi (qcomgpsd) nothing writes LastGPSPosition:
+  only ubloxd does."""
+  try:
+    from pathlib import Path
+    from openpilot.starpilot.navigation.position import LastPositionStore
+    if root is None:
+      from openpilot.starpilot.storage import starpilot_storage_root
+      root = starpilot_storage_root() / "navigation"
+    saved = LastPositionStore(Path(root)).read()
+    return None if saved is None else _position(saved["latitude"], saved["longitude"])
+  except Exception:
+    return None
+
+
+def last_position(params, nav_root=None):
+  """The last known position for the nearest-first order: LastGPSPosition (either service), else 7.0's navigation
+  store. None: every folder of the selection is built."""
+  try:
+    near = parse_position(params.get("LastGPSPosition"))
+  except Exception:
+    near = None
+  return near if near is not None else navigation_position(nav_root)
 
 
 def wanted(params, CP=None):
   """Built only for a Mazda with the master switch on and an option that needs the map view (map curves, speed
   limit, merge or exits) Test or On: the same rule processes.py starts this daemon with (config.needs_view)."""
   from openpilot.starpilot.car.mazda.speed import config as C
+  from openpilot.starpilot.car.mazda.speed import processes
   try:
-    if CP is not None and CP.brand != "mazda":
+    if CP is not None and processes.car_brand(params, CP)[0] != "mazda":
       return False
     return C.read(params).needs_view
   except Exception:
     return False
+
+
+def build_status(built, total, building=False, failed=0):
+  """The status file's dict (status.build_text says it in words); a folder count, never a position."""
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  if total is None:
+    return {"state": ST.NO_MAP, "built": 0, "total": 0, "failed": 0}
+  state = ST.UP_TO_DATE if built >= total else ST.BUILDING if building else ST.PARTIAL
+  return {"state": state, "built": int(built), "total": int(total), "failed": int(failed)}
 
 
 def _lowest_priority():
@@ -270,10 +328,17 @@ def main():
   from openpilot.common.params import Params
   from openpilot.common.swaglog import cloudlog
   from openpilot.starpilot.maps.storage import offline_root
+  from openpilot.starpilot.car.mazda.speed import status as ST
   _lowest_priority()
   params = Params()
   log = BuildLog(mirror=cloudlog.info)
   failed = {}
+  last = [None]
+
+  def report(value):
+    if value != last[0] and ST.write(ST.BUILD_NAME, value):
+      last[0] = value
+
   while True:
     if not wanted(params):
       time.sleep(IDLE_INTERVAL)
@@ -281,9 +346,10 @@ def main():
     try:
       folders = selected_folders(offline_root())
       if folders is None:
+        report(build_status(0, None))
         time.sleep(IDLE_INTERVAL)
         continue
-      run_once(folders, near=parse_position(params.get("LastGPSPosition")), log=log, failed=failed)
+      run_once(folders, near=last_position(params), log=log, failed=failed, report=report)
     except Exception:
       cloudlog.exception("mazda_curve_mapd failed")
       log("failed, see the system log")

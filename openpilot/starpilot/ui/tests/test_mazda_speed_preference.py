@@ -101,10 +101,13 @@ def test_speed_limit_merge_and_exit_rows_say_when_the_map_service_will_not_run(m
   import openpilot.starpilot.ui.mazda_speed_feature as F
   from openpilot.starpilot.maps import shadow_lifecycle as S
 
+  from openpilot.starpilot.car.mazda.speed import status as ST
+
   def reasons(saved):
     owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
     return {r.key: r.reason for r in rows(owner)}
-  with tempfile.TemporaryDirectory() as d:
+  with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as status_dir:
+    monkeypatch.setattr(ST, "STATUS_DIR", status_dir)      # no status file from the two helpers
     saved = Params(d)
     Path(saved.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, "enabled": True}).encode())
     monkeypatch.setattr(S, "_owned_root", lambda root, anchor: True)
@@ -124,3 +127,22 @@ def test_speed_limit_merge_and_exit_rows_say_when_the_map_service_will_not_run(m
     got = reasons(saved)[PREFIX + "exits"]
     assert "add Map Data to the speed limit sources" in got and "Show Speed Limits" not in got
     assert all("MapdShadow" not in r for r in reasons(saved).values())
+
+
+def test_rows_show_the_curve_map_build_and_the_last_drives_gps(monkeypatch):
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  import openpilot.starpilot.ui.mazda_speed_feature as F
+  with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as status_dir:
+    monkeypatch.setattr(ST, "STATUS_DIR", status_dir)
+    monkeypatch.setattr(F, "map_service_status", lambda params, cp: "")
+    saved = Params(d)
+    Path(saved.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, "enabled": True}).encode())
+    ST.write(ST.BUILD_NAME, {"state": ST.BUILDING, "built": 3, "total": 5, "failed": 0})
+    ST.write(ST.GPS_NAME, {"state": ST.GPS_NO_MESSAGES, "src": ""})
+    owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
+    got = {r.key: r.reason for r in rows(owner)}
+    for k in ("curves", "merge", "exits"):
+      assert "Now: curve maps: building… 3 of 5 folders built" in got[PREFIX + k], got[PREFIX + k]
+    for k in ("curves", "speed_limit", "merge", "exits"):
+      assert "last drive: no GPS position: no message from the GPS" in got[PREFIX + k], got[PREFIX + k]
+    assert "curve maps" not in got[PREFIX + "speed_limit"] and "Now:" not in got[PREFIX + "camera_curves"]

@@ -8,6 +8,8 @@ Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename
   {"v": 2, "t": monotonic s of the position (the GPS sample minus GPS_LAG), "gps": "ok" | "none" (no GPS position),
    "trust": GpsTrust status (0 ok ...), "start_ok": bool, "held": bool, "matched": bool, "cls": road class,
    "link": bool, "data": bool (curve files cover here), "chain": matched road (chain id, 0 none), "acc": GPS error m,
+   "src": the GPS service used ("gpsLocation" qcomgpsd / "gpsLocationExternal" ubloxd), "why": with "gps": "none",
+          why there is no position (status.GPS_NO_MESSAGES / GPS_NO_FIX / GPS_STALE),
    "curves": [{"id", "pts": [[d, r], ...], "ramp", "adv", "len"}],
    "ramp": the matched link's ramp record {"id", "hwy": leads to a highway, "spd": m/s of the road it leads to,
            "from_hwy": leaves a highway} or absent,
@@ -16,6 +18,10 @@ Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename
               curve profile from the car, "m": the match (1 our highway, 2 this link, 0 other), "sh": the map shapes
               past the split (2 link, 1 highway, 0 no answer), "ly" / "hy": m right of the car where the link / the
               highway is MODEL_AT m ahead (null unknown)}]}  (at most EXITS_MAX, only while on or just past a highway)
+The GPS: both services 7.0's GPS daemons publish, gpsLocation (qcomgpsd: comma 3X / tizi, e.g. the Konik A1M) and
+gpsLocationExternal (ubloxd); the newest valid fix wins (7.0's own rule, starpilot/gps/source.select_source, without
+its 25 m accuracy cut: GpsTrust pauses on a bad accuracy itself). Both are GpsLocationData: degrees, m/s, degrees,
+m. flags are decoded (GpsTrust's reliability) only for qcomdiag; ublox flags mean something else.
 The reader (read_view) never raises and returns None for a missing, unreadable, other-version or stale view.
 
 Exits ahead (part f, the exit plan in exit_plan.py): a ramp record of type exit / interchange whose start lies on the
@@ -38,12 +44,14 @@ import os
 import time
 
 from openpilot.starpilot.car.mazda.speed import map_match as MM
+from openpilot.starpilot.car.mazda.speed import status as ST
 from openpilot.starpilot.car.mazda.speed.curve_memory import way_place
 
 VIEW_PATH = "/dev/shm/mazda_speed_view.json"
 VIEW_VERSION = 2
 GPS_LAG = 0.85                # s: the position is this old when it arrives (0.7-1.0 s measured)
 GPS_STALE = 1.5               # s without a new fix: "none"
+GPS_SERVICES = ("gpsLocationExternal", "gpsLocation")   # ubloxd, qcomgpsd (7.0 runs one of them per device)
 LOOKAHEAD = 1000.0            # m
 START_ACC = 15.0              # m: start-of-drive trust on a matched link needs the GPS error at or below this
 IN_CURVE_SLACK = 60.0         # m past an exit a curve still counts as the one we are in (the old value)
@@ -434,7 +442,8 @@ class MapView:
     data = self.store.covers(lat, lon)
     way_id, fwd = self.matcher.update(lat, lon, bearing, acc if MM.USE_GPS_ACCURACY else 0.0)
     matched = bool(way_id)
-    self.trust.update(dt, speed, acc if MM.USE_GPS_ACCURACY else 0.0, 0, data, matched, self.matcher.ambiguous)
+    self.trust.update(dt, speed, acc if MM.USE_GPS_ACCURACY else 0.0, int(gps.get("rel", 0) or 0), data, matched,
+                      self.matcher.ambiguous)
     view.update(gps="ok", trust=self.trust.status, matched=matched, cls=self.matcher.road_class,
                 link=bool(self.matcher.on_link), data=data, chain=int(self.matcher.chain_id) if matched else 0,
                 acc=round(acc, 1))
@@ -461,6 +470,75 @@ class MapView:
     return view
 
 
+def gps_sample(g, stamp, now, valid=True):
+  """One GpsLocationData of either service (gpsLocation from qcomgpsd, gpsLocationExternal from ubloxd) -> the dict
+  MapView.update takes. stamp: the message's monotonic s. Never raises on odd values (a non-finite number is no fix)."""
+  def num(v, default=0.0):
+    try:
+      v = float(v)
+    except (TypeError, ValueError):
+      return default
+    return v if math.isfinite(v) else default
+  lat, lon = num(g.latitude, math.nan), num(g.longitude, math.nan)
+  try:
+    src = str(g.source)
+  except Exception:
+    src = ""
+  fix = bool(valid and g.hasFix and 0.0 <= now - stamp < GPS_STALE and math.isfinite(lat) and math.isfinite(lon) and
+             abs(lat) <= 90.0 and abs(lon) <= 180.0 and not (lat == 0.0 and lon == 0.0))
+  acc = num(g.horizontalAccuracy)
+  rel = MM.gps_flags(g.flags)["reliability"] if src == "qcomdiag" else 0
+  return {"lat": lat, "lon": lon, "bearing": num(g.bearingDeg) % 360.0, "speed": max(num(g.speed), 0.0),
+          "acc": acc if acc > 0.0 else 0.0, "rel": rel, "fix": fix, "src": src}
+
+
+def pick_gps(sm, now):
+  """(stamp s, sample, service) to process this cycle, or None. The newest valid fix of the two services wins and is
+  processed when its service sent it this cycle; with no fix anywhere the newest new message (no fix) is processed."""
+  best = nofix = None
+  for s in GPS_SERVICES:
+    if not sm.seen[s]:
+      continue
+    stamp = sm.logMonoTime[s] * 1e-9
+    g = gps_sample(sm[s], stamp, now, sm.valid[s])
+    if g["fix"]:
+      if best is None or stamp > best[0]:
+        best = (stamp, g, s)
+    elif sm.updated[s] and (nofix is None or stamp > nofix[0]):
+      nofix = (stamp, g, s)
+  if best is not None:
+    return best if sm.updated[best[2]] else None
+  return nofix
+
+
+def no_gps_why(sm, now):
+  """Why there is no position: no message from either GPS service yet, the messages stopped, or no fix."""
+  seen = [sm.logMonoTime[s] * 1e-9 for s in GPS_SERVICES if sm.seen[s]]
+  if not seen:
+    return ST.GPS_NO_MESSAGES
+  return ST.GPS_STALE if now - max(seen) >= GPS_STALE else ST.GPS_NO_FIX
+
+
+class DriveGps:
+  """This drive's GPS state for the settings rows (status.GPS_NAME): "ok" once the drive has had a position, until
+  then why it has none. Returns the dict to write when it changed (a handful of writes per drive)."""
+
+  def __init__(self):
+    self.state, self.src, self.fix_s, self.last = None, "", 0.0, None
+
+  def update(self, now, fix, why, src=""):
+    if fix and self.last is not None:
+      self.fix_s += min(max(now - self.last, 0.0), 1.0)
+    self.last = now if fix else None
+    state = ST.GPS_OK if (fix or self.state == ST.GPS_OK) else why
+    if fix and src:
+      self.src = src
+    if state != self.state:
+      self.state = state
+      return {"state": state, "src": self.src}
+    return None
+
+
 def main():
   from openpilot.cereal import messaging
   from openpilot.common.params import Params
@@ -475,23 +553,34 @@ def main():
       time.sleep(60)
   store = MM.MapCurveStore()
   mv = MapView(store)
-  sm = messaging.SubMaster(["gpsLocationExternal"])
+  sm = messaging.SubMaster(list(GPS_SERVICES))
+  drive = DriveGps()
   last_write = 0.0
   while True:
     sm.update(200)
     now = time.monotonic()
     try:
-      if sm.updated["gpsLocationExternal"]:
-        g = sm["gpsLocationExternal"]
-        t = sm.logMonoTime["gpsLocationExternal"] * 1e-9
-        fix = bool(g.hasFix) and now - t < GPS_STALE and math.isfinite(g.latitude) and math.isfinite(g.longitude)
-        gps = {"lat": g.latitude, "lon": g.longitude, "bearing": g.bearingDeg, "speed": g.speed,
-               "acc": g.horizontalAccuracy, "fix": fix}
-        write_view(mv.update(t, gps))
+      got = pick_gps(sm, now)
+      if got is not None:
+        t, gps, service = got
+        view = mv.update(t, gps)
+        view["src"] = service
+        if not gps["fix"]:
+          view["why"] = ST.GPS_NO_FIX
+        write_view(view)
         last_write = now
+        changed = drive.update(now, gps["fix"], ST.GPS_NO_FIX, service)
       elif now - last_write > GPS_STALE:
-        write_view(mv.update(now, None))
+        view = mv.update(now, None)
+        view["why"] = no_gps_why(sm, now)
+        write_view(view)
         last_write = now
+        changed = drive.update(now, False, view["why"])
+      else:
+        changed = None
+      if changed is not None:
+        ST.write(ST.GPS_NAME, changed)
+        cloudlog.warning(f"mazda_mapviewd: GPS {changed['state']} {changed['src']}")
     except Exception:
       cloudlog.exception("mazda_mapviewd failed")
       time.sleep(1.0)

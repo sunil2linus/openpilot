@@ -41,8 +41,8 @@ SHAKY_NONE, SHAKY_START, SHAKY_RESTART = 0, 1, 2
 # (round T, T1b) "Map curves off: no GPS yet": once per drive, before the first position, once cruise is engaged or the car
 # is above this
 NOGPS_NOTICE_SPEED = 15 * 0.44704   # m/s
-# The GPS chip's own error estimate (qcomgpsd fills gpsLocation.horizontalAccuracy since StarPilot; openpilot left
-# it 0). Its values have not been checked against a drive yet: until then it is only logged, and the pause and
+# The GPS chip's own error estimate (qcomgpsd fills gpsLocation.horizontalAccuracy, ubloxd gpsLocationExternal's;
+# both in m). Its values have not been checked against a drive yet: until then it is only logged, and the pause and
 # the ambiguity distance work without it (USE_GPS_ACCURACY). Turn on once a drive shows ~3-15 m on open roads.
 USE_GPS_ACCURACY = False
 ACC_PAUSE = 50.0           # m: an error estimate above this (or reliability "very low") for BAD_CONFIRM pauses
@@ -170,7 +170,9 @@ def gps_flags(flags):
 def gps_quality(gps_location):
   """The fix quality keys added to the planner's gps_position (never raises: fakes and other sources give 0)."""
   try:
-    q = gps_flags(getattr(gps_location, "flags", 0))
+    # flags are qcomgpsd's position quality only for source qcomdiag; ubloxd fills them with the ublox fix flags
+    # (bit 0 = fix ok), which read as reliability 1 "very low" here
+    q = gps_flags(getattr(gps_location, "flags", 0) if str(getattr(gps_location, "source", "")) == "qcomdiag" else 0)
     acc = float(getattr(gps_location, "horizontalAccuracy", 0.0) or 0.0)
     return {"accuracy": acc if math.isfinite(acc) and acc > 0 else 0.0,
             "satellites": int(getattr(gps_location, "satelliteCount", 0) or 0),

@@ -45,7 +45,19 @@ UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat
 
 
 MAP_ROWS = ("speed_limit", "merge", "exits")
+CURVE_FILE_ROWS = ("curves", "merge", "exits")     # use the curve files mazda_curve_mapd builds parked
+GPS_ROWS = ("curves", "speed_limit", "merge", "exits")   # need mazda_mapviewd's GPS position
 MAP_STATUS_CACHE = 5.0          # s
+
+
+def daemon_status():
+  """(curve-map build text, last drive's GPS text) from the two helpers' status files (speed/status.py), "" each when
+  there is nothing to say. Never raises."""
+  try:
+    from openpilot.starpilot.car.mazda.speed import status as ST
+    return ST.build_text(ST.read(ST.BUILD_NAME)), ST.gps_text(ST.read(ST.GPS_NAME))
+  except Exception:
+    return "", ""
 
 
 def map_service_status(params, cp):
@@ -119,6 +131,7 @@ class MazdaSpeedFeature:
     self.vehicle_params = owner.vehicle_params
     self.vehicle_fingerprint = owner.vehicle_fingerprint
     self._map_status = None         # (monotonic s, text)
+    self._daemon_status = None      # (monotonic s, (build text, gps text))
 
   def map_status(self, cp):
     import time
@@ -126,6 +139,13 @@ class MazdaSpeedFeature:
     if self._map_status is None or now - self._map_status[0] > MAP_STATUS_CACHE:
       self._map_status = (now, map_service_status(self.params, cp))
     return self._map_status[1]
+
+  def helper_status(self):
+    import time
+    now = time.monotonic()
+    if self._daemon_status is None or now - self._daemon_status[0] > MAP_STATUS_CACHE:
+      self._daemon_status = (now, daemon_status())
+    return self._daemon_status[1]
 
   def capability(self):
     cp = self.vehicle_params()
@@ -162,9 +182,15 @@ class MazdaSpeedFeature:
     for field, label, reason, step in SUB_ROWS:
       kind, default, lim = C.SCHEMA[field]
       value = getattr(cfg, field)
+      now_says = []
       if field in MAP_ROWS:
-        status = self.map_status(self.vehicle_params())
-        reason = reason + (" Now: " + status if status else "")
+        now_says.append(self.map_status(self.vehicle_params()))
+      if field in CURVE_FILE_ROWS or field in GPS_ROWS:
+        build, gps = self.helper_status()
+        now_says += [build if field in CURVE_FILE_ROWS else "", gps if field in GPS_ROWS else ""]
+      now_says = [t for t in now_says if t]
+      if now_says:
+        reason = reason + " Now: " + " ".join(now_says)
       if kind == "mode":
         rows.append(FeatureRow(PREFIX + field, label, _shown(value), choices=tuple(MODE_LABELS.values()),
                                default_value=_shown(default), reason=reason + " Applies at the next drive.", **common))
