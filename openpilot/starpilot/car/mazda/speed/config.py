@@ -9,8 +9,11 @@ Rules:
   * Modes: "off" / "test" (computes and logs, never presses) / "on".
   * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
     version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan, version 4 the stop
-    slowdown and the on-screen notices (+ their sound). A field of a later version in an older document is invalid
-    (unknown fields are invalid).
+    slowdown and the on-screen notices (+ their sound), version 5 (Stage 3) the gas auto-resume and the steering
+    limit test. A field of a later version in an older document is invalid (unknown fields are invalid).
+  * Stage 3: `auto_resume` (with the master switch) and `ti_steer_700` (without it: it is a steering setting, used only
+    with the Torque Interceptor) also set panda safety param bits at car start (vehicle_preferences.py ->
+    opendbc/car/mazda/speed_flags.py), so they apply from the next drive (the next car start).
 No openpilot imports beyond the saved-value reader, so it is unit tested offline.
 """
 import json
@@ -18,8 +21,9 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 4                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
-VERSIONS = (1, 2, 3, 4)         #    merge / exits; 4: + stops / notices / notice_sound (older documents still read)
+VERSION = 5                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3, 4, 5)      #    merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700
+                                #    (older documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -41,10 +45,13 @@ SCHEMA = {
   "stops": ("mode", "off", MODES),                  # (v4) stop slowdown: a stopped car / a stop ahead (stops.py)
   "notices": ("bool", False, None),                 # (v4) short on-screen notices (notices.py -> selfdrived)
   "notice_sound": ("bool", False, None),            # (v4) ... the stop / brake notices with a chime
+  "auto_resume": ("bool", False, None),             # (v5) after his brake, his gas presses RES for him (auto_resume.py)
+  "ti_steer_700": ("bool", False, None),            # (v5) TI steering limit test 600 -> 700 (not under the master switch)
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
 V4_FIELDS = frozenset(("stops", "notices", "notice_sound"))
+V5_FIELDS = frozenset(("auto_resume", "ti_steer_700"))
 
 
 class ConfigError(ValueError):
@@ -68,6 +75,8 @@ class Config:
   stops: str = "off"
   notices: bool = False
   notice_sound: bool = False
+  auto_resume: bool = False
+  ti_steer_700: bool = False
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -89,7 +98,8 @@ class Config:
   @property
   def needs_view(self):
     """The map view daemon (and its curve files) are needed: map curves, the limit (road / GPS trust), merge, exits."""
-    return self.enabled and any(self.mode(n) != "off" for n in ("curves", "speed_limit", "merge", "exits"))
+    return self.enabled and (any(self.mode(n) != "off" for n in ("curves", "speed_limit", "merge", "exits")) or
+                             self.auto_resume)
 
   @property
   def shows_notices(self):
@@ -98,7 +108,18 @@ class Config:
 
   @property
   def any_active(self):
-    return self.enabled and any(self.mode(n) != "off" for n, (k, _, _) in SCHEMA.items() if k == "mode")
+    return self.enabled and (any(self.mode(n) != "off" for n, (k, _, _) in SCHEMA.items() if k == "mode") or
+                             self.auto_resume)
+
+  @property
+  def auto_resume_on(self):
+    """(Stage 3) the gas auto-resume: the master switch and its own switch (its panda bit is set from this too)."""
+    return bool(self.enabled and self.auto_resume)
+
+  @property
+  def steer_700_on(self):
+    """(Stage 3) the TI steering limit test: its own switch only (applied only on a car with the TI)."""
+    return bool(self.ti_steer_700)
 
 
 def _unique(pairs):
@@ -129,7 +150,7 @@ def decode(raw):
   if doc.get("version") not in VERSIONS or type(doc.get("version")) is not int:
     raise ConfigError("version")
   if ((doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)) or
-      (doc["version"] < 4 and V4_FIELDS & set(doc))):
+      (doc["version"] < 4 and V4_FIELDS & set(doc)) or (doc["version"] < 5 and V5_FIELDS & set(doc))):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():

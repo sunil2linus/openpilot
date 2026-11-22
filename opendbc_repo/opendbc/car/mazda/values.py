@@ -25,12 +25,21 @@ class CarControllerParams:
   # proven mazda-frogpilot-dev limit of 600. The panda safety (mazda.h, MAZDA_TI_STEERING_LIMITS) uses the same limit.
   TI_STEER_MAX = 600
   TI_STEER_DRIVER_MULTIPLIER = 40  # weight driver torque (the TI's own sensor, see carstate)
+  # Steering limit test (Stage 3, off by default): 700 with the TI and MazdaSafetyFlags.TI_STEER_700 in the safety param
+  # (speed_flags.py sets it at car start; mazda.h MAZDA_TI_STEERING_LIMITS_700 uses the same limit).
+  TI_STEER_MAX_TEST = 700
 
   def __init__(self, CP):
     # Without a TI the class values above are used unchanged (stock StarPilot).
     if CP.flags & MazdaFlags.TORQUE_INTERCEPTOR:
       self.STEER_MAX = self.TI_STEER_MAX
       self.STEER_DRIVER_MULTIPLIER = self.TI_STEER_DRIVER_MULTIPLIER
+      try:
+        param = int(CP.safetyConfigs[0].safetyParam)
+      except (AttributeError, IndexError, TypeError, ValueError):
+        param = 0
+      if param & MazdaSafetyFlags.TORQUE_INTERCEPTOR and param & MazdaSafetyFlags.TI_STEER_700:
+        self.STEER_MAX = self.TI_STEER_MAX_TEST
 
 
 @dataclass

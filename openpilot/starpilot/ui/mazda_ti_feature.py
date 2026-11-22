@@ -12,7 +12,8 @@ ROWS = (('TorqueInterceptorEnabled', 'Torque Interceptor (Mazda)',
 
 
 # The saved CarParams of a 2017-21 Gen1 Mazda without the TI are dashcam/passive with [noOutput, 0] (card.py replaces the
-# safety config), so the row also accepts that configuration, not only the live (mazda, 0).
+# safety config), so the row also accepts that configuration, not only the live (mazda, 0). The Stage 3 bits (gas
+# auto-resume, steering test; opendbc/car/mazda/speed_flags.py) come from these settings and do not change the car.
 CONFIGURATIONS = ((int(structs.CarParams.SafetyModel.mazda), 0), (int(structs.CarParams.SafetyModel.noOutput), 0))
 
 
@@ -28,7 +29,8 @@ def capable(cp) -> bool:
       return False
     if installed(cp):
       return True
-    configurations = tuple((_model_raw(c.safetyModel), int(c.safetyParam)) for c in cp.safetyConfigs)
+    from opendbc.car.mazda.speed_flags import STAGE3_BITS
+    configurations = tuple((_model_raw(c.safetyModel), int(c.safetyParam) & ~STAGE3_BITS) for c in cp.safetyConfigs)
     return bool(cp.carFingerprint in TI_CARS and int(cp.flags) == int(MazdaFlags.GEN1) and
                 not cp.openpilotLongitudinalControl and cp.pcmCruise and
                 len(configurations) == 1 and configurations[0] in CONFIGURATIONS)

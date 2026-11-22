@@ -34,7 +34,10 @@ def test_sub_features_need_the_master_switch():
 
 
 @pytest.mark.parametrize("raw", [
-  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 5}).encode(), json.dumps({"version": 1, "curve_offset_mph": 2}).encode(),
+  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 6}).encode(),
+  json.dumps({"version": 4, "auto_resume": True}).encode(), json.dumps({"version": 4, "ti_steer_700": True}).encode(),
+  json.dumps({"version": 5, "auto_resume": 1}).encode(), json.dumps({"version": 5, "ti_steer_700": "on"}).encode(),
+  json.dumps({"version": 5, "auto_resume_after_brake": True}).encode(), json.dumps({"version": 1, "curve_offset_mph": 2}).encode(),
   json.dumps({"version": 2, "speed_limit": "on"}).encode(), json.dumps({"version": 1, "exits": "test"}).encode(),
   json.dumps({"version": 3, "merge": "yes"}).encode(), json.dumps({"version": 3, "limit_offset_mph": 11}).encode(),
   json.dumps({"version": 3, "limit_offset_mph": 2.5}).encode(), json.dumps({"version": 3, "stops": "on"}).encode(),
@@ -68,12 +71,13 @@ def test_encode_roundtrip_is_canonical():
   cfg = C.with_value(C.Config(), "enabled", True)
   cfg = C.with_value(cfg, "curves", "test")
   raw = C.encode(cfg)
-  assert raw == b'{"curves":"test","enabled":true,"version":4}'
+  assert raw == b'{"curves":"test","enabled":true,"version":5}'
   assert C.decode(b'{"curves":"test","enabled":true,"version":1}') == cfg     # a version 1 document still reads
   assert C.decode(b'{"curves":"test","enabled":true,"version":2}') == cfg     # ... and a version 2 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":3}') == cfg     # ... and a version 3 one
+  assert C.decode(b'{"curves":"test","enabled":true,"version":4}') == cfg     # ... and a version 4 one
   assert C.decode(raw) == cfg
-  assert C.encode(C.Config()) == b'{"version":4}'
+  assert C.encode(C.Config()) == b'{"version":5}'
   with pytest.raises(C.ConfigError):
     C.with_value(cfg, "plan_lat", 9.0)
   with pytest.raises(C.ConfigError):
@@ -141,3 +145,18 @@ def test_version_4_stops_and_notices_default_off_and_need_the_master_switch():
   # an older document still reads, with the new options off
   old = C.decode(json.dumps({"version": 3, "enabled": True, "merge": "on"}).encode())
   assert old.presses("merge") and old.stops == "off" and not old.notices
+
+
+def test_version_5_stage3_options_default_off():
+  cfg = C.Config()
+  assert cfg.auto_resume is False and cfg.ti_steer_700 is False
+  assert not cfg.auto_resume_on and not cfg.steer_700_on and not cfg.any_active and not cfg.needs_view
+  # the gas auto-resume needs the master switch; it then runs the speed control and the map view (its map guard)
+  cfg = C.decode(json.dumps({"version": 5, "auto_resume": True}).encode())
+  assert not cfg.auto_resume_on and not cfg.any_active and not cfg.needs_view
+  cfg = C.decode(json.dumps({"version": 5, "enabled": True, "auto_resume": True}).encode())
+  assert cfg.auto_resume_on and cfg.any_active and cfg.needs_view and not cfg.shows_notices
+  # the steering limit test is its own switch (not under the master switch) and starts nothing of the speed control
+  cfg = C.decode(json.dumps({"version": 5, "ti_steer_700": True}).encode())
+  assert cfg.steer_700_on and not cfg.any_active and not cfg.needs_view
+  assert C.encode(cfg) == b'{"ti_steer_700":true,"version":5}'

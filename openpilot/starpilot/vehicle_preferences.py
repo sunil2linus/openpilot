@@ -9,6 +9,16 @@ from openpilot.starpilot.car.tesla.radar_settings import RadarSettings
 from openpilot.starpilot.car.tesla.pedal_preferences import PedalSettings
 
 
+def mazda_stage3_requested(params) -> tuple[bool, bool]:
+  """(auto resume, TI steering 700) from the Mazda speed control setting; an invalid or unreadable one: both off."""
+  try:
+    from openpilot.starpilot.car.mazda.speed.config import read
+    cfg = read(params)
+    return bool(cfg.valid and cfg.auto_resume_on), bool(cfg.valid and cfg.steer_700_on)
+  except Exception:
+    return False, False
+
+
 def bolt_disable_supported(cp) -> bool:
   from opendbc.car.gm.values import is_bolt_cc_profile, is_bolt_pedal_profile, is_bolt_pedal_stock_denied
   identities = ("CHEVROLET_BOLT_CC_2017", "CHEVROLET_BOLT_CC_2018_2021", "CHEVROLET_BOLT_CC_2022_2023",
@@ -51,6 +61,10 @@ class VehicleStartupPreferences:
   vw_stock_long: bool = field(default=False, kw_only=True)
   # Mazda Gen1 + MoreTorque Torque Interceptor: a hardware declaration, so it does not depend on SafeMode
   mazda_torque_interceptor: bool = field(default=False, kw_only=True)
+  # Mazda Stage 3 panda bits from the Mazda speed control setting (MazdaSpeedControlConfig): the gas auto-resume window
+  # and the TI steering limit test 700 (opendbc/car/mazda/speed_flags.py)
+  mazda_auto_resume: bool = field(default=False, kw_only=True)
+  mazda_ti_steer_700: bool = field(default=False, kw_only=True)
 
   @classmethod
   def read(cls, params, *, enabled: bool):
@@ -69,6 +83,7 @@ class VehicleStartupPreferences:
       mazda_ti = read_saved(params, "TorqueInterceptorEnabled", 8) == (b"1", True)
     except (OSError, TypeError, ValueError):
       mazda_ti = False
+    mazda_auto_resume, mazda_steer_700 = mazda_stage3_requested(params)
     try:
       raw_radar, radar_readable = read_saved(params, "HondaBoschARadar", 8)
       honda_radar = radar_readable and raw_radar in (None, b"1")
@@ -93,6 +108,7 @@ class VehicleStartupPreferences:
                             readable and safe in (None, b"0"))
     except (OSError, TypeError, ValueError):
       return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
+                 mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700,
                  subaru_smoothing=smoothing, disable_bolt_long=disable_bolt, honda_bosch_a_radar=honda_radar, tesla_preap_stock=preap_stock,
                  tesla_preap_radar=radar, tesla_preap_pedal=pedal,
                  gm_camera_pedal=False, toyota_filter=False)
@@ -113,6 +129,7 @@ class VehicleStartupPreferences:
                        read_saved(params, "TeslaCoopSteering", 8) == (b"1", True))
     screen_brake = read_saved(params, 'TeslaAOLDisengageOnBrake', 8) == (b'1', True)
     return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
+               mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700,
                subaru_smoothing=smoothing, subaru_avh_startup=bool(enabled and readable and safe in (None, b"0") and
                     read_saved(params, "IsReleaseBranch", 8) in ((None, True), (b"0", True)) and
                     read_saved(params, "SubaruAvhStartup", 8) == (b"1", True)),
@@ -206,6 +223,8 @@ class VehicleStartupPreferences:
     self._prepare_honda_radar(cp)
     from opendbc.car.mazda.torque_interceptor import prepare as prepare_mazda_ti
     prepare_mazda_ti(cp, self.mazda_torque_interceptor)
+    from opendbc.car.mazda.speed_flags import prepare as prepare_mazda_speed_flags
+    prepare_mazda_speed_flags(cp, auto_resume_requested=self.mazda_auto_resume, steer_700_requested=self.mazda_ti_steer_700)
     from opendbc.car.chrysler.brake_hold import apply_brake_hold
     apply_brake_hold(cp, self.jeep_brake_hold)
     if not self.toyota_filter:

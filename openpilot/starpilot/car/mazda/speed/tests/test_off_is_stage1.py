@@ -58,7 +58,12 @@ def no_files(monkeypatch):
                                  b'{"version":3,"enabled":true,"stops":"on"}',
                                  b'{"version":4,"enabled":false,"stops":"on","notices":true,"notice_sound":true}',
                                  b'{"version":4,"enabled":true,"notices":true,"notice_sound":true}',
-                                 b'{"version":4,"enabled":true,"stops":"maybe"}'])
+                                 b'{"version":4,"enabled":true,"stops":"maybe"}',
+                                 # (Stage 3) the gas auto-resume without the master switch, the steering test alone
+                                 # (not a speed feature), a Stage 3 field in a version 4 document
+                                 b'{"version":5,"enabled":false,"auto_resume":true}',
+                                 b'{"version":5,"ti_steer_700":true}', b'{"version":5,"enabled":true,"ti_steer_700":true}',
+                                 b'{"version":4,"enabled":true,"auto_resume":true}'])
 def test_off_returns_the_same_frames_and_makes_nothing(raw, no_files):
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)

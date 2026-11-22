@@ -2,7 +2,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS, MazdaFlags, TI_STATE
+from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS, MazdaFlags, MazdaSafetyFlags, TI_STATE
 from opendbc.car.mazda.stock_aol import qualified
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -10,6 +10,14 @@ ButtonType = structs.CarState.ButtonEvent.Type
 DASHBOARD_CARS = frozenset(CAR)
 # Gen1 alone (stock) or Gen1 with a Torque Interceptor: both have the same camera.
 DASHBOARD_FLAGS = (int(MazdaFlags.GEN1), int(MazdaFlags.GEN1 | MazdaFlags.TORQUE_INTERCEPTOR))
+CRZ_INFO_STALE = 20             # carstate updates (0.2 s; CRZ_INFO comes at 50 Hz): an older value is "not allowed"
+
+
+def _safety_param(CP) -> int:
+  try:
+    return int(CP.safetyConfigs[0].safetyParam)
+  except (AttributeError, IndexError, TypeError, ValueError):
+    return 0
 
 
 class DashboardCameraParser(CANParser):
@@ -47,6 +55,13 @@ class CarState(CarStateBase):
     self.decel_button = 0
     self.cancel_button = 0
     self.dashboard_stop_sign = None
+    # Gas auto-resume (Stage 3, only with MazdaSafetyFlags.AUTO_RESUME in the safety param): the radar's CRZ_INFO
+    # ACC_SET_ALLOWED (the car would take RES / SET now) and CRZ_CTRL byte 4 non-zero (the cruise cannot be set)
+    self.auto_resume = bool(_safety_param(CP) & MazdaSafetyFlags.AUTO_RESUME)
+    self.crz_set_allowed = False
+    self.crz_not_allowed = False
+    self.crz_info_ts = 0
+    self.crz_info_age = 10_000
 
     # Torque Interceptor (TI) state, from TI_FEEDBACK on bus 1
     self.torque_interceptor = bool(CP.flags & MazdaFlags.TORQUE_INTERCEPTOR)
@@ -166,6 +181,15 @@ class CarState(CarStateBase):
     self.crz_cancel = cp.vl["CRZ_BTNS"]["CAN_OFF"] == 1
     self.lkas_blocked = lkas_blocked
     self.radar_has_lead = cp.vl["CRZ_CTRL"]["RADAR_HAS_LEAD"] == 1
+    if self.auto_resume:
+      # CRZ_INFO (0x21B, the radar, bus 0, 50 Hz) is registered as not required (get_can_parsers): a missing one never
+      # makes canValid false; a value not refreshed for CRZ_INFO_STALE updates reads "not allowed". ACC_SET_ALLOWED is 0
+      # while the brake is down and for up to ~10 s at a standstill after it (the owner's logs): a "not now".
+      ts = cp.ts_nanos["CRZ_INFO"]["ACC_SET_ALLOWED"]
+      self.crz_info_age = 0 if (ts and ts != self.crz_info_ts) else self.crz_info_age + 1
+      self.crz_info_ts = ts
+      self.crz_set_allowed = cp.vl["CRZ_INFO"]["ACC_SET_ALLOWED"] == 1 and ts > 0 and self.crz_info_age < CRZ_INFO_STALE
+      self.crz_not_allowed = cp.vl["CRZ_CTRL"]["CRZ_BYTE_4"] != 0
 
     # camera signals
     self.cam_lkas = cp_cam.vl["CAM_LKAS"]
@@ -202,8 +226,10 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
+    # gas auto-resume (Stage 3): CRZ_INFO is parsed only with its safety bit, as not required (NaN: never in canValid)
+    pt_messages = [("CRZ_INFO", float('nan'))] if _safety_param(CP) & MazdaSafetyFlags.AUTO_RESUME else []
     parsers = {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, 0),
       Bus.cam: (DashboardCameraParser(DBC[CP.carFingerprint][Bus.pt])
                 if CP.brand == 'mazda' and CP.carFingerprint in DASHBOARD_CARS and
                 int(CP.flags) in DASHBOARD_FLAGS and not CP.notCar
