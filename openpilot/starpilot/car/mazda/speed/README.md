@@ -8,7 +8,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 
 | module | job | origin |
 |---|---|---|
-| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 5; 1-4 still read): strict decode, bounds, defaults (all off) | new |
+| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 7; 1-6 still read): strict decode, bounds, defaults (all off) | new |
 | `cruise_model.py` | measured MRCC response, dash offset, the one braking envelope, undershoot, LKAS floor | new |
 | `car_profile.py` | per-car learned button latency + hold overrun (same file as the old fork) | ported |
 | `actuator.py` | ONE button actuator: taps, phase-locked holds, attribution, "his buttons win" | rewritten, old rules |
@@ -214,19 +214,25 @@ it) for at most 2 s. Notices need the master switch and at least one feature Tes
 
 ## Part (t): the Bookmark tag
 
-The speed control's private SubMaster also reads `userBookmark` (only while the speed control runs). Each new one
-writes a `tag` line into the event log: wall time, `CurrentRoute` (the route name, no position), seconds since the
+The speed control's private SubMaster also reads `userBookmark` (only while the speed control runs: any feature Test
+/ On, or the Tag button setting). Each new one writes a `tag` line into the event log: wall time, `CurrentRoute` (the route name, no position), seconds since the
 drive started (+ an approximate segment), vEgo, set, anchor, owner, the plan (and its test-mode side), each
 contributor's state and proposal, the view summary (GPS state, trust, road class, link, ramp, curve / exit counts,
 whether a road name is present - not the name), the lead, and our button presses of the last 10 s. With notices on,
 "Tagged" shows.
 
-**Put the Bookmark button on the onroad screen (7.0, comma 3X / tizi, e.g. the Konik A1M):** while driving (a drive
-started, no alert on screen), tap the small round **Quick Select** button in the bottom-left corner of the driving
-screen (or swipe up-right from that corner); the Quick Select shelf opens with three slots. Tap an empty slot, then
-choose **Bookmark** in the picker (8 per page: Next / Previous). From then on one tap on that slot saves a bookmark
-(7.0 shows "Bookmark Saved") and writes our tag. (7.0's small corner bookmark icon is the comma four / compact
-screen's only; on tizi Quick Select is the way. Galaxy lists Bookmark but cannot press it.)
+**The TAG button (Large screen: comma 3X / tizi, e.g. the Konik A1M):** parked, in the Mazda speed control rows turn
+on **Tag button on the driving screen** (the master switch must be on; no other option is needed). While driving a
+TAG pill (208 x 112 px) shows at the top left, directly under the set speed / speed limit group, left-aligned with it
+(default layout: x 88, y 400; it sits 16 px under the lowest thing that group can draw - its card, the sign, the
+speed limit confirmation and its Accept / Reject prompt - and slides right or lower when another enabled widget is in
+the way, e.g. right of the CEM road gauge when the speed-limit sources row makes the group taller; mirrored to the
+right with right-hand drive). One tap saves one bookmark through the same Bookmark action Quick Select runs (7.0
+shows "Bookmark Saved"; the pill flashes SAVED) and writes our tag. It stays on screen during alerts and our
+notices; it hides while Quick Select is open. With only the master switch and this setting on, the speed control runs
+"tag only": it writes the tag lines and never presses a button (no car profile, no notices). The setting is
+`tag_button` in `MazdaSpeedControlConfig` (version 7); the button is `ui/mazda_tag_button.py` (Quick Select's
+Bookmark slot still works too).
 
 Tools (over ssh, parked):
 `python -m openpilot.starpilot.car.mazda.speed.tag_tool list` lists the tags with times;

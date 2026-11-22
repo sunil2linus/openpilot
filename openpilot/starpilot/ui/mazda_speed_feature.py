@@ -50,11 +50,14 @@ SUB_ROWS = (
    "You brake. A far guess above 45 mph only taps 1-3 mph down. Test warns without pressing.", 0.),
   ("notices", "On-screen notices",
    "Short notices on the driving screen: curve, exit ramp, stop ahead, stopped car, speed limit, merge, GPS and " +
-   "the car's camera. Stock alerts always come first. Tag: put Bookmark in a Quick Select slot (driving: tap the " +
-   "small round button in the bottom-left corner, tap an empty slot, choose Bookmark); a tap on it saves a tag " +
-   "in the speed control's log.", 0.),
+   "the car's camera. Stock alerts always come first. A tag (the Tag button below) shows \"Tagged\".", 0.),
   ("notice_sound", "Notice chime",
    "A short chime with the stop ahead, stopped car, exit ramp brake and camera fault notices.", 0.),
+  ("tag_button", "Tag button on the driving screen",
+   "Shows a TAG button on the driving screen, top left, under the set speed and speed limit. One tap saves " +
+   "a bookmark (\"Bookmark Saved\") and a tag line with what the speed control saw in its log, also when every " +
+   "other option here is off (it then never presses a button). It stays on screen during alerts; it hides while " +
+   "Quick Select is open.", 0.),
   ("auto_resume", "Resume after brake (gas)",
    "After your brake turns the cruise off (main switch still on), pressing the gas makes StarPilot press RES, so the " +
    "cruise comes back at your set speed. Only on a public road matched on the offline map with a good GPS position, " +

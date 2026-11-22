@@ -10,8 +10,8 @@ Rules:
   * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
     version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan, version 4 the stop
     slowdown and the on-screen notices (+ their sound), version 5 (Stage 3) the gas auto-resume and the steering
-    limit test, version 6 the curve map build range. A field of a later version in an older document is invalid
-    (unknown fields are invalid).
+    limit test, version 6 the curve map build range, version 7 the Tag button on the driving screen. A field of a
+    later version in an older document is invalid (unknown fields are invalid).
   * Stage 3: `auto_resume` (with the master switch) and `ti_steer_700` (without it: it is a steering setting, used only
     with the Torque Interceptor) also set panda safety param bits at car start (vehicle_preferences.py ->
     opendbc/car/mazda/speed_flags.py), so they apply from the next drive (the next car start).
@@ -22,9 +22,9 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 6                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
-VERSIONS = (1, 2, 3, 4, 5, 6)   #    merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700;
-                                #    6: + curve_range_mi (older documents still read)
+VERSION = 7                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3, 4, 5, 6, 7)  # merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700;
+                                #    6: + curve_range_mi; 7: + tag_button (older documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -51,12 +51,14 @@ SCHEMA = {
   "auto_resume": ("bool", False, None),             # (v5) after his brake, his gas presses RES for him (auto_resume.py)
   "ti_steer_700": ("bool", False, None),            # (v5) TI steering limit test 600 -> 700 (not under the master switch)
   "curve_range_mi": ("choice", 100, CURVE_RANGES),  # (v6) the parked curve-map builder's range (curve_mapd.py), 0 = all
+  "tag_button": ("bool", False, None),              # (v7) a TAG button on the driving screen (a Bookmark: our tag line)
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
 V4_FIELDS = frozenset(("stops", "notices", "notice_sound"))
 V5_FIELDS = frozenset(("auto_resume", "ti_steer_700"))
 V6_FIELDS = frozenset(("curve_range_mi",))
+V7_FIELDS = frozenset(("tag_button",))
 
 
 class ConfigError(ValueError):
@@ -83,6 +85,7 @@ class Config:
   auto_resume: bool = False
   ti_steer_700: bool = False
   curve_range_mi: int = 100
+  tag_button: bool = False
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -116,6 +119,12 @@ class Config:
   def any_active(self):
     return self.enabled and (any(self.mode(n) != "off" for n, (k, _, _) in SCHEMA.items() if k == "mode") or
                              self.auto_resume)
+
+  @property
+  def tag_on(self):
+    """(v7) the Tag button on the driving screen: the master switch and its own switch. It also runs the speed
+    control's event log for the tag lines when no other feature is on (caller.make: tag only, it never presses)."""
+    return bool(self.enabled and self.tag_button)
 
   @property
   def auto_resume_on(self):
@@ -162,7 +171,7 @@ def decode(raw):
     raise ConfigError("version")
   if ((doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)) or
       (doc["version"] < 4 and V4_FIELDS & set(doc)) or (doc["version"] < 5 and V5_FIELDS & set(doc)) or
-      (doc["version"] < 6 and V6_FIELDS & set(doc))):
+      (doc["version"] < 6 and V6_FIELDS & set(doc)) or (doc["version"] < 7 and V7_FIELDS & set(doc))):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():

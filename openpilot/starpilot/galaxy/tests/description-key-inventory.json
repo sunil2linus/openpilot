@@ -451,5 +451,6 @@
   "mazda_speed:notices",
   "mazda_speed:notice_sound",
   "mazda_speed:auto_resume",
-  "mazda_speed:ti_steer_700"
+  "mazda_speed:ti_steer_700",
+  "mazda_speed:tag_button"
 ]

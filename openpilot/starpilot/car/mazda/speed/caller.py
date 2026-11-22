@@ -9,6 +9,10 @@ Also here (part H / T): the on-screen notices (notices.py, only with `notices` o
 userBookmark (the onroad Bookmark button, read through the private SubMaster) one "tag" line with a snapshot of the
 speed control goes into the event log (never a position) and, with notices on, a short "Tagged" notice.
 
+Tag only (v7 `tag_button` with the master switch, every other feature off): the speed control runs only for the tag
+lines (the Tag button on the driving screen, ui/mazda_tag_button.py, sends the same userBookmark): no contributor,
+no car profile, no notices, and it never presses (the command is always None).
+
 Stage 3: the gas auto-resume (auto_resume.py, only with `auto_resume` on AND its panda bit in this drive's safety param,
 opendbc/car/mazda/speed_flags.py): its logic runs every frame next to the planner; its RES goes out through the same
 actuator (its RES path for the cruise off) and the same frame builder, never through a second sender.
@@ -59,6 +63,7 @@ class SpeedControl:
     self.CP = CP
     self.cfg = cfg
     self.auto_resume = auto_resume   # (Stage 3) auto_resume.AutoResumeLogic, or None
+    self.tag_only = bool(cfg.tag_on and not cfg.any_active)   # (v7) only the tag lines: never a press
     self.ar_road = None
     self.ar_key = None
     self.ar_key_t = 0.0
@@ -161,7 +166,7 @@ class SpeedControl:
     for why, before, after in self.planner.changes:
       self._log("anchor", why=why, before=before, after=after)
     self.last_reason = plan.reason
-    command = plan.command if d["engaged"] else None
+    command = plan.command if d["engaged"] and not self.tag_only else None
     want_res = self._auto_resume(d, ctx, now)
     busy = bool(self.auto_resume is not None and self.auto_resume.busy and not want_res)
     act = self.actuator.update(ActInputs(cruise_enabled=d["cruise_enabled"], set_speed=d["set_speed"], v_ego=d["v_ego"],
@@ -304,13 +309,14 @@ def make(card):
   """SpeedControl for this drive, or False (off: the Stage 1 drive)."""
   try:
     cfg = C.read(card.params)
-    if not cfg.any_active or not eligible(card.CP):
+    if not (cfg.any_active or cfg.tag_on) or not eligible(card.CP):
       return False
     from openpilot.starpilot.car.mazda.speed.car_profile import CarProfile
     from openpilot.starpilot.car.mazda.speed.events import EventLog
     from opendbc.car.mazda.values import MazdaFlags
     log = EventLog()
-    profile = CarProfile(fingerprint=str(card.CP.carFingerprint), ti=bool(int(card.CP.flags) & int(MazdaFlags.TORQUE_INTERCEPTOR)))
+    profile = None if not cfg.any_active else CarProfile(fingerprint=str(card.CP.carFingerprint),   # (tag only: none)
+                                                          ti=bool(int(card.CP.flags) & int(MazdaFlags.TORQUE_INTERCEPTOR)))
     from openpilot.starpilot.car.mazda.speed.contributors import build
     memory = None
     if cfg.active("curves"):

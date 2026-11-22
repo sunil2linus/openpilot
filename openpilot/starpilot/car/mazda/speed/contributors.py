@@ -175,7 +175,7 @@ def build(cfg, CP, log=None, memory=None, metric=False, auto_resume=False):
   if cfg.active("stops"):
     from openpilot.starpilot.car.mazda.speed.stops import StopSlowdown
     out.append(StopSlowdown(cfg, presses=cfg.presses("stops"), metric=metric))
-  if not out and not auto_resume:
+  if not out and not auto_resume and not cfg.tag_on:
     return [], None
   return out, Sources(want_model=bool(out), want_view=cfg.needs_view, map_presses=cfg.presses("curves"),
                       want_slc=any(cfg.active(n) for n in ("speed_limit", "merge", "exits")),

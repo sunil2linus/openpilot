@@ -302,6 +302,12 @@ class StarShellSession:
     if profile == Profile.LARGE:
       self.favorites.prepare()
       self.view.onroad.quick_select_layer = lambda _content, _state: self.favorites.render(time.monotonic())
+    self.tag_button = None
+    if profile == Profile.LARGE:  # (Mazda speed control: the TAG button, mazda_tag_button.py)
+      from openpilot.starpilot.car.mazda.speed.config import read as read_mazda_speed
+      from openpilot.starpilot.ui.mazda_tag_button import TagButton
+      self.tag_button = TagButton(self._tag_bookmark, lambda: read_mazda_speed(ui_state.params), lambda: ui_state.CP)
+      self.view.onroad.tag_layer = lambda _content, state: self.tag_button.render(self.fonts, state, time.monotonic())
     self._favorite_snapshot = None
     self._favorite_data = None
     self._favorite_read_at = None
@@ -340,6 +346,11 @@ class StarShellSession:
                       state.appearance.camera_view in (CameraViewChoice.NONE, CameraViewChoice.DRIVER))
     alert_allowed = state.alert.size == AlertSize.NONE or allow_personality_notice and is_personality_notice(state.alert)
     return bool(state.camera_available and alert_allowed and camera_allowed)
+
+  def _tag_bookmark(self) -> bool:
+    """The TAG button's tap: the same Bookmark action Quick Select runs (bookmarkButton + userBookmark)."""
+    binding = self._native_favorite_actions().get(BOOKMARK)
+    return bool(binding is not None and binding.available and binding.invoke is not None and binding.invoke())
 
   def _bookmark_authority(self) -> bool:
     if (getattr(ui_state, "replay_clock", None) is not None or
@@ -1738,8 +1749,14 @@ class StarShellSession:
     self._favorite_claimed = False
     self._navigation_claimed = False
     self._onroad_claimed = False
+    self._tag_claimed = False
     if mode == ShellMode.ONROAD:
       self._update_favorites(snapshot.onroad, now)
+      tag = getattr(self, "tag_button", None)
+      if tag is not None and not self.favorites.is_open and tag.press(x, y, now):
+        self._tag_claimed = True
+        self.input.cancel()
+        return
       if self.favorites.is_open or self.favorites.claims_corner(x, y):
         self._favorite_claimed = self.favorites.press(x, y, now)
         self.input.cancel()
@@ -1761,6 +1778,9 @@ class StarShellSession:
       if snapshot := self._settings_gesture_snapshot():
         self.input.move(x, y, timestamp, snapshot)
       return
+    if getattr(self, "_tag_claimed", False):
+      self.tag_button.move(x, y)
+      return
     if getattr(self, "_navigation_claimed", False):
       self.view.onroad.navigation.move(x, y, self.snapshot(mode).onroad)
       return
@@ -1778,6 +1798,10 @@ class StarShellSession:
       if snapshot is not None:
         self.input.release(x, y, timestamp, snapshot)
       return self._request_emitted
+    if getattr(self, "_tag_claimed", False):
+      self._tag_claimed = False
+      self.tag_button.release(x, y, time.monotonic())
+      return True
     if getattr(self, "_navigation_claimed", False):
       self._navigation_claimed = False
       self.view.onroad.navigation.release(x, y, self.snapshot(mode).onroad)
@@ -1802,6 +1826,9 @@ class StarShellSession:
     self._lane_change_request_epoch = getattr(self, "_lane_change_request_epoch", 0) + 1
     self.input.cancel()
     self.favorites.cancel()
+    if (tag := getattr(self, "tag_button", None)) is not None:
+      tag.cancel()
+    self._tag_claimed = False
     self.view.onroad.navigation.cancel()
     self._navigation_claimed = False
     self._favorite_claimed = False

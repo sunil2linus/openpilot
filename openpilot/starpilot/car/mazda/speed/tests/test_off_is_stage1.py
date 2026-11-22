@@ -63,7 +63,10 @@ def no_files(monkeypatch):
                                  # (not a speed feature), a Stage 3 field in a version 4 document
                                  b'{"version":5,"enabled":false,"auto_resume":true}',
                                  b'{"version":5,"ti_steer_700":true}', b'{"version":5,"enabled":true,"ti_steer_700":true}',
-                                 b'{"version":4,"enabled":true,"auto_resume":true}'])
+                                 b'{"version":4,"enabled":true,"auto_resume":true}',
+                                 # (v7) the Tag button without the master switch, or in a version 6 document
+                                 b'{"version":7,"enabled":false,"tag_button":true}',
+                                 b'{"version":6,"enabled":true,"tag_button":true}'])
 def test_off_returns_the_same_frames_and_makes_nothing(raw, no_files):
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)

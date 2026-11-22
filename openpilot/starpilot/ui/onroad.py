@@ -449,6 +449,8 @@ class OnroadView:
       if not ordered and (pip_layer := self._legacy_pip_layer(state)) is not None:
         pip_layer(content, state)
       self.alert.render(content, state.alert)
+      if not self.projection_viewport and (tag_layer := getattr(self, 'tag_layer', None)) is not None:
+        tag_layer(content, state)  # over the alerts: the Mazda TAG button (mazda_tag_button.py)
     finally:
       clip.end_scissor_mode()
     if not self.projection_viewport and state.appearance.show_developer_sidebar:

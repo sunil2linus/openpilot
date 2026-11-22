@@ -72,7 +72,7 @@ def test_master_off_by_default_confirmed_on_and_sub_options():
     assert "cannot stop the car" in shown[PREFIX + 'stops'].reason and "You brake" in shown[PREFIX + 'stops'].reason
     for k in ('notices', 'notice_sound'):
       assert shown[PREFIX + k].value == 'Off' and shown[PREFIX + k].choices == ('Off', 'On')
-    assert "Bookmark" in shown[PREFIX + 'notices'].reason and "Quick Select" in shown[PREFIX + 'notices'].reason
+    assert "Tag button" in shown[PREFIX + 'notices'].reason and "Quick Select" not in shown[PREFIX + 'notices'].reason
     assert owner.apply(row_change(shown[PREFIX + 'notices']))
     assert C.read(saved).notices is True and C.read(saved).stops == 'off'
     assert owner.apply(row_change({r.key: r for r in rows(owner)}[PREFIX + 'stops']))
@@ -105,7 +105,7 @@ def test_invalid_document_is_off_and_repairable():
     request = row_change(shown[0])
     assert not owner.apply(replace(request, value='On'))
     assert owner.apply(request)
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":6}'
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":7}'
     assert [r.key for r in rows(owner)] == [MASTER, PREFIX + 'ti_steer_700']
 
 
@@ -233,7 +233,7 @@ def test_curve_map_build_range_row(monkeypatch):
       row = {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi']
       assert owner.apply(row_change(row))
       assert C.read(saved).curve_range_mi == miles
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"enabled":true,"version":6}'
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"enabled":true,"version":7}'
     row = {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi']
     assert owner.apply(row_change(row, -1))
     assert C.read(saved).curve_range_mi == 50 and {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi'].value == '50 mi'
