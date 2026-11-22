@@ -4,7 +4,7 @@ change): the curve profiles ahead on the matched road as [distance ahead (m), ra
 time, the GPS trust state and the matched road's class. card (curve_plan.py) moves the points by the distance it
 drove since that time.
 
-Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename) at the GPS rate (10 Hz):
+Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename) at the GPS rate (1 Hz qcomgpsd .. 10 Hz ubloxd):
   {"v": 2, "t": monotonic s of the position (the GPS sample minus GPS_LAG), "gps": "ok" | "none" (no GPS position),
    "trust": GpsTrust status (0 ok ...), "start_ok": bool, "held": bool, "matched": bool, "cls": road class,
    "link": bool, "data": bool (curve files cover here), "chain": matched road (chain id, 0 none), "acc": GPS error m,
@@ -22,7 +22,8 @@ The GPS: both services 7.0's GPS daemons publish, gpsLocation (qcomgpsd: comma 3
 gpsLocationExternal (ubloxd); the newest valid fix wins (7.0's own rule, starpilot/gps/source.select_source, without
 its 25 m accuracy cut: GpsTrust pauses on a bad accuracy itself). Both are GpsLocationData: degrees, m/s, degrees,
 m. flags are decoded (GpsTrust's reliability) only for qcomdiag; ublox flags mean something else.
-The reader (read_view) never raises and returns None for a missing, unreadable, other-version or stale view.
+The reader (read_view) never raises and returns None for a missing, unreadable or other-version view; how old a view
+may be is the readers' one rule in view_age.py (alive up to VIEW_ALIVE s after its GPS message).
 
 Exits ahead (part f, the exit plan in exit_plan.py): a ramp record of type exit / interchange whose start lies on the
 matched highway road (within ON_CHAIN of its shape) ahead within EXIT_LOOK; kept (watched) until EXIT_KEEP behind,
@@ -46,11 +47,12 @@ import time
 from openpilot.starpilot.car.mazda.speed import map_match as MM
 from openpilot.starpilot.car.mazda.speed import status as ST
 from openpilot.starpilot.car.mazda.speed.curve_memory import way_place
+from openpilot.starpilot.car.mazda.speed.view_age import GPS_LAG, VIEW_ALIVE
 
 VIEW_PATH = "/dev/shm/mazda_speed_view.json"
 VIEW_VERSION = 2
-GPS_LAG = 0.85                # s: the position is this old when it arrives (0.7-1.0 s measured)
-GPS_STALE = 1.5               # s without a new fix: "none"
+# GPS_LAG (view_age.py): the position is this old when it arrives (0.7-1.0 s measured)
+GPS_STALE = VIEW_ALIVE        # s without a new fix: "none" (as long as a reader keeps a view alive: one missed 1 Hz fix)
 GPS_SERVICES = ("gpsLocationExternal", "gpsLocation")   # ubloxd, qcomgpsd (7.0 runs one of them per device)
 LOOKAHEAD = 1000.0            # m
 START_ACC = 15.0              # m: start-of-drive trust on a matched link needs the GPS error at or below this

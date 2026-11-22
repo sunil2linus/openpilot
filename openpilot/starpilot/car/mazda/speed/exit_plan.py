@@ -8,7 +8,11 @@ match moved onto the ramp (50-150 m past the split). Here the map view (map_view
 start ahead, its side, the ramp's curve profile, the match and the map shapes past the split; this plan decides.
 
 Evidence and decisions, per exit (a fresh plan for each exit: a new link, or the same link whose start moved by
-more than SAME_EXIT, starts with nothing; a stale view is followed by the distance driven and is not a new exit):
+more than SAME_EXIT, starts with nothing; a view that is gone is followed by the distance driven and is not a new exit).
+The view (view_age.py): alive up to VIEW_ALIVE after its GPS message (a 1 Hz GPS); the evidence timers below grow only
+while it is CURRENT and hold (neither grow nor restart) while it is LATE (a missed fix); every confirmation and release
+from the map also needs VIEWS_MIN different views saying it; gone, the plan follows the last view (DEAD_RECKON) with
+silent shapes and no match, as without GPS:
   * Before the split: his blinker toward the exit's side within SIGNAL_REACH of the split (latched for this exit);
     the camera's lane: the car in the lane next to the road edge on that side (LaneView, DECIDE_NEAR); the model path
     bending toward the link near the split (the map's laterals MODEL_AT m ahead; MODEL_SEP apart at least).
@@ -59,9 +63,10 @@ Pure (tests/test_exit_plan.py).
 import math
 
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
-from openpilot.starpilot.car.mazda.speed.curve_plan import point_speed, VIEW_STALE
+from openpilot.starpilot.car.mazda.speed.curve_plan import point_speed
 from openpilot.starpilot.car.mazda.speed.limits import whole_limit
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
+from openpilot.starpilot.car.mazda.speed.view_age import GONE, LATE, ViewClock, ViewCount
 
 MPH, KPH = M.MPH, M.KPH
 TRUST_OK = 0
@@ -95,7 +100,7 @@ BLINKER_GRACE = 1.0         # s his blinker counts as still on after its last on
                             # is the flashing lamp held 0.4 s: flash gaps, a self-cancel at the lane change)
 PASSED = 400.0              # m past the split unresolved: released
 HANDOVER_MAX = 3000.0       # m past the split: a handover not done by then is given up
-DEAD_RECKON = 5.0           # s a plan is followed by the distance driven without a fresh view
+DEAD_RECKON = 5.0           # s a plan is followed by the distance driven without a live view
 HANDOVER_GAP = 10 * MPH     # m/s
 STREET_STEADY = 2.0         # s
 STREET_MAX = (55, 90)       # dash units: a street's limit
@@ -207,6 +212,8 @@ class Plan:
     self.view_t = None          # the last view the split's place was refreshed from
     self.before = None          # his anchor before the handover lowered it (a restore when overturned)
     self.restore = None         # (anchor, until)
+    self.link_n, self.match_n = ViewCount(), ViewCount()           # views saying link / matched on the link
+    self.hwy_n, self.hwy_match_n = ViewCount(), ViewCount()        # views saying highway / matched on it past HWY_MATCH_FROM
     self.blink_t = None         # s of his last exit-side blinker frame before the split (BLINKER_GRACE)
     self.last_target = None     # the plan's target of the frame before (the bound never raises it)
     self.pts = []               # [(odometer m, radius)] of the ramp's profile
@@ -237,6 +244,8 @@ class ExitPlan:
     self.ended = None           # the last plan that ended (logs, tests)
     self.last = None
     self.brake_needed = False
+    self.view_clock = ViewClock()
+    self.live = GONE            # this frame's view state (view_age.py)
 
   # ---- helpers ----
   def lat(self, ctx):
@@ -302,10 +311,15 @@ class ExitPlan:
       self.lanes.update(0.05, ctx.get("lanes"))
     out = Contribution("exit", None, presses=self.presses, kind="handover")
     view = ctx.get("view")
-    fresh = (view is not None and view.get("gps") == "ok" and now - view.get("t", -1e9) <= VIEW_STALE and
-             not view.get("paused"))
-    if fresh:
-      self.good = (view, self.odo - v * max(now - view["t"], 0.0))
+    live = self.view_clock.update(view, now)
+    if live != GONE and view.get("paused"):
+      live = GONE
+    self.live = live
+    alive = live != GONE
+    if alive and (self.good is None or self.good[0]["t"] != view["t"]):
+      self.good = (view, self.odo - v * max(now - view["t"], 0.0))   # a new view: where it was on our odometer
+    elif alive:
+      self.good = (view, self.good[1])
     elif self.good is not None and now - self.good[0]["t"] > DEAD_RECKON:
       self.good = None
     p = self.plan
@@ -317,7 +331,7 @@ class ExitPlan:
       return out
     gview, gt_odo = self.good
     driven = self.odo - gt_odo
-    e = self._exit_in_view(gview, driven) if fresh or p is not None else None
+    e = self._exit_in_view(gview, driven) if alive or p is not None else None
     if e is not None:
       at = gt_odo + e["d"]
       if p is None or p.id != e["id"] or abs(at - p.at) > SAME_EXIT:
@@ -326,10 +340,10 @@ class ExitPlan:
         if p is None or not p.handover or p.id != e["id"]:
           p = self.plan = Plan(e["id"], at, e.get("side", 0))
           p.view_t = gview["t"]
-      elif fresh and gview["t"] != p.view_t and p.at - self.odo > 0.0:
+      elif alive and gview["t"] != p.view_t and p.at - self.odo > 0.0:
         p.at += AT_GAIN * (at - p.at)          # the same exit: its split's place from the new view
         p.view_t = gview["t"]
-      if fresh:
+      if alive:
         p.pts = [(gt_odo + d, r) for d, r in e.get("pts", [])]
         p.hwy, p.spd = bool(e.get("hwy")), float(e.get("spd", 0.0) or 0.0)
         if e.get("side"):
@@ -348,7 +362,7 @@ class ExitPlan:
         return self._restore(ctx, out, now)
       if p.handover and not (p.cancelled or p.handed) and d > -HANDOVER_MAX:
         return self._handover(ctx, out)
-      if d < -PASSED or (e is None and fresh):
+      if d < -PASSED or (e is None and alive):
         self.plan = None
       return out
     # ---- his decisions ----
@@ -371,40 +385,15 @@ class ExitPlan:
         p.v_ref = None
     if 0.0 < d <= DECIDE_NEAR and p.side and self.lanes.edge.get(p.side):
       p.lane = True
-    ex = e if (e is not None and fresh) else {}
-    verdict = self._model_verdict(ctx, ex)
-    if -SAME_EXIT <= d <= MODEL_NEAR and verdict == 2:
-      p.model_link_t += dt
-      if d > 0 and p.model_link_t >= MODEL_CONFIRM - 1e-6:
-        p.model = True
-    else:
-      p.model_link_t = 0.0 if verdict != 2 else p.model_link_t
-    p.model_hwy_t = p.model_hwy_t + dt if verdict == 1 else 0.0
-    sh = ex.get("sh", 0) if ex else 0
-    if sh:
-      p.last_shape = sh
-    if sh == 2:
-      p.quiet_t = p.quiet_m = 0.0
-    elif sh == 0:
-      p.quiet_t += dt
-      p.quiet_m += v * dt
-      p.link_t = max(p.link_t - dt, 0.0)       # scattered "link" frames do not add up
-      if p.quiet_t >= SHAPE_QUIET_T - 1e-6 or p.quiet_m >= SHAPE_QUIET_M:
-        p.link_t = 0.0
-        p.shape_link_seen = False
-        if p.last_shape == 2:
-          p.last_shape = 0                     # an old "link" no longer blocks the release
-    p.link_t = p.link_t + dt if sh == 2 else (0.0 if sh == 1 else p.link_t)
-    p.shape_link_seen = p.shape_link_seen or sh == 2
-    p.hwy_t = p.hwy_t + dt if sh == 1 else (0.0 if sh == 2 else p.hwy_t)
+    ex = e if (e is not None and alive) else {}
+    if live != LATE:
+      self._evidence(p, ctx, ex, gview, d, v, dt)
     trust_ok = bool(ex and gview.get("trust") == TRUST_OK)
     m = ex.get("m", 0) if ex else 0
-    p.match_t = p.match_t + dt if (m == 2 and trust_ok) else 0.0
-    p.hwy_match_t = p.hwy_match_t + dt if (m == 1 and trust_ok and d <= -HWY_MATCH_FROM) else 0.0
     # ---- a confirmation overturned ----
     if p.confirmed and d <= 0.0:
       on_link_now = m == 2 and trust_ok
-      if p.hwy_t >= HWY_CONFIRM - 1e-6 or (p.hwy_match_t >= HWY_MATCH - 1e-6 and p.last_shape != 2):
+      if self._hwy_shapes(p) or self._hwy_match(p):
         return self._overturn(ctx, out, "highway after the confirmation", now)
       if p.gas_t >= GAS_HELD - 1e-6 and not on_link_now:
         return self._overturn(ctx, out, "his gas after the confirmation", now)
@@ -413,10 +402,10 @@ class ExitPlan:
       if p.v_split is None:
         p.v_split, p.split_t = v, now
       if not p.confirmed:
-        if (p.link_t >= LINK_CONFIRM - 1e-6 or p.match_t >= MATCH_CONFIRM - 1e-6 or
+        if ((p.link_t >= LINK_CONFIRM - 1e-6 and p.link_n) or (p.match_t >= MATCH_CONFIRM - 1e-6 and p.match_n) or
             (p.shape_link_seen and p.model_link_t >= MODEL_CONFIRM - 1e-6)):
           p.confirmed = True
-        elif (p.hwy_t >= HWY_CONFIRM - 1e-6 or (p.hwy_match_t >= HWY_MATCH - 1e-6 and p.last_shape != 2) or
+        elif (self._hwy_shapes(p) or self._hwy_match(p) or
               (p.model_hwy_t >= MODEL_CONFIRM - 1e-6 and p.last_shape != 2)):
           self._end("highway")
           self.last = ("released", "highway")
@@ -472,6 +461,55 @@ class ExitPlan:
       p.handover = True
     return self._handover(ctx, out) if p.handover else out
 
+  @staticmethod
+  def _hwy_shapes(p):
+    return p.hwy_t >= HWY_CONFIRM - 1e-6 and bool(p.hwy_n)
+
+  @staticmethod
+  def _hwy_match(p):
+    return p.hwy_match_t >= HWY_MATCH - 1e-6 and bool(p.hwy_match_n) and p.last_shape != 2
+
+  def _evidence(self, p, ctx, ex, gview, d, v, dt):
+    """The evidence timers of this frame (a CURRENT view, or none: silent shapes, no match). Not called while the view
+    is LATE: they hold."""
+    vt = gview["t"]
+    verdict = self._model_verdict(ctx, ex)
+    if -SAME_EXIT <= d <= MODEL_NEAR and verdict == 2:
+      p.model_link_t += dt
+      if d > 0 and p.model_link_t >= MODEL_CONFIRM - 1e-6:
+        p.model = True
+    else:
+      p.model_link_t = 0.0 if verdict != 2 else p.model_link_t
+    p.model_hwy_t = p.model_hwy_t + dt if verdict == 1 else 0.0
+    sh = ex.get("sh", 0) if ex else 0
+    if sh:
+      p.last_shape = sh
+    if sh == 2:
+      p.quiet_t = p.quiet_m = 0.0
+    elif sh == 0:
+      p.quiet_t += dt
+      p.quiet_m += v * dt
+      p.link_t = max(p.link_t - dt, 0.0)       # scattered "link" frames do not add up
+      if p.quiet_t >= SHAPE_QUIET_T - 1e-6 or p.quiet_m >= SHAPE_QUIET_M:
+        p.link_t = 0.0
+        p.shape_link_seen = False
+        if p.last_shape == 2:
+          p.last_shape = 0                     # an old "link" no longer blocks the release
+    p.link_t = p.link_t + dt if sh == 2 else (0.0 if sh == 1 else p.link_t)
+    p.shape_link_seen = p.shape_link_seen or sh == 2
+    p.hwy_t = p.hwy_t + dt if sh == 1 else (0.0 if sh == 2 else p.hwy_t)
+    trust_ok = bool(ex and gview.get("trust") == TRUST_OK)
+    m = ex.get("m", 0) if ex else 0
+    p.match_t = p.match_t + dt if (m == 2 and trust_ok) else 0.0
+    p.hwy_match_t = p.hwy_match_t + dt if (m == 1 and trust_ok and d <= -HWY_MATCH_FROM) else 0.0
+    # the views behind each timer (VIEWS_MIN): counted while it grows, forgotten when it restarts
+    for t, n, said in ((p.link_t, p.link_n, sh == 2), (p.hwy_t, p.hwy_n, sh == 1), (p.match_t, p.match_n, p.match_t > 0.0),
+                       (p.hwy_match_t, p.hwy_match_n, p.hwy_match_t > 0.0)):
+      if t <= 0.0:
+        n.reset()
+      elif said:
+        n.add(vt)
+
   def _bounded(self, p, target):
     """The target with the DIP_MAX bound (the set, true, never more than DIP_MAX under where our slowing began; the
     planner's undershoot taken into account). The bound never raises the plan above its last target: deeper already
@@ -509,11 +547,12 @@ class ExitPlan:
       return out
     ctx["exit_busy"] = True
     view = ctx.get("view")
-    fresh = view is not None and view.get("gps") == "ok" and now - view.get("t", -1e9) <= VIEW_STALE
-    trust_ok = bool(fresh and view.get("trust") == TRUST_OK and view.get("matched"))
+    live = self.view_clock.update(view, now)
+    trust_ok = bool(live != GONE and view.get("trust") == TRUST_OK and view.get("matched"))
     on_link = bool(trust_ok and view.get("link"))
     street = bool(trust_ok and not view.get("link") and view.get("cls") not in (1, 3))
-    p.street_t = p.street_t + self.dt if street else 0.0
+    if live != LATE or not street:
+      p.street_t = p.street_t + self.dt if street else 0.0   # (STREET_STEADY: grows on CURRENT views, holds while LATE)
     if not (on_link or street):
       return out                     # only on a confident match of the ramp or the street
     # (exit_busy: the limit follow waits until the handover is done)

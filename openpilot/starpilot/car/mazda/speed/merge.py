@@ -24,7 +24,9 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
   * His SET- on the link while a curve holds the merge is a curve speed at any speed (it opens again after the
     curve from that speed: the proposal carries it as its band, the planner raises it even above a street's speed,
     e.g. after an interchange loop); his SET- otherwise declines the merge for this link.
-  * The episode (declined, done, his curve speed) is kept across a stale or missing view on the same link for up to
+  * The map view counts while it is alive (view_age.py; a 1 Hz GPS's views included); the steady times (H_STEADY,
+    STREET_END) grow only on CURRENT views and hold while it is LATE (a missed fix).
+  * The episode (declined, done, his curve speed) is kept across a gone or missing view on the same link for up to
     STALE_KEEP / STALE_KEEP_M; it starts over only on another link or after really leaving (the highway HWY_KEEP,
     a street STREET_END, or a longer gap). A one-shot anchor (the end at T, a boost dropped to T, the way down at a
     street) is proposed again until the planner has it (PENDING_MAX), so his change in that frame cannot lose it;
@@ -37,6 +39,7 @@ import math
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
 from openpilot.starpilot.car.mazda.speed.limits import whole_limit
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
+from openpilot.starpilot.car.mazda.speed.view_age import GONE, LATE, ViewClock
 
 MPH, KPH = M.MPH, M.KPH
 TRUST_OK = 0
@@ -57,7 +60,7 @@ LEAD_MIN_SPEED = 13.0            # m/s
 LEAD_CLOSING = 3.0               # m/s
 LEAD_STALE = 0.5                 # s
 TARGET_MAX = (85, 140)
-STALE_KEEP = 15.0                # s without a fresh view on the link: the episode is kept this long ...
+STALE_KEEP = 15.0                # s without a live view on the link: the episode is kept this long ...
 STALE_KEEP_M = 400.0             # m ... or this far
 PENDING_MAX = 2.0                # s a one-shot anchor is proposed again
 
@@ -74,6 +77,7 @@ class Merge:
     self.reset_episode()
     self.t = None
     self.last = None
+    self.view_clock = ViewClock()
 
   def reset_episode(self):
     self.declined = self.done = False
@@ -147,9 +151,11 @@ class Merge:
     self.t = now
     out = Contribution("merge", None, presses=self.presses, kind="merge")
     view = ctx.get("view")
-    fresh = view is not None and view.get("gps") == "ok" and now - view.get("t", -1e9) <= 1.0
-    ramp = (view.get("ramp") or {}) if fresh else {}
-    on_link = bool(fresh and view.get("link") and ramp.get("hwy"))
+    live = self.view_clock.update(view, now)
+    alive = live != GONE             # view_age.py
+    late = live == LATE
+    ramp = (view.get("ramp") or {}) if alive else {}
+    on_link = bool(alive and view.get("link") and ramp.get("hwy"))
     if on_link and ramp.get("id") != self.link:
       pending = self.pending
       self.link = ramp.get("id")
@@ -158,7 +164,7 @@ class Merge:
     if self.link is None:
       self.last = ("idle", None)
       return self._pending(out, ctx, now)
-    if not fresh:
+    if not alive:
       self.stale_t += dt
       self.stale_m += max(v, 0.0) * dt
       if self.stale_t <= STALE_KEEP and self.stale_m <= STALE_KEEP_M:
@@ -168,12 +174,12 @@ class Merge:
     else:
       self.stale_t = self.stale_m = 0.0
     if not on_link:
-      if fresh and view.get("cls") in (1, 3) and not view.get("link"):
+      if alive and view.get("cls") in (1, 3) and not view.get("link"):
         self.hwy_t = (self.hwy_t or 0.0) + dt
         self.street_t = 0.0
-      elif fresh and view.get("matched") and not view.get("link"):
-        self.street_t += dt
-      if (self.hwy_t is not None and self.hwy_t > HWY_KEEP) or self.street_t >= STREET_END or not fresh:
+      elif alive and view.get("matched") and not view.get("link"):
+        self.street_t += 0.0 if late else dt
+      if (self.hwy_t is not None and self.hwy_t > HWY_KEEP) or self.street_t >= STREET_END or not alive:
         end = self.boosting and not self.done
         self.link = None
         self.last = ("ended", None)
@@ -182,7 +188,7 @@ class Merge:
           self._once(min(self.target(self.h), v + M.DASH_OFFSET) if street else self.target(self.h), now)
         return self._pending(out, ctx, now)
     ctx["merge_busy"] = True
-    trust = bool(fresh and (view.get("trust") == TRUST_OK or view.get("start_ok")))
+    trust = bool(alive and (view.get("trust") == TRUST_OK or view.get("start_ok")))
     guards = self.guards(ctx)
     for e in ctx.get("act_events", ()):
       if e.get("kind") == "driver" and e.get("direction") == "SET_MINUS" and on_link:
@@ -195,13 +201,13 @@ class Merge:
     if self.declined or self.done:
       self.last = ("declined" if self.declined else "done", self.h)
       return self._pending(out, ctx, now)
-    h, src = self.highway_limit(ctx, view) if fresh else (None, "")
+    h, src = self.highway_limit(ctx, view) if alive else (None, "")
     if h != self.h:
       if self.h is not None and self.boosting:
         self._once(self.target(self.h), now)     # the target moved: start from the old one
       self.h, self.h_t = h, 0.0
       self.boosting = False
-    elif h is not None:
+    elif h is not None and not (late and trust):
       self.h_t = self.h_t + dt if trust else 0.0
     if self.h is None or self.h_t < H_STEADY - 1e-6:
       self.last = ("wait limit", self.h)

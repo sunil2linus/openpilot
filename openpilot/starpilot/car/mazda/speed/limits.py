@@ -14,8 +14,9 @@ old fork did not follow them either); when 7.0 selected vision, the map / dash r
 Rules (ported from the old fork's speed_limit_follow, written as one contributor):
   * A reading is a limit only as a whole multiple of 5 mph (10 km/h) between LIMIT_MIN and LIMIT_MAX.
   * A new limit must be reported unchanged with clean GPS trust (the map view's trust 0) for the whole steady time
-    (LOWER_STEADY for a lower one, RAISE_STEADY for a higher or first one); a bad-trust frame restarts it. A gap in
-    the readings keeps the last steady limit for LIMIT_KEEP.
+    (LOWER_STEADY for a lower one, RAISE_STEADY for a higher or first one); a bad-trust frame restarts it, and so does
+    a frame without a live map view (view_age.py); while the view is LATE (a missed GPS fix) it holds. A gap in the
+    readings keeps the last steady limit for LIMIT_KEEP.
   * The proposal: the steady limit + limit_offset_mph (dash, whole steps, no margin), at most TARGET_MAX.
     The planner takes it when the anchor is ours (our limit raise, merge, exit handover: re-capped by a lower limit in
     any band), or when he engaged (SET / RES) at a speed within the band of the limit it replaces (the old limit up to
@@ -29,14 +30,16 @@ Rules (ported from the old fork's speed_limit_follow, written as one contributor
     directly: published whenever 7.0's map provider runs, checked as map_observation does), but only a preview
     seen on the current road (a road change, the matched chain, drops it); a preview never holds a lowering.
   * F5 fallback: no GPS position (the map view's "none": ctx no_gps) and the limit unknown, the car at
-    FALLBACK_FROM or more for FALLBACK_AFTER, within FALLBACK_WINDOW of engaging: FALLBACK (43 mph) as a "fallback"
-    proposal (up only). With GPS an untagged street keeps his speed.
+    FALLBACK_FROM or more for FALLBACK_AFTER without a break (any frame with the view alive, a known limit, below
+    FALLBACK_FROM restarts it), within FALLBACK_WINDOW of engaging: FALLBACK (43 mph) as a "fallback" proposal (up
+    only). With GPS an untagged street keeps his speed.
 Pure (tests/test_limits.py).
 """
 import math
 
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
+from openpilot.starpilot.car.mazda.speed.view_age import GONE, LATE, ViewClock
 
 MPH, KPH = M.MPH, M.KPH
 LIMIT_SOURCES = ("map", "dashboard")
@@ -127,6 +130,7 @@ class SpeedLimit:
     self.engaged_t = None
     self.fast_t = 0.0
     self.last = None               # for the log
+    self.view_clock = ViewClock()
 
   def band(self, limit):
     return (limit * self.unit, (limit + max(LIMIT_BAND[self.k], self.offset)) * self.unit)
@@ -139,9 +143,10 @@ class SpeedLimit:
     dt = 0.0 if self.t is None else min(max(now - self.t, 0.0), 0.5)
     self.t = now
     view = ctx.get("view")
-    fresh = view is not None and view.get("gps") == "ok" and now - view.get("t", -1e9) <= 1.0
-    clean = bool(fresh and view.get("trust") == TRUST_OK)
-    chain = view.get("chain", 0) if fresh else None
+    live = self.view_clock.update(view, now)
+    alive = live != GONE
+    clean = bool(alive and view.get("trust") == TRUST_OK)
+    chain = view.get("chain", 0) if alive else None
     for e in ctx.get("act_events", ()):
       if e.get("kind") in ("engaged", "resumed"):
         # match on engage: the band of the steady limit already known (none known: the first one's band, below)
@@ -158,8 +163,8 @@ class SpeedLimit:
       self.last_seen = now
     if raw != self.cand:
       self.cand, self.cand_t = raw, 0.0
-    elif raw is not None:
-      self.cand_t = self.cand_t + dt if clean else 0.0     # restarts at the last bad-trust frame
+    elif raw is not None and not (clean and live == LATE):
+      self.cand_t = self.cand_t + dt if clean else 0.0     # restarts at the last bad-trust frame (holds while LATE)
     if self.cand is not None and self.cand != self.steady:
       need = LOWER_STEADY if self.steady is not None and self.cand < self.steady else RAISE_STEADY
       if self.cand_t >= need - 1e-6:
@@ -174,7 +179,11 @@ class SpeedLimit:
       self.preview = None
     if self.preview is not None and chain is not None and self.preview[1] != chain:
       self.preview = None          # seen on the road before: stale, never holds anything
-    busy = bool(ctx.get("merge_busy") or ctx.get("exit_busy") or (fresh and view.get("link")))
+    busy = bool(ctx.get("merge_busy") or ctx.get("exit_busy") or (alive and view.get("link")))
+    # F5: the fallback's time at speed needs every condition on every frame (no_gps from contributors: view not alive)
+    fallback = bool(self.steady is None and raw is None and ctx.get("no_gps") and self.engaged_t is not None and
+                    now - self.engaged_t <= FALLBACK_WINDOW and not busy)
+    self.fast_t = self.fast_t + dt if (fallback and v >= FALLBACK_FROM) else 0.0
     out = Contribution("speed_limit", None, presses=self.presses, kind="limit")
     if self.steady is not None:
       if busy:
@@ -190,12 +199,9 @@ class SpeedLimit:
       self.last = ("limit", self.steady)
       return out
     # F5: the limit unknown
-    if (raw is None and ctx.get("no_gps") and self.engaged_t is not None and now - self.engaged_t <= FALLBACK_WINDOW
-        and not busy):
-      self.fast_t = self.fast_t + dt if v >= FALLBACK_FROM else 0.0
-      if self.fast_t >= FALLBACK_AFTER - 1e-6:
-        out.anchor, out.kind = FALLBACK[self.k] * self.unit, "fallback"
-        self.last = ("fallback", None)
-        return out
+    if fallback and self.fast_t >= FALLBACK_AFTER - 1e-6:
+      out.anchor, out.kind = FALLBACK[self.k] * self.unit, "fallback"
+      self.last = ("fallback", None)
+      return out
     self.last = ("unknown", None)
     return out

@@ -210,7 +210,9 @@ def test_view_road_and_inputs():
   view = {"v": 2, "t": now - 0.1, "gps": "ok", "trust": 0, "matched": True, "cls": 5, "chain": 42}
   alive, cls, name, age, last, trust = road.update(view, now)
   assert (alive, cls, name, age, last, trust) == (True, 5, "42", 0.0, "42", 0)
-  assert road.update(dict(view, t=now - 0.6), now)[0] is False                  # stale: no map
+  # gone (view_age.py: older than VIEW_ALIVE after its GPS message; the old rule was 0.5 s after the stamp): no map
+  assert road.update(dict(view, t=now - 0.85 - 2.6), now)[0] is False
+  assert road.update(dict(view, t=now - 1.85), now)[0] is True                  # a 1 Hz GPS's view: alive
   assert road.update(dict(view, gps="none"), now)[0] is False
   got = road.update(dict(view, matched=False, t=now + 0.9), now + 1.0)
   assert got[:3] == (True, 0, "") and got[4] == "42" and got[3] == 1.0

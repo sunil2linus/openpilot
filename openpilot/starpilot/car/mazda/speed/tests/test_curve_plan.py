@@ -3,6 +3,7 @@ import math
 
 from openpilot.starpilot.car.mazda.speed import config as C
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
+from openpilot.starpilot.car.mazda.speed import view_age as VA
 from openpilot.starpilot.car.mazda.speed.camera import CameraCurve, CameraVeto, VETO_CONFIRM, REARM_CONFIRM, VETO_MAX_FLIPS
 from openpilot.starpilot.car.mazda.speed.curve_plan import CurvePlan, KEEP_PAST, point_speed
 
@@ -81,7 +82,9 @@ def test_offset_cap_advisory_and_ramp_lateral():
 def test_no_map_stale_held_or_no_gps_gives_no_target():
   plan = CurvePlan(CFG)
   assert target(plan, None) is None
-  assert target(plan, view([[100.0, 80.0]], t=0.0), now=1.5) is None     # stale
+  # gone: older than VIEW_ALIVE after its GPS message (view_age.py; the old rule was 1.0 s after the stamp)
+  assert target(plan, view([[100.0, 80.0]], t=0.0), now=VA.GPS_LAG + VA.VIEW_ALIVE + 0.01) is None
+  assert target(CurvePlan(CFG), view([[100.0, 80.0]], t=0.0), now=1.85) is not None   # a 1 Hz GPS's view: alive
   assert target(plan, view([[100.0, 80.0]], held=True)) is None
   assert target(plan, view([[100.0, 80.0]], gps="none")) is None
 

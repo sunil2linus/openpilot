@@ -12,6 +12,8 @@ The curve contributor: the map's curve profiles ahead (from the map view, map_vi
     curve (entered: its first point behind the car; over: its last point KEEP_PAST behind) is recorded.
   * Mid-curve the target only steps UP with GPS trust OK; otherwise it holds the lowest it had in that curve.
   * The camera's veto (camera.py) drops a curve the camera sees straight through its tight points.
+  * The view is used while it is alive (view_age.py: up to VIEW_ALIVE after its GPS message, a 1 Hz GPS's views
+    included), its points moved by the distance driven since its time.
   * If the view drops out mid-curve, the last good one is followed by the distance driven (DEAD_RECKON): the set speed
     is never raised in a curve just because the GPS went away.
   * The LKAS floor is asked for when the curve's own lowest point speed is at least 30 mph.
@@ -22,11 +24,11 @@ import math
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
 from openpilot.starpilot.car.mazda.speed.curve_memory import MARK_OVER, PassRecorder, apply_memory, curve_key, offset_on
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
+from openpilot.starpilot.car.mazda.speed.view_age import view_alive
 
 MPH = M.MPH
 KEEP_PAST = 18.0              # m a point keeps governing after the car passed it (GPS lag)
-VIEW_STALE = 1.0              # s: an older map view is no map
-DEAD_RECKON = 10.0            # s: when the map view drops out (stale, no GPS, paused, held), the last good view is
+DEAD_RECKON = 10.0            # s: when the map view drops out (not alive: view_age.py; no GPS, paused, held), the last good view is
 DEAD_RECKON_M = 300.0         # m: followed by the distance driven this long / this far, so a curve being slowed for
                               # (or driven) is finished; no new curve can start from it
 ADVISORY_OVER = 10 * MPH
@@ -73,8 +75,7 @@ class CurvePlan:
   def __call__(self, ctx):
     view = ctx.get("view")
     now, v = ctx.get("now", 0.0), ctx.get("v_ego", 0.0)
-    bad = (view is None or view.get("gps") != "ok" or now - view.get("t", -1e9) > VIEW_STALE or
-           view.get("held") or view.get("paused"))
+    bad = not view_alive(view, now) or view.get("held") or view.get("paused")
     if not bad:
       self.good = view
     else:

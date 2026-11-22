@@ -13,7 +13,8 @@ import math
 import time
 
 from openpilot.starpilot.car.mazda.speed.camera import CameraCurve, CameraVeto, model_path
-from openpilot.starpilot.car.mazda.speed.curve_plan import CurvePlan, VIEW_STALE
+from openpilot.starpilot.car.mazda.speed.curve_plan import CurvePlan
+from openpilot.starpilot.car.mazda.speed.view_age import GONE, ViewClock
 
 VIEW_EVERY = 10               # frames (10 Hz) between two reads of the map view file
 MODEL_DT = 0.05
@@ -80,6 +81,7 @@ class Sources:
     self.lead = None
     self.engageable = False
     self.veto = CameraVeto(MODEL_DT)
+    self.view_clock = ViewClock()
 
   def context(self, d):
     """d: the caller's per-frame dict (v_ego, blinker, lkas_blocked, ...). Returns the ctx for contributors."""
@@ -121,7 +123,10 @@ class Sources:
                path_y=self.path_y, lanes=self.lanes, lead=self.lead, engageable=self.engageable,
                slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
                preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None)
-    view_ok = self.view is not None and self.view.get("gps") == "ok" and now - self.view.get("t", -1e9) <= VIEW_STALE
+    # the one rule (view_age.py): the view is alive up to VIEW_ALIVE after its GPS message (a 1 Hz GPS included)
+    live = self.view_clock.update(self.view, now) if self.want_view else GONE
+    view_ok = live != GONE
+    ctx["view_live"], ctx["view_new"] = live, bool(self.want_view and self.view_clock.new)
     ctx["gps_ok"] = view_ok if self.want_view else True
     ctx["no_gps"] = bool(self.want_view and not view_ok)   # F5: no GPS position (the camera-only curve is more careful)
     ctx["veto"] = self.veto

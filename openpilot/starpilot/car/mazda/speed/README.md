@@ -27,6 +27,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `events.py` | JSONL feature-event log under `/data/media/0/mazda_speed/` | simplified |
 | `caller.py` | the hook card.py calls; off = returns the frames list untouched | new |
 | `processes.py` | when the manager runs the two daemons (CarParamsPersistent before the first drive) | new |
+| `view_age.py` | the one rule for how old a map view may be (alive / current / gone), for every reader | new |
 | `status.py` | the two helpers' status files the settings rows read (curve-map build, last drive's GPS) | new |
 | `stops.py` | (g) stop slowdown: stopped car (radard's lead), stop ahead (short model path), dash stop sign, RES restore | ported rules |
 | `notices.py` | (h) card side of the notices: triggers, once-per-event + gap rules, the tmpfs notice file, camera fault | new (+ old MazdaCamNotice) |
@@ -225,7 +226,19 @@ position-like keys are dropped even though the log has none).
   re-read at most every 30 s and decoded only when its bytes change.
 * The view file is a small JSON (curve profile points as distance-ahead + radius at a monotonic timestamp, road
   class, ramp flags, GPS trust state). It is written atomically (tmp + rename) on tmpfs. card reads it at 10 Hz and
-  moves the points by the distance driven since the timestamp; a view older than 0.5 s is "no map".
+  moves the points by the distance driven since the timestamp.
+* **When the view counts (view_age.py, one rule for every reader).** The A1M's GPS (qcomgpsd) gives 1 fix per second;
+  ubloxd up to 10. The view's time is the fix minus GPS_LAG (0.85 s), so the age is counted from the GPS message
+  (`now - (t + GPS_LAG)`). **Alive** up to 2.5 s: one missed 1 Hz fix is fine, a stopped mazda_mapviewd or a lost GPS
+  is "no GPS" within about 2.5-3.4 s (the old fork: 3 s; mazda_mapviewd also writes "none" after 2.5 s without a fix).
+  **Current** for one GPS period after the message (the period seen + 0.25 s, at most 1.5 s). States hold while the
+  view is alive (no_gps / gps_ok, the road, the trust, the exit plan, the merge); places move by the distance driven.
+  Evidence timers (exit link / match / highway, the limit's steady time, the merge's steady times, the exit handover's
+  street) grow only on current frames and hold (no growth, no restart) between current and alive; every map
+  confirmation or release of an exit also needs 2 different views. Older than alive: exactly the old "no GPS".
+  (Before this rule a view older than 1.0 s from its stamp, 0.5 s for the auto-resume, was "no map": with the 1 Hz
+  GPS the view was usable only ~10% of the time, exits never confirmed, the auto-resume never ran and the 43 mph
+  fallback fired with a good fix.)
 * card subscribes to modelV2 / slcState / radarState through a private SubMaster created only when an option that
   needs it is on (card's own subscription list is unchanged). The view file is version 2 (part f: ramp, exits).
 * The button frame is appended after `CI.apply()` and only when that frame has no CRZ_BTNS of its own
@@ -289,7 +302,7 @@ The window closes when the cruise comes on, the main switch goes off, 180 s of m
 is set again. A new brake press never refills the 8 frames; only a new cruise-on -> brake-cancel does. SET+ / SET-
 never pass. **Car side** (`auto_resume.py`, the old fork's rules): armed by his brake cancel (cruise on >= 2 s, no
 cancel of ours / openpilot's / his within 0.5 s, a set speed), his gas held 0.3 s, then RES only on a public road on
-the map view (class 1-12, GPS trust 0, the road unchanged 1 s), the wheel calm (0.5 s; 2 s after > 90 deg), under 10
+the map view (class 1-12, GPS trust 0, the road unchanged 1 s and in 2 views in a row; the view alive, view_age.py), the wheel calm (0.5 s; 2 s after > 90 deg), under 10
 mph only behind a moving car, the car's ACC_SET_ALLOWED, openpilot engageable, nothing else pressing. 4 frames right
 after new wheel frames (CTR = wheel + 1), >= 0.1 s apart; the cruise must be on 0.6 s later; one retry; 8 frames, 170 s
 moving or 800 m at most; openpilot's cancel after it: given up until the cruise comes on by other means.

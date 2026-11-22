@@ -10,7 +10,9 @@ presses RES for him, so the cruise comes back at his set speed. Port of the owne
   B. Map guard (no timer): only on a mapped public road (road class 1 motorway .. 12 residential) with GPS trust 0, AT
      THE SEND, and the road unchanged for MAP_STABLE_TIME before it. 7.0: from the map view (mazda_mapviewd, the same
      file the curve features read): "cls" for the class, "trust" for the GPS trust and the matched road "chain" in place
-     of mapd's road name; a view older than VIEW_STALE is no map. Unknown, other classes or a worse trust: no.
+     of mapd's road name; the view counts while it is alive (view_age.py: up to VIEW_ALIVE after its GPS message, so
+     a 1 Hz GPS works), and the road must also be the same in ROAD_VIEWS views in a row (known and stable, as the old
+     fork's name hold meant). Unknown, other classes or a worse trust: no.
   C. Wheel calm: nothing is sent while turning (|lateral accel| from the wheel angle and the speed >= MERGE_TURN_LAT, the
      wheel winding, or |wheel angle| >= AUTO_RESUME_MAX_ANGLE); calm CALM_TIME first; AUTO_RESUME_BIG_TURN_WAIT after
      the wheel was over AUTO_RESUME_BIG_TURN. The gas may be down during the turn; the press goes out when the wheel
@@ -46,7 +48,6 @@ MERGE_TURN_LAT = 1.0             # m/s^2 (the old fork's curve_slowdown.MergeTur
 MERGE_TURN_RATE = 15.0           # deg/s with |angle| growing
 MERGE_TURN_RATIO = 18.9
 MERGE_TURN_SLIP = 0.001          # s^2/m^2
-VIEW_STALE = 0.5                 # s: an older map view is no map (curve_plan.VIEW_STALE)
 
 ARM_CRUISE_ON = 2.0              # s the cruise was on before his brake
 # the cruise falls 20-40 ms after the brake edge, with the brake still down (16 logged brake cancels): the brake must be
@@ -60,7 +61,8 @@ AUTO_RESUME_BIG_TURN = 90.0      # deg: after a big turn of the wheel wait AUTO_
 AUTO_RESUME_BIG_TURN_WAIT = 2.0  # s since |wheel angle| was last above AUTO_RESUME_BIG_TURN
 MAP_STABLE_TIME = 1.0            # s the road class and road unchanged before a send
 MAP_BLIP = 1.5                   # s: class 0 for less than this, then the same class and road again, is no road change
-ROAD_NAME_HOLD = 5.0             # s (the old fork's mapdOut name hold; the 7.0 view's road is fresh or there is no map)
+ROAD_NAME_HOLD = 5.0             # s (the old fork's mapdOut name hold; the 7.0 view's road is alive or there is no map)
+ROAD_VIEWS = 2                   # views in a row with the same road class and road before a send (a 1 Hz GPS: 1 s)
 ROAD_NAME_FRESH = 4.0            # s
 AUTO_RESUME_CREEP_SPEED = 10 * MS_PER_MPH    # m/s (4.5): slower than this only behind a moving lead
 LEAD_NEAR = 50.0                 # m
@@ -121,11 +123,12 @@ class AutoResumeInputs:
   op_cancel: bool = False         # openpilot asks for CANCEL (CC.cruiseControl.cancel)
   cancel_sent: bool = False       # a CANCEL frame goes out this frame (carcontroller)
   other_button_active: bool = False   # openpilot's RESUME (stop and go) this frame
-  plan_alive: bool = False        # the map view is fresh
+  plan_alive: bool = False        # the map view is alive (view_age.py)
   road_class: int = 0             # the view's road class
   road_name: str = ""             # the view's matched road ("" none)
   road_name_age: float = 0.0      # s since that road was received
   road_name_last: str = ""        # the last road received, however old (compared with the road at his brake)
+  road_views: int = ROAD_VIEWS    # views in a row with this road class and road
   lead_status: bool = False       # radarState.leadOne
   lead_d: float = 0.0             # m
   lead_v: float = 0.0             # m/s
@@ -379,7 +382,7 @@ class AutoResumeLogic:
       return "gas"
     if not self.map_ok(i):
       return "map"
-    if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME):
+    if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME) or int(i.road_views) < ROAD_VIEWS:
       return "road just changed"
     last = str(i.road_name_last or i.road_name or "")
     if not (i.road_name_age <= ROAD_NAME_FRESH or last == self.brake_name):
@@ -479,24 +482,35 @@ class AutoResumeLogic:
 
 class ViewRoad:
   """The map guard's road from the map view file (mazda_mapviewd). update() -> (alive, class, road, age, last road, trust):
-  alive = a fresh view with a GPS position; road = the matched road ("chain", "" unmatched), the stand-in for the old
-  fork's mapd road name; age = s since a matched road was last seen; trust = the view's GpsTrust status (4 unknown)."""
+  alive = the view is alive (view_age.py) with a GPS position; road = the matched road ("chain", "" unmatched), the
+  stand-in for the old fork's mapd road name; age = s since a matched road was last seen; trust = the view's GpsTrust
+  status (4 unknown). `views`: how many views in a row had this road class and road (0 without a live view)."""
   def __init__(self):
     self.last = ""
     self.last_t = None
+    self.clock = None
+    self.key = None
+    self.views = 0
 
   def _age(self, now):
     return 1e9 if self.last_t is None else max(now - self.last_t, 0.0)
 
   def update(self, view, now):
-    fresh = bool(view is not None and view.get("gps") == "ok" and now - float(view.get("t", -1e9)) <= VIEW_STALE)
-    if not fresh:
+    from openpilot.starpilot.car.mazda.speed.view_age import GONE, ViewClock   # (AutoResumeLogic itself stays pure)
+    if self.clock is None:
+      self.clock = ViewClock()
+    if self.clock.update(view, now) == GONE:
+      self.key, self.views = None, 0
       return False, 0, "", self._age(now), self.last, 4
     matched = bool(view.get("matched"))
     road = str(int(view.get("chain", 0) or 0)) if matched else ""
     if road:
       self.last, self.last_t = road, now
     cls = int(view.get("cls", 0) or 0) if matched else 0
+    if (cls, road) != self.key:
+      self.key, self.views = (cls, road), 1
+    elif self.clock.new:
+      self.views += 1
     trust = int(view["trust"]) if view.get("trust") is not None else 4
     return True, cls, road, self._age(now), self.last, trust
 
@@ -521,7 +535,7 @@ def inputs_from(d, ctx, road: ViewRoad, *, wheelbase=2.7, steer_ratio=15.5, slow
     set_allowed=bool(d.get("set_allowed", False)), not_allowed=bool(d.get("not_allowed", False)),
     op_cancel=bool(d.get("op_cancel", False)), cancel_sent=bool(d.get("cancel_sent", False)),
     other_button_active=bool(d.get("op_resume", False)), plan_alive=alive, road_class=cls if alive else 0,
-    road_name=name, road_name_age=age, road_name_last=last,
+    road_name=name, road_name_age=age, road_name_last=last, road_views=road.views if alive else 0,
     lead_status=bool(lead is not None and lead.get("status")), lead_d=float(lead["d"]) if lead is not None else 0.0,
     lead_v=float(lead["v"]) if lead is not None else 0.0, can_valid=bool(d.get("can_valid", False)),
     gps_trust=trust if alive else 4, engageable=bool(ctx.get("engageable", False)), slowdown_busy=bool(slowdown_busy),
