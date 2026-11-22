@@ -40,7 +40,8 @@ def test_master_off_by_default_confirmed_on_and_sub_options():
     groups = {'vehicle': True, 'parked_preferences': True}
     owner = owner_for(saved, ti_cp(), groups)
     shown = rows(owner)
-    assert [r.key for r in shown] == [MASTER] and shown[0].value == 'Off'
+    # (Stage 3) the steering limit test row is shown without the master switch on a TI car
+    assert [r.key for r in shown] == [MASTER, PREFIX + 'ti_steer_700'] and shown[0].value == 'Off'
     assert all(purpose(r) for r in shown)
     request = row_change(shown[0])
     assert request.value == 'On' and MASTER in VEHICLE_BOOL_KEYS and 'SET+' in confirmation_question(request)
@@ -81,7 +82,7 @@ def test_master_off_by_default_confirmed_on_and_sub_options():
     assert owner.apply(replace(row_change(master), confirmation=True))
     cfg = C.read(saved)
     assert not cfg.enabled and cfg.curves == 'test' and not cfg.any_active
-    assert [r.key for r in rows(owner)] == [MASTER]
+    assert [r.key for r in rows(owner)] == [MASTER, PREFIX + 'ti_steer_700']
 
 
 def test_unavailable_while_driving_and_only_for_mazda():
@@ -104,8 +105,8 @@ def test_invalid_document_is_off_and_repairable():
     request = row_change(shown[0])
     assert not owner.apply(replace(request, value='On'))
     assert owner.apply(request)
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":4}'
-    assert [r.key for r in rows(owner)] == [MASTER]
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":5}'
+    assert [r.key for r in rows(owner)] == [MASTER, PREFIX + 'ti_steer_700']
 
 
 def test_speed_limit_merge_and_exit_rows_say_when_the_map_service_will_not_run(monkeypatch):
@@ -157,3 +158,53 @@ def test_rows_show_the_curve_map_build_and_the_last_drives_gps(monkeypatch):
     for k in ("curves", "speed_limit", "merge", "exits"):
       assert "last drive: no GPS position: no message from the GPS" in got[PREFIX + k], got[PREFIX + k]
     assert "curve maps" not in got[PREFIX + "speed_limit"] and "Now:" not in got[PREFIX + "camera_curves"]
+
+
+def test_stage3_rows_confirmed_on_and_the_steering_test_only_with_the_ti():
+  with tempfile.TemporaryDirectory() as d:
+    saved = Params(d)
+    groups = {'vehicle': True, 'parked_preferences': True}
+    owner = owner_for(saved, ti_cp(), groups)
+    # the steering limit test: shown with the master switch off, Off by default, confirmed to turn on
+    steer = {r.key: r for r in rows(owner)}[PREFIX + 'ti_steer_700']
+    assert steer.value == 'Off' and steer.choices == ('Off', 'On') and 'Test only' in steer.reason
+    assert '600 to 700' in steer.reason and 'next drive' in steer.reason
+    request = row_change(steer)
+    assert request.key in VEHICLE_BOOL_KEYS and '700' in confirmation_question(request)
+    assert not owner.apply(request)
+    assert owner.apply(replace(request, confirmation=True))
+    assert C.read(saved).steer_700_on and not C.read(saved).any_active
+    # off needs no question
+    assert owner.apply(row_change({r.key: r for r in rows(owner)}[PREFIX + 'ti_steer_700']))
+    assert not C.read(saved).ti_steer_700
+    # the gas auto-resume: a sub-option of the master switch, confirmed to turn on, says it applies at the next drive
+    master = {r.key: r for r in rows(owner)}[MASTER]
+    assert owner.apply(replace(row_change(master), confirmation=True))
+    ar = {r.key: r for r in rows(owner)}[PREFIX + 'auto_resume']
+    assert ar.value == 'Off' and 'RES' in ar.reason and 'Panda' in ar.reason and 'next drive' in ar.reason
+    request = row_change(ar)
+    assert request.key in VEHICLE_BOOL_KEYS and 'RES' in confirmation_question(request)
+    assert not owner.apply(request)
+    assert owner.apply(replace(request, confirmation=True))
+    assert C.read(saved).auto_resume_on and C.read(saved).any_active
+    # without the TI: no steering test row, and it cannot be turned on
+    stock = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], False, False, False)
+    stock_owner = owner_for(saved, stock, groups)
+    keys = [r.key for r in rows(stock_owner)]
+    assert PREFIX + 'ti_steer_700' not in keys and PREFIX + 'auto_resume' in keys
+    fake = replace(row_change(steer), confirmation=True, expected=Path(saved.get_param_path(C.KEY)).read_bytes(),
+                   capability=('MAZDA_CX5_2022', 'mazda', 'mazda-gen1-speed-buttons'), vehicle_fingerprint='MAZDA_CX5_2022')
+    assert not stock_owner.apply(fake) and not C.read(saved).ti_steer_700
+
+
+def test_rows_stay_with_a_stage3_bit_in_the_saved_carparams():
+  # (Stage 3) the auto-resume bit in the safety param must not hide the Mazda rows (mazda_ti_feature.capable)
+  from opendbc.car.mazda.values import MazdaSafetyFlags
+  with tempfile.TemporaryDirectory() as d:
+    saved = Params(d)
+    cp = CarInterface.get_params(CAR.MAZDA_CX5_2022, gen_empty_fingerprint(), [], False, False, False)
+    cp.safetyConfigs[0].safetyParam = int(MazdaSafetyFlags.AUTO_RESUME)
+    assert [r.key for r in rows(owner_for(saved, cp, {}))] == [MASTER]
+    cp = ti_cp()
+    cp.safetyConfigs[0].safetyParam |= int(MazdaSafetyFlags.AUTO_RESUME | MazdaSafetyFlags.TI_STEER_700)
+    assert [r.key for r in rows(owner_for(saved, cp, {}))] == [MASTER, PREFIX + 'ti_steer_700']

@@ -51,13 +51,26 @@ SUB_ROWS = (
    "in the speed control's log.", 0.),
   ("notice_sound", "Notice chime",
    "A short chime with the stop ahead, stopped car, exit ramp brake and camera fault notices.", 0.),
+  ("auto_resume", "Resume after brake (gas)",
+   "After your brake turns the cruise off (main switch still on), pressing the gas makes StarPilot press RES, so the " +
+   "cruise comes back at your set speed. Only on a public road matched on the offline map with a good GPS position, " +
+   "the wheel straight, under 10 mph only behind a moving car, and only when the car allows it. Your buttons and the " +
+   "brake always win. Needs map curves data (an offline map, curve maps built) and GPS, like the map features. It " +
+   "sets a Panda safety setting when the car starts: change it before you start the car.", 0.),
 )
+# (Stage 3) shown without the master switch, only on a car with the Torque Interceptor: a steering setting
+STEER_700_ROW = ("ti_steer_700", "Steering limit test (700)",
+                 "Test only. With the Torque Interceptor it raises the maximum steering command from 600 to 700 " +
+                 "(the Panda and StarPilot together); the steering for a given curve stays the same, only the most it " +
+                 "may ask for goes up. Watch for steering faults; turn it off if any appear. It sets a Panda safety " +
+                 "setting when the car starts, so a change applies at the next drive (the next car start).")
+CONFIRM_ON = ("enabled", "auto_resume", "ti_steer_700")   # turning these on needs the confirmation question
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
 
 MAP_ROWS = ("speed_limit", "merge", "exits")
-CURVE_FILE_ROWS = ("curves", "merge", "exits")     # use the curve files mazda_curve_mapd builds parked
-GPS_ROWS = ("curves", "speed_limit", "merge", "exits")   # need mazda_mapviewd's GPS position
+CURVE_FILE_ROWS = ("curves", "merge", "exits", "auto_resume")   # use the curve files mazda_curve_mapd builds parked
+GPS_ROWS = ("curves", "speed_limit", "merge", "exits", "auto_resume")   # need mazda_mapviewd's GPS position
 MAP_STATUS_CACHE = 5.0          # s
 
 
@@ -164,6 +177,14 @@ class MazdaSpeedFeature:
       return None
     return (str(cp.carFingerprint), str(cp.brand), 'mazda-gen1-speed-buttons')
 
+  def _ti_car(self):
+    try:
+      from opendbc.car.mazda.torque_interceptor import installed
+      cp = self.vehicle_params()
+      return bool(cp is not None and installed(cp))
+    except Exception:
+      return False
+
   def _source(self):
     raw, readable = read_saved(self.params, C.KEY, C.MAX_BYTES)
     try:
@@ -188,6 +209,10 @@ class MazdaSpeedFeature:
                        reason="Presses the cruise SET+/SET- buttons for curves, speed limits, merges, exits and stops. Off by " +
                        "default; applies at the next drive.",
                        **common)]
+    if self._ti_car():
+      field, label, reason = STEER_700_ROW
+      rows.append(FeatureRow(PREFIX + field, label, _shown(cfg.ti_steer_700), choices=("Off", "On"),
+                             default_value="Off", reason=reason, **common))
     if not cfg.enabled:
       return tuple(rows)
     for field, label, reason, step in SUB_ROWS:
@@ -232,8 +257,10 @@ class MazdaSpeedFeature:
         if field not in C.SCHEMA or cfg is None:
           return False
         value = parse_value(field, request.value)
-        if field == "enabled" and value and not request.confirmation:
-          return False   # turning the button presses on needs the confirmation question
+        if field in CONFIRM_ON and value and not request.confirmation:
+          return False   # turning the button presses (or a Stage 3 Panda setting) on needs the confirmation question
+        if field == "ti_steer_700" and value and not self._ti_car():
+          return False   # only on a car with the Torque Interceptor
         new = C.with_value(cfg, field, value)
       encoded = C.encode(new)
     except C.ConfigError:

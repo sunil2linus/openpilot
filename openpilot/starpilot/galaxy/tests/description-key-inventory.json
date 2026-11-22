@@ -448,5 +448,7 @@
   "mazda_speed:exits",
   "mazda_speed:stops",
   "mazda_speed:notices",
-  "mazda_speed:notice_sound"
+  "mazda_speed:notice_sound",
+  "mazda_speed:auto_resume",
+  "mazda_speed:ti_steer_700"
 ]

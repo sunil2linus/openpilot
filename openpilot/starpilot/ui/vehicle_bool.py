@@ -3,7 +3,7 @@
 VEHICLE_BOOL_KEYS = frozenset(("AlphaLongitudinalEnabled", "SubaruAvhStartup", "SubaruStopStartOff", "SubaruSNG", "SubaruRedneckCruise",
                               "GMPedalLongitudinal", "DisableOpenpilotLongitudinal", "LongPitch", "VoltSNG", "SNGHack", "GMAutoHold", "VoltOnePedalMode",
                               "TeslaCoopSteering", "TeslaAOLScreenTap", "TeslaAOLDisengageOnBrake", "TorqueInterceptorEnabled",
-                              "mazda_speed:enabled",
+                              "mazda_speed:enabled", "mazda_speed:auto_resume", "mazda_speed:ti_steer_700",
                               "RemoteStartBootsComma", "HKGRemoteStartBootsComma", "IgnoreIgnitionLine", "TeslaWakeOnCAN"))
 
 
@@ -49,6 +49,13 @@ def confirmation_question(request):
   if request.key == "mazda_speed:enabled":
     return (f"{verb} Mazda speed control at the next drive? StarPilot then presses the cruise SET+ and SET- buttons " +
             "to slow for curves. Your own button presses, the brake and the gas always win.")
+  if request.key == "mazda_speed:auto_resume":
+    return (f"{verb} the gas auto-resume at the next drive? After your brake turns the cruise off, your gas press " +
+            "makes StarPilot press RES, so the cruise comes back at your set speed. It changes a Panda safety setting " +
+            "when the car starts.")
+  if request.key == "mazda_speed:ti_steer_700":
+    return (f"{verb} the steering limit test at the next drive? This is a test: with the Torque Interceptor it raises " +
+            "the maximum steering command from 600 to 700. Turn it off if a steering fault appears.")
   if request.key == "TeslaCoopSteering":
     return f"{verb} Tesla cooperative steering after the next startup? Light steering input adjusts the assisted steering angle within its limits."
   if request.key == "TeslaAOLScreenTap":

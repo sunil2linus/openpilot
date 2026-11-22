@@ -33,6 +33,8 @@ DESCRIPTIONS = {
   'mazda_speed:stops': 'Takes speed off early for a stopped car or a planned stop, and warns; the cruise cannot stop the car: you brake.',
   'mazda_speed:notices': 'Shows short notices on the driving screen after stock alerts; a Bookmark in Quick Select tags the log.',
   'mazda_speed:notice_sound': 'Plays a short chime with the stop, stopped car, exit brake and camera fault notices.',
+  'mazda_speed:auto_resume': 'After your brake turns the stock cruise off, your gas press makes StarPilot press RES so the cruise comes back at your set speed; only on a mapped public road with good GPS and the wheel straight. It sets a Panda safety setting when the car starts.',
+  'mazda_speed:ti_steer_700': 'Test only: with the Mazda Torque Interceptor, raises the maximum steering command from 600 to 700 in the Panda and in StarPilot. Turn it off if a steering fault appears; it sets a Panda safety setting when the car starts.',
   'TorqueInterceptorEnabled': 'For a Gen1 Mazda with a MoreTorque Torque Interceptor installed: StarPilot also steers below 28 mph. Turn on only with the interceptor fitted; applies after the next startup.',
   'FordRearFogIndicator': 'Shows a movable amber telltale while the Ford rear fog light is on, using read-only vehicle status.',
   'DisengageOnAccelerator': 'When enabled, pressing the accelerator pedal will disengage openpilot.',
