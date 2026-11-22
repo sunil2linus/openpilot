@@ -1,4 +1,4 @@
-# Mazda speed control (buttons) — design note (Stage 2 + parts g, h, t)
+# Mazda speed control (buttons) — design note (Stage 2 + parts g, h, t; Stage 3)
 
 Gen1 CX-5 with stock MRCC (`pcmCruise`, no openpilot longitudinal). The only way to change speed is the cruise
 buttons (CRZ_BTNS 0x09D: SET+, SET-, RES). Everything here is OFF by default. With the master switch off the car
@@ -8,7 +8,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 
 | module | job | origin |
 |---|---|---|
-| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 4; 1-3 still read): strict decode, bounds, defaults (all off) | new |
+| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 5; 1-4 still read): strict decode, bounds, defaults (all off) | new |
 | `cruise_model.py` | measured MRCC response, dash offset, the one braking envelope, undershoot, LKAS floor | new |
 | `car_profile.py` | per-car learned button latency + hold overrun (same file as the old fork) | ported |
 | `actuator.py` | ONE button actuator: taps, phase-locked holds, attribution, "his buttons win" | rewritten, old rules |
@@ -32,6 +32,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `notices.py` | (h) card side of the notices: triggers, once-per-event + gap rules, the tmpfs notice file, camera fault | new (+ old MazdaCamNotice) |
 | `notice_alert.py` | (h) selfdrived side: reads the notice file at <= 10 Hz, one low-priority Alert per new notice | new |
 | `tag_tool.py` | (t) `list` / `pack` the Bookmark tags of the event log | new |
+| `auto_resume.py` | (Stage 3) gas auto-resume after a brake cancel: the old fork's logic + the map view adapter | ported |
 
 ## Part (f): speed limit, merge, exits (each off / test / on; test computes and logs, never presses)
 
@@ -220,8 +221,8 @@ position-like keys are dropped even though the log has none).
 * card subscribes to modelV2 / slcState / radarState through a private SubMaster created only when an option that
   needs it is on (card's own subscription list is unchanged). The view file is version 2 (part f: ramp, exits).
 * The button frame is appended after `CI.apply()` and only when that frame has no CRZ_BTNS of its own
-  (openpilot's CANCEL/RESUME always win). Panda safety is unchanged: mazda.h already lets CRZ_BTNS through while
-  controls are allowed (cruise engaged).
+  (openpilot's CANCEL/RESUME always win). mazda.h lets CRZ_BTNS through while controls are allowed (cruise engaged);
+  with the cruise off only CANCEL, and (Stage 3, bit 256 only) RES inside the panda's auto-resume window.
 
 ## Hook points in 7.0
 
@@ -242,11 +243,80 @@ position-like keys are dropped even though the log has none).
 * Rewritten: the actuator (one class, not the old 4,700-line controller), the planner, curve geometry (spline +
   distance profiles), the camera's role (veto + camera-only target only).
 * Dropped on purpose: curve_learner, model_follow, in-curve camera taps/keep, post-apex taps, RampTail,
-  CURVE_OWN_RAISE, MERGE_MODEL_OPEN, lead-in-curve follow, auto resume (Stage 3), steering 700 test (Stage 3),
-  any panda change (Stage 3).
+  CURVE_OWN_RAISE, MERGE_MODEL_OPEN, lead-in-curve follow. (The auto resume, the steering 700 test and the panda
+  changes came in Stage 3, below.)
 
 ## Open questions (need the car)
 
 See the Stage 2 report: button cadence/phase lock on 7.0's card timing, CRZ_SPEED step in mph, LKAS_BLOCK
 meaning with the TI, view-file latency, the planning decel/lag numbers, and the lateral limits after 7.0's new
 lateral controller.
+
+## Stage 3: resume after brake, steering limit test, one steering check (all off by default)
+
+Three items, each OFF by default. With all of them off the safety param, the CarParams, the parsers and every frame
+are the Stage 2 ones (`tests/test_stage3.py::test_off_the_safety_param_and_the_limits_are_stage2`,
+`tests/test_off_is_stage1.py`). Both settings are in `MazdaSpeedControlConfig` (version 5; no new Params key). They set
+panda safety param bits **when the car starts** (`starpilot/vehicle_preferences.py` -> `opendbc/car/mazda/speed_flags.py`,
+right after the Torque Interceptor's bit), so a change applies at the **next drive** (the next car start).
+
+| bit | C (`mazda.h`) | Python (`values.py`) | set when |
+|---|---|---|---|
+| 8 | `MAZDA_PARAM_TORQUE_INTERCEPTOR` | `MazdaSafetyFlags.TORQUE_INTERCEPTOR` | TorqueInterceptorEnabled (Stage 1) |
+| 256 | `MAZDA_PARAM_AUTO_RESUME` | `MazdaSafetyFlags.AUTO_RESUME` | master switch + `auto_resume` |
+| 512 | `MAZDA_PARAM_TI_STEER_700` | `MazdaSafetyFlags.TI_STEER_700` | `ti_steer_700`, only with bit 8 |
+
+The bits are only in the safety param, never in CP.flags (`opendbc/safety/tests/test_mazda.py::test_safety_flags_match_mazda_h`).
+
+### A. Resume after brake (gas) (`auto_resume`, under the master switch)
+
+When his brake drops the stock cruise to standby, his gas press makes us press RES, so the cruise comes back at his
+set speed. **Panda window** (mazda.h, only with bit 256): while controls are not allowed, a CRZ_BTNS frame with byte 0
+== 0x04 (RES alone) passes only if
+* the panda saw the cruise's falling edge (CRZ_CTRL CRZ_ACTIVE 1 -> 0) with the brake pressed (PEDALS 0x10) and the
+  main switch on (CRZ_CTRL bit 17) in that same frame (this opens the window, with a fresh budget and timer);
+* now: the main switch on, the brake released, the gas pressed (ENGINE_DATA), the RX checks valid;
+* fewer than 8 frames so far in this window; at most 180 s of moving time since the edge (standing still not counted).
+The window closes when the cruise comes on, the main switch goes off, 180 s of moving time pass, or the safety mode
+is set again. A new brake press never refills the 8 frames; only a new cruise-on -> brake-cancel does. SET+ / SET-
+never pass. **Car side** (`auto_resume.py`, the old fork's rules): armed by his brake cancel (cruise on >= 2 s, no
+cancel of ours / openpilot's / his within 0.5 s, a set speed), his gas held 0.3 s, then RES only on a public road on
+the map view (class 1-12, GPS trust 0, the road unchanged 1 s), the wheel calm (0.5 s; 2 s after > 90 deg), under 10
+mph only behind a moving car, the car's ACC_SET_ALLOWED, openpilot engageable, nothing else pressing. 4 frames right
+after new wheel frames (CTR = wheel + 1), >= 0.1 s apart; the cruise must be on 0.6 s later; one retry; 8 frames, 170 s
+moving or 800 m at most; openpilot's cancel after it: given up until the cruise comes on by other means.
+The RES goes out through the one actuator (its only press with the cruise off) and is booked as his RES: the planner
+keeps his anchor ("resumed"), the actuator waits DRIVER_QUIET, the stop slowdown treats it as his RES (restore,
+RES quiet), the exit plan lets go. It needs the map view (an offline map, curve maps built, GPS), like the map features.
+Event log: `auto_resume` lines (armed / sent / refused + why) and `auto_resume_state` on each state / wait change.
+
+**Why "not always works" on the old fork (from reading the rules; no logs here):** most misses would be the car side
+holding a press until the gas has been up 3 s (GAS_RECENT): after a stop at a junction the wheel is turned (wait for
+calm, 2 s after a big turn), the road changes (1 s), the GPS trust must be 0 (it is 1 "shaky" early in a drive and
+after a GPS pause, 2 "low" next to a parallel road or with a poor fix), ACC_SET_ALLOWED stays 0 up to ~10 s after a
+stop, and under 10 mph a moving car ahead is needed. If
+he lifts the gas during those waits the press is dropped and a new gas press is needed. A brake tap that drops the
+cruise without PEDALS BRAKE_ON in the CRZ_CTRL frame of the fall (a different switch) would open no window at all (the
+panda and the car side both need it). Nothing of this was changed (no logs to justify it); the new
+`auto_resume_state` lines show the rule that held a press. Checked and fine: both sides read the same brake / gas bits,
+the frame is phase-locked to the wheel's CRZ_BTNS counter, the car stays inside the panda's budget and time.
+
+### B. Steering limit test (700) (`ti_steer_700`, TI cars only, not under the master switch)
+
+With the TI and bit 512 the panda uses MAZDA_TI_STEERING_LIMITS_700 (max 700; rates 10 / 25, rt delta 300, driver
+allowance 15 as with 600) for CAM_LKAS and CAM_LKAS2, and carcontroller's STEER_MAX is 700. latAccelFactor x 700/600
+and friction x 600/700, so the torque for a lateral acceleration below the old ceiling is unchanged: only the ceiling
+moves. A test: watch for steering faults.
+
+### C. One steering check for the TI command
+
+Stage 1 checked CAM_LKAS2 as a second torque command, which moved the one shared rate limiter twice per frame (the two
+messages taking turns could ramp twice as fast; the rt delta still capped it). Now CAM_LKAS2 must repeat the last
+CAM_LKAS value the checks accepted (carcontroller sends CAM_LKAS first, the same value), 0 without controls, and stay
+within max_torque; it no longer touches the limiter.
+
+### Needs the car
+
+The panda window on the bus (the fall comes with BRAKE_ON in the same CRZ_CTRL frame; the 16 logged brake cancels of
+the old fork say yes), RES accepted from standby at 7.0's card timing, openpilot engaging on our RES with the gas down,
+the 700 limit without TI / EPS faults.
