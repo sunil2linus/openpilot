@@ -354,5 +354,34 @@ class TestModelManager(unittest.TestCase):
       self.assertTrue(push.call_args.args[0].manager['isOnroad'])
 
 
+  def test_one_fresh_scan_per_download_tap(self):
+    """Upstream 7.0 UI fix: tapping Get took two fresh model scans in one UI frame (the intent check, then _model_do);
+    each is ~0.15 s warm / ~0.5 s cold on the device, so the parked evidence (pandaStates, 0.3 s) went stale before
+    the manager's parked check and it said "Turn the vehicle off". One fresh scan is now shared by the whole tap."""
+    from openpilot.starpilot.ui import runtime_app
+    from openpilot.starpilot.ui.feature_settings_state import FeatureRow, FeatureUiAction
+    missing = {"value": "missing2", "label": "M", "installed": False, "selectable": False, "requiresGpu": False,
+               "downloadAvailable": True, "gpuAvailable": True}
+    data = {**self.data, "models": [self.small, missing]}
+    scans = []
+    manager = mock.Mock()
+    manager.snapshot.side_effect = lambda: scans.append(1) or data
+    manager.action.return_value = {"message": "Downloading"}
+    session = runtime_app.StarShellSession.__new__(runtime_app.StarShellSession)
+    session._mode, session.selected, session.input = ShellMode.SETTINGS, Destination.DRIVING_MODEL, mock.Mock()
+    session.model_page, session.model_scroll, session.model_manager = "models:catalog", 0, manager
+    row = FeatureRow("model:missing2", "M", "", actions=(("Favorite", True), ("Get", True)))
+    session.model_snapshot = mock.Mock(return_value=SimpleNamespace(rows=(row,)))
+    session._unavailable = mock.Mock()
+    session._models_ui(FeatureUiAction("action", row, 1))
+    session._unavailable.assert_not_called()
+    manager.action.assert_called_once_with("download", {"model": "missing2", "allowGpuWithoutGpu": False})
+    self.assertEqual(len(scans), 1)
+    # a confirmation (another frame) still rechecks with its own fresh scan
+    scans.clear()
+    session._model_do("download", "missing2")
+    self.assertEqual(len(scans), 1)
+
+
 if __name__ == "__main__":
   unittest.main()

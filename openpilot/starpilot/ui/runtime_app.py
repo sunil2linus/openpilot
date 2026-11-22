@@ -1007,12 +1007,15 @@ class StarShellSession:
     elif row.key == "models:active" and action.kind == "action" and action.direction in (0, 1):
       self._model_open(("models:pick:small", "models:pick:big")[action.direction])
     elif action.kind == "action":
-      intent = model_row_intent(self.model_manager_snapshot(fresh=True), self.model_page, row.key, action.direction)
+      # One fresh scan per tap, shared with _model_do: a scan takes ~0.15 s warm (~0.5 s cold) on the device, and two
+      # in one UI frame left the parked evidence (pandaStates, 0.3 s) stale, so the action saw the car "on".
+      data = self.model_manager_snapshot(fresh=True)
+      intent = model_row_intent(data, self.model_page, row.key, action.direction)
       # A refreshed button that now means something else must not act on the displayed press.
       if intent is None or action.direction >= len(row.actions) or intent[0] != row.actions[action.direction][0]:
         self._unavailable("model list changed; try again")
       else:
-        self._model_do(*intent[1:])
+        self._model_do(*intent[1:], data=data)
     self._snapshot_cache = None
 
   def _model_option(self, index: int) -> None:
@@ -1036,11 +1039,12 @@ class StarShellSession:
     self.input.cancel()
     gui_app.push_widget(dialog)
 
-  def _model_do(self, action: str, model_id: str = "", profile: str = "", confirmed: bool = False) -> None:
+  def _model_do(self, action: str, model_id: str = "", profile: str = "", confirmed: bool = False, data=None) -> None:
     from openpilot.system.ui.lib.application import gui_app
     from openpilot.system.ui.widgets import DialogResult
     from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
-    data = self.model_manager_snapshot(fresh=True)
+    # data: the fresh snapshot this same tap already took (_models_ui); otherwise (a confirmation, the randomizer) scan now
+    data = self.model_manager_snapshot(fresh=True) if data is None else data
     model = next((m for m in data.get("models", ()) if m.get("value") == model_id), None)
     needs_gpu = model_needs_gpu(data, action, model)
     if not confirmed and (action == "delete" or needs_gpu):
