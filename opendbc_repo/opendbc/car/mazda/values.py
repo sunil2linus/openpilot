@@ -64,8 +64,12 @@ class MazdaFlags(IntFlag):
 
 
 class MazdaSafetyFlags(IntFlag):
-  # panda safety param bits (opendbc/safety/modes/mazda.h). 0 is stock StarPilot.
+  # panda safety param bits (opendbc/safety/modes/mazda.h MAZDA_PARAM_*, tests/test_safety_flags.py checks they match).
+  # 0 is stock StarPilot. These bits are only in the safety param, never in CP.flags.
   TORQUE_INTERCEPTOR = 8
+  # Stage 3, both off by default and set at car start from the Mazda speed control setting (speed_flags.py):
+  AUTO_RESUME = 256     # the gas auto-resume window: RES alone after a brake cancel (mazda.h)
+  TI_STEER_700 = 512    # steering limit test: TI limit 700 instead of 600 (ignored without TORQUE_INTERCEPTOR)
 
 
 @dataclass

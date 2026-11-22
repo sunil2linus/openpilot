@@ -22,8 +22,77 @@
 
 // safety param flags (opendbc/car/mazda/values.py: MazdaSafetyFlags). 0 is stock StarPilot.
 #define MAZDA_PARAM_TORQUE_INTERCEPTOR 8U
+#define MAZDA_PARAM_AUTO_RESUME 256U      // gas auto-resume window (Mazda speed control "auto_resume", off by default)
+#define MAZDA_PARAM_TI_STEER_700 512U     // steering limit test 700, only together with the TI flag (off by default)
 
 static bool mazda_torque_interceptor = false;
+static bool mazda_auto_resume = false;
+static bool mazda_ti_steer_700 = false;
+
+// Gas auto-resume (stock MRCC, openpilot/starpilot/car/mazda/speed/auto_resume.py; port of the owner's previous fork).
+// While controls are not allowed only CANCEL may be sent, except in this narrow window: after the driver's brake turned
+// the cruise off (the cruise's falling edge with the brake pressed and the main switch on), with the main switch still
+// on, the brake released and the gas pressed now, RES (0x04) alone may be sent, at most MAZDA_AR_MAX_FRAMES frames per
+// brake cancel and only within MAZDA_AR_MAX_MOVING_US of moving time after it. The window closes when the cruise comes
+// on or the main switch goes off; the frame budget is refilled only by a new cruise on -> brake cancel cycle (never by a
+// new brake press). SET+ / SET- are never allowed. Without the flag nothing changes.
+#define MAZDA_AR_MAX_FRAMES 8U
+#define MAZDA_AR_MAX_MOVING_US 180000000U   // 180 s, counted only while the car moves
+#define MAZDA_BTN_RES 0x04U                 // CRZ_BTNS byte 0: RES (bit 2) alone
+static bool mazda_ar_window = false;        // the last cruise falling edge was a brake cancel, window still open
+static bool mazda_ar_main_on = false;       // CRZ_CTRL CRZ_AVAILABLE (bit 17), read only with the flag
+static bool mazda_ar_cruise_prev = false;
+static bool mazda_ar_moving_prev = false;
+static uint32_t mazda_ar_moving_us = 0U;    // moving time since that falling edge
+static uint32_t mazda_ar_ts_last = 0U;
+static uint32_t mazda_ar_frames = 0U;       // RES frames allowed in this window
+
+static void mazda_auto_resume_cruise(bool cruise_engaged, bool main_on) {
+  mazda_ar_main_on = main_on;
+  if (cruise_engaged) {
+    mazda_ar_window = false;
+  } else if (mazda_ar_cruise_prev) {
+    // falling edge: a window only for a brake cancel with the main switch on; a fresh budget and moving time
+    mazda_ar_window = brake_pressed && main_on;
+    mazda_ar_frames = 0U;
+    mazda_ar_moving_us = 0U;
+    mazda_ar_moving_prev = vehicle_moving;
+    mazda_ar_ts_last = microsecond_timer_get();
+  } else {
+  }
+  if (!main_on) {
+    mazda_ar_window = false;
+  }
+  mazda_ar_cruise_prev = cruise_engaged;
+}
+
+static void mazda_auto_resume_time(void) {
+  // count the time since the brake cancel while the car moves (standing still never counts)
+  uint32_t ts = microsecond_timer_get();
+  if (mazda_ar_window && mazda_ar_moving_prev) {
+    uint32_t elapsed = safety_get_ts_elapsed(ts, mazda_ar_ts_last);
+    if (elapsed > (MAZDA_AR_MAX_MOVING_US - mazda_ar_moving_us)) {
+      mazda_ar_moving_us = MAZDA_AR_MAX_MOVING_US + 1U;
+      mazda_ar_window = false;
+    } else {
+      mazda_ar_moving_us += elapsed;
+    }
+  }
+  mazda_ar_ts_last = ts;
+  mazda_ar_moving_prev = vehicle_moving;
+}
+
+static bool mazda_auto_resume_allowed(uint8_t button) {
+  bool allowed = false;
+  // not with the RX checks failing: gas / brake / cruise could be stale
+  if (mazda_auto_resume && mazda_ar_window && (button == MAZDA_BTN_RES) && mazda_ar_main_on && !brake_pressed &&
+      gas_pressed && !safety_rx_checks_invalid && (mazda_ar_moving_us <= MAZDA_AR_MAX_MOVING_US) &&
+      (mazda_ar_frames < MAZDA_AR_MAX_FRAMES)) {
+    mazda_ar_frames += 1U;
+    allowed = true;
+  }
+  return allowed;
+}
 
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
 static void mazda_rx_hook(const CANPacket_t *msg) {
@@ -32,6 +101,9 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
     // sample speed: scale by 0.01 to get kph
     int speed = (msg->data[2] << 8) | msg->data[3];
     vehicle_moving = speed > 10;  // moving when speed > 0.1 kph
+    if (mazda_auto_resume) {
+      mazda_auto_resume_time();
+    }
   }
 
   // With a TI the driver torque comes from the TI's own sensor, not from the EPS
@@ -52,6 +124,9 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
     const bool was_allowed = controls_allowed;
     pcm_cruise_check(cruise_engaged);
     mazda_aol_engagement(msg, cruise_engaged, !was_allowed && controls_allowed);
+    if (mazda_auto_resume) {
+      mazda_auto_resume_cruise(cruise_engaged, GET_BIT(msg, 17U));
+    }
   }
 
   if (msg_matches(msg, MAZDA_ENGINE_DATA, MAZDA_MAIN)) {
@@ -86,7 +161,20 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     .type = TorqueDriverLimited,
   };
 
-  const TorqueSteeringLimits limits = mazda_torque_interceptor ? MAZDA_TI_STEERING_LIMITS : MAZDA_STEERING_LIMITS;
+  // Steering limit test (Mazda speed control setting "ti_steer_700", off by default; only with the TI flag, see
+  // mazda_init): carcontroller STEER_MAX 700. Everything but max_torque is the same as MAZDA_TI_STEERING_LIMITS.
+  const TorqueSteeringLimits MAZDA_TI_STEERING_LIMITS_700 = {
+    .max_torque = 700,
+    .max_rate_up = 10,
+    .max_rate_down = 25,
+    .max_rt_delta = 300,
+    .driver_torque_multiplier = 1,
+    .driver_torque_allowance = 15,
+    .type = TorqueDriverLimited,
+  };
+
+  const TorqueSteeringLimits ti_limits = mazda_ti_steer_700 ? MAZDA_TI_STEERING_LIMITS_700 : MAZDA_TI_STEERING_LIMITS;
+  const TorqueSteeringLimits limits = mazda_torque_interceptor ? ti_limits : MAZDA_STEERING_LIMITS;
 
   bool tx = true;
   // Check if msg is sent on the main BUS
@@ -117,10 +205,11 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   // cruise buttons check
   if (msg_matches(msg, MAZDA_CRZ_BTNS, MAZDA_MAIN)) {
     // allow resume spamming while controls allowed, but
-    // only allow cancel while controls not allowed
+    // only allow cancel while controls not allowed (and the auto-resume window's RES, see above)
     bool cancel_cmd = (msg->data[0] == 0x1U);
     if (!controls_allowed && !cancel_cmd) {
-      tx = false;
+      // (MISRA 13.5: the check with a side effect, the window's frame budget, is not an operand of &&)
+      tx = mazda_auto_resume_allowed(msg->data[0]);
     }
   }
 
@@ -161,6 +250,15 @@ static safety_config mazda_init(uint16_t param) {
   };
 
   mazda_torque_interceptor = GET_FLAG(param, MAZDA_PARAM_TORQUE_INTERCEPTOR);
+  mazda_auto_resume = GET_FLAG(param, MAZDA_PARAM_AUTO_RESUME);
+  mazda_ti_steer_700 = mazda_torque_interceptor && GET_FLAG(param, MAZDA_PARAM_TI_STEER_700);
+  mazda_ar_window = false;
+  mazda_ar_main_on = false;
+  mazda_ar_cruise_prev = false;
+  mazda_ar_moving_prev = false;
+  mazda_ar_moving_us = 0U;
+  mazda_ar_ts_last = 0U;
+  mazda_ar_frames = 0U;
 
   mazda_aol_reset();
   mazda_aol_enabled = (param == 0U) && ((unsigned int)alternative_experience == 32U);
