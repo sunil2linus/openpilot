@@ -99,13 +99,17 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  // TI command (CAM_LKAS2): same 12-bit, offset 2048 encoding as CAM_LKAS and the same value in the same
-  // frame, so checking it with the same limits passes a valid command and it cannot bypass the torque checks.
-  // It is only on the TX list with a TI.
+  // TI command (CAM_LKAS2): same 12-bit, offset 2048 encoding as CAM_LKAS. carcontroller sends the same value right
+  // after CAM_LKAS in every frame, so the TI command must repeat the last CAM_LKAS value the checks above accepted
+  // (desired_torque_last; 0 after a violation or without controls), and it is bounded by max_torque on its own. It is
+  // not checked as a second torque command: that moved the one shared rate limiter twice per frame, so the two
+  // messages taking turns could step twice max_rate_up per frame (Stage 3 review). It is only on the TX list with a TI.
   if (msg_matches(msg, MAZDA_TI_LKAS, MAZDA_AUX)) {
     int desired_torque = (((msg->data[0] & 0x0FU) << 8) | msg->data[1]) - 2048U;
+    const bool torque_allowed = lateral_controls_allowed() || (desired_torque == 0);
+    const bool over_max = safety_max_limit_check(desired_torque, limits.max_torque, -limits.max_torque);
 
-    if (steer_torque_cmd_checks(desired_torque, -1, limits)) {
+    if ((desired_torque != desired_torque_last) || !torque_allowed || over_max) {
       tx = false;
     }
   }

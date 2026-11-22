@@ -127,10 +127,13 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
     self.assertFalse(self._tx(self._ti_cmd_msg(700)))
 
   def test_ti_cmd_rate_limit(self):
+    # (Stage 3, C) the rate limit is checked on CAM_LKAS, which carcontroller sends first in the same frame; the TI
+    # command then has to repeat that value (it no longer steps the shared limiter by itself)
     self.safety.set_controls_allowed(True)
     self._set_prev_torque(0)
     self.assertFalse(self._tx(self._ti_cmd_msg(self.MAX_RATE_UP + 1)))
     self._set_prev_torque(0)
+    self.assertTrue(self._tx(self._torque_cmd_msg(self.MAX_RATE_UP)))
     self.assertTrue(self._tx(self._ti_cmd_msg(self.MAX_RATE_UP)))
 
   def test_ti_cmd_only_on_bus_1(self):
@@ -156,14 +159,79 @@ class TestMazdaTorqueInterceptorSafety(TestMazdaSafety):
       self._rx(self._torque_driver_msg(-100))
     self._set_prev_torque(600)
     self.assertFalse(self._tx(self._torque_cmd_msg(600)))
-    self._set_prev_torque(600)
+    # (Stage 3, C) the blocked CAM_LKAS reset the limiter: the TI command of the same frame is blocked too
     self.assertFalse(self._tx(self._ti_cmd_msg(600)))
+
+  # (Stage 3, C) these talk to the hook directly: the CmdSafety subclass pairs each TI command with a CAM_LKAS frame
+  def _tx_raw(self, msg):
+    return self.safety.safety_tx_hook(msg)
+
+  def _lkas_msg(self, torque):
+    return self.packer.make_can_msg_safety("CAM_LKAS", 0, {"LKAS_REQUEST": torque})
+
+  def test_ti_cmd_cannot_double_the_rate_limit(self):
+    # (Stage 3, C) one shared rate limiter for two messages: in Stage 1 the TI command was checked as a second torque
+    # command and moved the limiter's state too, so CAM_LKAS and CAM_LKAS2 taking turns each stepped MAX_RATE_UP from
+    # the other one's value: twice the rate per frame. The TI command must now repeat the last checked CAM_LKAS value.
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(0)
+    self._set_prev_torque(0)
+    torque = 0
+    for frame in range(1, 6):
+      self.safety.set_timer(frame * 10000)
+      torque += self.MAX_RATE_UP
+      self.assertTrue(self._tx_raw(self._lkas_msg(torque)))
+      self.assertFalse(self._tx_raw(self._ti_cmd_msg(torque + self.MAX_RATE_UP)), f"{frame=}")
+      self.assertTrue(self._tx_raw(self._ti_cmd_msg(torque)))
+
+  def test_ti_cmd_must_match_the_last_lkas_cmd(self):
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(0)
+    self.assertTrue(self._tx_raw(self._lkas_msg(self.MAX_RATE_UP)))
+    for other in (0, self.MAX_RATE_UP - 1, self.MAX_RATE_UP + 1, -self.MAX_RATE_UP):
+      self.assertFalse(self._tx_raw(self._ti_cmd_msg(other)), other)
+    self.assertTrue(self._tx_raw(self._ti_cmd_msg(self.MAX_RATE_UP)))
+    # checking the TI command never moves the limiter: CAM_LKAS still steps from its own last value
+    self.assertTrue(self._tx_raw(self._lkas_msg(2 * self.MAX_RATE_UP)))
+    # a blocked CAM_LKAS resets the limiter to 0: the TI command cannot carry the blocked value
+    self.assertFalse(self._tx_raw(self._lkas_msg(5 * self.MAX_RATE_UP)))
+    self.assertFalse(self._tx_raw(self._ti_cmd_msg(5 * self.MAX_RATE_UP)))
+    self.assertFalse(self._tx_raw(self._ti_cmd_msg(2 * self.MAX_RATE_UP)))
+    self.assertTrue(self._tx_raw(self._ti_cmd_msg(0)))
+
+  def test_ti_cmd_after_controls_lost_is_zero(self):
+    self.safety.set_controls_allowed(True)
+    self._set_prev_torque(0)
+    self.assertTrue(self._tx_raw(self._lkas_msg(self.MAX_RATE_UP)))
+    self.safety.set_controls_allowed(False)
+    # controls lost between the two messages of one frame: the TI command is blocked (it is not 0, and a 0 has to
+    # follow a CAM_LKAS 0 too); carcontroller's next frame (CAM_LKAS 0, then CAM_LKAS2 0) passes
+    self.assertFalse(self._tx_raw(self._ti_cmd_msg(self.MAX_RATE_UP)))
+    self.assertFalse(self._tx_raw(self._ti_cmd_msg(0)))
+    self.assertTrue(self._tx_raw(self._lkas_msg(0)))
+    self.assertTrue(self._tx_raw(self._ti_cmd_msg(0)))
+
+  def test_ti_cmd_bounded_on_its_own(self):
+    # even with the limiter's last value out of bounds (only possible by hand), the TI command stays within max_torque
+    top = self.MAX_TORQUE_LOOKUP[1][0]
+    self.safety.set_controls_allowed(True)
+    for t in (top + 1, -top - 1, 2047, -2048):
+      self.safety.set_desired_torque_last(t)
+      self.assertFalse(self._tx_raw(self._ti_cmd_msg(t)), t)
 
 
 class TestMazdaTorqueInterceptorCmdSafety(TestMazdaTorqueInterceptorSafety):
-  """Runs the generic torque steering tests on the TI command (CAM_LKAS2, bus 1) instead of CAM_LKAS."""
+  """Runs the generic torque steering tests on the TI command (CAM_LKAS2, bus 1) instead of CAM_LKAS. As carcontroller
+  sends them, each TI command goes out right after the same value on CAM_LKAS (bus 0); the TI command's own result is
+  what the generic test checks."""
   def _torque_cmd_msg(self, torque, steer_req=1):
     return self._ti_cmd_msg(torque)
+
+  def _tx(self, msg):
+    if msg.addr == 0x249:
+      raw = ((msg.data[0] & 0x0F) << 8) | msg.data[1]
+      super()._tx(self.packer.make_can_msg_safety("CAM_LKAS", 0, {"LKAS_REQUEST": raw - 2048}))
+    return super()._tx(msg)
 
 
 def _rx_checks_valid(param, include_ti):
