@@ -8,8 +8,9 @@ Rules:
   * Sub-features only run with `enabled` (the master switch) on.
   * Modes: "off" / "test" (computes and logs, never presses) / "on".
   * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
-    version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan. A field of a later version
-    in an older document is invalid; stop slowdown has no field yet (unknown fields are invalid).
+    version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan, version 4 the stop
+    slowdown and the on-screen notices (+ their sound). A field of a later version in an older document is invalid
+    (unknown fields are invalid).
 No openpilot imports beyond the saved-value reader, so it is unit tested offline.
 """
 import json
@@ -17,8 +18,8 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 3                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
-VERSIONS = (1, 2, 3)            #    merge / exits (version 1 and 2 documents still read)
+VERSION = 4                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3, 4)         #    merge / exits; 4: + stops / notices / notice_sound (older documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -37,9 +38,13 @@ SCHEMA = {
   "limit_offset_mph": ("int", 3, (0, 10)),          # (v3) ... at the limit + this (dash mph; km/h dash: the same number)
   "merge": ("mode", "off", MODES),                  # (v3) on-ramp merge: up to the highway's limit + offset
   "exits": ("mode", "off", MODES),                  # (v3) exit plan: pre-slow for an exit ramp's curves before the split
+  "stops": ("mode", "off", MODES),                  # (v4) stop slowdown: a stopped car / a stop ahead (stops.py)
+  "notices": ("bool", False, None),                 # (v4) short on-screen notices (notices.py -> selfdrived)
+  "notice_sound": ("bool", False, None),            # (v4) ... the stop / brake notices with a chime
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
+V4_FIELDS = frozenset(("stops", "notices", "notice_sound"))
 
 
 class ConfigError(ValueError):
@@ -60,6 +65,9 @@ class Config:
   limit_offset_mph: int = 3
   merge: str = "off"
   exits: str = "off"
+  stops: str = "off"
+  notices: bool = False
+  notice_sound: bool = False
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -82,6 +90,11 @@ class Config:
   def needs_view(self):
     """The map view daemon (and its curve files) are needed: map curves, the limit (road / GPS trust), merge, exits."""
     return self.enabled and any(self.mode(n) != "off" for n in ("curves", "speed_limit", "merge", "exits"))
+
+  @property
+  def shows_notices(self):
+    """The on-screen notices: the master switch, notices on and at least one feature Test or On (they come from it)."""
+    return bool(self.enabled and self.notices and self.any_active)
 
   @property
   def any_active(self):
@@ -115,7 +128,8 @@ def decode(raw):
     raise ConfigError("not an object")
   if doc.get("version") not in VERSIONS or type(doc.get("version")) is not int:
     raise ConfigError("version")
-  if (doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)):
+  if ((doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)) or
+      (doc["version"] < 4 and V4_FIELDS & set(doc))):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():

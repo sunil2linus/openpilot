@@ -28,6 +28,11 @@ whole steps, no margin: Contribution.anchor); the planner takes it only by these
   * "restore" (a handover overturned: the exit was not taken): only up, only from our handover anchor;
   * never in a frame with his own change (his buttons win), never with the cruise off.
 The first proposal in the order handover, merge, limit, fallback that passes is taken.
+
+A contributor may also give a CEILING (dash units, Contribution.ceiling) instead of, or with, a target: the command
+never goes above it while it governs. The stop slowdown uses it for its 1 mph guard taps (a ceiling one step under
+the set at a time, never more than its bound) and for a step-by-step raise after his RES (a ceiling one step above
+the set: taps, no 5 mph hold). A ceiling is a wish like a target: the lowest command wins, his overrule blocks it.
 Pure logic (tests/test_planner.py).
 """
 from dataclasses import dataclass, field
@@ -54,6 +59,7 @@ class Contribution:
   kind: str = ""                  # its rule: one of KINDS
   band: tuple | None = None       # "limit": (low, high) dash m/s, an engaged anchor in it follows the proposal
   no_raise: bool = False          # while it governs, the command never goes above the current set (an unresolved exit)
+  ceiling: float | None = None    # dash units m/s: the command never above this (stop guard taps, a step-by-step raise)
 
 
 @dataclass
@@ -136,23 +142,30 @@ class Planner:
           return c
     return None
 
+  def _wish(self, c, v_ego):
+    """The command (dash units) contribution c asks for, or None (no wish): its target's set command, its ceiling."""
+    cmd = None if c.target is None else M.set_command(c.target, v_ego, self.metric, c.lkas_floor)
+    if c.ceiling is not None:
+      cmd = c.ceiling if cmd is None else min(cmd, c.ceiling)
+    return cmd
+
   def _command(self, contributions, i, dry):
-    best = None
+    best, best_cmd = None, None
     for c in contributions:
-      if c.target is None or c.presses == dry:
+      if (c.target is None and c.ceiling is None) or c.presses == dry:
         continue
       if c.name in self.blocked and not dry:
         continue
-      if best is None or c.target < best.target:
-        best = c
+      cmd = self._wish(c, i.v_ego)
+      if c.no_raise and not dry:
+        cmd = min(cmd, i.set_speed)
+      if best is None or cmd < best_cmd:
+        best, best_cmd = c, cmd
     if best is None:
       return self.anchor, "", None
-    cmd = M.set_command(best.target, i.v_ego, self.metric, best.lkas_floor)
-    if best.no_raise and not dry:
-      cmd = min(cmd, i.set_speed)
-    if cmd >= self.anchor - 0.5 * self.step:
+    if best_cmd >= self.anchor - 0.5 * self.step:
       return self.anchor, "", best.target
-    return cmd, best.name, best.target
+    return best_cmd, best.name, best.target
 
   def update(self, i: PlanInputs) -> PlanOutput:
     self.changes = []
@@ -162,9 +175,8 @@ class Planner:
         self.changes.append(("main off", self.anchor, None))
       self.anchor, self.blocked, self.lowered, self.owner, self.ours_why = None, {}, False, None, ""
       return out
-    anchor_wish = {c.name: c.episode for c in i.contributions if c.target is not None and c.presses and
-                   self.anchor is not None and
-                   M.set_command(c.target, i.v_ego, self.metric, c.lkas_floor) < self.anchor - 0.5 * self.step}
+    anchor_wish = {c.name: c.episode for c in i.contributions if (c.target is not None or c.ceiling is not None) and
+                   c.presses and self.anchor is not None and self._wish(c, i.v_ego) < self.anchor - 0.5 * self.step}
     his_change = False
     for e in i.events:
       k = e["kind"]
@@ -194,7 +206,7 @@ class Planner:
     current = {c.name: c for c in i.contributions if c.presses}
     for name, episode in list(self.blocked.items()):
       c = current.get(name)
-      if c is None or c.target is None:
+      if c is None or (c.target is None and c.ceiling is None):
         del self.blocked[name]
       elif episode is not None:
         if c.episode != episode:

@@ -445,5 +445,8 @@
   "mazda_speed:speed_limit",
   "mazda_speed:limit_offset_mph",
   "mazda_speed:merge",
-  "mazda_speed:exits"
+  "mazda_speed:exits",
+  "mazda_speed:stops",
+  "mazda_speed:notices",
+  "mazda_speed:notice_sound"
 ]

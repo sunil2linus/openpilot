@@ -65,6 +65,17 @@ def test_master_off_by_default_confirmed_on_and_sub_options():
     assert owner.apply(row_change(lat, 1)) and C.read(saved).plan_lat == 2.3
     # a stale source is refused
     assert not owner.apply(row_change(lat, 1))
+    # (v4) the stop slowdown is a mode row, the notices and their chime On / Off rows, all off by default
+    shown = {r.key: r for r in rows(owner)}
+    assert shown[PREFIX + 'stops'].value == 'Off' and shown[PREFIX + 'stops'].choices == ('Off', 'Test (log only)', 'On')
+    assert "cannot stop the car" in shown[PREFIX + 'stops'].reason and "You brake" in shown[PREFIX + 'stops'].reason
+    for k in ('notices', 'notice_sound'):
+      assert shown[PREFIX + k].value == 'Off' and shown[PREFIX + k].choices == ('Off', 'On')
+    assert "Bookmark" in shown[PREFIX + 'notices'].reason and "Quick Select" in shown[PREFIX + 'notices'].reason
+    assert owner.apply(row_change(shown[PREFIX + 'notices']))
+    assert C.read(saved).notices is True and C.read(saved).stops == 'off'
+    assert owner.apply(row_change({r.key: r for r in rows(owner)}[PREFIX + 'stops']))
+    assert C.read(saved).mode('stops') == 'test' and C.read(saved).shows_notices
     # off again: the sub-options keep their values but are hidden and inactive
     master = {r.key: r for r in rows(owner)}[MASTER]
     assert owner.apply(replace(row_change(master), confirmation=True))
@@ -93,7 +104,7 @@ def test_invalid_document_is_off_and_repairable():
     request = row_change(shown[0])
     assert not owner.apply(replace(request, value='On'))
     assert owner.apply(request)
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":3}'
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":4}'
     assert [r.key for r in rows(owner)] == [MASTER]
 
 

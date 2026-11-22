@@ -1,4 +1,4 @@
-# Mazda speed control (buttons) — Stage 2 design note
+# Mazda speed control (buttons) — design note (Stage 2 + parts g, h, t)
 
 Gen1 CX-5 with stock MRCC (`pcmCruise`, no openpilot longitudinal). The only way to change speed is the cruise
 buttons (CRZ_BTNS 0x09D: SET+, SET-, RES). Everything here is OFF by default. With the master switch off the car
@@ -8,7 +8,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 
 | module | job | origin |
 |---|---|---|
-| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 3): strict decode, bounds, defaults (all off) | new |
+| `config.py` | the one JSON setting `MazdaSpeedControlConfig` (version 4; 1-3 still read): strict decode, bounds, defaults (all off) | new |
 | `cruise_model.py` | measured MRCC response, dash offset, the one braking envelope, undershoot, LKAS floor | new |
 | `car_profile.py` | per-car learned button latency + hold overrun (same file as the old fork) | ported |
 | `actuator.py` | ONE button actuator: taps, phase-locked holds, attribution, "his buttons win" | rewritten, old rules |
@@ -28,6 +28,10 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `caller.py` | the hook card.py calls; off = returns the frames list untouched | new |
 | `processes.py` | when the manager runs the two daemons (CarParamsPersistent before the first drive) | new |
 | `status.py` | the two helpers' status files the settings rows read (curve-map build, last drive's GPS) | new |
+| `stops.py` | (g) stop slowdown: stopped car (radard's lead), stop ahead (short model path), dash stop sign, RES restore | ported rules |
+| `notices.py` | (h) card side of the notices: triggers, once-per-event + gap rules, the tmpfs notice file, camera fault | new (+ old MazdaCamNotice) |
+| `notice_alert.py` | (h) selfdrived side: reads the notice file at <= 10 Hz, one low-priority Alert per new notice | new |
+| `tag_tool.py` | (t) `list` / `pack` the Bookmark tags of the event log | new |
 
 ## Part (f): speed limit, merge, exits (each off / test / on; test computes and logs, never presses)
 
@@ -95,14 +99,104 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   need the download (item 3), not a running map service. Without the download (item 3) nothing map-based works: only
   the camera-only curves remain.
 
-Not in Stage 2 (absent, not half-wired): stop slowdown (g), on-screen notices (h: log only).
+## Part (g): stop slowdown (`stops`: off / test / on)
+
+**What it can and cannot do.** The stock cruise brakes at most about 1 m/s^2 and never sets below 19 mph (30 km/h).
+It cannot stop the car, and for a stop seen late it cannot even slow enough. This feature takes speed off EARLY and
+warns ("Stopped car ahead" / "Stop ahead"); **the driver brakes**. Test mode computes, logs and warns, never presses.
+
+* **Stopped car (G1)**: radard's lead (camera-based on this car; the stock radar's "has lead" bit only lowers the
+  needed camera probability, it is never required) stopped (<= 2 m/s) or slower than half our speed, closing by
+  >= 3 m/s, within 160 m, for 0.5 s without a break (a 20 m distance jump is another car). Target: the lead's speed
+  (the floor for a stopped car) 15 m behind it with the planning decel after the cruise's lag; a stopped car within
+  130 m: the floor at once (one hold).
+* **Stop ahead (G2)**: the old fork's stop-light flag, computed here from modelV2 (old starpilot planner, CEM
+  `stop_sign_and_light`): planned path `position.x[-1]` shorter than v x 8 s (x1.2 from 45 mph, capped 9 s), on with
+  2.5 m / off with 4 m of hysteresis, not above 75 mph, not in a slow turn, not with a lead inside the path (G1's job).
+  Confirmed after 1.0 s without a break -> the floor at the path's end (at once within 130 m). Above 45 mph with the
+  stop >= 140 m away only 1 mph guard taps (from 0.5 s, one per 0.5 s, at most 3 mph) until it is nearer: a far
+  model-only guess never drops the set more than 3 mph (the old fork's 53 -> 30 drop with nothing ahead).
+  7.0's own stop-light detector (conditional_mode/stop.py) is not used: its host only runs with openpilot
+  longitudinal (planner_host.py checks `CP.openpilotLongitudinalControl`), which this car does not have.
+* **Stop sign (G3)**: carstate's `dashboard_stop_sign` (CAM_TRAFFIC_SIGNS STOP_SIGN == 9; its parser runs for Gen1
+  and Gen1 + TI) seen within 2 s shortens G2's confirmation to 0.5 s. Never a trigger without a short model path.
+  No map stop sign: neither our curve files nor 7.0's `mapdOut` have a stop node (not added).
+* **Release / restore**: the lead moving away (>= 1.5 m/s, not closing, 0.5 s) or gone 2 s with the path long; the
+  path long again for 1 s. The planner then raises toward the anchor as always. **His RES** with the set left low:
+  the episode ends and the set comes back at once (hold, then taps) - but only step by step (a planner ceiling one
+  step above the set: taps, no hold) while the model path is shorter than v x 4 s or a lead within 80 m is closing;
+  no new episode for 3 s after his RES. His SET+ during a slowdown ends that episode (planner block + declined until
+  the cause is gone); his gas held 1 s too; his SET (a new engage) / main off forget it. The target only goes down
+  during an episode.
+* **Planner ceiling**: `Contribution.ceiling` (dash units) caps the command; the stop guard taps and the RES restore
+  use it (a ceiling is a wish like a target: the lowest command wins, his overrule blocks it).
+
+## Part (h): on-screen notices (`notices` off / on, `notice_sound` off / on)
+
+No capnp change. card (notices.py) writes `/dev/shm/mazda_speed_notice.json` atomically **only when a notice fires**:
+`{v, sid, seq, kind, text1, text2, sound, until}` (never a position). selfdrived has one small, marked hook
+(`selfdrived.py`: 2 lines in `__init__`, 2 lines in `update_alerts` after the departure advisories, the same style as
+the blindspot / departure / Tesla extension alerts): `notice_alert.make()` is `None` unless a Mazda with the speed
+control, notices and one feature Test / On (read once per drive); `poll()` stats the file at most every 0.1 s, reads
+it only when its mtime / size changed, and turns a new (sid, seq) into one `Alert` (Priority.LOWER, small or mid,
+alert type `mazdaSpeedNotice/notice`); any error -> no alert. It is never put up while another alert is on screen
+(it waits for a free screen until its `until`, 3 s), and every stock alert of LOW or above replaces it.
+Sound: only `AudibleAlert.prompt`, only for the warnings, only with `notice_sound` on.
+
+| notice | when | sound |
+|---|---|---|
+| Curve ahead — slowing to NN | a map / camera curve starts to lower OUR set (once per curve; NN = its tightest point's set) | no |
+| Exit ramp — slowing | the exit plan starts to lower the set (once per exit) | no |
+| Exit ramp — brake for the curve / Cruise cannot slow enough | the 12 mph bound keeps the set >= 3 mph above what the ramp needs | yes |
+| Stop ahead / Cruise may not stop · brake | G2 confirmed (also in `stops` Test) | yes |
+| Stopped car ahead / Cruise may not stop · brake | G1 confirmed (also in `stops` Test) | yes |
+| Speed limit NN — set to NN | the limit rule changes OUR anchor (Speed limit unknown — set to 43: the fallback) | no |
+| Merging — set speed high | the merge boost starts (once per ramp) | no |
+| Mazda speed control: no GPS position | 15 s moving without a position (once per drive; map features only) | no |
+| Curve maps not built here | 10 s moving with a position but no curve files here (once per drive) | no |
+| Car's camera reports a fault / Lane keep may be off · steering weaker | TI cars: CAM_LKAS ERR_BIT_1/2 (the old MazdaCamNotice, again at most every 60 s) | yes |
+| Car's lane keep is off / Steering is weaker in curves until it clears | TI cars: LANE_LINES 0 for 5 s above 35 mph (latched) | no |
+| Car's camera fault cleared | 2 s without either fault | no |
+| Tagged | a Bookmark tag was written (part t) | no |
+
+At least 3 s between two notices (1 s before a warning); a notice inside the gap waits in one slot (a warning wins
+it) for at most 2 s. Notices need the master switch and at least one feature Test / On.
+
+## Part (t): the Bookmark tag
+
+The speed control's private SubMaster also reads `userBookmark` (only while the speed control runs). Each new one
+writes a `tag` line into the event log: wall time, `CurrentRoute` (the route name, no position), seconds since the
+drive started (+ an approximate segment), vEgo, set, anchor, owner, the plan (and its test-mode side), each
+contributor's state and proposal, the view summary (GPS state, trust, road class, link, ramp, curve / exit counts,
+whether a road name is present - not the name), the lead, and our button presses of the last 10 s. With notices on,
+"Tagged" shows.
+
+**Put the Bookmark button on the onroad screen (7.0, comma 3X / tizi, e.g. the Konik A1M):** while driving (a drive
+started, no alert on screen), tap the small round **Quick Select** button in the bottom-left corner of the driving
+screen (or swipe up-right from that corner); the Quick Select shelf opens with three slots. Tap an empty slot, then
+choose **Bookmark** in the picker (8 per page: Next / Previous). From then on one tap on that slot saves a bookmark
+(7.0 shows "Bookmark Saved") and writes our tag. (7.0's small corner bookmark icon is the comma four / compact
+screen's only; on tizi Quick Select is the way. Galaxy lists Bookmark but cannot press it.)
+
+Tools (over ssh, parked):
+`python -m openpilot.starpilot.car.mazda.speed.tag_tool list` lists the tags with times;
+`... tag_tool pack` says what it would pack (dry run), `... tag_tool pack --write [--out FILE] [--window 60]`
+writes the log lines within 60 s of each tag into one file (default `/data/media/0/mazda_speed/tags-<time>.jsonl`;
+position-like keys are dropped even though the log has none).
+
+## Maintenance
+
+* **Reset the learned car profile** (button latency, hold overrun): parked, `rm /data/media/0/mazda_car_profile.json`;
+  it starts fresh at the next drive (car_profile.py also ignores it by itself when the fingerprint or the TI flag
+  changes). No settings row.
 
 ## Data flow (no capnp changes)
 
 ```
  parked:   7.0 offline tiles (selected generation)  --curve_mapd-->  /data/media/0/mazda_curve_map/<lat>/<lon>/*.json
  onroad:   gpsLocation | gpsLocationExternal + curve files --mazda_mapviewd (map_view.py, 10 Hz)--> /dev/shm/mazda_speed_view.json
- card:     CarState + CRZ_BTNS + modelV2 + slcState + radarState + the view file --caller.py--> planner -> actuator -> CRZ_BTNS
+ card:     CarState + CRZ_BTNS + modelV2 + slcState + radarState + userBookmark + the view file --caller.py--> planner -> actuator -> CRZ_BTNS
+ card:     notices.py --(only when a notice fires)--> /dev/shm/mazda_speed_notice.json --notice_alert.py (selfdrived)--> Alert
 ```
 
 * **GPS**: 7.0 runs one GPS daemon per device: `qcomgpsd` publishes `gpsLocation` (comma 3X / tizi, e.g. the Konik
@@ -132,6 +226,7 @@ Not in Stage 2 (absent, not half-wired): stop slowdown (g), on-screen notices (h
 ## Hook points in 7.0
 
 * `selfdrive/car/card.py`: one block next to the Subaru software-cruise hook (`brand == "mazda"`).
+* `selfdrive/selfdrived/selfdrived.py` (part h): the notice hook, 2 lines in `__init__` + 2 lines in `update_alerts`.
 * `opendbc/car/mazda/carstate.py`: stores the raw CRZ_BTNS buttons (SET_P/SET_M/RES/CAN_OFF), LKAS_BLOCK and the
   radar lead bit as attributes (the CarState message is unchanged). `mazdacan.create_button_cmd` learns SET+/SET-.
 * `system/manager/process_config.py`: `mazda_curve_mapd` (offroad) and `mazda_mapviewd` (onroad), both only on a

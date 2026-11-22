@@ -150,6 +150,9 @@ class SelfdriveD:
     from openpilot.starpilot.car.tesla.stock_events import StockCruiseConsumer
     self.tesla_stock_consumer = StockCruiseConsumer(self.CP)
     self.tesla_stock_alerts = []
+    # Mazda speed control notices (starpilot/car/mazda/speed/notice_alert.py): None unless a Mazda with them on
+    from openpilot.starpilot.car.mazda.speed.notice_alert import make as make_mazda_speed_notice
+    self.mazda_speed_notice = make_mazda_speed_notice(self.CP, self.params)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -1210,6 +1213,8 @@ class SelfdriveD:
       if alert_type not in active_departure:
         self.AM.alerts.pop(alert_type, None)
     alerts.extend(departure)
+    if getattr(self, 'mazda_speed_notice', None) is not None:  # Mazda speed control notices (low priority, own file)
+      alerts.extend(self.mazda_speed_notice.poll(self.AM.current_alert))
     switchback = bool(self.switchback_capable and self.sm.seen['slcState'] and self.sm.alive['slcState'] and
                       self.sm.valid['slcState'] and self.sm['carControl'].latActive and
                       self.switchback_status.sample_state(self.sm['slcState'], drive_id=drive, now_ns=now_ns,

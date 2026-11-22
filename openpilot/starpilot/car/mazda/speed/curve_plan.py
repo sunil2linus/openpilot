@@ -55,6 +55,7 @@ class CurvePlan:
     self.last = None             # (target, curve id, why) for the log
     self.vetoed = set()
     self.good = None             # the last good view (DEAD_RECKON)
+    self.last_vmin = None
 
   def curve_lat(self, c, lkas_blocked):
     lat = self.cfg.ramp_lat if c.get("ramp") else self.cfg.plan_lat
@@ -87,7 +88,7 @@ class CurvePlan:
     driven = max(v, 0.0) * max(now - view["t"], 0.0)
     trust_ok = view.get("trust") == TRUST_OK or view.get("start_ok", False)
     veto = ctx.get("veto")
-    best, best_c, floor = None, None, False
+    best, best_c, floor, best_vmin = None, None, False, None
     seen = set()
     for c in view.get("curves", []):
       cid = c["id"]
@@ -121,7 +122,7 @@ class CurvePlan:
       elif not inside:
         self.held.pop(cid, None)
       if best is None or target < best:
-        best, best_c, floor = target, cid, min(speeds) >= M.LKAS_FLOOR_FROM
+        best, best_c, floor, best_vmin = target, cid, min(speeds) >= M.LKAS_FLOOR_FROM, min(speeds)
     for cid in list(self.held):
       if cid not in seen:
         del self.held[cid]
@@ -132,6 +133,7 @@ class CurvePlan:
       if cid not in seen:
         del self.ti_only[cid]
     self.last = (best, best_c, "curve")
+    self.last_vmin = best_vmin   # true m/s of the governing curve's tightest point (the notice's "slowing to")
     return Contribution("map_curve", best, lkas_floor=floor, presses=self.presses, episode=best_c)
 
   # ---- curve memory passes ----

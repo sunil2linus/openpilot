@@ -137,6 +137,8 @@ class CameraCurve:
     self.presses = presses
     self.window = deque(maxlen=max(1, int(round(CAM_CONFIRM / dt))))
     self.last = None
+    self.raw_vmin = None
+    self.last_vmin = None
 
   def raw_target(self, ctx):
     path, v = ctx.get("path"), ctx.get("v_ego", 0.0)
@@ -152,11 +154,14 @@ class CameraCurve:
     best = None
     for x, k in zip(xs, ks, strict=True):
       if d0 <= x <= d1 and abs(k) >= CAM_MIN_K:
-        e = M.envelope(math.sqrt(lat / abs(k)), x, v)
+        vp = math.sqrt(lat / abs(k))
+        e = M.envelope(vp, x, v)
         best = e if best is None else min(best, e)
+        self.raw_vmin = vp if self.raw_vmin is None else min(self.raw_vmin, vp)
     return best
 
   def __call__(self, ctx):
+    self.raw_vmin = None
     raw = self.raw_target(ctx)
     if raw is not None and ctx.get("map_covers_camera"):
       raw = None
@@ -164,4 +169,6 @@ class CameraCurve:
     target = max(self.window) if len(self.window) == self.window.maxlen else math.inf
     target = None if not math.isfinite(target) else target
     self.last = target
+    if self.raw_vmin is not None:
+      self.last_vmin = self.raw_vmin  # true m/s of the tightest point seen (the notice's "slowing to")
     return Contribution("camera_curve", target, presses=self.presses)

@@ -2,8 +2,10 @@
 
 Each contributor is a callable(ctx) -> planner.Contribution or None, run in this order (a later one may read an
 earlier one's contribution in ctx["contribs"] and its "busy" flag): the map curve profile (curves), the camera-only
-curve (camera_curves), the exit plan (exits), the merge (merge), the speed limit (speed_limit). Test mode builds them
-with presses=False: computed and logged, never commanded / never taken as an anchor.
+curve (camera_curves), the exit plan (exits), the merge (merge), the speed limit (speed_limit), the stop slowdown
+(stops). Test mode builds them with presses=False: computed and logged, never commanded / never taken as an anchor.
+The private SubMaster also reads userBookmark (the onroad Bookmark button, for the speed control's tag line; only
+while the speed control runs this drive): ctx["bookmark"] is True on a frame with a new one.
 """
 import math
 import time
@@ -35,6 +37,11 @@ def radar_lead(radar):
     out = {"status": bool(lead.status), "v": float(lead.vLead), "vrel": float(lead.vRel), "d": float(lead.dRel)}
   except AttributeError:
     return None
+  try:
+    prob = float(lead.modelProb)
+    out["prob"] = prob if math.isfinite(prob) else 0.0
+  except (AttributeError, TypeError, ValueError):
+    pass
   return out if all(math.isfinite(out[k]) for k in ("v", "vrel", "d")) else None
 
 
@@ -43,13 +50,14 @@ class Sources:
   unchanged) and the map view file. Fills the ctx every contributor reads."""
 
   def __init__(self, want_model=True, want_view=True, sm=None, read_view=None, clock=time.monotonic, map_presses=True,
-               want_slc=False, want_radar=False):
+               want_slc=False, want_radar=False, want_bookmark=False):
     self.want_model, self.want_view = want_model, want_view
     self.want_slc, self.want_radar = want_slc, want_radar
+    self.want_bookmark = want_bookmark
     self.map_presses = map_presses   # the camera only steps aside for map curves that are really pressed for
     self.sm = sm
     services = (["modelV2"] if want_model else []) + (["slcState", "mapdOut"] if want_slc else []) + \
-               (["radarState"] if want_radar else [])
+               (["radarState"] if want_radar else []) + (["userBookmark"] if want_bookmark else [])
     if self.sm is None and services:
       from openpilot.cereal import messaging
       self.sm = messaging.SubMaster(services)
@@ -75,6 +83,7 @@ class Sources:
     ctx = dict(d)
     ctx["now"] = now
     model_new = False
+    bookmark = False
     if self.sm is not None:
       self.sm.update(0)
       if self.want_model and self.sm.updated["modelV2"]:
@@ -96,9 +105,11 @@ class Sources:
       if self.want_radar and self.sm.updated["radarState"]:
         lead = radar_lead(self.sm["radarState"])
         self.lead = None if lead is None else dict(lead, t=now)
+      if self.want_bookmark and self.sm.updated["userBookmark"]:
+        bookmark = True
     if self.want_view and self.frame % VIEW_EVERY == 1:
       self.view = self.read_view()
-    ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t,
+    ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
                path_y=self.path_y, lanes=self.lanes, lead=self.lead,
                slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
                preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None)
@@ -141,8 +152,11 @@ def build(cfg, CP, log=None, memory=None, metric=False):
   if cfg.active("speed_limit"):
     from openpilot.starpilot.car.mazda.speed.limits import SpeedLimit
     out.append(SpeedLimit(cfg, presses=cfg.presses("speed_limit"), metric=metric))
+  if cfg.active("stops"):
+    from openpilot.starpilot.car.mazda.speed.stops import StopSlowdown
+    out.append(StopSlowdown(cfg, presses=cfg.presses("stops"), metric=metric))
   if not out:
     return [], None
   return out, Sources(want_model=True, want_view=cfg.needs_view, map_presses=cfg.presses("curves"),
                       want_slc=any(cfg.active(n) for n in ("speed_limit", "merge", "exits")),
-                      want_radar=cfg.active("merge"))
+                      want_radar=cfg.active("merge") or cfg.active("stops"), want_bookmark=True)

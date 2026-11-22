@@ -55,7 +55,10 @@ def no_files(monkeypatch):
                                  b'{"version":3,"enabled":false,"speed_limit":"on","merge":"on","exits":"on"}',
                                  b'{"version":3,"enabled":true,"limit_offset_mph":5}',
                                  b'{"version":2,"enabled":true,"exits":"on"}',
-                                 b'{"version":3,"enabled":true,"stops":"on"}'])
+                                 b'{"version":3,"enabled":true,"stops":"on"}',
+                                 b'{"version":4,"enabled":false,"stops":"on","notices":true,"notice_sound":true}',
+                                 b'{"version":4,"enabled":true,"notices":true,"notice_sound":true}',
+                                 b'{"version":4,"enabled":true,"stops":"maybe"}'])
 def test_off_returns_the_same_frames_and_makes_nothing(raw, no_files):
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)
@@ -93,13 +96,14 @@ def _files_to(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("doc", [{"speed_limit": "test"}, {"merge": "test"}, {"exits": "test"},
-                                 {"speed_limit": "on"}, {"merge": "on"}, {"exits": "on"},
+                                 {"speed_limit": "on"}, {"merge": "on"}, {"exits": "on"}, {"stops": "test"},
+                                 {"stops": "on"},
                                  {"speed_limit": "test", "merge": "test", "exits": "test", "curves": "test"}])
 def test_the_part_f_options_without_a_map_or_a_limit_never_press(doc, tmp_path, monkeypatch):
   _files_to(tmp_path, monkeypatch)
   with tempfile.TemporaryDirectory() as d:
     params = Params(d)
-    Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, "enabled": True, **doc}).encode())
+    Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 4, "enabled": True, **doc}).encode())
     card = fake_card(params)
     for k in range(600):
       frames = []
@@ -107,7 +111,9 @@ def test_the_part_f_options_without_a_map_or_a_limit_never_press(doc, tmp_path, 
       assert out is frames
     assert card.mazda_speed is not False
     names = {type(c).__name__ for c in card.mazda_speed.contributors}
-    want = {"speed_limit": "SpeedLimit", "merge": "Merge", "exits": "ExitPlan", "curves": "CurvePlan"}
+    want = {"speed_limit": "SpeedLimit", "merge": "Merge", "exits": "ExitPlan", "curves": "CurvePlan",
+            "stops": "StopSlowdown"}
+    assert card.mazda_speed.notices is None          # notices off: nothing decides or writes a notice
     assert names == {want[k] for k in doc} | ({"CurvePlan"} if "merge" in doc else set())
     for c in card.mazda_speed.contributors:
       if type(c).__name__ == "CurvePlan" and "curves" not in doc:
@@ -141,3 +147,31 @@ def test_card_hook_is_the_only_call_and_only_for_mazda():
   assert lines[1].strip() == 'if self.CP.brand == "mazda":'
   assert lines[3].strip() == "can_sends = update_mazda_speed(self, CS, CC, can_sends, now_nanos)"
   assert lines[4].strip() == "self.publish_sendcan(can_sends, valid=CS.canValid)"
+
+
+@pytest.mark.parametrize("raw", [None, b'{"version":4}', b'{"version":4,"enabled":false,"stops":"on","notices":true}',
+                                 b'{"version":4,"enabled":true,"stops":"on"}', b'{"version":4,"enabled":true,"notices":true}',
+                                 b'not json'])
+def test_selfdrived_notice_hook_is_inert_when_off(raw):
+  from openpilot.starpilot.car.mazda.speed.notice_alert import make
+  with tempfile.TemporaryDirectory() as d:
+    params = Params(d)
+    if raw is not None:
+      Path(params.get_param_path(C.KEY)).write_bytes(raw)
+    assert make(ti_cp(), params) is None
+
+
+def test_notices_on_write_only_through_the_notice_file(tmp_path, monkeypatch):
+  _files_to(tmp_path, monkeypatch)
+  import openpilot.starpilot.car.mazda.speed.notices as N
+  monkeypatch.setattr(N, "NOTICE_PATH", str(tmp_path / "notice.json"))
+  monkeypatch.setattr(N.NoticeWriter.__init__, "__defaults__", (str(tmp_path / "notice.json"), N.time.monotonic))
+  with tempfile.TemporaryDirectory() as d:
+    params = Params(d)
+    Path(params.get_param_path(C.KEY)).write_bytes(b'{"version":4,"enabled":true,"stops":"test","notices":true}')
+    card = fake_card(params)
+    for _ in range(300):
+      frames = []
+      assert caller.update(card, cs(), cc(), frames, 0) is frames
+    assert card.mazda_speed is not False and card.mazda_speed.notices is not None
+    assert not (tmp_path / "notice.json").exists()     # nothing happened: no notice

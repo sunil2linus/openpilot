@@ -40,6 +40,17 @@ SUB_ROWS = (
    "Slows as much as the ramp needs while your signal toward the exit is on (within about 400 m); a short signal " +
    "slows at most 12 mph, so keep it on to the split for a tight exit or brake yourself. Hands the speed to the " +
    "street's limit after; lets go at once if you stay on the highway, press a button or hold the gas.", 0.),
+  ("stops", "Stop slowdown",
+   "Takes speed off early for a stopped car ahead or a stop the camera's driving model plans (red light, stop " +
+   "sign, queue), and warns. The cruise brakes at most about 1 m/s² and not below 19 mph: it cannot stop the car. " +
+   "You brake. A far guess above 45 mph only taps 1-3 mph down. Test warns without pressing.", 0.),
+  ("notices", "On-screen notices",
+   "Short notices on the driving screen: curve, exit ramp, stop ahead, stopped car, speed limit, merge, GPS and " +
+   "the car's camera. Stock alerts always come first. Tag: put Bookmark in a Quick Select slot (driving: tap the " +
+   "small round button in the bottom-left corner, tap an empty slot, choose Bookmark); a tap on it saves a tag " +
+   "in the speed control's log.", 0.),
+  ("notice_sound", "Notice chime",
+   "A short chime with the stop ahead, stopped car, exit ramp brake and camera fault notices.", 0.),
 )
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
@@ -174,7 +185,7 @@ class MazdaSpeedFeature:
                          if readable else "Saved settings cannot be read.", **common),)
     rows = [FeatureRow(MASTER, "Mazda speed control (buttons)", _shown(cfg.enabled), choices=("Off", "On"),
                        default_value="Off",
-                       reason="Presses the cruise SET+/SET- buttons for curves, speed limits, merges and exits. Off by " +
+                       reason="Presses the cruise SET+/SET- buttons for curves, speed limits, merges, exits and stops. Off by " +
                        "default; applies at the next drive.",
                        **common)]
     if not cfg.enabled:
@@ -193,6 +204,9 @@ class MazdaSpeedFeature:
         reason = reason + " Now: " + " ".join(now_says)
       if kind == "mode":
         rows.append(FeatureRow(PREFIX + field, label, _shown(value), choices=tuple(MODE_LABELS.values()),
+                               default_value=_shown(default), reason=reason + " Applies at the next drive.", **common))
+      elif kind == "bool":
+        rows.append(FeatureRow(PREFIX + field, label, _shown(value), choices=("Off", "On"),
                                default_value=_shown(default), reason=reason + " Applies at the next drive.", **common))
       else:
         rows.append(FeatureRow(PREFIX + field, label, _shown(value), step=step, minimum=float(lim[0]), maximum=float(lim[1]),

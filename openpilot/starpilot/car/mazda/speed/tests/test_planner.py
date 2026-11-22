@@ -125,3 +125,24 @@ def test_braking_envelope():
   target = 40 * MPH
   cmd_true = M.set_command(target, 50 * MPH) - M.DASH_OFFSET
   assert M.cruise_decel(50 * MPH - cmd_true) >= M.PLAN_DECEL
+
+
+def test_a_ceiling_caps_the_command_in_dash_units_and_is_a_wish_like_a_target():
+  p = Planner()
+  step(p, 53, 51, [engaged(53)])
+  out = step(p, 53, 51, name="other", extra=[Contribution("stop", None, ceiling=51 * MPH)])
+  assert out.reason == "stop" and abs(mph(out.command) - 51) < 1e-6           # exactly 2 steps, no undershoot
+  out = step(p, 53, 51, target_mph=40, extra=[Contribution("stop", None, ceiling=51 * MPH)])
+  assert out.reason == "curve" and mph(out.command) < 51                       # the lowest command wins
+  out = step(p, 53, 51, name="other", extra=[Contribution("stop", None, ceiling=60 * MPH)])
+  assert out.reason == "" and abs(mph(out.command) - 53) < 1e-6                # never above his anchor
+  out = step(p, 53, 51, name="other", extra=[Contribution("stop", None, ceiling=50 * MPH, presses=False)])
+  assert out.reason == "" and out.dry_reason == "stop" and abs(mph(out.dry_command) - 50) < 1e-6   # test: logged only
+  # his SET+ under the anchor while the ceiling governs: blocked for the episode (no lowering, no raise)
+  step(p, 50, 50, name="other", extra=[Contribution("stop", None, ceiling=50 * MPH, episode="s1")])
+  out = step(p, 51, 50, [driver("SET_PLUS", 51)], name="other",
+             extra=[Contribution("stop", None, ceiling=50 * MPH, episode="s1")])
+  out = step(p, 51, 50, name="other", extra=[Contribution("stop", None, ceiling=49 * MPH, episode="s1")])
+  assert "his choice" in out.reason and abs(mph(out.command) - 51) < 1e-6
+  out = step(p, 51, 50, name="other", extra=[Contribution("stop", None, ceiling=49 * MPH, episode="s2")])
+  assert out.reason == "stop"                                                  # a new episode: his overrule is over

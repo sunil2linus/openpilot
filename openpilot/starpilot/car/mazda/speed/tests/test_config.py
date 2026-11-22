@@ -34,10 +34,13 @@ def test_sub_features_need_the_master_switch():
 
 
 @pytest.mark.parametrize("raw", [
-  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 4}).encode(), json.dumps({"version": 1, "curve_offset_mph": 2}).encode(),
+  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 5}).encode(), json.dumps({"version": 1, "curve_offset_mph": 2}).encode(),
   json.dumps({"version": 2, "speed_limit": "on"}).encode(), json.dumps({"version": 1, "exits": "test"}).encode(),
   json.dumps({"version": 3, "merge": "yes"}).encode(), json.dumps({"version": 3, "limit_offset_mph": 11}).encode(),
   json.dumps({"version": 3, "limit_offset_mph": 2.5}).encode(), json.dumps({"version": 3, "stops": "on"}).encode(),
+  json.dumps({"version": 3, "notices": True}).encode(), json.dumps({"version": 2, "notice_sound": True}).encode(),
+  json.dumps({"version": 4, "stops": "yes"}).encode(), json.dumps({"version": 4, "notices": "on"}).encode(),
+  json.dumps({"version": 4, "notice_sound": 1}).encode(), json.dumps({"version": 4, "stop_warnings": "on"}).encode(),
   json.dumps({"version": "1"}).encode(),
   json.dumps({"version": True}).encode(), doc(enabled=1), doc(enabled="true"), doc(curves="yes"), doc(nope=1),
   doc(curve_offset_mph=6), doc(curve_offset_lat=4.5), doc(side_force_cap=3.0), doc(speed_limit_follow="on"), doc(plan_lat=3.6), doc(ti_only_lat=1.79),
@@ -65,11 +68,12 @@ def test_encode_roundtrip_is_canonical():
   cfg = C.with_value(C.Config(), "enabled", True)
   cfg = C.with_value(cfg, "curves", "test")
   raw = C.encode(cfg)
-  assert raw == b'{"curves":"test","enabled":true,"version":3}'
+  assert raw == b'{"curves":"test","enabled":true,"version":4}'
   assert C.decode(b'{"curves":"test","enabled":true,"version":1}') == cfg     # a version 1 document still reads
   assert C.decode(b'{"curves":"test","enabled":true,"version":2}') == cfg     # ... and a version 2 one
+  assert C.decode(b'{"curves":"test","enabled":true,"version":3}') == cfg     # ... and a version 3 one
   assert C.decode(raw) == cfg
-  assert C.encode(C.Config()) == b'{"version":3}'
+  assert C.encode(C.Config()) == b'{"version":4}'
   with pytest.raises(C.ConfigError):
     C.with_value(cfg, "plan_lat", 9.0)
   with pytest.raises(C.ConfigError):
@@ -122,3 +126,18 @@ def test_version_3_options_default_off_and_need_the_master_switch():
   assert on.limit_offset_mph == 0 and on.needs_view and on.any_active and on.mode("curves") == "off"
   assert C.decode(C.encode(on)) == on
 
+
+
+def test_version_4_stops_and_notices_default_off_and_need_the_master_switch():
+  cfg = C.Config()
+  assert (cfg.stops, cfg.notices, cfg.notice_sound) == ("off", False, False) and not cfg.shows_notices
+  off = C.decode(json.dumps({"version": 4, "stops": "on", "notices": True, "notice_sound": True}).encode())
+  assert off.mode("stops") == "off" and not off.any_active and not off.shows_notices      # master off
+  on = C.decode(json.dumps({"version": 4, "enabled": True, "stops": "test", "notices": True}).encode())
+  assert on.active("stops") and not on.presses("stops") and on.any_active and on.shows_notices and not on.needs_view
+  assert not on.notice_sound and C.decode(C.encode(on)) == on
+  # notices alone (nothing that computes) show nothing
+  assert not C.decode(json.dumps({"version": 4, "enabled": True, "notices": True}).encode()).shows_notices
+  # an older document still reads, with the new options off
+  old = C.decode(json.dumps({"version": 3, "enabled": True, "merge": "on"}).encode())
+  assert old.presses("merge") and old.stops == "off" and not old.notices

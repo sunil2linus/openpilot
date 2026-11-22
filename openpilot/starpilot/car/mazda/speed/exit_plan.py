@@ -101,6 +101,7 @@ STREET_STEADY = 2.0         # s
 STREET_MAX = (55, 90)       # dash units: a street's limit
 STREET_MIN = (25, 40)
 TARGET_MIN = 15 * MPH
+BRAKE_GAP = 3 * MPH           # m/s: the bound holds the plan this much above what the ramp needs: "brake" notice
 
 # ---- the camera's lane (ported LaneView: in the lane next to the road edge on a side) ----
 LANE_LINE_PROB = 0.3
@@ -235,6 +236,7 @@ class ExitPlan:
     self.dt = 0.0
     self.ended = None           # the last plan that ended (logs, tests)
     self.last = None
+    self.brake_needed = False
 
   # ---- helpers ----
   def lat(self, ctx):
@@ -294,6 +296,7 @@ class ExitPlan:
     now, v = ctx.get("now", 0.0), max(ctx.get("v_ego", 0.0), 0.0)
     dt = 0.0 if self.t is None else min(max(now - self.t, 0.0), 0.5)
     self.t, self.dt = now, dt
+    self.brake_needed = False
     self.odo += v * dt
     if ctx.get("model_new"):
       self.lanes.update(0.05, ctx.get("lanes"))
@@ -424,6 +427,7 @@ class ExitPlan:
     # ---- the target ----
     full, reach = self.targets(p, v, self.lat(ctx))
     target, why = None, "watch"
+    unbounded = None                           # what the ramp needs where the DIP_MAX bound holds the plan higher
     if p.signal and reach is not None and v <= reach + REACH_START:
       if not p.reach_on and p.v_ref is None:
         p.v_ref = v                            # our slowing begins here: DIP_MAX from this speed
@@ -437,7 +441,7 @@ class ExitPlan:
         if blink_on or edge_lane:
           target, why = reach, ("reach signal" if blink_on else "reach edge lane")   # as deep as the ramp needs
         else:
-          target, why = self._bounded(p, reach), "reach"
+          target, why, unbounded = self._bounded(p, reach), "reach", reach
     else:
       evidence = p.signal or p.lane or p.model
       firm_ok = p.signal or (p.lane and p.model)     # the edge lane alone is also the ordinary right lane
@@ -447,7 +451,7 @@ class ExitPlan:
           p.firm_t += dt
         p.hold = None
       elif p.reach_on and reach is not None:
-        target, why = reach, "reach"
+        target, why, unbounded = reach, "reach", reach
       elif evidence:
         if p.hold is None:
           p.hold = v
@@ -457,6 +461,9 @@ class ExitPlan:
     if target is not None and full is not None and p.confirmed:
       target = full
     p.last_target = target
+    # (part H) the bound keeps the set higher than the ramp needs: the exit brake notice (notices.py)
+    self.brake_needed = bool(target is not None and unbounded is not None and not p.confirmed and
+                             target > unbounded + BRAKE_GAP)
     out.target = target
     out.episode = p.id
     out.no_raise = bool(target is not None and not p.confirmed)   # unresolved: no SET+ inside the exit area
