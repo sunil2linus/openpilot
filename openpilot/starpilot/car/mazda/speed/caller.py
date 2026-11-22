@@ -8,18 +8,34 @@ Any exception turns the feature off for the rest of the drive (steering is never
 Also here (part H / T): the on-screen notices (notices.py, only with `notices` on) and the tag line: on each new
 userBookmark (the onroad Bookmark button, read through the private SubMaster) one "tag" line with a snapshot of the
 speed control goes into the event log (never a position) and, with notices on, a short "Tagged" notice.
+
+Stage 3: the gas auto-resume (auto_resume.py, only with `auto_resume` on AND its panda bit in this drive's safety param,
+opendbc/car/mazda/speed_flags.py): its logic runs every frame next to the planner; its RES goes out through the same
+actuator (its RES path for the cruise off) and the same frame builder, never through a second sender.
 """
 import time
 from collections import deque
 
 from openpilot.starpilot.car.mazda.speed import config as C
-from openpilot.starpilot.car.mazda.speed.actuator import Actuator, ActInputs, SET_PLUS
+from openpilot.starpilot.car.mazda.speed.actuator import Actuator, ActInputs, RESUME, SET_PLUS
 from openpilot.starpilot.car.mazda.speed.planner import Planner, PlanInputs
 
 CRZ_BTNS = 0x09D
 PLAN_LOG_GAP = 0.2            # s: a changed plan is logged at most this often
 GPS_LOG_STALE = 5.0           # s: an older map view is logged as "stale" (mazda_mapviewd stopped writing)
 TAG_PRESSES = 10.0            # s of our own button presses in a tag's snapshot
+
+
+def _cancel_frame(f):
+  try:
+    return f[0] == CRZ_BTNS and bool(bytes(f[1])[0] & 0x01)
+  except (IndexError, TypeError, ValueError):
+    return False
+
+
+def _gear_drive(CS):
+  from opendbc.car import structs
+  return getattr(CS, "gearShifter", None) == structs.CarState.GearShifter.drive    # (as card.py compares it)
 
 
 def _plain(v):
@@ -39,9 +55,16 @@ def eligible(CP) -> bool:
 
 class SpeedControl:
   def __init__(self, CP, cfg, params, is_metric, log=None, profile=None, contributors=None, sources=None, memory=None,
-               notices=None):
+               notices=None, auto_resume=None):
     self.CP = CP
     self.cfg = cfg
+    self.auto_resume = auto_resume   # (Stage 3) auto_resume.AutoResumeLogic, or None
+    self.ar_road = None
+    self.ar_key = None
+    self.ar_key_t = 0.0
+    if auto_resume is not None:
+      from openpilot.starpilot.car.mazda.speed.auto_resume import ViewRoad
+      self.ar_road = ViewRoad()
     self.params = params
     self.notices = notices           # notices.Notices (only with notices on), else None
     self.t0 = None                   # monotonic s of the first frame
@@ -90,7 +113,16 @@ class SpeedControl:
                 "lat_active": bool(CC.latActive), "torque": float(CC.actuators.torque),
                 "steer_alert": str(CC.hudControl.visualAlert).endswith("steerRequired"),
                 "angle": float(CS.steeringAngleDeg), "steering_pressed": bool(CS.steeringPressed),
-                "stop_sign_raw": getattr(ocs, "dashboard_stop_sign", None), **self._camera(ocs)}
+                "stop_sign_raw": getattr(ocs, "dashboard_stop_sign", None), **self._camera(ocs),
+                # (Stage 3) the gas auto-resume's inputs
+                "steer_rate": float(getattr(CS, "steeringRateDeg", 0.0) or 0.0), "gear_drive": _gear_drive(CS),
+                "door_open": bool(getattr(CS, "doorOpen", False)),
+                "seatbelt_unlatched": bool(getattr(CS, "seatbeltUnlatched", False)),
+                "can_valid": bool(getattr(CS, "canValid", False)),
+                "set_allowed": bool(getattr(ocs, "crz_set_allowed", False)),
+                "not_allowed": bool(getattr(ocs, "crz_not_allowed", False)),
+                "op_cancel": bool(CC.cruiseControl.cancel), "op_resume": bool(CC.cruiseControl.resume),
+                "cancel_sent": any(_cancel_frame(f) for f in can_sends)}
 
   @staticmethod
   def _camera(ocs):
@@ -130,11 +162,16 @@ class SpeedControl:
       self._log("anchor", why=why, before=before, after=after)
     self.last_reason = plan.reason
     command = plan.command if d["engaged"] else None
+    want_res = self._auto_resume(d, ctx, now)
+    busy = bool(self.auto_resume is not None and self.auto_resume.busy and not want_res)
     act = self.actuator.update(ActInputs(cruise_enabled=d["cruise_enabled"], set_speed=d["set_speed"], v_ego=d["v_ego"],
                                          gas=d["gas"], brake=d["brake"], standstill=d["standstill"],
                                          set_plus=d["set_plus"], set_minus=d["set_minus"], resume=d["resume"],
                                          cancel=d["cancel"], wheel_counter=d["wheel_counter"], command=command,
-                                         allow_lower=plan.allow_lower, other_button=d["other_button"]))
+                                         allow_lower=plan.allow_lower, other_button=d["other_button"] or busy,
+                                         auto_resume=want_res))
+    if want_res and act.button != RESUME:
+      self.auto_resume.unsend()           # the actuator did not send it: not counted against the panda's budget
     self.events = act.events
     for e in act.events:
       self._log("act", event=e)
@@ -159,6 +196,30 @@ class SpeedControl:
       self._tag(now, d, ctx, plan, states)
     self._learn(d["cruise_enabled"])
     return (act.button, act.counter) if act.button is not None else None
+
+  def _auto_resume(self, d, ctx, now):
+    """(Stage 3) one frame of the gas auto-resume logic. True: it wants its RES frame now."""
+    ar = self.auto_resume
+    if ar is None:
+      return False
+    from openpilot.starpilot.car.mazda.speed.actuator import frames
+    from openpilot.starpilot.car.mazda.speed.auto_resume import ARMED, BUSY_AFTER, SENDING, STATE_NAMES, inputs_from
+    act = self.actuator
+    # the actuator has a press going: a hold, or a SET+/SET- frame within BUSY_AFTER
+    busy = bool(act.hold is not None or act.frame - act.last_send < frames(BUSY_AFTER))
+    i = inputs_from(d, ctx, self.ar_road, wheelbase=float(getattr(self.CP, "wheelbase", 0.0) or 2.7),
+                    steer_ratio=float(getattr(self.CP, "steerRatio", 0.0) or 15.5), slowdown_busy=busy,
+                    is_metric=self.metric)
+    button = ar.update(i)
+    for kind, data in ar.events:
+      self._log("auto_resume", event=kind, **data)
+    ar.events.clear()
+    key = (STATE_NAMES.get(ar.state, str(ar.state)), ar.wait_why if ar.state in (ARMED, SENDING) else "")
+    if key != self.ar_key and now - self.ar_key_t >= PLAN_LOG_GAP:
+      self.ar_key, self.ar_key_t = key, now
+      self._log("auto_resume_state", state=key[0], wait=key[1], map=bool(i.plan_alive), cls=i.road_class,
+                trust=i.gps_trust, set_allowed=i.set_allowed, engageable=i.engageable)
+    return button is not None
 
   def _route(self):
     """The route name 7.0's loggerd keeps in CurrentRoute (no position), or ""."""
@@ -192,6 +253,8 @@ class SpeedControl:
       "lead": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in (ctx.get("lead") or {}).items() if k != "t"},
       "radar_lead": d.get("radar_lead"),
       "presses": [list(p) for p in self.presses if now - p[0] <= TAG_PRESSES],
+      "auto_resume": None if self.auto_resume is None else {"state": self.auto_resume.state,
+                                                            "wait": self.auto_resume.wait_why},
     }
     self._log("tag", **snapshot)
     if self.notices is not None:
@@ -232,6 +295,8 @@ class SpeedControl:
     from opendbc.car.mazda import mazdacan
     from opendbc.car.mazda.values import Buttons
     packer = card.CI.CC.packer
+    if button == RESUME:
+      return mazdacan.create_button_cmd(packer, self.CP, counter, Buttons.RESUME)
     return mazdacan.create_button_cmd(packer, self.CP, counter, Buttons.SET_PLUS if button == SET_PLUS else Buttons.SET_MINUS)
 
 
@@ -251,14 +316,22 @@ def make(card):
     if cfg.active("curves"):
       from openpilot.starpilot.car.mazda.speed.curve_memory import CurveMemory
       memory = CurveMemory()
-    contributors, sources = build(cfg, card.CP, log, memory=memory, metric=bool(getattr(card, "is_metric", False)))
+    auto_resume = None
+    if cfg.auto_resume_on:
+      from opendbc.car.mazda.speed_flags import auto_resume as panda_auto_resume
+      if panda_auto_resume(card.CP):      # the panda's window bit is in this drive's safety param
+        from openpilot.starpilot.car.mazda.speed.auto_resume import AutoResumeLogic
+        auto_resume = AutoResumeLogic(bool(getattr(card, "is_metric", False)))
+    contributors, sources = build(cfg, card.CP, log, memory=memory, metric=bool(getattr(card, "is_metric", False)),
+                                  auto_resume=auto_resume is not None)
     notices = None
     if cfg.shows_notices:
       from openpilot.starpilot.car.mazda.speed.notices import Notices
       notices = Notices(cfg, metric=bool(getattr(card, "is_metric", False)), log=log,
                         ti=bool(int(card.CP.flags) & int(MazdaFlags.TORQUE_INTERCEPTOR)))
     return SpeedControl(card.CP, cfg, card.params, getattr(card, "is_metric", False), log=log, profile=profile,
-                        contributors=contributors, sources=sources, memory=memory, notices=notices)
+                        contributors=contributors, sources=sources, memory=memory, notices=notices,
+                        auto_resume=auto_resume)
   except Exception:
     try:
       from openpilot.common.swaglog import cloudlog

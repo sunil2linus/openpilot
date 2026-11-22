@@ -6,6 +6,8 @@ curve (camera_curves), the exit plan (exits), the merge (merge), the speed limit
 (stops). Test mode builds them with presses=False: computed and logged, never commanded / never taken as an anchor.
 The private SubMaster also reads userBookmark (the onroad Bookmark button, for the speed control's tag line; only
 while the speed control runs this drive): ctx["bookmark"] is True on a frame with a new one.
+Stage 3: with the gas auto-resume it also reads selfdriveState (ctx["engageable"]: openpilot has no no-entry now; False
+when not received) and radarState (its creep guard), and the map view (its map guard).
 """
 import math
 import time
@@ -50,14 +52,16 @@ class Sources:
   unchanged) and the map view file. Fills the ctx every contributor reads."""
 
   def __init__(self, want_model=True, want_view=True, sm=None, read_view=None, clock=time.monotonic, map_presses=True,
-               want_slc=False, want_radar=False, want_bookmark=False):
+               want_slc=False, want_radar=False, want_bookmark=False, want_selfdrive=False):
     self.want_model, self.want_view = want_model, want_view
     self.want_slc, self.want_radar = want_slc, want_radar
     self.want_bookmark = want_bookmark
+    self.want_selfdrive = want_selfdrive
     self.map_presses = map_presses   # the camera only steps aside for map curves that are really pressed for
     self.sm = sm
     services = (["modelV2"] if want_model else []) + (["slcState", "mapdOut"] if want_slc else []) + \
-               (["radarState"] if want_radar else []) + (["userBookmark"] if want_bookmark else [])
+               (["radarState"] if want_radar else []) + (["userBookmark"] if want_bookmark else []) + \
+               (["selfdriveState"] if want_selfdrive else [])
     if self.sm is None and services:
       from openpilot.cereal import messaging
       self.sm = messaging.SubMaster(services)
@@ -74,6 +78,7 @@ class Sources:
     self.slc = None
     self.preview = None
     self.lead = None
+    self.engageable = False
     self.veto = CameraVeto(MODEL_DT)
 
   def context(self, d):
@@ -107,10 +112,13 @@ class Sources:
         self.lead = None if lead is None else dict(lead, t=now)
       if self.want_bookmark and self.sm.updated["userBookmark"]:
         bookmark = True
+      if self.want_selfdrive:
+        self.engageable = bool(self.sm.seen["selfdriveState"] and self.sm.alive["selfdriveState"] and
+                               getattr(self.sm["selfdriveState"], "engageable", False))
     if self.want_view and self.frame % VIEW_EVERY == 1:
       self.view = self.read_view()
     ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
-               path_y=self.path_y, lanes=self.lanes, lead=self.lead,
+               path_y=self.path_y, lanes=self.lanes, lead=self.lead, engageable=self.engageable,
                slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
                preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None)
     view_ok = self.view is not None and self.view.get("gps") == "ok" and now - self.view.get("t", -1e9) <= VIEW_STALE
@@ -134,8 +142,9 @@ class Sources:
     return False
 
 
-def build(cfg, CP, log=None, memory=None, metric=False):
-  """(contributors, sources) for this drive."""
+def build(cfg, CP, log=None, memory=None, metric=False, auto_resume=False):
+  """(contributors, sources) for this drive. auto_resume (Stage 3): the gas auto-resume runs this drive (it has no
+  contributor; it needs the view, the radar lead and selfdriveState)."""
   out = []
   if cfg.active("curves"):
     out.append(CurvePlan(cfg, presses=cfg.presses("curves"), memory=memory))
@@ -155,8 +164,9 @@ def build(cfg, CP, log=None, memory=None, metric=False):
   if cfg.active("stops"):
     from openpilot.starpilot.car.mazda.speed.stops import StopSlowdown
     out.append(StopSlowdown(cfg, presses=cfg.presses("stops"), metric=metric))
-  if not out:
+  if not out and not auto_resume:
     return [], None
-  return out, Sources(want_model=True, want_view=cfg.needs_view, map_presses=cfg.presses("curves"),
+  return out, Sources(want_model=bool(out), want_view=cfg.needs_view, map_presses=cfg.presses("curves"),
                       want_slc=any(cfg.active(n) for n in ("speed_limit", "merge", "exits")),
-                      want_radar=cfg.active("merge") or cfg.active("stops"), want_bookmark=True)
+                      want_radar=cfg.active("merge") or cfg.active("stops") or auto_resume, want_bookmark=True,
+                      want_selfdrive=auto_resume)

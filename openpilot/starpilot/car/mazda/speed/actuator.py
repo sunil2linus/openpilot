@@ -23,6 +23,10 @@ only presses toward it. Rules kept from the old fork's controller (curve_slowdow
   * The car's maximum set speed is 90 mph / 145 km/h; it is only learned lower when the set speed reaches it, or
     after SET_MAX_MISSES spaced, unanswered single SET+ presses at the same set speed at or above SET_MAX_LEARN.
   * Below the car's own minimum set speed (30 km/h = 18.6 mph) nothing is pressed down.
+  * (Stage 3) The one press with the cruise OFF: the gas auto-resume's RES (auto_resume.py decides when; the panda's
+    window lets it through). Only with the cruise off, no openpilot CANCEL/RESUME frame and none of his buttons or the
+    brake this frame. It is booked as his RES: the RES edge (so DRIVER_QUIET follows it, as after his RES) and the
+    "driver_button" RES event the planner and the stop slowdown read; the cruise coming back is the usual "resumed".
 Pure logic, no openpilot imports: unit tested offline (tests/test_actuator.py).
 """
 from dataclasses import dataclass, field
@@ -33,6 +37,7 @@ KPH = 1 / 3.6
 
 SET_PLUS = "SET_PLUS"
 SET_MINUS = "SET_MINUS"
+RESUME = "RES"                # (Stage 3) only the gas auto-resume's RES with the cruise off
 
 BUTTON_GAP = 20               # frames (0.2 s) between two of our frames, taps
 COUNTER_OFFSETS = (1, 1, 0, None)   # tap frames: CTR = wheel CTR + 1 + offset; None = skip that slot
@@ -93,6 +98,7 @@ class ActInputs:
   allow_lower: bool = True
   other_button: bool = False  # openpilot sends CANCEL/RESUME this frame
   dry_run: bool = False       # test mode: decide, never press (nothing is booked as ours)
+  auto_resume: bool = False   # (Stage 3) the gas auto-resume wants its RES frame now (cruise off)
 
 
 @dataclass
@@ -110,7 +116,7 @@ class Press:
 
 @dataclass
 class ActOutput:
-  button: str | None = None   # SET_PLUS / SET_MINUS to send this frame
+  button: str | None = None   # SET_PLUS / SET_MINUS (or RESUME, Stage 3) to send this frame
   counter: int = 0            # the value for mazdacan.create_button_cmd's `counter` (it sends counter + 1)
   would_press: str | None = None   # dry run: what would have been pressed
   events: list = field(default_factory=list)
@@ -381,6 +387,16 @@ class Actuator:
       return "standstill"
     return None
 
+  def _auto_resume(self, i, out):
+    """(Stage 3) the gas auto-resume's RES frame, the one press with the cruise off (see the module notes)."""
+    if i.cruise_enabled or i.other_button or i.brake or i.set_plus or i.set_minus or i.resume or i.cancel or i.dry_run:
+      self._event(out, "auto_res_refused")
+      return out
+    self.edges["RES"] = self.frame
+    self._event(out, "driver_button", button="RES", auto=True)
+    out.button, out.counter = RESUME, max(i.wheel_counter, 0)
+    return out
+
   def update(self, i: ActInputs) -> ActOutput:
     out = ActOutput()
     self.frame += 1
@@ -401,6 +417,8 @@ class Actuator:
     if self.hold is not None and (i.set_plus or i.set_minus or i.resume or i.cancel or i.brake or not i.cruise_enabled):
       self._stop_hold(out, "driver")
     self._expire(i, out)
+    if i.auto_resume:
+      return self._auto_resume(i, out)
     if self.disabled:
       return out
     if self.last_set is None or not i.cruise_enabled:
