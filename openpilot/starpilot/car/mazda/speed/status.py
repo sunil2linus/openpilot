@@ -47,24 +47,37 @@ def read(name, directory=None):
 
 
 def build_text(value):
-  """The curve-map builder's state in plain words, or "" when it has not written one."""
+  """The curve-map builder's state in plain words, or "" when it has not written one. With a build range: the map
+  areas within it and every downloaded one ("within 100 miles 5 of 5 built; all downloaded 5 of 33"), so a short
+  range is not mistaken for the whole map; the whole map (or an older status file without those counts): one count."""
   if not value:
     return ""
   state = value.get("state")
   try:
     built, total = int(value.get("built", 0)), int(value.get("total", 0))
+    failed = int(value.get("failed", 0) or 0)
+    rng = int(value.get("range", 0) or 0)
+    all_built, all_total = int(value.get("all_built", built)), int(value.get("all_total", total))
   except (TypeError, ValueError):
-    built, total = 0, 0
+    built, total, failed, rng, all_built, all_total = 0, 0, 0, 0, 0, 0
   if state == NO_MAP:
     return "curve maps: no offline map downloaded (download one in Maps settings)."
+  failed_words = f", {failed} failed (see build_log.txt)" if failed else ""
+  if rng > 0 and "all_total" in value:
+    counts = f"within {rng} miles {built} of {total} built{{failed}}; all downloaded {all_built} of {all_total}"
+    if state == UP_TO_DATE:
+      return "curve maps: " + counts.format(failed="") + "."
+    if state == BUILDING:
+      return "curve maps: building… " + counts.format(failed="") + " (parked, on power)."
+    if state == PARTIAL:
+      return "curve maps: " + counts.format(failed=failed_words) + f"; the rest within {rng} miles are built while parked."
+    return ""
   if state == UP_TO_DATE:
-    return f"curve maps: up to date ({total} of {total} folders built)." if total else "curve maps: up to date."
+    return f"curve maps: up to date ({total} of {total} map areas built)." if total else "curve maps: up to date."
   if state == BUILDING:
-    return f"curve maps: building… {built} of {total} folders built (parked, on power)."
+    return f"curve maps: building… {built} of {total} map areas built (parked, on power)."
   if state == PARTIAL:
-    failed = int(value.get("failed", 0) or 0)
-    return (f"curve maps: {built} of {total} folders built" + (f", {failed} failed (see build_log.txt)" if failed else "") +
-            "; the rest are built while parked.")
+    return f"curve maps: {built} of {total} map areas built" + failed_words + "; the rest are built while parked."
   return ""
 
 

@@ -34,7 +34,12 @@ def test_sub_features_need_the_master_switch():
 
 
 @pytest.mark.parametrize("raw", [
-  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 6}).encode(),
+  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 7}).encode(), json.dumps({"version": 0}).encode(),
+  json.dumps({"version": 5, "curve_range_mi": 200}).encode(), json.dumps({"version": 1, "curve_range_mi": 0}).encode(),
+  json.dumps({"version": 6, "curve_range_mi": 150}).encode(), json.dumps({"version": 6, "curve_range_mi": -1}).encode(),
+  json.dumps({"version": 6, "curve_range_mi": "100"}).encode(), json.dumps({"version": 6, "curve_range_mi": 100.0}).encode(),
+  json.dumps({"version": 6, "curve_range_mi": True}).encode(), json.dumps({"version": 6, "curve_range_mi": None}).encode(),
+  json.dumps({"version": 6, "curve_map_range": 100}).encode(),
   json.dumps({"version": 4, "auto_resume": True}).encode(), json.dumps({"version": 4, "ti_steer_700": True}).encode(),
   json.dumps({"version": 5, "auto_resume": 1}).encode(), json.dumps({"version": 5, "ti_steer_700": "on"}).encode(),
   json.dumps({"version": 5, "auto_resume_after_brake": True}).encode(), json.dumps({"version": 1, "curve_offset_mph": 2}).encode(),
@@ -71,13 +76,14 @@ def test_encode_roundtrip_is_canonical():
   cfg = C.with_value(C.Config(), "enabled", True)
   cfg = C.with_value(cfg, "curves", "test")
   raw = C.encode(cfg)
-  assert raw == b'{"curves":"test","enabled":true,"version":5}'
+  assert raw == b'{"curves":"test","enabled":true,"version":6}'
   assert C.decode(b'{"curves":"test","enabled":true,"version":1}') == cfg     # a version 1 document still reads
   assert C.decode(b'{"curves":"test","enabled":true,"version":2}') == cfg     # ... and a version 2 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":3}') == cfg     # ... and a version 3 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":4}') == cfg     # ... and a version 4 one
+  assert C.decode(b'{"curves":"test","enabled":true,"version":5}') == cfg     # ... and a version 5 one
   assert C.decode(raw) == cfg
-  assert C.encode(C.Config()) == b'{"version":5}'
+  assert C.encode(C.Config()) == b'{"version":6}'
   with pytest.raises(C.ConfigError):
     C.with_value(cfg, "plan_lat", 9.0)
   with pytest.raises(C.ConfigError):
@@ -159,4 +165,27 @@ def test_version_5_stage3_options_default_off():
   # the steering limit test is its own switch (not under the master switch) and starts nothing of the speed control
   cfg = C.decode(json.dumps({"version": 5, "ti_steer_700": True}).encode())
   assert cfg.steer_700_on and not cfg.any_active and not cfg.needs_view
-  assert C.encode(cfg) == b'{"ti_steer_700":true,"version":5}'
+  assert C.encode(cfg) == b'{"ti_steer_700":true,"version":6}'
+
+
+def test_version_6_curve_map_build_range():
+  # default 100 miles: what the builder always did (a document without the field, of any version)
+  for version in C.VERSIONS:
+    cfg = C.decode(json.dumps({"version": version}).encode())
+    assert cfg.curve_range_mi == 100 and cfg.curve_range_miles == 100.0
+  assert C.CURVE_RANGES == (30, 50, 100, 200, 300, 0)
+  for miles in C.CURVE_RANGES:
+    cfg = C.decode(json.dumps({"version": 6, "enabled": True, "curves": "on", "curve_range_mi": miles}).encode())
+    assert cfg.curve_range_mi == miles and C.decode(C.encode(cfg)) == cfg
+    assert cfg.curve_range_miles == (None if miles == C.WHOLE_MAP else float(miles))
+    assert cfg.presses("curves") and cfg.needs_view
+  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 0)) == b'{"curve_range_mi":0,"version":6}'
+  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 100)) == b'{"version":6}'    # the default is not written
+  # the range alone starts nothing
+  assert not C.decode(b'{"version":6,"enabled":true,"curve_range_mi":300}').any_active
+  with pytest.raises(C.ConfigError):
+    C.with_value(C.Config(), "curve_range_mi", 75)
+  with tempfile.TemporaryDirectory() as d:
+    params = Params(d)
+    Path(params.get_param_path(C.KEY)).write_bytes(b'{"version":6,"curve_range_mi":0,"extra":1}')
+    assert not C.read(params).valid and C.read(params).curve_range_mi == 100       # unknown field: invalid, default

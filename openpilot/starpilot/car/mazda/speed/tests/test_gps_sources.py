@@ -195,10 +195,10 @@ def test_build_status_counts_and_words(tmp_path):
   assert D.run_once(folders, str(tmp_path), log=lambda s: None, builder=fake, report=reports.append) == 1
   assert [r["state"] for r in reports] == [ST.BUILDING, ST.UP_TO_DATE]
   assert reports[0]["built"] == 0 and reports[0]["total"] == 1 and reports[-1]["built"] == 1
-  assert ST.build_text(reports[0]) == "curve maps: building… 0 of 1 folders built (parked, on power)."
-  assert ST.build_text(reports[-1]) == "curve maps: up to date (1 of 1 folders built)."
+  assert ST.build_text(reports[0]) == "curve maps: building… 0 of 1 map areas built (parked, on power)."
+  assert ST.build_text(reports[-1]) == "curve maps: up to date (1 of 1 map areas built)."
   assert "no offline map downloaded" in ST.build_text(D.build_status(0, None))
-  assert ST.build_text(D.build_status(3, 5)) == "curve maps: 3 of 5 folders built; the rest are built while parked."
+  assert ST.build_text(D.build_status(3, 5)) == "curve maps: 3 of 5 map areas built; the rest are built while parked."
   assert ST.build_text(None) == "" and ST.build_text({"state": "odd"}) == ""
 
   def boom(*a, **k):

@@ -17,6 +17,10 @@ SUB_ROWS = (
   ("curves", "Curves from the map",
    "Lowers the cruise set speed before curves found in the offline map. Exit ramp curves before the split need " +
    "Exit ramps. Test computes and logs, never presses.", 0.),
+  ("curve_range_mi", "Curve map build range",
+   "Which downloaded map areas get curve maps: those within this many miles of where the car was last parked " +
+   "(nearest first), or Whole map (everything downloaded). Each map area takes about 2-3 minutes, built only while " +
+   "parked with power; the whole map can take hours.", 0.),
   ("camera_curves", "Curves from the camera",
    "Lowers the set speed carefully for curves missing from the map, from what the camera sees (about 2 s ahead).", 0.),
   ("curve_offset_mph", "Curve speed offset",
@@ -68,8 +72,13 @@ CONFIRM_ON = ("enabled", "auto_resume", "ti_steer_700")   # turning these on nee
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
 
+# (v6) choice rows: field -> {saved value: shown label}
+CHOICE_LABELS = {"curve_range_mi": {**{m: f"{m} mi" for m in C.CURVE_RANGES if m != C.WHOLE_MAP}, C.WHOLE_MAP: "Whole map"}}
+APPLIES = {"curve_range_mi": " A change applies while parked within about a minute (after the map area being built), " +
+                             "no reboot needed."}
+
 MAP_ROWS = ("speed_limit", "merge", "exits")
-CURVE_FILE_ROWS = ("curves", "merge", "exits", "auto_resume")   # use the curve files mazda_curve_mapd builds parked
+CURVE_FILE_ROWS = ("curves", "curve_range_mi", "merge", "exits", "auto_resume")   # use the curve files mazda_curve_mapd builds parked
 GPS_ROWS = ("curves", "speed_limit", "merge", "exits", "auto_resume")   # need mazda_mapviewd's GPS position
 MAP_STATUS_CACHE = 5.0          # s
 
@@ -129,6 +138,11 @@ def _shown(value):
 def parse_value(field, text):
   """The displayed / requested text -> the saved value for `field`, or raise ConfigError."""
   kind, _, lim = C.SCHEMA[field]
+  if kind == "choice":
+    values = {v: k for k, v in CHOICE_LABELS[field].items()}
+    if text not in values:
+      raise C.ConfigError(field)
+    return values[text]
   if kind == "bool":
     if text not in ("Off", "On"):
       raise C.ConfigError(field)
@@ -227,7 +241,11 @@ class MazdaSpeedFeature:
       now_says = [t for t in now_says if t]
       if now_says:
         reason = reason + " Now: " + " ".join(now_says)
-      if kind == "mode":
+      if kind == "choice":
+        labels = CHOICE_LABELS[field]
+        rows.append(FeatureRow(PREFIX + field, label, labels[value], choices=tuple(labels[v] for v in lim),
+                               default_value=labels[default], reason=reason + APPLIES[field], **common))
+      elif kind == "mode":
         rows.append(FeatureRow(PREFIX + field, label, _shown(value), choices=tuple(MODE_LABELS.values()),
                                default_value=_shown(default), reason=reason + " Applies at the next drive.", **common))
       elif kind == "bool":

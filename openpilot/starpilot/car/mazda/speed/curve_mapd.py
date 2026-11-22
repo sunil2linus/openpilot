@@ -13,11 +13,15 @@ starpilot/system/curve_mapd.py, pointed at 7.0's offline maps).
     JSON, its tiles changed (their SHA-256 in the receipt), or it was built by an older BUILDER_VERSION or
     FORMAT_VERSION (curve_builder.py: bumped on every geometry change). Files are written with fsync and the state
     last, so a folder killed half way is simply built again.
-  * Which folders: those within RANGE_MILES of the last known position (LastGPSPosition from either GPS service,
+  * Which folders: those within the "Curve map build range" (config curve_range_mi: 30 / 50 / 100 / 200 / 300 miles,
+    default 100 = RANGE_MILES, or the whole map) of the last known position (LastGPSPosition from either GPS service,
     else 7.0's navigation last-position store: on a comma 3X / tizi only ubloxd writes LastGPSPosition, and those
-    devices run qcomgpsd), nearest first; with no position yet, every folder of the selection.
-  * Status: <mazda_speed>/curve_build_status.json (status.py: "3 of 5 folders built", "building", "up to date",
-    "no offline map downloaded"), read by the settings rows; folder counts only.
+    devices run qcomgpsd), nearest first; the whole map or no position yet: every folder of the selection (nearest
+    first when there is a position). The range is read again on every pass (every CHECK_INTERVAL while parked) and
+    before each folder: a change stops the pass after the folder being built, so it applies without a reboot.
+  * Status: <mazda_speed>/curve_build_status.json (status.py: "within 100 miles 3 of 5 built; all downloaded 3 of 33",
+    "building", "no offline map downloaded"), read by the settings rows; counts and the range only, never a position.
+    Folders out of range are counted as built from their state alone (no curve file is opened for them).
   * A MemoryError on a dense folder: gc.collect() and one retry; a second failure skips that folder for the rest of
     this parked session (logged) instead of retrying it forever. gc.collect() between folders.
   * Log: <curve root>/build_log.txt (size capped), never a GPS position.
@@ -135,14 +139,30 @@ def folder_box_distance_miles(near, folder):
   return math.hypot(dx, dy) / MILE_M
 
 
+def state_current(folder, tiles, curve_root=CURVE_ROOT):
+  """Built by the current builder / format for these tiles, from the folder's state alone (the light check used to
+  count folders out of range: their curve files are not opened every pass)."""
+  try:
+    state = read_state(os.path.join(curve_root, folder))
+    return (state is not None and int(state.get("format", 0)) >= B.FORMAT_VERSION and
+            int(state.get("builder", 0)) >= B.BUILDER_VERSION and state.get("signature") == signature(tiles))
+  except (TypeError, ValueError):
+    return False
+
+
+def in_scope(near, folder, range_miles):
+  """The folder is built: no position or no range (whole map), or its box within range_miles."""
+  return near is None or range_miles is None or folder_box_distance_miles(near, folder) <= range_miles
+
+
 def plan(folders, curve_root=CURVE_ROOT, near=None, range_miles=RANGE_MILES, failed=()):
-  """[(folder, why)] to build, nearest first. folders: selected_folders()."""
+  """[(folder, why)] to build, nearest first. folders: selected_folders(). range_miles None: the whole map."""
   todo = []
   for folder, info in folders.items():
     if folder in failed:
       continue
     dist = folder_box_distance_miles(near, folder) if near is not None else 0.0
-    if near is not None and dist > range_miles:
+    if not in_scope(near, folder, range_miles):
       continue
     why = check_folder(folder, info["tiles"], curve_root)
     if why is not None:
@@ -178,21 +198,30 @@ def build_folder(folder, info, curve_root=CURVE_ROOT, log=print, builder=B.build
 
 
 def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=lambda: False, failed=None,
-             builder=B.build, report=None):
-  """One pass over the folders in scope. failed: {folder: tries} kept by the caller for the parked session.
-  report(status dict): told before each folder and after the pass (the settings rows' status file)."""
+             builder=B.build, report=None, range_miles=RANGE_MILES):
+  """One pass over the folders in scope (range_miles None: the whole map). failed: {folder: tries} kept by the
+  caller for the parked session. report(status dict): told before each folder and after the pass (the settings
+  rows' status file)."""
   failed = {} if failed is None else failed
   skip = {f for f, n in failed.items() if n >= 2}
-  stale = plan(folders, curve_root, near)                 # every folder in scope that is not up to date
+  stale = plan(folders, curve_root, near, range_miles)    # every folder in scope that is not up to date
   todo = [(f, w) for f, w in stale if f not in skip]
-  total = sum(near is None or folder_box_distance_miles(near, f) <= RANGE_MILES for f in folders)
+  scope = [f for f in folders if in_scope(near, f, range_miles)]
+  total = len(scope)
   built = total - len(stale)
+  scope = set(scope)
+  outside = sum(state_current(f, folders[f]["tiles"], curve_root) for f in folders if f not in scope)
+  shown_range = range_miles if (near is not None and range_miles is not None) else None   # None: all in scope
+
+  def status(n, **kw):
+    return build_status(n, total, range_miles=shown_range, all_built=n + outside, all_total=len(folders), **kw)
+
   done = 0
   for folder, why in todo:
     if should_stop():
       break
     if report is not None:
-      report(build_status(built + done, total, building=True, failed=len(stale) - len(todo)))
+      report(status(built + done, building=True, failed=len(stale) - len(todo)))
     log(f"building {folder} ({why})")
     for attempt in (1, 2):
       try:
@@ -210,7 +239,7 @@ def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=l
         break
     gc.collect()
   if report is not None:
-    report(build_status(built + done, total, failed=sum(f in failed and failed[f] >= 2 for f, _ in stale)))
+    report(status(built + done, failed=sum(f in failed and failed[f] >= 2 for f, _ in stale)))
   return done
 
 
@@ -308,13 +337,24 @@ def wanted(params, CP=None):
     return False
 
 
-def build_status(built, total, building=False, failed=0):
-  """The status file's dict (status.build_text says it in words); a folder count, never a position."""
+def build_range(params):
+  """The configured "Curve map build range" in miles, or None for the whole map (config.curve_range_mi)."""
+  from openpilot.starpilot.car.mazda.speed import config as C
+  return C.read(params).curve_range_miles
+
+
+def build_status(built, total, building=False, failed=0, range_miles=None, all_built=None, all_total=None):
+  """The status file's dict (status.build_text says it in words); counts and the range only, never a position.
+  built / total: the folders in scope; range: its miles (0: everything is in scope: the whole map or no position);
+  all_built / all_total: every folder of the selected map."""
   from openpilot.starpilot.car.mazda.speed import status as ST
   if total is None:
     return {"state": ST.NO_MAP, "built": 0, "total": 0, "failed": 0}
   state = ST.UP_TO_DATE if built >= total else ST.BUILDING if building else ST.PARTIAL
-  return {"state": state, "built": int(built), "total": int(total), "failed": int(failed)}
+  out = {"state": state, "built": int(built), "total": int(total), "failed": int(failed)}
+  if all_total is not None:
+    out.update({"range": int(range_miles or 0), "all_built": int(all_built), "all_total": int(all_total)})
+  return out
 
 
 def _lowest_priority():
@@ -349,7 +389,9 @@ def main():
         report(build_status(0, None))
         time.sleep(IDLE_INTERVAL)
         continue
-      run_once(folders, near=last_position(params), log=log, failed=failed, report=report)
+      rng = build_range(params)                           # read every pass: a change needs no reboot
+      run_once(folders, near=last_position(params), log=log, failed=failed, report=report, range_miles=rng,
+               should_stop=lambda rng=rng: build_range(params) != rng)
     except Exception:
       cloudlog.exception("mazda_curve_mapd failed")
       log("failed, see the system log")

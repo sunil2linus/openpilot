@@ -5,6 +5,8 @@ import json
 import math
 import os
 
+import pytest
+
 from openpilot.starpilot.car.mazda.speed import curve_builder as B
 from openpilot.starpilot.car.mazda.speed import curve_mapd as D
 
@@ -168,3 +170,136 @@ def test_the_builder_runs_for_every_option_that_needs_the_map_view(tmp_path):
     Path(params.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 3, **doc}).encode())
     assert D.wanted(params, cp) is want, doc
     assert processes.curve_build(False, params, cp) is want       # the daemon starts by the same rule
+
+
+# ---------------- (config v6) the curve map build range ----------------
+
+NEAR = (42.5, -83.0)
+# folder -> miles from NEAR to its box: 0, 34.5, 61.6, 172.7, about 255, 310.9, 768.9
+RANGE_FOLDERS = ("42/-84", "40/-84", "40/-86", "38/-84", "42/-78", "36/-84", "30/-90")
+IN_RANGE = {30: RANGE_FOLDERS[:1], 50: RANGE_FOLDERS[:2], 100: RANGE_FOLDERS[:3], 200: RANGE_FOLDERS[:4],
+            300: RANGE_FOLDERS[:5], None: RANGE_FOLDERS}
+
+
+def range_folders():
+  return {f: {"dir": "/x", "tiles": TILES} for f in reversed(RANGE_FOLDERS)}    # dict order is not the build order
+
+
+def fake_builder(calls):
+  def build(src, out, **kw):
+    calls.append(os.path.relpath(out, os.path.dirname(os.path.dirname(out))))
+    return {"files": [], "curves": 0, "ramps": 0}
+  return build
+
+
+def test_folder_distances_used_by_the_range_tests():
+  miles = [D.folder_box_distance_miles(NEAR, f) for f in RANGE_FOLDERS]
+  assert miles == sorted(miles) and miles[0] == 0
+  assert 30 < miles[1] < 50 < miles[2] < 100 < miles[3] < 200 < miles[4] < 300 < miles[5]
+
+
+@pytest.mark.parametrize("miles", [30, 50, 100, 200, 300, None])
+def test_plan_with_each_range_nearest_first(tmp_path, miles):
+  got = [f for f, _ in D.plan(range_folders(), str(tmp_path), near=NEAR, range_miles=miles)]
+  assert got == list(IN_RANGE[miles])
+  # no position: every folder, whatever the range (as before)
+  assert sorted(f for f, _ in D.plan(range_folders(), str(tmp_path), near=None, range_miles=miles)) == sorted(RANGE_FOLDERS)
+
+
+@pytest.mark.parametrize("miles", [30, 50, 100, 200, 300, None])
+def test_run_once_with_each_range_builds_in_range_and_reports_both_counts(tmp_path, miles):
+  calls, reports = [], []
+  n = D.run_once(range_folders(), str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls),
+                 report=reports.append, range_miles=miles)
+  want = list(IN_RANGE[miles])
+  assert n == len(want) and calls == want
+  last = reports[-1]
+  assert set(last) == {"state", "built", "total", "failed", "range", "all_built", "all_total"}   # counts only
+  assert (last["built"], last["total"], last["all_built"], last["all_total"]) == (len(want), len(want), len(want), 7)
+  assert last["range"] == (miles or 0) and last["state"] == "up_to_date"
+  first = reports[0]
+  assert first["state"] == "building" and first["built"] == 0 and first["all_built"] == 0
+
+
+def test_the_default_range_is_100_miles_as_before(tmp_path):
+  from openpilot.starpilot.car.mazda.speed import config as C
+  assert D.RANGE_MILES == C.Config().curve_range_miles == 100.0
+  calls = []
+  D.run_once(range_folders(), str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls))
+  assert calls == list(IN_RANGE[100])
+
+
+def test_folders_out_of_range_count_as_built_from_their_state(tmp_path):
+  calls, reports = [], []
+  folders = range_folders()
+  D.run_once(folders, str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls), range_miles=None)
+  assert len(calls) == 7
+  D.run_once(folders, str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls), report=reports.append,
+             range_miles=30)
+  assert len(calls) == 7                                               # nothing to build
+  assert {k: reports[-1][k] for k in ("built", "total", "range", "all_built", "all_total")} == \
+    {"built": 1, "total": 1, "range": 30, "all_built": 7, "all_total": 7}
+  # a stale folder out of range is not counted as built, and is not built
+  folders["30/-90"] = {"dir": "/x", "tiles": dict.fromkeys(TILES, "cd" * 32)}
+  D.run_once(folders, str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls), report=reports.append,
+             range_miles=30)
+  assert len(calls) == 7 and reports[-1]["all_built"] == 6
+
+
+def test_no_position_builds_everything_and_says_one_count(tmp_path):
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  calls, reports = [], []
+  D.run_once(range_folders(), str(tmp_path), near=None, log=lambda _: None, builder=fake_builder(calls),
+             report=reports.append, range_miles=100)
+  assert sorted(calls) == sorted(RANGE_FOLDERS)
+  assert reports[-1]["range"] == 0 and reports[-1]["total"] == 7
+  assert ST.build_text(reports[-1]) == "curve maps: up to date (7 of 7 map areas built)."
+
+
+def test_a_range_change_stops_the_pass_after_the_folder_being_built(tmp_path):
+  calls = []
+  D.run_once(range_folders(), str(tmp_path), near=NEAR, log=lambda _: None, builder=fake_builder(calls),
+             range_miles=None, should_stop=lambda: len(calls) >= 1)
+  assert calls == ["42/-84"]
+
+
+def test_build_range_is_read_from_the_saved_config(tmp_path):
+  from pathlib import Path
+  from openpilot.common.params import Params
+  from openpilot.starpilot.car.mazda.speed import config as C
+  params = Params(str(tmp_path))
+  assert D.build_range(params) == 100.0                               # nothing saved: the default
+  for raw, want in ((b'{"version":6,"curve_range_mi":300}', 300.0), (b'{"version":6,"curve_range_mi":0}', None),
+                    (b'{"version":5,"enabled":true}', 100.0), (b'{"version":6,"curve_range_mi":7}', 100.0)):
+    Path(params.get_param_path(C.KEY)).write_bytes(raw)
+    assert D.build_range(params) == want, raw
+
+
+def test_status_texts_say_the_range_and_the_whole_map():
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  t = ST.build_text
+  assert t(D.build_status(5, 5, range_miles=100, all_built=5, all_total=33)) == \
+    "curve maps: within 100 miles 5 of 5 built; all downloaded 5 of 33."
+  assert t(D.build_status(3, 5, building=True, range_miles=100, all_built=3, all_total=33)) == \
+    "curve maps: building… within 100 miles 3 of 5 built; all downloaded 3 of 33 (parked, on power)."
+  assert t(D.build_status(3, 5, failed=1, range_miles=30, all_built=4, all_total=33)) == \
+    "curve maps: within 30 miles 3 of 5 built, 1 failed (see build_log.txt); all downloaded 4 of 33; " + \
+    "the rest within 30 miles are built while parked."
+  # the whole map (range 0): one count
+  assert t(D.build_status(12, 33, range_miles=None, all_built=12, all_total=33)) == \
+    "curve maps: 12 of 33 map areas built; the rest are built while parked."
+  assert t(D.build_status(12, 33, building=True, range_miles=None, all_built=12, all_total=33)) == \
+    "curve maps: building… 12 of 33 map areas built (parked, on power)."
+  assert t(D.build_status(33, 33, range_miles=None, all_built=33, all_total=33)) == \
+    "curve maps: up to date (33 of 33 map areas built)."
+  assert t(D.build_status(0, None)) == "curve maps: no offline map downloaded (download one in Maps settings)."
+  # an older status file (no range / all-downloaded counts) still reads
+  assert t({"state": "up_to_date", "built": 5, "total": 5, "failed": 0}) == "curve maps: up to date (5 of 5 map areas built)."
+  assert t({"state": "building", "built": 3, "total": 5, "failed": 0}) == \
+    "curve maps: building… 3 of 5 map areas built (parked, on power)."
+  assert t({"state": "partial", "built": 3, "total": 5, "failed": 2}) == \
+    "curve maps: 3 of 5 map areas built, 2 failed (see build_log.txt); the rest are built while parked."
+  assert t({"state": "up_to_date", "built": 0, "total": 0}) == "curve maps: up to date."
+  assert t({"state": "building", "built": "x"}) == "curve maps: building… 0 of 0 map areas built (parked, on power)."
+  assert t(None) == "" and t({"state": "odd"}) == ""
+  assert all("folder" not in t(v) for v in ({"state": s, "built": 1, "total": 2} for s in ("building", "partial", "up_to_date")))

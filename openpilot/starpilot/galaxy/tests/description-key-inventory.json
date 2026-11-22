@@ -436,6 +436,7 @@
   "mazda_speed:enabled",
   "mazda_speed:reset",
   "mazda_speed:curves",
+  "mazda_speed:curve_range_mi",
   "mazda_speed:camera_curves",
   "mazda_speed:plan_lat",
   "mazda_speed:ramp_lat",

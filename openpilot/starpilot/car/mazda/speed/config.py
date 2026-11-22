@@ -10,7 +10,8 @@ Rules:
   * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
     version 3 the speed limit follow (+ its offset), the on-ramp merge and the exit plan, version 4 the stop
     slowdown and the on-screen notices (+ their sound), version 5 (Stage 3) the gas auto-resume and the steering
-    limit test. A field of a later version in an older document is invalid (unknown fields are invalid).
+    limit test, version 6 the curve map build range. A field of a later version in an older document is invalid
+    (unknown fields are invalid).
   * Stage 3: `auto_resume` (with the master switch) and `ti_steer_700` (without it: it is a steering setting, used only
     with the Torque Interceptor) also set panda safety param bits at car start (vehicle_preferences.py ->
     opendbc/car/mazda/speed_flags.py), so they apply from the next drive (the next car start).
@@ -21,14 +22,16 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 5                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
-VERSIONS = (1, 2, 3, 4, 5)      #    merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700
-                                #    (older documents still read)
+VERSION = 6                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3, 4, 5, 6)   #    merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700;
+                                #    6: + curve_range_mi (older documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
+WHOLE_MAP = 0                   # curve_range_mi: build every map area of the selected offline map
+CURVE_RANGES = (30, 50, 100, 200, 300, WHOLE_MAP)   # miles (the old fork's MazdaCurveMapRange choices + the whole map)
 
-# field -> (kind, default, bounds or choices)
+# field -> (kind, default, bounds or choices); "choice": an int out of the listed ones
 SCHEMA = {
   "enabled": ("bool", False, None),
   "curves": ("mode", "off", MODES),                 # curves from the map (+ camera veto / camera-only curves)
@@ -47,11 +50,13 @@ SCHEMA = {
   "notice_sound": ("bool", False, None),            # (v4) ... the stop / brake notices with a chime
   "auto_resume": ("bool", False, None),             # (v5) after his brake, his gas presses RES for him (auto_resume.py)
   "ti_steer_700": ("bool", False, None),            # (v5) TI steering limit test 600 -> 700 (not under the master switch)
+  "curve_range_mi": ("choice", 100, CURVE_RANGES),  # (v6) the parked curve-map builder's range (curve_mapd.py), 0 = all
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
 V4_FIELDS = frozenset(("stops", "notices", "notice_sound"))
 V5_FIELDS = frozenset(("auto_resume", "ti_steer_700"))
+V6_FIELDS = frozenset(("curve_range_mi",))
 
 
 class ConfigError(ValueError):
@@ -77,6 +82,7 @@ class Config:
   notice_sound: bool = False
   auto_resume: bool = False
   ti_steer_700: bool = False
+  curve_range_mi: int = 100
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -121,6 +127,11 @@ class Config:
     """(Stage 3) the TI steering limit test: its own switch only (applied only on a car with the TI)."""
     return bool(self.ti_steer_700)
 
+  @property
+  def curve_range_miles(self):
+    """(v6) miles around the last known position the curve maps are built for, or None: the whole map."""
+    return None if self.curve_range_mi == WHOLE_MAP else float(self.curve_range_mi)
+
 
 def _unique(pairs):
   out = {}
@@ -150,7 +161,8 @@ def decode(raw):
   if doc.get("version") not in VERSIONS or type(doc.get("version")) is not int:
     raise ConfigError("version")
   if ((doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)) or
-      (doc["version"] < 4 and V4_FIELDS & set(doc)) or (doc["version"] < 5 and V5_FIELDS & set(doc))):
+      (doc["version"] < 4 and V4_FIELDS & set(doc)) or (doc["version"] < 5 and V5_FIELDS & set(doc)) or
+      (doc["version"] < 6 and V6_FIELDS & set(doc))):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():
@@ -167,6 +179,9 @@ def decode(raw):
         raise ConfigError(k)
     elif kind == "int":
       if type(v) is not int or not lim[0] <= v <= lim[1]:
+        raise ConfigError(k)
+    elif kind == "choice":
+      if type(v) is not int or v not in lim:
         raise ConfigError(k)
     elif kind == "float":
       if type(v) not in (int, float) or not math.isfinite(v) or not lim[0] <= v <= lim[1]:

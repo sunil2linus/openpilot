@@ -20,6 +20,9 @@ DESCRIPTIONS = {
   'mazda_speed:enabled': 'For a Gen1 Mazda with the stock radar cruise: StarPilot presses the cruise SET+/SET- buttons to slow for curves and restore your speed after. Your buttons, the brake and the gas always win. Takes effect when a drive starts.',
   'mazda_speed:reset': 'Replaces invalid Mazda speed control settings with the defaults (everything off).',
   'mazda_speed:curves': 'Lowers the cruise set speed before curves found in the offline map; exit ramp curves before the split need Exit ramps. Test computes and logs without pressing.',
+  'mazda_speed:curve_range_mi': ('Chooses which downloaded map areas get curve maps: those within 30, 50, 100, 200 or 300 miles '
+                                 'of where the car was last parked, or the whole map. Each map area takes about 2-3 minutes, '
+                                 'built only while parked with power.'),
   'mazda_speed:camera_curves': 'Lowers the cruise set speed carefully for curves missing from the map, from what the camera sees.',
   'mazda_speed:curve_offset_mph': 'Plans the tight part of map curves a few mph faster, never above the offset side force; a curve that was hard to steer loses it.',
   'mazda_speed:curve_offset_lat': 'Limits the side force the curve speed offset may plan.',

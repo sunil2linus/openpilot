@@ -99,6 +99,13 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   by our own parked daemon (`mazda_curve_mapd`) straight from the downloaded offline tiles of the selected region; they
   need the download (item 3), not a running map service. Without the download (item 3) nothing map-based works: only
   the camera-only curves remain.
+* **Curve map build range** (config v6 `curve_range_mi`: 30 / 50 / 100 / 200 / 300 miles or 0 = Whole map, default
+  100 = the old fixed range; shown next to "Curves from the map"): the builder only builds the map areas (2 x 2 degree
+  folders) within this range of the last known position, nearest first; Whole map builds every downloaded area,
+  nearest first. Each area takes about 2-3 minutes, built only while parked with power. The builder reads the range
+  every pass (every minute while parked) and before each area, so a change applies after the area being built, with
+  no reboot. The status says both counts (in range and all downloaded) so a short range is not mistaken for the whole
+  map (the owner had 33 areas downloaded and saw "5 of 5 built").
 
 ## Part (g): stop slowdown (`stops`: off / test / on)
 
@@ -207,8 +214,9 @@ position-like keys are dropped even though the log has none).
   The parked builder's nearest-first order uses `LastGPSPosition` (either service) or, on a tizi where only ubloxd would
   write that param, 7.0's navigation last-position store.
 * **Status the owner can see** (no Params key; `status.py`, files in `/data/media/0/mazda_speed/`, never a position):
-  `curve_build_status.json` (mazda_curve_mapd: "curve maps: 3 of 5 folders built", "building…", "up to date", "no
-  offline map downloaded") and `gps_status.json` (mazda_mapviewd: "last drive: no GPS position: no message from the
+  `curve_build_status.json` (mazda_curve_mapd: "curve maps: within 100 miles 5 of 5 built; all downloaded 5 of 33.",
+  "building… within 100 miles 3 of 5 built; …", with Whole map "12 of 33 map areas built", "no offline map
+  downloaded"; an older file without the range counts still reads) and `gps_status.json` (mazda_mapviewd: "last drive: no GPS position: no message from the
   GPS" / "the GPS has no fix" / "the GPS messages stopped"). The settings rows for map curves, speed limit, merge and
   exits add them after "Now:". The event log gets a `gps` line whenever the view's GPS state changes (ok + service,
   or why: no_messages / no_fix / stale / no_view = the view file is missing).

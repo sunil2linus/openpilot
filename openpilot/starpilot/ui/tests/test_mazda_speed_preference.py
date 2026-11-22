@@ -105,7 +105,7 @@ def test_invalid_document_is_off_and_repairable():
     request = row_change(shown[0])
     assert not owner.apply(replace(request, value='On'))
     assert owner.apply(request)
-    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":5}'
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"version":6}'
     assert [r.key for r in rows(owner)] == [MASTER, PREFIX + 'ti_steer_700']
 
 
@@ -154,7 +154,7 @@ def test_rows_show_the_curve_map_build_and_the_last_drives_gps(monkeypatch):
     owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
     got = {r.key: r.reason for r in rows(owner)}
     for k in ("curves", "merge", "exits"):
-      assert "Now: curve maps: building… 3 of 5 folders built" in got[PREFIX + k], got[PREFIX + k]
+      assert "Now: curve maps: building… 3 of 5 map areas built" in got[PREFIX + k], got[PREFIX + k]
     for k in ("curves", "speed_limit", "merge", "exits"):
       assert "last drive: no GPS position: no message from the GPS" in got[PREFIX + k], got[PREFIX + k]
     assert "curve maps" not in got[PREFIX + "speed_limit"] and "Now:" not in got[PREFIX + "camera_curves"]
@@ -208,3 +208,41 @@ def test_rows_stay_with_a_stage3_bit_in_the_saved_carparams():
     cp = ti_cp()
     cp.safetyConfigs[0].safetyParam |= int(MazdaSafetyFlags.AUTO_RESUME | MazdaSafetyFlags.TI_STEER_700)
     assert [r.key for r in rows(owner_for(saved, cp, {}))] == [MASTER, PREFIX + 'ti_steer_700']
+
+
+def test_curve_map_build_range_row(monkeypatch):
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  import openpilot.starpilot.ui.mazda_speed_feature as F
+  with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as status_dir:
+    monkeypatch.setattr(ST, "STATUS_DIR", status_dir)
+    monkeypatch.setattr(F, "map_service_status", lambda params, cp: "")
+    saved = Params(d)
+    Path(saved.get_param_path(C.KEY)).write_bytes(json.dumps({"version": 5, "enabled": True}).encode())  # an old document
+    owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
+    shown = rows(owner)
+    keys = [r.key for r in shown]
+    assert keys.index(PREFIX + 'curve_range_mi') == keys.index(PREFIX + 'curves') + 1     # next to Curves from the map
+    row = {r.key: r for r in shown}[PREFIX + 'curve_range_mi']
+    assert row.label == 'Curve map build range' and row.value == '100 mi' and row.default_value == '100 mi'
+    assert row.choices == ('30 mi', '50 mi', '100 mi', '200 mi', '300 mi', 'Whole map')
+    assert '2-3 minutes' in row.reason and 'parked with power' in row.reason and 'no reboot' in row.reason
+    assert 'next drive' not in row.reason and purpose(row)
+    # each press steps to the next choice, saved in the one document (version 6); Whole map is 0
+    want = [200, 300, 0, 30, 50, 100]
+    for miles in want:
+      row = {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi']
+      assert owner.apply(row_change(row))
+      assert C.read(saved).curve_range_mi == miles
+    assert Path(saved.get_param_path(C.KEY)).read_bytes() == b'{"enabled":true,"version":6}'
+    row = {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi']
+    assert owner.apply(row_change(row, -1))
+    assert C.read(saved).curve_range_mi == 50 and {r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi'].value == '50 mi'
+    for bad in ('75 mi', '100', 'whole map'):
+      assert not owner.apply(replace(row_change({r.key: r for r in rows(owner)}[PREFIX + 'curve_range_mi']), value=bad))
+    # the build status shows on the row, both counts
+    ST.write(ST.BUILD_NAME, {"state": ST.UP_TO_DATE, "built": 5, "total": 5, "failed": 0, "range": 100, "all_built": 5,
+                             "all_total": 33})
+    owner = owner_for(saved, ti_cp(), {'vehicle': True, 'parked_preferences': True})
+    got = {r.key: r.reason for r in rows(owner)}
+    for k in ('curves', 'curve_range_mi'):
+      assert "Now: curve maps: within 100 miles 5 of 5 built; all downloaded 5 of 33." in got[PREFIX + k], got[PREFIX + k]
