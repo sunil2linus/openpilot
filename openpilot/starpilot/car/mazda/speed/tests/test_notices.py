@@ -46,7 +46,7 @@ def run(n, now, *, d=None, ctx=None, reason="", contributors=(), changes=(), wan
 def test_writer_writes_one_atomic_small_json_and_never_raises(tmp_path):
   path = str(tmp_path / "notice.json")
   w = N.NoticeWriter(path=path, clock=lambda: 100.0)
-  assert w.write("stop_ahead", "Stop ahead", "Cruise may not stop · brake", True)
+  assert w.write("stop_ahead", "Stop ahead", "Cruise may not stop, brake", True)
   doc = json.loads(open(path).read())
   assert set(doc) == A.FIELDS and doc["seq"] == 1 and doc["kind"] == "stop_ahead" and doc["sound"] is True
   assert doc["until"] == 100.0 + N.SHOW_WITHIN and not os.path.exists(path + ".tmp")
@@ -74,7 +74,7 @@ def test_curve_notice_once_per_curve_with_the_curve_speed():
   run(n, 0.1, ctx=ctx, reason="map_curve", contributors=[c])
   run(n, 5.0, ctx=ctx, reason="", contributors=[c])
   run(n, 10.0, ctx=ctx, reason="map_curve", contributors=[c])              # the same curve again: no
-  assert [r[1] for r in w.rows] == ["Curve ahead — slowing to 37"]          # + the dash offset (2 mph)
+  assert [r[1] for r in w.rows] == ["Curve ahead - slowing to 37"]          # + the dash offset (2 mph)
   ctx2 = {"contribs": {"map_curve": Contribution("map_curve", 30.0, episode="c2")}}
   run(n, 11.0, ctx=ctx2, reason="", contributors=[c])
   run(n, 20.0, ctx=ctx2, reason="map_curve", contributors=[c])
@@ -120,8 +120,8 @@ def test_stop_warnings_fire_once_per_episode_with_sound_also_in_test_mode(presse
   run(n, 2.0, contributors=[s])
   s.notice = "stop_ahead"
   run(n, 2.5, contributors=[s])
-  assert w.rows == [("stopped_car", "Stopped car ahead", "Cruise may not stop · brake", True),
-                    ("stop_ahead", "Stop ahead", "Cruise may not stop · brake", True)]
+  assert w.rows == [("stopped_car", "Stopped car ahead", "Cruise may not stop, brake", True),
+                    ("stop_ahead", "Stop ahead", "Cruise may not stop, brake", True)]
   n2, w2 = notices(C.Config(enabled=True, stops="test", notices=True))
   run(n2, 0.0, contributors=[Stops("stop_ahead", False)])
   assert w2.rows[0][3] is False                                             # notice_sound off: no sound
@@ -148,8 +148,23 @@ def test_limit_and_merge_notices_come_from_our_anchor_changes():
   run(n, 4.0, contributors=[MergeC()], changes=[("merge", 40 * MPH, 75 * MPH)])
   run(n, 8.0, contributors=[MergeC()], changes=[("merge", 75 * MPH, 70 * MPH)])     # the taper: no notice
   run(n, 12.0, changes=[("driver SET_PLUS", 40 * MPH, 50 * MPH)])                   # his own: no notice
-  assert [r[1] for r in w.rows] == ["Speed limit 45 — set to 48", "Merging — set speed high"]
+  assert [r[1] for r in w.rows] == ["Speed limit 45 - set to 48", "Merging - set speed high"]
   assert all(r[3] is False for r in w.rows)
+
+
+class Limit55:
+  steady = 55
+
+
+Limit55.__name__ = "SpeedLimit"
+
+
+def test_the_same_limit_is_announced_again_when_the_road_comes_back_to_it():
+  n, w = notices()
+  run(n, 0.0, contributors=[Limit()], changes=[("limit", 50 * MPH, 48 * MPH)])
+  run(n, 10.0, contributors=[Limit55()], changes=[("limit", 48 * MPH, 58 * MPH)])
+  run(n, 20.0, contributors=[Limit()], changes=[("limit", 58 * MPH, 48 * MPH)])
+  assert [r[1] for r in w.rows] == ["Speed limit 45 - set to 48", "Speed limit 55 - set to 58", "Speed limit 45 - set to 48"]
 
 
 class ExitC:
@@ -205,7 +220,7 @@ def test_camera_fault_lane_lines_and_cleared_on_a_ti_car_only():
   frames(6.0, lane_lines=2)                     # lines back 5 s, then 2 s clear
   frames(3.0)
   assert [r[0] for r in w.rows] == ["cam_fault", "cam_cleared", "lines_off", "cam_cleared"]
-  assert w.rows[0][1:] == ("Car's camera reports a fault", "Lane keep may be off · steering weaker", True)
+  assert w.rows[0][1:] == ("Car's camera reports a fault", "Lane keep may be off, steering weaker", True)
   n2, w2 = notices(ti=False)
   for k in range(100):
     run(n2, k * 0.05, d={"v_ego": 20.0, "cam_err": True, "lane_lines": 0})
@@ -247,7 +262,7 @@ def test_reader_new_seq_makes_one_alert_and_the_same_seq_none(tmp_path):
   put(path, seq=2, kind="tagged", text1="Tagged", text2="", sound=False)
   got = r.poll(EMPTY, now=1.8)
   assert got[0].alert_text_1 == "Tagged" and got[0].audible_alert == AudibleAlert.none
-  put(path, sid="new", seq=1, kind="merge", text1="Merging — set speed high", text2="", sound=False)  # next drive
+  put(path, sid="new", seq=1, kind="merge", text1="Merging - set speed high", text2="", sound=False)  # next drive
   assert len(r.poll(EMPTY, now=2.0)) == 1
 
 
@@ -378,4 +393,4 @@ def test_curve_notice_through_the_chain_once_with_the_curves_set_speed():
       road.car.receive(*r)
   curve = [row for row in w.rows if row[0] == "curve"]
   want = round((math.sqrt(2.2 * 72) + M.DASH_OFFSET) / MPH)
-  assert curve == [("curve", f"Curve ahead — slowing to {want}", "", False)]
+  assert curve == [("curve", f"Curve ahead - slowing to {want}", "", False)]

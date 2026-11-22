@@ -14,12 +14,12 @@ waits in one pending slot (a warning takes the slot over an info) for at most PE
 fire in Test mode too (they warn without pressing); the rest only when our set really changes.
 
 The texts (plain, short; old fork wording where it had one):
-  "Curve ahead — slowing to NN"                  a map / camera curve starts to lower the set (once per curve)
-  "Exit ramp — slowing"                          the exit plan starts to lower the set (once per exit)
-  "Exit ramp — brake for the curve"              the exit plan cannot reach the ramp's speed inside its bound
-  "Stop ahead" / "Stopped car ahead"             the stop slowdown (stops.py), "Cruise may not stop · brake"
-  "Speed limit NN — set to NN"                   the limit rule changes OUR set (no sound)
-  "Merging — set speed high"                     the merge boost starts (once per ramp)
+  "Curve ahead - slowing to NN"                  a map / camera curve starts to lower the set (once per curve)
+  "Exit ramp - slowing"                          the exit plan starts to lower the set (once per exit)
+  "Exit ramp - brake for the curve"              the exit plan cannot reach the ramp's speed inside its bound
+  "Stop ahead" / "Stopped car ahead"             the stop slowdown (stops.py), "Cruise may not stop, brake"
+  "Speed limit NN - set to NN"                   the limit rule changes OUR set (no sound)
+  "Merging - set speed high"                     the merge boost starts (once per ramp)
   "Mazda speed control: no GPS position"         once per drive
   "Curve maps not built here"                    once per drive (the view has no curve files for the area)
   "Car's camera reports a fault" / "Car's lane keep is off" / "Car's camera fault cleared"   (TI cars, the old
@@ -51,17 +51,17 @@ LINES_OFF_TIME = 5.0          # ... and STOCK_LKAS_OFF_TIME
 
 WARNINGS = frozenset(("stop_ahead", "stopped_car", "exit_brake", "cam_fault"))
 TEXTS = {
-  "curve": ("Curve ahead — slowing to {n}", ""),
-  "exit": ("Exit ramp — slowing", ""),
-  "exit_brake": ("Exit ramp — brake for the curve", "Cruise cannot slow enough"),
-  "stop_ahead": ("Stop ahead", "Cruise may not stop · brake"),
-  "stopped_car": ("Stopped car ahead", "Cruise may not stop · brake"),
-  "limit": ("Speed limit {n} — set to {m}", ""),
-  "limit_unknown": ("Speed limit unknown — set to {m}", ""),
-  "merge": ("Merging — set speed high", ""),
+  "curve": ("Curve ahead - slowing to {n}", ""),
+  "exit": ("Exit ramp - slowing", ""),
+  "exit_brake": ("Exit ramp - brake for the curve", "Cruise cannot slow enough"),
+  "stop_ahead": ("Stop ahead", "Cruise may not stop, brake"),
+  "stopped_car": ("Stopped car ahead", "Cruise may not stop, brake"),
+  "limit": ("Speed limit {n} - set to {m}", ""),
+  "limit_unknown": ("Speed limit unknown - set to {m}", ""),
+  "merge": ("Merging - set speed high", ""),
   "no_gps": ("Mazda speed control: no GPS position", ""),
   "no_data": ("Curve maps not built here", ""),
-  "cam_fault": ("Car's camera reports a fault", "Lane keep may be off · steering weaker"),
+  "cam_fault": ("Car's camera reports a fault", "Lane keep may be off, steering weaker"),
   "lines_off": ("Car's lane keep is off", "Steering is weaker in curves until it clears"),
   "cam_cleared": ("Car's camera fault cleared", ""),
   "tagged": ("Tagged", ""),
@@ -278,7 +278,7 @@ class Notices:
       if why == "limit":
         lim = getattr(by_name.get("SpeedLimit"), "steady", None)
         if lim is not None:
-          self.fire("limit", now, key=f"limit:{lim}:{self._n(after)}", n=int(lim), m=self._n(after))
+          self.fire("limit", now, n=int(lim), m=self._n(after))   # each real change (changes only holds those)
       elif why == "fallback":
         self.fire("limit_unknown", now, key=f"fallback:{self._n(after)}", m=self._n(after))
       elif why == "merge" and before is not None and after > before:

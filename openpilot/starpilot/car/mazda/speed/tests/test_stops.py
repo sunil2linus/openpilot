@@ -345,3 +345,38 @@ def test_res_that_re_engages_the_cruise_after_his_brake_still_restores_step_by_s
   r.step(10, 19, n=20, cruise=False, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
   r.step(10, 19, n=5, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)                 # back on
   assert st.restore is not None and r.out.reason == "stop" and abs(r.out.command - 20 * MPH) < 1e-6
+
+
+# ---------------- review round (Neon) ----------------
+def test_his_set_plus_during_the_step_by_step_restore_ends_it_and_the_set_is_not_frozen():
+  r, st = rig()
+  r.step(45, n=60, lead=lead(60.0), path=path(300), model_age=0.0)
+  r.step(10, 19, n=5, cruise=False, lead=lead(15.0, v=0.0, vrel=-1.0), path=path(300), model_age=0.0)
+  r.step(10, 19, events=[res_event()], cruise=False, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
+  r.step(10, 19, n=20, cruise=False, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
+  r.step(10, 19, n=5, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
+  assert st.restore is not None and r.out.reason == "stop"
+  r.step(10, 21, events=[driver("SET_PLUS", 21)], lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
+  r.step(10, n=50, lead=lead(30.0, v=2.0, vrel=-2.0), path=path(300), model_age=0.0)
+  assert st.restore is None and "stop" not in r.p.blocked
+  assert not r.out.reason.startswith("his choice") and cmd_mph(r) >= 21 - 1e-6
+
+
+def test_a_dashboard_stop_sign_is_not_held_back_by_the_far_guard():
+  stamp = {"n": 0}
+
+  def sign(t):
+    stamp["n"] += 1
+    return (True, stamp["n"])
+  r, st = rig(set_mph=55)
+  r.step(55, 55, n=60, path=path(200), model_age=0.0, stop_sign_raw=sign)     # 0.6 s, 195 m away, with the sign
+  assert r.out.reason == "stop" and r.out.target is not None                  # the full target, not guard taps
+  r2, st2 = rig(set_mph=55)
+  r2.step(55, 55, n=300, path=path(200), model_age=0.0)                       # no sign: guard taps only (as before)
+  assert r2.out.target is None
+
+
+def test_the_guard_ceiling_is_never_below_the_cars_minimum_set():
+  r, st = rig(set_mph=19)
+  r.step(50, 19, n=400, path=path(200), model_age=0.0, gas=False)
+  assert r.out.command is None or r.out.command >= CAR_MIN_SET - 1e-6

@@ -273,8 +273,10 @@ class StopSlowdown:
       if self.active is not None or low:
         self.active = None
         self.restore = now + RESTORE_MAX if low else None
-    if self.active is not None and (plus or self.gas_t >= GAS_HELD - 1e-6):
-      self.active, self.declined = None, True
+    if plus or self.gas_t >= GAS_HELD - 1e-6:
+      if self.active is not None:
+        self.active, self.declined = None, True
+      self.restore = None                      # his SET+ / gas during the step-by-step raise: no ceiling any more
     ep = self.active
 
     # ---- causes ----
@@ -290,7 +292,7 @@ class StopSlowdown:
     quiet = now - self.res_t < RES_QUIET
 
     if ep is None and not self.declined and not quiet and ctx.get("cruise_enabled", False) and v >= START_SPEED:
-      far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR
+      far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR and not sign
       guard_due = stop_on and far and self.short_t >= GUARD_START - 1e-6
       if lead_ok or (stop_confirmed and not far) or guard_due:
         ep = self._start(now, set_speed)
@@ -304,7 +306,7 @@ class StopSlowdown:
         ep["stop"], ep["guard_set"] = False, None
       if lead_ok:
         ep["lead"] = True
-      far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR
+      far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR and not sign
       if stop_confirmed and not far:
         ep["stop"], ep["guard_set"] = True, None
       elif stop_on and far and not ep["stop"] and self.short_t >= GUARD_START - 1e-6 and ep["guard_set"] is None:
@@ -351,7 +353,7 @@ class StopSlowdown:
       steps = (min(GUARD_MAX, 1 + int((self.short_t - GUARD_START) / GUARD_EVERY + 1e-6)) if self.short else
                ep["guard_t"])
       ep["guard_t"] = max(ep["guard_t"], steps)
-      out.ceiling = ep["guard_set"] - ep["guard_t"] * self.step
+      out.ceiling = max(ep["guard_set"] - ep["guard_t"] * self.step, CAR_MIN_SET)
     self.last = (why, target if out.ceiling is None else ("ceiling", round(out.ceiling / self.step, 1)))
     ctx["stop_busy"] = True
     return out
