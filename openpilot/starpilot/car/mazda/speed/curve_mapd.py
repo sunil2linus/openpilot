@@ -99,15 +99,30 @@ def read_state(curve_dir):
     return None
 
 
+_FILE_OK = {}     # path -> (mtime_ns, size, format) of a file that parsed: the idle look every minute only stats it
+
+
 def file_ok(path):
-  """A curve file is there when it is not empty and parses (a power cut could leave a 0-byte or torn file)."""
+  """A curve file is there when it is not empty and parses (a power cut could leave a 0-byte or torn file).
+  A file that parsed is not read again while its time and size stay the same (in this process): with the whole map
+  built, the look every CHECK_INTERVAL would otherwise parse every curve file of every map area."""
   try:
-    if os.path.getsize(path) == 0:
+    st = os.stat(path)
+    if st.st_size == 0:
       return False
+    key = (st.st_mtime_ns, st.st_size, B.FORMAT_VERSION)
+    if _FILE_OK.get(path) == key:
+      return True
     with open(path) as f:
       d = json.load(f)
-    return isinstance(d, dict) and d.get("version") == B.FORMAT_VERSION
+    ok = isinstance(d, dict) and d.get("version") == B.FORMAT_VERSION
+    if ok:
+      _FILE_OK[path] = key
+    else:
+      _FILE_OK.pop(path, None)
+    return ok
   except (OSError, ValueError):
+    _FILE_OK.pop(path, None)
     return False
 
 

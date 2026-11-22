@@ -303,3 +303,29 @@ def test_status_texts_say_the_range_and_the_whole_map():
   assert t({"state": "building", "built": "x"}) == "curve maps: building… 0 of 0 map areas built (parked, on power)."
   assert t(None) == "" and t({"state": "odd"}) == ""
   assert all("folder" not in t(v) for v in ({"state": s, "built": 1, "total": 2} for s in ("building", "partial", "up_to_date")))
+
+
+def test_a_curve_file_that_parsed_is_only_looked_at_again_when_it_changes(tmp_path, monkeypatch):
+  import builtins
+  import json as _json
+  import os as _os
+  p = tmp_path / "a.json"
+  p.write_text(_json.dumps({"version": D.B.FORMAT_VERSION}))
+  D._FILE_OK.clear()
+  opened = []
+  real = builtins.open
+
+  def counting(path, *a, **k):
+    if str(path) == str(p):
+      opened.append(1)
+    return real(path, *a, **k)
+  monkeypatch.setattr(builtins, "open", counting)
+  assert D.file_ok(str(p)) and D.file_ok(str(p)) and D.file_ok(str(p))
+  assert len(opened) == 1                                   # read once, then only its time and size
+  monkeypatch.setattr(builtins, "open", real)
+  p.write_text("{broken")                                   # changed (torn): read again, not ok, forgotten
+  _os.utime(p, ns=(1, 1))
+  assert not D.file_ok(str(p)) and str(p) not in D._FILE_OK
+  p.write_text("")
+  assert not D.file_ok(str(p))
+  assert not D.file_ok(str(tmp_path / "missing.json"))
