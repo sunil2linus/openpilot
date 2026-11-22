@@ -17,6 +17,10 @@ only presses toward it. Rules kept from the old fork's controller (curve_slowdow
     pause pressing (and cut a hold). A set speed change near his button edge, or that is not explained by our presses,
     is HIS: reported to the planner as a driver change. Nothing is pressed while he is on a button or DRIVER_QUIET
     after it.
+  * The press that engages is the engagement: SET+, SET- or RES from standby. The first frame with the cruise on
+    reports "engaged" (another set speed than before, or the first) or "resumed" (the same). A set speed change within
+    ENGAGE_SETTLE after that, with his button edge within DRIVER_RECENT before the cruise came on and no new one
+    since, is the car still showing the speed that press set: reported as "engaged" too (changed), not his change.
   * Whole dash steps: the set speed is compared as round(set / step) (the dash reads 48.989 for 49).
   * A press of ours that lands as a fraction of a step means the dash unit is not ours: off for the drive.
   * Ignored presses: NO_EFFECT_LIMIT in a row back off NO_EFFECT_BACKOFF; NO_EFFECT_TRIPS back-offs: off for the drive.
@@ -50,6 +54,7 @@ LATENCY_KEEP = 9
 DRIVER_RECENT = 1.5           # s after his button edge: changes in that direction are his
 DRIVER_QUIET = 1.0            # s after his last button edge before we press again
 CRUISE_SETTLE = 0.3           # s of cruise engaged before the first press
+ENGAGE_SETTLE = 0.5           # s after the cruise came on: a set change without a new button edge is the engagement's
 GAS_SETTLE = 0.5              # s after the gas is released before a press (a SET on the gas jumps to the current speed)
 NO_EFFECT_LIMIT = 6
 NO_EFFECT_BACKOFF = 10.0      # s
@@ -147,6 +152,8 @@ class Actuator:
     self.new_wheel = False
     self.edges = {SET_PLUS: -10**9, SET_MINUS: -10**9, "RES": -10**9, "CANCEL": -10**9}
     self.prev_buttons = (False, False, False, False)
+    self.rise = -10**9                    # frame of his last button edge (a press starting)
+    self.engage_frame = -10**9            # frame the cruise last came on
     self.gas_frame = -10**9
     self.no_effect = 0
     self.trips = 0
@@ -205,6 +212,7 @@ class Actuator:
       before, self.last_set = self.last_set, i.set_speed
       after_gap = self.cruise_gap
       self.cruise_gap = False
+      self.engage_frame = self.frame
       if before is None or self.steps(before) != self.steps(i.set_speed):
         self._event(out, "engaged", before=before, after=i.set_speed, changed=before is not None)
       elif after_gap:
@@ -214,6 +222,13 @@ class Actuator:
     if abs(delta) < 0.5 * self.step:
       return
     before, self.last_set = self.last_set, i.set_speed
+    if (self.frame - self.engage_frame <= frames(ENGAGE_SETTLE) and
+        self.engage_frame - frames(DRIVER_RECENT) <= self.rise <= self.engage_frame and
+        not self.inflight and self.hold is None and self.settling is None):
+      # the car still showing the speed his engaging press set (his press just before the cruise came on, no new
+      # one since): the engagement
+      self._event(out, "engaged", before=before, after=i.set_speed, changed=True, settle=True)
+      return
     direction = SET_PLUS if delta > 0 else SET_MINUS
     raw_steps = abs(delta) / self.step
     n = int(round(raw_steps))
@@ -409,6 +424,7 @@ class Actuator:
       if now:
         self.edges[name] = self.frame      # held counts as recent all along
       if now and not before:
+        self.rise = self.frame
         self._event(out, "driver_button", button=name)
     self.prev_buttons = buttons
     if i.gas:

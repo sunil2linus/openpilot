@@ -44,10 +44,33 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   Vision readings are not followed. It needs **Show Speed Limits** on (the default) and **Map Data** among the speed
   limit sources (the offline maps provider running). Navigation is **not** used: 7.0's `navInstruction` (navd, 1 Hz,
   an online Mapbox route with NavigationEnabled) and `starpilotNavigation` are no qualified offline exit signal.
+  Known (drive 0000000c): slcState's map row is "valid" exactly when 7.0's mapdOut says matchedLimit with way
+  selection "current" (every sample). mapd says "unknown" (ErrAmbiguousWay: competing roads) for many whole GPS fixes
+  and "possible" for the first fix of a new match, so on some streets the row is valid only ~18% of the time (the 1 Hz
+  fix makes each answer last 1 s). That is 7.0's own selection, not our reading (slcState comes at 20 Hz; the 0.5 s
+  staleness never cut a reading). A limit is followed only once one 3-5 s run of clean readings comes.
 * **Anchor owner.** The planner knows who owns the anchor: engaged (his SET / RES), his (his SET+/SET-) or ours.
   Contributors only *propose* anchors (limit, fallback, merge, handover); the planner takes them by its rules
-  (planner.py): ours in any band, his engaged speed only within the band of the limit that changed, his own buttons
-  never. All pressing is still the one actuator.
+  (planner.py): ours in any band, his engaged speed within the band of the limit that changed. All pressing is still
+  the one actuator.
+  * **The press that engages is an engagement.** SET+, SET- or RES from standby engage the stock cruise. The actuator
+    reports that press as "engaged" (another set speed) or "resumed" (the same set speed), also when the car shows
+    the new set speed a few frames after the cruise came on (ENGAGE_SETTLE 0.5 s, his press within 1.5 s before and
+    no new press since). "resumed" keeps the anchor (we restore from there); an anchor his SET+/SET- had made his
+    becomes engaged again (logged "resumed (was his)"), one of ours stays ours. The gas auto-resume's RES is the same
+    "resumed". (Drive 0000000c t 1872: his RES from standby kept "his" from an earlier SET+, so that engagement had
+    no limit proposals and no fallback.) His SET+ / SET- after the cruise is on are his, as before.
+  * **The limit change rule** (the old fork's speed_limit_follow rules 1 and 9). His own speed (his SET+ / SET-, or
+    his engaged speed out of the band) is re-taken only by a NEW limit: one that became steady after his last press
+    or engagement (the limit `seq`). A higher one needs his speed in the band of the limit it replaces (his 50 on a
+    45 road -> 55 + offset; his 62 there stays). A lower one (the limit went down) re-takes his speed in any band,
+    only on a street (road class known, not a highway, not a link), after 5 s unchanged with GPS trust 0 (8 s for a
+    drop of more than 20 mph). Fresh for 30 s after it became steady. Never while he overrules a slowdown (a reason
+    he blocked), and a raise never while a slowdown is under way: it waits, and is gone after the 30 s. Once taken
+    the speed is ours; his next SET+ / SET- is his again, until the next limit change. On a highway his own speed
+    above a lower limit is never pressed down (80 on a 70 road, 78 on a new 55). "The limit it replaces" survives a
+    gap in the readings (7.0's map provider says "ambiguous road" for whole stretches): the last steady limit, and
+    the one his speed was at, are kept 90 s; the same limit back after a gap is no change.
 * **Limit**: steady 3 s (lower) / 5 s (higher, first) with GPS trust 0 on every frame (restarts at a bad frame);
   limit + offset (default 3 mph), whole dash steps, no margin; nothing on links or while merge / exit are busy; a raise
   waits for a lower preview (mapdOut's previewSpeedLimit; slcState's upcoming value is never filled on this car)
@@ -307,7 +330,7 @@ mph only behind a moving car, the car's ACC_SET_ALLOWED, openpilot engageable, n
 after new wheel frames (CTR = wheel + 1), >= 0.1 s apart; the cruise must be on 0.6 s later; one retry; 8 frames, 170 s
 moving or 800 m at most; openpilot's cancel after it: given up until the cruise comes on by other means.
 The RES goes out through the one actuator (its only press with the cruise off) and is booked as his RES: the planner
-keeps his anchor ("resumed"), the actuator waits DRIVER_QUIET, the stop slowdown treats it as his RES (restore,
+keeps his anchor ("resumed"; an anchor his SET+/SET- made his is an engaged one again), the actuator waits DRIVER_QUIET, the stop slowdown treats it as his RES (restore,
 RES quiet), the exit plan lets go. It needs the map view (an offline map, curve maps built, GPS), like the map features.
 Event log: `auto_resume` lines (armed / sent / refused + why) and `auto_resume_state` on each state / wait change.
 

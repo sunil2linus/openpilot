@@ -14,13 +14,25 @@ The driver's own speed ("anchor", dash units):
   * his SET- is his new speed (we never raise above it); while a reason is on it also blocks our lowering for that
     reason ("his buttons win": the curve he slowed for himself is his);
   * RES with the set where we left it keeps the anchor (we restore from there); main off forgets it.
+  * The press that engages the cruise (SET+, SET- or RES from standby) is the engagement, not a change of his: the
+    actuator reports "engaged" / "resumed" for it (also when the car shows the new set speed a few frames after the
+    cruise came on). "resumed" keeps the anchor and its value; an anchor his SET+/SET- had made his becomes
+    "engaged" again (a new engagement), one of ours stays ours.
 We never press above the anchor; his own speed is only pressed down by a contributor he turned on.
 
-Who owns the anchor (`owner`): "engaged" (he engaged / SET at that speed), "his" (his SET+/SET- made it his) or "ours"
-(a speed we set: the limit follow, the merge, the exit handover). A contributor may PROPOSE a new anchor (dash units,
-whole steps, no margin: Contribution.anchor); the planner takes it only by these rules (test mode: logged only):
+Who owns the anchor (`owner`): "engaged" (he engaged / SET / RES at that speed), "his" (his SET+/SET- made it his) or
+"ours" (a speed we set: the limit follow, the merge, the exit handover). A contributor may PROPOSE a new anchor (dash
+units, whole steps, no margin: Contribution.anchor); the planner takes it only by these rules (test mode: logged only):
   * "limit": when the anchor is ours (raise or lower, any band), or he engaged at a speed within the proposal's band
-    (the limit's band); never when his SET+/SET- made it his; never his own higher speed out of the band;
+    (the limit's band). His own speed (engaged or his SET+/SET-) is re-taken only by a NEW limit (the limit
+    change rule, the old fork's rules 1 and 9): a proposal whose limit became steady after the anchor became his
+    (Contribution.seq above the limit seq of his last SET+/SET- or engagement) and that its contributor marks
+    `retake` (fresh, and for a lower one: a street, the longer steady time). A raise then needs his speed in the
+    band of the limit it replaces (his 50 on a 45 road -> the 55 road's speed; his 65 there stays); a lower one
+    takes any band. Never while he overrules a slowdown (a blocked reason), and a raise never while a slowdown is
+    under way (a contributor wants less than the anchor): it waits (the proposal stays fresh for a while). Once
+    taken the anchor is ours; his next SET+/SET- makes it his again until the next limit change. His own higher
+    speed on a highway is never pressed down (80 on a 70 road);
   * "fallback" (43 mph with the limit unknown): only up, only an engaged or our anchor;
   * "merge": up from an anchor that is ours, a street's (MERGE_SURFACE_MAX), or his curve speed on that link (the
     proposal's band: his SET- in a ramp curve); down (the taper, the end) only from our merge anchor;
@@ -60,6 +72,8 @@ class Contribution:
   band: tuple | None = None       # "limit": (low, high) dash m/s, an engaged anchor in it follows the proposal
   no_raise: bool = False          # while it governs, the command never goes above the current set (an unresolved exit)
   ceiling: float | None = None    # dash units m/s: the command never above this (stop guard taps, a step-by-step raise)
+  seq: int = 0                    # "limit" / "fallback": the id of the steady limit (it grows with each limit change)
+  retake: bool = False            # "limit": this proposal may re-take his own speed (the limit change rule above)
 
 
 @dataclass
@@ -95,16 +109,18 @@ class Planner:
     self.changes = []               # anchor changes for the log: (why, before, after)
     self.owner = None               # HIS / ENGAGED / OURS (None: no anchor)
     self.ours_why = ""              # the rule that made it ours
+    self.own_seq = 0                # the limit seq when the anchor last became the driver's (engaged / his)
 
   def _set_anchor(self, value, why):
     if self.anchor is None or abs(value - self.anchor) >= 0.5 * self.step:
       self.changes.append((why, self.anchor, value))
     self.anchor = value
 
-  def _driver(self, e, active_reasons):
+  def _driver(self, e, active_reasons, seq=0):
     d, after = e.get("direction"), e.get("after")
     if after is None:
       return
+    self.own_seq = seq                        # a limit steady before his press is answered by it
     if d == SET_PLUS and self.anchor is not None and self.lowered and after < self.anchor - 0.5 * self.step:
       self.blocked.update(active_reasons)     # he takes back part of our lowering: no more lowering this episode
       self.changes.append(("his SET+ under the anchor", self.anchor, self.anchor))
@@ -113,8 +129,9 @@ class Planner:
     self.owner, self.ours_why = HIS, ""
     self.blocked.update(active_reasons)
 
-  def _takes(self, c):
-    """True when proposal c may become the anchor now (the rules in the module doc)."""
+  def _takes(self, c, slowing=False):
+    """True when proposal c may become the anchor now (the rules in the module doc). slowing: a contributor wants the
+    set speed under the anchor this frame (a slowdown under way)."""
     a, half = self.anchor, 0.5 * self.step
     if c.anchor is None or abs(c.anchor - a) < half:
       return False
@@ -130,15 +147,23 @@ class Planner:
     if c.kind == "limit":
       if self.owner == OURS:
         return True
-      return bool(self.owner == ENGAGED and c.band is not None and c.band[0] - half <= a <= c.band[1] + half)
+      in_band = c.band is not None and c.band[0] - half <= a <= c.band[1] + half
+      if self.owner == ENGAGED and in_band:
+        return True
+      # the limit change rule: a NEW limit re-takes his own speed (engaged or his)
+      if not (c.retake and c.seq > self.own_seq) or self.blocked:
+        return False
+      if c.anchor > a:
+        return in_band and not slowing
+      return True
     if c.kind == "fallback":
       return c.anchor > a and self.owner in (OURS, ENGAGED)
     return False
 
-  def _proposals(self, contributions, dry):
+  def _proposals(self, contributions, dry, slowing=False):
     for kind in KINDS:
       for c in contributions:
-        if c.kind == kind and c.anchor is not None and c.presses != dry and self._takes(c):
+        if c.kind == kind and c.anchor is not None and c.presses != dry and self._takes(c, slowing):
           return c
     return None
 
@@ -177,28 +202,37 @@ class Planner:
       return out
     anchor_wish = {c.name: c.episode for c in i.contributions if (c.target is not None or c.ceiling is not None) and
                    c.presses and self.anchor is not None and self._wish(c, i.v_ego) < self.anchor - 0.5 * self.step}
+    seq = max((c.seq for c in i.contributions if c.kind in ("limit", "fallback")), default=0)
     his_change = False
     for e in i.events:
       k = e["kind"]
       if k == "engaged" and (e.get("before") is None or e.get("changed") or self.anchor is None):
         self._set_anchor(e["after"], "engaged")
         self.blocked, self.lowered, self.owner, self.ours_why = {}, False, ENGAGED, ""
+        self.own_seq = seq
         his_change = True
       elif k == "resumed" and self.anchor is None:
         self._set_anchor(e["after"], "resumed")
-        self.owner, self.ours_why = ENGAGED, ""
+        self.owner, self.ours_why, self.own_seq = ENGAGED, "", seq
         his_change = True
+      elif k == "resumed":
+        # his RES (or our auto-resume's) is an engagement: the anchor stays (we restore from there); his own speed
+        # from before is an engaged one again, ours stays ours
+        if self.owner == HIS:
+          self.owner, self.own_seq = ENGAGED, seq
+          self.changes.append(("resumed (was his)", self.anchor, self.anchor))
+          his_change = True
       elif k == "driver":
-        self._driver(e, anchor_wish)
+        self._driver(e, anchor_wish, seq)
         his_change = True
     if self.anchor is None or not i.cruise_enabled:
       return out
     if not his_change:
-      prop = self._proposals(i.contributions, dry=False)
+      prop = self._proposals(i.contributions, dry=False, slowing=bool(anchor_wish))
       if prop is not None:
         self._set_anchor(prop.anchor, prop.kind)
         self.owner, self.ours_why = OURS, prop.kind
-      dry_prop = self._proposals(i.contributions, dry=True)
+      dry_prop = self._proposals(i.contributions, dry=True, slowing=bool(anchor_wish))
       if dry_prop is not None:
         out.dry_anchor, out.dry_anchor_kind = dry_prop.anchor, dry_prop.kind
     # a reason he overruled stays blocked for the episode (curve) he overruled; without an episode, until it no longer

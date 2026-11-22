@@ -20,8 +20,19 @@ Rules (ported from the old fork's speed_limit_follow, written as one contributor
   * The proposal: the steady limit + limit_offset_mph (dash, whole steps, no margin), at most TARGET_MAX.
     The planner takes it when the anchor is ours (our limit raise, merge, exit handover: re-capped by a lower limit in
     any band), or when he engaged (SET / RES) at a speed within the band of the limit it replaces (the old limit up to
-    + max(LIMIT_BAND, offset); at a first limit: the new limit's band). His SET+ / SET- make the speed his: no more
-    proposals take. His own higher speed (80 on a 70 road) is out of the band: never pressed down.
+    + max(LIMIT_BAND, offset); at a first limit: the new limit's band). His own higher speed (80 on a 70 road) is out
+    of the band: never pressed down.
+  * The limit change rule (the old fork's rules 1 and 9): his own speed (his SET+ / SET-, or his engaged speed out of
+    the band) is re-taken only by a NEW limit, one that became steady after his last press / engagement (`seq`,
+    planner.py). The proposal is marked `retake` while it is fresh (RETAKE_WINDOW after it became steady). Under his
+    speed only for a limit that went down, only on a street (a live view, road class known, not a highway nor a
+    link), once that limit has been reported unchanged with clean trust for RETAKE_LOWER (RETAKE_LOWER_BIG for a drop
+    of more than BIG_DROP): his 62 on a new 55 road stays. A raise needs his speed in the band of the limit it
+    replaces (the planner checks it). His next SET+ / SET- after that is his again, until the next limit change.
+  * The limit it replaces (as the old fork): the steady one before, or, after a gap of readings longer than
+    LIMIT_KEEP (7.0's map provider says "ambiguous road" for whole stretches), the last steady one within MATCH_KEEP;
+    a lower limit his speed was not at in between (a cross road while stopped) does not count when his speed was in
+    the band of an older one (`matched`, within MATCH_KEEP). The same limit back after a gap is no change.
   * Only on roads: nothing on a link (the merge / exit own it) nor while the merge or the exit plan are busy.
   * Match on engage: he engages (SET / RES) with the set inside the band of an already-known steady limit -> the
     limit + offset is proposed at once (the old fork's "match on engage"; owner: limit + 3), whether the limit became
@@ -58,6 +69,12 @@ FALLBACK_FROM = 35 * MPH             # m/s true
 FALLBACK_AFTER = 3.0                 # s
 FALLBACK_WINDOW = 120.0              # s after engaging
 SLC_STALE = 0.5                      # s
+MATCH_KEEP = 90.0                    # s: the old limit (and the one his speed was at) for a change after a gap
+RETAKE_WINDOW = 30.0                 # s after a limit became steady it may re-take his speed (the old offer time)
+RETAKE_LOWER = 5.0                   # s unchanged with clean trust before a lower limit re-takes his speed (old rule 9)
+RETAKE_LOWER_BIG = 8.0               # s ... for a drop of more than BIG_DROP (old LOWER_BIG_STEADY)
+BIG_DROP = (20, 32)                  # mph / km/h
+HIGHWAY_CLASSES = (1, 3)             # map_view.HIGHWAY_CLASSES
 
 
 def map_preview(road, valid=True):
@@ -131,12 +148,28 @@ class SpeedLimit:
     self.fast_t = 0.0
     self.last = None               # for the log
     self.view_clock = ViewClock()
+    self.seq = 0                   # grows each time the steady limit changes (planner: the limit change rule)
+    self.steady_t = None           # when the steady limit last changed
+    self.known = None              # (dash units, s): the last steady limit and when it was last reported
+    self.matched = None            # (dash units, s): the last steady limit his anchor was in the band of, and when
 
   def band(self, limit):
     return (limit * self.unit, (limit + max(LIMIT_BAND[self.k], self.offset)) * self.unit)
 
   def target(self, limit):
     return min(limit + self.offset, TARGET_MAX[self.k]) * self.unit
+
+  def _retake(self, now, tgt, anchor, street):
+    """The limit change rule (module doc): may this proposal re-take his own speed now?"""
+    if self.steady_t is None or now - self.steady_t > RETAKE_WINDOW + 1e-6:
+      return False
+    if anchor is None or tgt >= anchor - 0.5 * self.unit:
+      return True                  # a raise (the planner checks the band of the limit it replaces)
+    if self.prev is None or self.steady >= self.prev:
+      return False                 # under his speed only for a limit that went DOWN (his 62 on a new 55 road stays)
+    big = self.prev - self.steady > BIG_DROP[self.k]
+    need = RETAKE_LOWER_BIG if big else RETAKE_LOWER
+    return bool(street and self.cand == self.steady and self.cand_t >= need - 1e-6)
 
   def __call__(self, ctx):
     now, v = ctx.get("now", 0.0), ctx.get("v_ego", 0.0)
@@ -168,10 +201,24 @@ class SpeedLimit:
     if self.cand is not None and self.cand != self.steady:
       need = LOWER_STEADY if self.steady is not None and self.cand < self.steady else RAISE_STEADY
       if self.cand_t >= need - 1e-6:
-        self.prev, self.steady = self.steady, self.cand
-        self.change_band = self.band(self.prev if self.prev is not None else self.steady)
+        new, old = self.cand, self.steady
+        if old is None and self.known is not None and now - self.known[1] <= MATCH_KEEP:
+          old = self.known[0]      # forgotten in a gap of readings (LIMIT_KEEP), still the road's old limit
+        m = self.matched
+        if m is not None and now - m[1] <= MATCH_KEEP and m[0] != old and m[0] < new:
+          old = m[0]               # the limit his speed was at, before a short detour (the old fork's "matched")
+        self.prev, self.steady = old, new
+        self.change_band = self.band(old if old is not None else new)
+        if old is None or new != old:
+          self.seq, self.steady_t = self.seq + 1, now    # a real change of the road's limit (not one back after a gap)
+    if self.steady is not None and raw == self.steady:
+      self.known = (self.steady, now)
+      a = ctx.get("anchor")
+      lo, hi = self.band(self.steady)
+      if a is not None and lo - 0.5 * self.unit <= a <= hi + 0.5 * self.unit:
+        self.matched = (self.steady, now)
     if raw is None and now - self.last_seen > LIMIT_KEEP:
-      self.steady = self.prev = None
+      self.steady = self.prev = self.steady_t = None
     up = whole_limit(up_mps, self.metric) if up_mps else None
     if up is not None and (self.preview is None or self.preview[0] != up):
       self.preview = (up, chain)
@@ -184,7 +231,7 @@ class SpeedLimit:
     fallback = bool(self.steady is None and raw is None and ctx.get("no_gps") and self.engaged_t is not None and
                     now - self.engaged_t <= FALLBACK_WINDOW and not busy)
     self.fast_t = self.fast_t + dt if (fallback and v >= FALLBACK_FROM) else 0.0
-    out = Contribution("speed_limit", None, presses=self.presses, kind="limit")
+    out = Contribution("speed_limit", None, presses=self.presses, kind="limit", seq=self.seq)
     if self.steady is not None:
       if busy:
         self.last = ("busy", self.steady)
@@ -196,6 +243,8 @@ class SpeedLimit:
         self.last = ("preview lower", self.steady)
         return out                 # a raise waits for the lower limit just ahead
       out.anchor, out.band = tgt, self.change_band
+      out.retake = self._retake(now, tgt, anchor, alive and not view.get("link") and
+                                int(view.get("cls", 0) or 0) not in (0,) + HIGHWAY_CLASSES)
       self.last = ("limit", self.steady)
       return out
     # F5: the limit unknown
