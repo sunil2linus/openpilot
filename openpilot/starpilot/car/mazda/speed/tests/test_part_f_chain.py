@@ -39,7 +39,7 @@ def test_a_lower_limit_takes_an_engaged_in_band_speed_down_in_whole_steps():
     trace, ctl = run(road, [SpeedLimit(cfg, presses=cfg.presses("speed_limit"))], 4000,
                      lambda t: 70 if t < 8 else 55, lambda t: view(t))
     if mode == "on":
-      assert abs(trace[-1][2] - 58) < 1e-6 and road.car.sent
+      assert abs(trace[-1][2] - 55) < 1e-6 and road.car.sent     # (a highway: the posted limit, no offset)
       assert all(abs(x[2] - round(x[2])) < 1e-6 for x in trace)
     else:
       assert road.car.sent == [] and all(abs(x[2] - 73) < 1e-6 for x in trace)
@@ -55,6 +55,6 @@ def test_the_merge_boosts_and_ends_at_the_target():
     if mode == "on":
       top = max(x[2] for x in trace)
       assert 80 <= top <= 90 + 1e-6, top            # the boost, capped at the car's max
-      assert abs(trace[-1][2] - 73) < 1e-6, trace[-1]
+      assert abs(trace[-1][2] - 70) < 1e-6, trace[-1]           # (the highway's posted limit, no offset)
     else:
       assert road.car.sent == [] and all(abs(x[2] - 45) < 1e-6 for x in trace)

@@ -36,11 +36,13 @@ class ExitRoad(Road):
     out = []
     for k, (split, cd) in enumerate(self.exits):
       d = split - self.s
+      past = -d
+      taking = self.take is True or (type(self.take) is int and self.take == k)
+      if taking and past >= max(self.street_from, 600.0):
+        v.update(cls=5, link=False, chain=200 + k)     # (still on the exit's street once it is out of the list)
       if d > 1500 or d < -600:
         continue
       pts = [[round(split + cd + x - self.s, 1), R35] for x in (0.0, 40.0, 80.0)]
-      past = -d
-      taking = self.take is True or (type(self.take) is int and self.take == k)
       sh, m = 0, 1
       if taking and past >= self.shape_from:
         sh = 2

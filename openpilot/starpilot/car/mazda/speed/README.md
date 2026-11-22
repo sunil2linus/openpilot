@@ -48,7 +48,12 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   selection "current" (every sample). mapd says "unknown" (ErrAmbiguousWay: competing roads) for many whole GPS fixes
   and "possible" for the first fix of a new match, so on some streets the row is valid only ~18% of the time (the 1 Hz
   fix makes each answer last 1 s). That is 7.0's own selection, not our reading (slcState comes at 20 Hz; the 0.5 s
-  staleness never cut a reading). A limit is followed only once one 3-5 s run of clean readings comes.
+  staleness never cut a reading). So the steady time **rides through those seconds**: it holds (neither grows nor
+  restarts) through a gap of readings up to 2.5 s (two missed 1 Hz fixes, like view_age's LATE) and restarts only on
+  a different value or a longer gap; mapdOut's own limit on a "possible" fix (read through the same private
+  SubMaster) counts as the same reading when it equals the candidate, never as a new value on its own. GPS trust
+  still counts in a gap (a bad-trust frame restarts it). Recorded drive: the longest steady run on the 2235-2295
+  stretch went from 8 s to 17 s; the times each limit became steady did not change.
 * **Anchor owner.** The planner knows who owns the anchor: engaged (his SET / RES), his (his SET+/SET-) or ours.
   Contributors only *propose* anchors (limit, fallback, merge, handover); the planner takes them by its rules
   (planner.py): ours in any band, his engaged speed within the band of the limit that changed. All pressing is still
@@ -56,8 +61,11 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   * **The press that engages is an engagement.** SET+, SET- or RES from standby engage the stock cruise. The actuator
     reports that press as "engaged" (another set speed) or "resumed" (the same set speed), also when the car shows
     the new set speed a few frames after the cruise came on (ENGAGE_SETTLE 0.5 s, his press within 1.5 s before and
-    no new press since). "resumed" keeps the anchor (we restore from there); an anchor his SET+/SET- had made his
-    becomes engaged again (logged "resumed (was his)"), one of ours stays ours. The gas auto-resume's RES is the same
+    no new press since). "resumed" keeps the anchor (we restore from there); one of ours stays ours. An anchor his
+    SET+/SET- had made his becomes engaged again **on a street** (logged "resumed (was his)"); on a highway, a link
+    or a road of unknown class it **stays his** (logged "resumed (his kept: not a street)"): he SET+ to 75 on a 70
+    highway, taps the brake, RES: 75 stays, and only a limit change after the RES re-takes it (the old fork's rule
+    8). With no GPS position at all the RES is an engagement as before. The gas auto-resume's RES is the same
     "resumed". (Drive 0000000c t 1872: his RES from standby kept "his" from an earlier SET+, so that engagement had
     no limit proposals and no fallback.) His SET+ / SET- after the cruise is on are his, as before.
   * **The limit change rule** (the old fork's speed_limit_follow rules 1 and 9). His own speed (his SET+ / SET-, or
@@ -70,14 +78,24 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
     the speed is ours; his next SET+ / SET- is his again, until the next limit change. On a highway his own speed
     above a lower limit is never pressed down (80 on a 70 road, 78 on a new 55). "The limit it replaces" survives a
     gap in the readings (7.0's map provider says "ambiguous road" for whole stretches): the last steady limit, and
-    the one his speed was at, are kept 90 s; the same limit back after a gap is no change.
+    the one his speed was at, are kept 90 s; the same limit back after a gap is no change. The one his speed was at
+    replaces the known old limit only when no old limit is known or the change is itself a raise (his 38 on a 35
+    road, then his own 57 on a 50 road, then 50 -> 40 is a drop from 50, not a raise from 35).
+  * **Who is pressed down on a highway** (checked): a highway limit drop lowers an anchor that is ours, or an engaged
+    one inside the old limit's band, after the lower limit's 3 s steady time, to the new posted limit; an anchor his
+    SET+ / SET- made his is never lowered on a highway (only a raise in the old limit's band re-takes it).
 * **Limit**: steady 3 s (lower) / 5 s (higher, first) with GPS trust 0 on every frame (restarts at a bad frame);
-  limit + offset (default 3 mph), whole dash steps, no margin; nothing on links or while merge / exit are busy; a raise
-  waits for a lower preview (mapdOut's previewSpeedLimit; slcState's upcoming value is never filled on this car)
-  seen on the same road; engaging inside the band of a known limit adopts limit + offset; 43 mph fallback only with
-  no GPS position and the limit unknown (3 s at >= 35 mph, within 120 s of engaging, up only).
+  the target is the limit + offset (default 3 mph) **on a street only** (the last known road class of the map view
+  is known and not a highway nor a link; the owner's "street speed: limit + 3", the old build's Street Speed); on a
+  highway, a link or a road whose class was never known it is the posted limit itself. Whole dash steps, no margin;
+  nothing on links or while merge / exit are busy; a raise waits for a lower preview (mapdOut's previewSpeedLimit;
+  slcState's upcoming value is never filled on this car) seen on the same road; engaging (SET or RES) inside the
+  band of a known limit adopts limit + offset **only on a street** with GPS trust 0 (the old fork's rule 8;
+  elsewhere his SET speed stays); 43 mph fallback only with no GPS position and the limit unknown (3 s at >= 35 mph,
+  within 120 s of engaging, up only).
 * **Merge**: on a link to a highway with trust 0 (or the start-of-drive trust on that link with GPS error <= 15 m);
-  the highway limit from the preview / reading, else the ramp's destination speed from the map; boost to target + 20
+  the highway limit from the preview / reading, else the ramp's destination speed from the map; the target is that
+  posted limit (no offset: a highway's, so the limit follow carries on at the same speed); boost to target + 20
   (car max 90), taper to target + 5 within 10 mph, end at the target. Waits for: a curve ahead planning below
   v + 5 mph, a short model path, a slow / closing / unknown radar lead, LKAS blocked. His SET- with a curve ahead is a
   curve speed; without, it declines the merge for that link.

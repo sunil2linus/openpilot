@@ -1,6 +1,6 @@
 """
 The on-ramp merge contributor (part f, F3): on a link to a highway, once nothing ahead asks for a lower speed, the
-set speed goes up toward the highway's limit + limit_offset_mph with a boost. It only PROPOSES anchors ("merge",
+set speed goes up toward the highway's posted limit with a boost. It only PROPOSES anchors ("merge",
 planner.py takes them by its rules: up from our anchor or a street's, down only from our merge anchor); it never
 presses and gives no slowing target.
 
@@ -13,9 +13,11 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
     when it already is a highway's, else the ramp's destination speed from the map (the next limit is often missing
     or still the street's at the link's start: it keeps waiting on the link, never gives up on a street limit). H must
     stay the same for H_STEADY with that trust.
-  * Target T = H + offset (dash). Boost: T + BOOST (at most the car's max, 90 mph); taper to T + TAPER_OVER once the
-    car is within TAPER_GAP of T; then T once within END_GAP (the merge is done: the anchor stays ours at T, so the
-    limit follow carries on from there). At most BOOST_MAX in the boost.
+  * Target T = H (dash): on a highway the target is the posted limit itself (the offset is a street's only, as the
+    limit follow's: limits.py; the old build's Street Speed), so the limit follow carries on at the same speed.
+    Boost: T + BOOST (at most the car's max, 90 mph); taper to T + TAPER_OVER once the car is within TAPER_GAP of T;
+    then T once within END_GAP (the merge is done: the anchor stays ours at T, so the limit follow carries on from
+    there). At most BOOST_MAX in the boost.
   * Waits (no raise; a running boost drops to T) while: a mapped / camera curve ahead plans below the car's speed +
     CURVE_NEAR (the ramp curve is not behind the car yet: the curve contributor says when its target rises; with map
     curves Off the merge gets a log-only curve plan for this, contributors.build), the
@@ -72,7 +74,6 @@ class Merge:
     self.metric = bool(metric)
     self.k = 1 if self.metric else 0
     self.unit = KPH if self.metric else MPH
-    self.offset = int(cfg.limit_offset_mph)
     self.link = None               # the ramp (chain id) of this episode
     self.reset_episode()
     self.t = None
@@ -235,4 +236,4 @@ class Merge:
     return self._propose(out, min(t_dash + BOOST[self.k] * self.unit, CAR_MAX[self.k] * self.unit), ctx)
 
   def target(self, h):
-    return min(h + self.offset, TARGET_MAX[self.k]) * self.unit
+    return min(h, TARGET_MAX[self.k]) * self.unit

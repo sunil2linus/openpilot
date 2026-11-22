@@ -8,6 +8,7 @@ from openpilot.starpilot.car.mazda.speed.planner import Contribution, ENGAGED, H
 from openpilot.starpilot.car.mazda.speed.tests.rig import MPH, Rig, driver, engaged, view
 
 CFG = C.Config(enabled=True, speed_limit="on", limit_offset_mph=3)
+STREET, HIGHWAY = 5, 1        # road classes: the offset (+3) and match on engage are a street's only (A2, A3)
 
 
 def slc(mph, upcoming=0.0):
@@ -18,10 +19,11 @@ def rig(cfg=CFG):
   return Rig([L.SpeedLimit(cfg, presses=cfg.presses("speed_limit"))])
 
 
-def drive(r, seconds, limit, v=60.0, trust=0, chain=1, upcoming=0.0, events=(), **kw):
+def drive(r, seconds, limit, v=60.0, trust=0, chain=1, upcoming=0.0, events=(), cls=STREET, **kw):
   n = int(round(seconds / r.dt))
   kw.setdefault("preview", {"speed": upcoming * MPH, "dist": 200.0, "t": 0.0} if upcoming else None)
-  return r.step(v_mph=v, n=n, events=events, slc=slc(limit), view=lambda t: view(t, trust=trust, chain=chain), **kw)
+  return r.step(v_mph=v, n=n, events=events, slc=slc(limit), view=lambda t: view(t, trust=trust, chain=chain, cls=cls),
+                **kw)
 
 
 def test_the_reading_from_slcstate():
@@ -44,29 +46,38 @@ def test_the_reading_from_slcstate():
 def test_his_own_80_on_a_70_road_is_never_pressed_down():
   r = rig()
   r.step(set_mph=80, events=[engaged(80)])
-  drive(r, 8, 70, v=78)
+  drive(r, 8, 70, v=78, cls=HIGHWAY)
   assert r.anchor_mph == 80 and r.p.owner == ENGAGED
-  drive(r, 8, 55, v=78)                       # not in the 70 road's band (70-75) either
+  drive(r, 8, 55, v=78, cls=HIGHWAY)          # not in the 70 road's band (70-75) either
   assert r.anchor_mph == 80
 
 
 def test_engaged_in_the_band_follows_a_change_and_then_it_is_ours():
+  # (a highway: the target is the posted limit itself, no offset; engaging at 73 on the 70 road snaps nothing)
   r = rig()
-  drive(r, 6, 70, v=70)
+  drive(r, 6, 70, v=70, cls=HIGHWAY)
   r.step(set_mph=73, events=[engaged(73)])
-  drive(r, 2.5, 55, v=70)
-  assert r.anchor_mph == 73                   # a lower limit needs its steady time first
-  drive(r, 1.0, 55, v=70)
-  assert r.anchor_mph == 58 and r.p.owner == OURS and r.p.ours_why == "limit"
-  drive(r, 4.0, 65, v=58)
-  assert r.anchor_mph == 58                   # a higher one waits longer
-  drive(r, 1.5, 65, v=58)
-  assert r.anchor_mph == 68
+  drive(r, 2.5, 55, v=70, cls=HIGHWAY)
+  assert r.anchor_mph == 73 and r.p.owner == ENGAGED   # a lower limit needs its steady time first
+  drive(r, 1.0, 55, v=70, cls=HIGHWAY)
+  assert r.anchor_mph == 55 and r.p.owner == OURS and r.p.ours_why == "limit"   # (A5: engaged in band, a drop)
+  drive(r, 4.0, 65, v=58, cls=HIGHWAY)
+  assert r.anchor_mph == 55                   # a higher one waits longer
+  drive(r, 1.5, 65, v=58, cls=HIGHWAY)
+  assert r.anchor_mph == 65
   # his SET+ / SET- make it his: no limit moves it again
   r.step(v_mph=66, events=[driver("SET_PLUS", 70)])
   assert r.p.owner == HIS
-  drive(r, 8, 55, v=68)
+  drive(r, 8, 55, v=68, cls=HIGHWAY)
   assert r.anchor_mph == 70
+  # the same on a street: limit + 3
+  r = rig()
+  drive(r, 6, 45, v=45)
+  drive(r, 0.01, 45, v=45, set_mph=45, events=[engaged(45)])
+  drive(r, 1.0, 45, v=45)
+  assert r.anchor_mph == 48 and r.p.owner == OURS            # (match on engage on a street)
+  drive(r, 3.5, 35, v=45)
+  assert r.anchor_mph == 38
 
 
 def test_match_on_engage_inside_the_band_of_a_known_limit_whatever_the_timing():
@@ -77,13 +88,21 @@ def test_match_on_engage_inside_the_band_of_a_known_limit_whatever_the_timing():
     drive(r, 0.01, 45, v=45, set_mph=45, events=[engaged(45)])
     drive(r, 3.0, 45, v=45)
     assert r.anchor_mph == 48 and r.p.ours_why == "limit", (pre, r.anchor_mph)
-  # in the band (70-75) on a 70 road: 73; above it (his 80) or under the limit (65): his
-  for his, want in ((75, 73), (80, 80), (65, 65)):
+  # in the band (50-55) on a 50 street: 53; above it (his 58) or under the limit (45): his
+  for his, want in ((55, 53), (58, 58), (45, 45)):
     r = rig()
-    drive(r, 6, 70, v=70)
-    r.step(set_mph=his, events=[engaged(his)])
-    drive(r, 2, 70, v=70)
+    drive(r, 6, 50, v=50)
+    drive(r, 0.01, 50, v=50, set_mph=his, events=[engaged(his)])
+    drive(r, 2, 50, v=50)
     assert r.anchor_mph == want, (his, r.anchor_mph)
+  # not on a highway, a link or an unknown road (the old fork's rule 8): his SET speed stays (engaged)
+  for cls, link in ((HIGHWAY, False), (2, True), (0, False)):
+    for pre in (6.0, 4.0):
+      r = rig()
+      r.step(v_mph=70, n=int(pre / r.dt), slc=slc(70), view=lambda t, c=cls, k=link: view(t, cls=c, link=k))
+      r.step(set_mph=73, events=[engaged(73)])
+      r.step(v_mph=70, n=300, slc=slc(70), view=lambda t, c=cls, k=link: view(t, cls=c, link=k))
+      assert r.anchor_mph == 73 and r.p.owner == ENGAGED, (cls, pre, r.anchor_mph)
 
 
 def test_a_bad_trust_frame_restarts_the_steady_time():
@@ -177,7 +196,12 @@ def test_the_43_mph_fallback_only_unknown_soon_after_engaging_and_up():
 def test_test_mode_never_moves_the_anchor():
   cfg = C.Config(enabled=True, speed_limit="test")
   r = rig(cfg)
-  drive(r, 6, 70, v=70)
+  drive(r, 6, 70, v=70, cls=HIGHWAY)
+  r.step(set_mph=73, events=[engaged(73)])
+  drive(r, 4, 55, v=70, cls=HIGHWAY)
+  assert r.anchor_mph == 73
+  r = rig(cfg)
+  drive(r, 6, 70, v=70)                       # (a street: 55 + 3)
   r.step(set_mph=73, events=[engaged(73)])
   out = drive(r, 4, 55, v=70)
   assert r.anchor_mph == 73 and abs(out.dry_anchor / MPH - 58) < 1e-6 and out.dry_anchor_kind == "limit"
@@ -227,7 +251,7 @@ def test_the_preview_comes_from_mapdout_as_map_observation_checks_it():
   r.step(set_mph=48, events=[engaged(48)])
   r.p.owner, r.p.ours_why = OURS, "limit"
   drive(r, 6, 45, v=48)
-  r.step(v_mph=48, n=600, slc={"limit": 55 * MPH, "upcoming": 40 * MPH, "t": 0.0}, view=lambda t: view(t))
+  r.step(v_mph=48, n=600, slc={"limit": 55 * MPH, "upcoming": 40 * MPH, "t": 0.0}, view=lambda t: view(t, cls=STREET))
   assert r.anchor_mph == 58
 
 

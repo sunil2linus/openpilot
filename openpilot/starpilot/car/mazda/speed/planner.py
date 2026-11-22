@@ -17,7 +17,8 @@ The driver's own speed ("anchor", dash units):
   * The press that engages the cruise (SET+, SET- or RES from standby) is the engagement, not a change of his: the
     actuator reports "engaged" / "resumed" for it (also when the car shows the new set speed a few frames after the
     cruise came on). "resumed" keeps the anchor and its value; an anchor his SET+/SET- had made his becomes
-    "engaged" again (a new engagement), one of ours stays ours.
+    "engaged" again (a new engagement) on a street; off a street (a highway, a link, an unknown road: the limit
+    contribution's keep_his) it stays his. One of ours stays ours.
 We never press above the anchor; his own speed is only pressed down by a contributor he turned on.
 
 Who owns the anchor (`owner`): "engaged" (he engaged / SET / RES at that speed), "his" (his SET+/SET- made it his) or
@@ -74,6 +75,7 @@ class Contribution:
   ceiling: float | None = None    # dash units m/s: the command never above this (stop guard taps, a step-by-step raise)
   seq: int = 0                    # "limit" / "fallback": the id of the steady limit (it grows with each limit change)
   retake: bool = False            # "limit": this proposal may re-take his own speed (the limit change rule above)
+  keep_his: bool = False          # "limit": a RES this frame off a street: a speed of his stays his (no engagement)
 
 
 @dataclass
@@ -217,8 +219,13 @@ class Planner:
         his_change = True
       elif k == "resumed":
         # his RES (or our auto-resume's) is an engagement: the anchor stays (we restore from there); his own speed
-        # from before is an engaged one again, ours stays ours
-        if self.owner == HIS:
+        # from before is an engaged one again (only on a street: off a street the limit contributor marks the frame
+        # keep_his and it stays his, so only a later limit change re-takes it), ours stays ours
+        if self.owner == HIS and any(c.kind == "limit" and c.keep_his for c in i.contributions):
+          self.own_seq = seq
+          self.changes.append(("resumed (his kept: not a street)", self.anchor, self.anchor))
+          his_change = True
+        elif self.owner == HIS:
           self.owner, self.own_seq = ENGAGED, seq
           self.changes.append(("resumed (was his)", self.anchor, self.anchor))
           his_change = True

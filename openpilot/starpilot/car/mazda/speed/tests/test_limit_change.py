@@ -41,9 +41,12 @@ def drive(r, seconds, limit, v=50.0, cls=STREET, hz=None, **kw):
 
 def his_50_on_a_45_road(r, cls=STREET, hz=None):
   drive(r, 6, 45, cls=cls, hz=hz)
-  r.step(v_mph=45, set_mph=45, events=[engaged(45)])
+  drive(r, 0.01, 45, v=45, cls=cls, hz=hz, set_mph=45, events=[engaged(45)])
   drive(r, 1, 45, cls=cls, hz=hz)
-  assert r.anchor_mph == 48 and r.p.owner == OURS            # (match on engage: 45 + 3)
+  if cls == STREET:
+    assert r.anchor_mph == 48 and r.p.owner == OURS          # (match on engage on a street: 45 + 3)
+  else:
+    assert r.anchor_mph == 45 and r.p.owner == ENGAGED       # (a highway: no match on engage, no offset)
   r.step(v_mph=48, set_mph=50, events=[driver("SET_PLUS", 50)])
   assert r.anchor_mph == 50 and r.p.owner == HIS
   drive(r, 8, 45, cls=cls, hz=hz)
@@ -57,7 +60,8 @@ def test_a_new_higher_limit_retakes_his_speed_in_the_band_of_the_old_one(cls):
   drive(r, 4.5, 55, cls=cls)
   assert r.anchor_mph == 50                                  # a higher limit's steady time first (5 s)
   drive(r, 0.7, 55, cls=cls)
-  assert r.anchor_mph == 58 and r.p.owner == OURS and r.p.ours_why == "limit"
+  want = 58 if cls == STREET else 55                         # (the offset is a street's only)
+  assert r.anchor_mph == want and r.p.owner == OURS and r.p.ours_why == "limit"
 
 
 def test_a_change_after_a_long_gap_of_readings_is_still_a_change_from_the_old_limit():
@@ -66,7 +70,7 @@ def test_a_change_after_a_long_gap_of_readings_is_still_a_change_from_the_old_li
   his_50_on_a_45_road(r, cls=HIGHWAY)
   drive(r, 45, None, cls=HIGHWAY)
   drive(r, 5.2, 55, cls=HIGHWAY)
-  assert r.anchor_mph == 58 and r.p.owner == OURS
+  assert r.anchor_mph == 55 and r.p.owner == OURS
   # ... but the same limit back after the gap is no change: his 46 stays
   r = rig()
   his_50_on_a_45_road(r)

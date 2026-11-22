@@ -37,7 +37,7 @@ def test_the_next_limit_still_the_streets_at_the_link_start_uses_the_ramps_desti
   on_link(r, 1.5, 40, limit=45)
   assert r.anchor_mph == 45                 # its steady time first
   on_link(r, 1.0, 40, limit=45)
-  assert r.anchor_mph == 90 and r.p.owner == OURS and r.p.ours_why == "merge"   # 70 + 3 + 20, capped at 90
+  assert r.anchor_mph == 90 and r.p.owner == OURS and r.p.ours_why == "merge"   # 70 + 20 (the target: the limit)
 
 
 def test_without_any_highway_limit_it_keeps_waiting_on_the_link():
@@ -46,7 +46,7 @@ def test_without_any_highway_limit_it_keeps_waiting_on_the_link():
   on_link(r, 10, 40, limit=45, spd=45)      # only the street's 45 known: wait, never give up
   assert r.anchor_mph == 45 and r.p.owner != OURS
   on_link(r, 2.5, 42, limit=45, upcoming=65, spd=45)   # the map's preview (mapdOut) shows the highway's 65
-  assert r.anchor_mph == 88                 # 65 + 3 + 20
+  assert r.anchor_mph == 85                 # 65 + 20 (on a highway the target is the posted limit, no offset)
 
 
 def test_boost_taper_and_end_at_the_target():
@@ -54,14 +54,14 @@ def test_boost_taper_and_end_at_the_target():
   r.step(v_mph=40, set_mph=45, events=[engaged(45)])
   on_link(r, 2.5, 40)
   assert r.anchor_mph == 90
-  on_link(r, 0.5, 60)
-  assert r.anchor_mph == 90                 # car 60 (62 on the dash): not yet within 10 of 73
-  on_link(r, 0.5, 62)                       # 64 on the dash: within 10, down to 78
-  assert r.anchor_mph == 78
-  on_link(r, 0.5, 70)                       # within 2: the target, done
-  assert r.anchor_mph == 73
-  on_link(r, 2.0, 66)
-  assert r.anchor_mph == 73                 # done stays done on this link
+  on_link(r, 0.5, 57)
+  assert r.anchor_mph == 90                 # car 57 (59 on the dash): not yet within 10 of 70
+  on_link(r, 0.5, 59)                       # 61 on the dash: within 10, down to 75
+  assert r.anchor_mph == 75
+  on_link(r, 0.5, 67)                       # within 2: the target, done
+  assert r.anchor_mph == 70
+  on_link(r, 2.0, 63)
+  assert r.anchor_mph == 70                 # done stays done on this link
 
 
 def test_his_set_minus_before_the_loop_is_a_curve_speed_then_the_merge_after_it():
@@ -102,7 +102,7 @@ def test_guards_hold_the_boost():
   assert r.anchor_mph == 90
   # a guard during the boost drops it to the target
   on_link(r, 0.2, 45, lkas_blocked=True)
-  assert r.anchor_mph == 73
+  assert r.anchor_mph == 70
 
 
 def test_start_of_drive_trust_on_the_link():
@@ -170,10 +170,10 @@ def test_the_end_anchor_is_a_whole_step_and_survives_his_change_in_that_frame():
   # the car reaches the target in a frame with his own change that keeps our anchor (his SET+ under our lowering:
   # the planner takes no proposal in that frame): the one-shot end is proposed again and taken next frame
   r.p.lowered = True
-  on_link(r, 0.01, 72, events=[driver("SET_PLUS", 80)])
+  on_link(r, 0.01, 69, events=[driver("SET_PLUS", 80)])
   assert r.anchor_mph == 90 and r.p.owner == "ours"
-  on_link(r, 0.1, 72)
-  assert r.anchor_mph == 73
+  on_link(r, 0.1, 69)
+  assert r.anchor_mph == 70
 
 
 def test_his_set_minus_in_an_interchange_loop_above_street_speed_is_a_curve_speed():

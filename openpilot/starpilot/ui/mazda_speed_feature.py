@@ -32,14 +32,14 @@ SUB_ROWS = (
   ("ti_only_lat", "Interceptor-only side force",
    "Side force (m/s²) used when the stock lane keeping is blocked before a curve and only the interceptor steers.", .1),
   ("speed_limit", "Follow the speed limit",
-   "Moves a speed we set (or one you set at the limit) to the posted limit plus the offset; never lowers a higher " +
-   "speed you chose yourself, and your SET+/SET- make the speed yours. Needs Show Speed Limits on and Map Data in " +
-   "the speed limit sources (offline maps).", 0.),
-  ("limit_offset_mph", "Speed limit offset", "Follow the limit at the limit plus this many mph (also the merge's " +
-   "and the exit street's target).", 1.),
+   "Moves a speed we set (or one you set at the limit) to the posted limit (on streets plus the offset); never " +
+   "lowers a higher speed you chose yourself, and your SET+/SET- make the speed yours. Needs Show Speed Limits on " +
+   "and Map Data in the speed limit sources (offline maps).", 0.),
+  ("limit_offset_mph", "Speed limit offset", "On streets, follow the limit at the limit plus this many mph (also the " +
+   "exit street's target). On highways and ramps the target is the posted limit itself.", 1.),
   ("merge", "On-ramp merge",
    "On a ramp onto a highway, once its curves are behind, raises the set speed (a boost) to reach the highway's " +
-   "limit plus the offset. Waits for a stop, a slow car ahead or blocked lane keeping.", 0.),
+   "posted limit. Waits for a stop, a slow car ahead or blocked lane keeping.", 0.),
   ("exits", "Exit ramps",
    "Slows as much as the ramp needs while your signal toward the exit is on (within about 400 m); a short signal " +
    "slows at most 12 mph, so keep it on to the split for a tight exit or brake yourself. Hands the speed to the " +

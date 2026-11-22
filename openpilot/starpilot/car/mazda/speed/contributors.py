@@ -4,6 +4,8 @@ Each contributor is a callable(ctx) -> planner.Contribution or None, run in this
 earlier one's contribution in ctx["contribs"] and its "busy" flag): the map curve profile (curves), the camera-only
 curve (camera_curves), the exit plan (exits), the merge (merge), the speed limit (speed_limit), the stop slowdown
 (stops). Test mode builds them with presses=False: computed and logged, never commanded / never taken as an anchor.
+With the limit follow it also keeps mapdOut's own limit on a "possible" fix (ctx["slc_possible"], limits.map_possible):
+the first fix of a new match, when slcState is not "valid" yet.
 The private SubMaster also reads userBookmark (the onroad Bookmark button, for the speed control's tag line; only
 while the speed control runs this drive): ctx["bookmark"] is True on a frame with a new one.
 Stage 3: with the gas auto-resume it also reads selfdriveState (ctx["engageable"]: openpilot has no no-entry now; False
@@ -78,6 +80,7 @@ class Sources:
     self.lanes = None
     self.slc = None
     self.preview = None
+    self.possible = None
     self.lead = None
     self.engageable = False
     self.veto = CameraVeto(MODEL_DT)
@@ -106,9 +109,11 @@ class Sources:
         limit, upcoming = reading(self.sm["slcState"]) if self.sm.valid["slcState"] else (None, 0.0)
         self.slc = {"limit": limit, "upcoming": upcoming, "t": now}
       if self.want_slc and self.sm.updated["mapdOut"]:
-        from openpilot.starpilot.car.mazda.speed.limits import map_preview
+        from openpilot.starpilot.car.mazda.speed.limits import map_possible, map_preview
         pv = map_preview(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]))
         self.preview = None if pv is None else dict(pv, t=now)
+        poss = map_possible(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]))
+        self.possible = None if poss is None else {"limit": poss, "t": now}
       if self.want_radar and self.sm.updated["radarState"]:
         lead = radar_lead(self.sm["radarState"])
         self.lead = None if lead is None else dict(lead, t=now)
@@ -122,7 +127,8 @@ class Sources:
     ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
                path_y=self.path_y, lanes=self.lanes, lead=self.lead, engageable=self.engageable,
                slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
-               preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None)
+               preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None,
+               slc_possible=self.possible if self.possible is not None and now - self.possible["t"] <= SLC_STALE else None)
     # the one rule (view_age.py): the view is alive up to VIEW_ALIVE after its GPS message (a 1 Hz GPS included)
     live = self.view_clock.update(self.view, now) if self.want_view else GONE
     view_ok = live != GONE

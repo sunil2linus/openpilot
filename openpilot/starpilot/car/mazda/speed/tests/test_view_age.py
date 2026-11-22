@@ -220,8 +220,8 @@ def test_a_limit_becomes_steady_at_the_gps_rate(hz):
   r = Rig([L.SpeedLimit(C.Config(enabled=True, speed_limit="on", limit_offset_mph=3))])
   r.step(v_mph=55, set_mph=55, events=[engaged(55)])
   r.step(v_mph=55, n=int(5.5 / r.dt), slc={"limit": 50 * MPH, "upcoming": 0.0, "t": 0.0},
-         view=at_hz(lambda t: view(t), hz))
-  assert r.anchor_mph == 53 and r.p.ours_why == "limit"
+         view=at_hz(lambda t: view(t, cls=5), hz))
+  assert r.anchor_mph == 53 and r.p.ours_why == "limit"          # (a street: 50 + 3)
 
 
 @pytest.mark.parametrize("hz", RATES)
