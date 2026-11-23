@@ -1302,6 +1302,51 @@ class LinkShapes:
     return v
 
 
+# Round V, V3 (7.0 drive r2 rt 668-686, Schoenherr Rd, chain 512529985: a straight road; where its two-way way meets the
+# one-way ways of its carriageways the map line jogs sideways, two opposite bends of 22-30 deg a few m apart, r 97-124 m,
+# planned as a curve). A map jog is no curve (read time, no rebuild): two consecutive curves of one chain bending opposite
+# ways whose turns cancel (net under JOG_NET), the road moved sideways at most JOG_OFFSET, the same road name, where a
+# one-way way meets a two-way way (the loaded shapes' one-way flags), never on a link, and either within JOG_GAP_WIDE with
+# each bend at most JOG_BEND_WIDE (the builder's split_doublets of round Q: files built before round Q still have these,
+# BUILDER_VERSION was not bumped then) or within JOG_GAP with each bend at most JOG_BEND (the 7.0 port's rule: a 30.2 deg
+# bend missed the builder's 30 by 0.2 deg).
+JOG_NET = 8.0              # deg (build_curve_map.SPLIT_NET_DEG)
+JOG_OFFSET = 12.0          # m (SPLIT_OFFSET_MAX)
+JOG_GAP_WIDE, JOG_BEND_WIDE = 60.0, 30.0   # m from the first's exit to the second's entry, deg (SPLIT_PAIR_GAP, SPLIT_BEND_MAX)
+JOG_GAP, JOG_BEND = 20.0, 35.0
+
+
+def _jog_sideways(c1, c2):
+  """m: how far the road after c2's exit lies beside the line through c1's entry along its heading."""
+  (la1, lo1), (la2, lo2) = c1["a"], c2["b"]
+  dy = (la2 - la1) * 111195.0
+  dx = (lo2 - lo1) * 111195.0 * math.cos(math.radians(la1))
+  h = math.radians(c1["a_hdg"])
+  return abs(dx * math.cos(h) - dy * math.sin(h))
+
+
+def jogs(curves, oneway_ids):
+  """(V3) The (chain, s_a) keys of the curves of one chain (sorted along it) that are a map jog, not a curve."""
+  out = set()
+  for c1, c2 in zip(curves, curves[1:]):
+    try:
+      if (c1.get("dir") == c2.get("dir") or c1.get("ramp") or c2.get("ramp") or
+          int(c1.get("cls", 0) or 0) in LINK_CLASSES or int(c2.get("cls", 0) or 0) in LINK_CLASSES or
+          (c1.get("name") or "") != (c2.get("name") or "") or abs(float(c1["turn"]) - float(c2["turn"])) >= JOG_NET):
+        continue
+      gap, bend = float(c2["s_a"]) - float(c1["s_b"]), max(float(c1["turn"]), float(c2["turn"]))
+      if not ((gap <= JOG_GAP_WIDE and bend <= JOG_BEND_WIDE) or (gap <= JOG_GAP and bend <= JOG_BEND)):
+        continue
+      ws = {int(w) for w in (c1.get("ways") or []) + (c2.get("ways") or [])}
+      if not (ws & oneway_ids and ws - oneway_ids):
+        continue
+      if _jog_sideways(c1, c2) <= JOG_OFFSET:
+        out.update(((c1.get("chain"), c1["s_a"]), (c2.get("chain"), c2["s_a"])))
+    except (KeyError, TypeError, ValueError):
+      continue
+  return out
+
+
 MEMORY_PATH = "/data/media/0/curve_memory.json"
 MEMORY_MATCH = 20.0        # m between a curve's apex and a remembered one to be the same curve (curve files rebuilt)
 MEMORY_SAME_PASS = 60.0    # s: passes this close in time are one pass (a divided road is two curve records ~20 m apart)
@@ -2137,9 +2182,33 @@ class MapCurves:
     s1 = ch["w"][k + 1][2] if k + 1 < len(ch["w"]) else ch["len"]
     return cid, increasing, s0, s1
 
+  def _jog_keys(self, cid):
+    """(V3) the map jogs of chain cid (cached per loaded set)."""
+    key = (id(self.store.curves), id(getattr(self.store, "grid", None)))
+    if getattr(self, "_jogs_key", None) != key:
+      self._jogs, self._jogs_key = {}, key
+    if cid not in self._jogs:
+      ow = self._oneway_ways()
+      self._jogs[cid] = jogs(self.store.curves.get(cid, []), ow) if ow is not None else set()
+    return self._jogs[cid]
+
+  def _oneway_ways(self):
+    """The one-way ways of the loaded shapes (None: no shapes)."""
+    g = getattr(self.store, "grid", None)
+    idx = [ri for ri in (g if isinstance(g, (list, tuple)) else [g]) if hasattr(ri, "way") and hasattr(ri, "oneway")]
+    if not idx:
+      return None
+    key = tuple(id(ri) for ri in idx)
+    ow = getattr(self, "_ow_ways", None)
+    if ow is None or ow[0] != key:
+      ow = (key, {int(ri.way[k]) for ri in idx for k in range(len(ri.way)) if ri.oneway[k]})
+      self._ow_ways = ow
+    return ow[1]
+
   def _curves_ahead(self, cid, increasing, s0, s1, lat, lon, bearing):
     out = []
     inside_exit = float("inf")
+    jog = self._jog_keys(cid)
     # (round V, V1) the junction with a street ahead on this link, m along the chain (None: none)
     rv = self.links.view(self.store.ramps.get(cid), self.way_k) if cid in self.store.ramps else None
     cut = None
@@ -2148,6 +2217,8 @@ class MapCurves:
       ch = self.store.chains.get(cid) or {}
       cut = float(rv["cut_s"]) if increasing else float(ch.get("len", 0.0) or 0.0) - float(rv["cut_s"])
     for c in self.store.curves.get(cid, []):
+      if jog and (c.get("chain"), c["s_a"]) in jog:
+        continue                  # (round V, V3) a map jog, not a curve
       if self.odo_ok and c.get("ramp") and c["s_a"] in self.entered:
         left = c["len"] - (self.odo - self.entered[c["s_a"]])
         if 0.0 < left < inside_exit:

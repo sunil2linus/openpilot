@@ -214,3 +214,44 @@ def test_v2_a_trunk_road_under_55_is_no_highway_for_a_link():
   assert MC.ramp_to_highway({"to": {"cls": 3, "speed": 55 * MC.MPH}})
   assert MC.ramp_to_highway({"to": {"cls": 3, "speed": 65 * MC.MPH}})   # (an untagged trunk: the builder's 65)
   assert MC.ramp_to_highway({"to": {"cls": 1, "speed": 45 * MC.MPH}})   # a motorway is one whatever its speed
+
+
+# ---- V3: a map jog where a two-way way meets a one-way way (Schoenherr Rd) is no curve ----
+
+def jog_scene(along=13.0, side=8.0, oneway=True):
+  """A straight two-way road north (way 60) whose next way (61, one-way: a carriageway) starts with a `side` m sideways
+  jog over `along` m: two opposite bends (13 m: ~32 deg each, kept by the builder's 30 deg split_doublets)."""
+  w1 = G.way(60, G.straight(0, -400, 0, 400), name="Schoenherr Road", cls=9)
+  w2 = G.way(61, [(0, 0), (side, along)] + [(side, along + 20 * i) for i in range(1, 21)], name="Schoenherr Road", cls=9,
+             oneway=oneway)
+  _set_node(w2, 0, w1, len(w1.lat) - 1)
+  return {60: w1, 61: w2}
+
+
+def _curve_ahead(ways, no_split=False, monkeypatch=None):
+  if no_split:
+    monkeypatch.setattr(B, "split_doublets", lambda cs, wb: cs)    # (files built before round Q)
+  root, curves, _ = _write(ways)
+  m = TM.planner(root)
+  la, lo = TM.pos(0, -150)
+  m.update(la, lo, 0.0, 60, True)
+  return m, curves
+
+
+def test_v3_a_jog_onto_a_carriageway_is_no_curve(monkeypatch):
+  m, curves = _curve_ahead(jog_scene())
+  assert len(curves) == 2 and 30.0 < max(c["turn"] for c in curves) <= 35.0     # the builder kept them (over 30 deg)
+  assert m.curve is None and m.status == MC.STATUS_NONE
+  # files from before round Q (no split_doublets): the builder's own rule applies at read time too
+  m, curves = _curve_ahead(jog_scene(along=16.0), no_split=True, monkeypatch=monkeypatch)
+  assert len(curves) == 2 and max(c["turn"] for c in curves) < 30.0
+  assert m.curve is None
+
+
+def test_v3_real_bends_stay():
+  # both ways two-way (no carriageway split): a curve
+  m, curves = _curve_ahead(jog_scene(oneway=False))
+  assert len(curves) == 2 and m.curve is not None
+  # a sharper S-bend (~40 deg each way): a curve
+  m, curves = _curve_ahead(jog_scene(along=16.0, side=14.0))
+  assert curves and max(c["turn"] for c in curves) > 35.0 and m.curve is not None
