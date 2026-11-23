@@ -161,6 +161,17 @@ def test_v1_navigation_and_the_on_ramp_search_see_the_exit_to_the_street():
   assert MC.ramp_to_highway({"to": {"cls": 1}}) and not MC.ramp_to_highway({"to": {"cls": 7}})
 
 
+def test_v1_navigation_does_not_plan_the_on_ramps_curve_across_the_street():
+  # (the joined chain's loop lies past the street: from the highway the exit has no curve; reviewer's _nav_exit note)
+  root, _, ramps = _write(junction_scene(loop=True))
+  m = TM.planner(root)
+  r = [x for x in ramps if x["wdir"][0][0] == 21][0]
+  la, lo = TM.pos(0, -300)
+  m.update(la, lo, 0.0, 10, True, ("off ramp", "slight right", MC.dist_m(la, lo, *r["start"])))
+  assert m.nav_ramp is not None and m.nav_ramp.get("cut_s") is not None
+  assert m.nav_exit == MC.NAV_EXIT_NO_CURVES
+
+
 # ---- V2: a turnaround (a Michigan left on Hall Rd) and a link to a trunk road under 55 are no on-ramps ----
 
 def turnaround_scene(gap=30.0, cls=3, link_cls=4, speed=50, name2="Hall Road", long_link=False):

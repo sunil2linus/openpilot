@@ -2642,6 +2642,11 @@ class MapCurves:
     curves = [(c, c["s_a"] if best["travel"] == "ab" else chain_len - c["s_b"]) for c in curves]
     for f in (w["forks"] if w["chain"] == best["chain"] else []):
       curves += [(c, f["from_start"] + s) for c, s in self._branch_curves(f)]
+    cut_s = self.nav_ramp.get("cut_s")
+    if cut_s is not None:
+      # (round V, V1: the exit ends at the street it meets; a curve or fork branch past that junction belongs to the
+      # on-ramp across the street and is not planned from the highway, as in _curves_ahead)
+      curves = [(c, s) for c, s in curves if s <= float(cut_s) + 1.0]
     if curves:
       c, s = min(curves, key=lambda cs: plan_speed(ramp_radius(cs[0]), distance + cs[1], cs[0].get("adv", 0.0), decel=self.decel))
       self.nav_curve, self.nav_curve_dist = c, distance + s
