@@ -5,6 +5,8 @@
   * A long press: our frames every wheel frame (within `lock_ms` after it) -> one step at once, after 0.5 s the next
     multiple of 5, then 5 more every 0.6 s while the frames keep coming; `overrun` more quanta land after release.
   * Set speed limits: the car's minimum 30 km/h (18.64 mph on an mph dash), maximum `max_mph`.
+  * `jump`: the car is above the set from his gas: a tap landing with the car JUMP_STEPS or more faster than the set
+    (SET+ or SET-) sets the car's current speed (whole dash steps, rounded down: r3 rt 435, 31.7 mph -> 31).
 """
 from openpilot.starpilot.car.mazda.speed import actuator as A
 
@@ -13,7 +15,8 @@ MPH = A.MPH
 
 class Mrcc:
   def __init__(self, set_mph=45, latency=12, ignore=0, overrun=0, max_mph=90, lock_ms=40, holds_work=True,
-               metric_dash=False, v_mph=None):
+               metric_dash=False, v_mph=None, jump=False):
+    self.jump = jump
     self.metric_dash = metric_dash
     self.unit = A.KPH if metric_dash else MPH
     self.set = set_mph * self.unit          # m/s as the car reports it
@@ -86,7 +89,10 @@ class Mrcc:
     for due, steps in list(self.pending):
       if self.frame >= due:
         self.pending.remove((due, steps))
-        self._move(steps)
+        if self.jump and int(self.v / self.unit) >= round(self.set_units) + A.JUMP_STEPS:
+          self.set = int(self.v / self.unit) * self.unit     # the jump: the car's current speed when it lands
+        else:
+          self._move(steps)
 
   def _to_quantum(self, sign):
     q = 10 if self.metric_dash else 5

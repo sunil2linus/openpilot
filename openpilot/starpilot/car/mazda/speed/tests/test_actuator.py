@@ -170,6 +170,53 @@ def test_no_set_plus_while_the_car_is_faster_than_the_set():
   assert not sends(car, A.SET_PLUS)
 
 
+def test_no_set_minus_while_the_car_is_faster_than_the_set():
+  # r3 rt 435: the car at ~32 mph coasting above a set of 28 after his gas; our SET- made the stock cruise take the
+  # current speed (28 -> 31). Now no SET- (tap or hold) while the car is JUMP_STEPS or more above the set.
+  act, car = A.Actuator(), Mrcc(28, v_mph=31.7, jump=True)
+  run(act, car, 100, gas=True)                      # his gas: the car above the set
+  outs = run(act, car, 300, command=15)
+  assert not sends(car, A.SET_MINUS) and round(car.set_units) == 28 and not events(outs, "hold_start")
+  # once the car is back near the set, SET- goes (and steps down, no jump)
+  car.track = True                                  # the cruise brings the car back to the set
+  outs = run(act, car, 3000, command=24)
+  assert sends(car, A.SET_MINUS) and round(car.set_units) == 24 and not events(outs, "driver")
+
+
+def test_set_minus_still_steps_down_when_we_lowered_the_set_below_the_car():
+  # our own slowdown: the set runs ahead of the car (car 50, set 44): SET- goes on as always
+  act, car = A.Actuator(), Mrcc(50, v_mph=50)
+  run(act, car, 50)
+  car.set = 44 * MPH
+  act.last_set = car.set
+  outs = run(act, car, 400, command=40)
+  assert sends(car, A.SET_MINUS) and round(car.set_units) == 40 and not events(outs, "driver")
+
+
+def test_a_jump_after_our_press_is_ours_never_his():
+  # the press went while the car was near the set and lands with the car well above it (the sim's jump: as after his
+  # gas): the stock cruise jumps the set UP to the car's speed. That change is our press's: ours, not his.
+  act, car = A.Actuator(), Mrcc(28, v_mph=29, jump=True)
+  run(act, car, 100)
+
+  def faster(frame, fields):
+    if car.sent and car.v < 32 * MPH:
+      car.v = 32 * MPH                              # right after our press, before it lands
+      fields["v_ego"] = car.v
+  outs = run(act, car, 200, command=20, every=faster)
+  assert sends(car, A.SET_MINUS)
+  ours = [e for e in events(outs, "ours") if e.get("jump")]
+  assert ours and ours[0]["direction"] == A.SET_PLUS and ours[0]["pressed"] == A.SET_MINUS
+  assert not events(outs, "driver")
+  # his own SET+ edge right before it: still his
+  act, car = A.Actuator(), Mrcc(50)
+  run(act, car, 50)
+  outs = run(act, car, 3, set_plus=True)
+  car._move(+1)
+  outs += run(act, car, 5)
+  assert events(outs, "driver") and not [e for e in events(outs, "ours") if e.get("jump")]
+
+
 def test_cruise_off_forgets_presses_and_resume_at_the_same_set_is_not_a_change():
   act, car = A.Actuator(), Mrcc(50)
   run(act, car, 100, command=50)

@@ -22,6 +22,10 @@ only presses toward it. Rules kept from the old fork's controller (curve_slowdow
     ENGAGE_SETTLE after that, with his button edge within DRIVER_RECENT before the cruise came on and no new one
     since, is the car still showing the speed that press set: reported as "engaged" too (changed), not his change.
   * Whole dash steps: the set speed is compared as round(set / step) (the dash reads 48.989 for 49).
+  * The car JUMP_STEPS or more faster than the set: no SET+ (it sets the car's current speed); no SET- either while
+    that is from his gas (the same jump; after our own lowering a SET- steps down as usual). A set change the other
+    way right after a press of ours (in flight, or just expired) with none of his buttons is that press landing as a
+    jump: ours, never his.
   * A press of ours that lands as a fraction of a step means the dash unit is not ours: off for the drive.
   * Ignored presses: NO_EFFECT_LIMIT in a row back off NO_EFFECT_BACKOFF; NO_EFFECT_TRIPS back-offs: off for the drive.
   * The car's maximum set speed is 90 mph / 145 km/h; it is only learned lower when the set speed reaches it, or
@@ -73,7 +77,10 @@ HOLD_MISS_FORGET = 120.0      # s
 HOLD_OVERRUN_DOWN = 0         # quanta that may land after a phase-locked SET- release (drives 44/45: none)
 HOLD_OVERRUN_UP = 1           # ... after a SET+ release (kept at 1: a restore hold stops a quantum short)
 
-JUMP_STEPS = 2                # the car this many steps faster than the set speed: a SET+ sets the current speed
+JUMP_STEPS = 2                # the car this many steps faster than the set speed: a SET+ sets the current speed; so
+                              # does a SET- while the car is above the set from HIS GAS (r3 rt 435: our SET- at 32 mph,
+                              # set 28, his gas just released, made it 31). Above the set because WE lowered it, a SET-
+                              # steps down as usual (every slowdown; drives 44/45).
 CAR_MIN_SET = 30 * KPH        # the car's own minimum set speed (18.6 mph)
 CAR_MAX_SET = (90 * MPH, 145 * KPH)
 SET_MAX_LEARN = (88 * MPH, 142 * KPH)
@@ -155,6 +162,7 @@ class Actuator:
     self.rise = -10**9                    # frame of his last button edge (a press starting)
     self.engage_frame = -10**9            # frame the cruise last came on
     self.gas_frame = -10**9
+    self.gas_above = False                # the car JUMP_STEPS+ above the set since his gas (no SET-: it would jump)
     self.no_effect = 0
     self.trips = 0
     self.backoff_until = -1
@@ -236,6 +244,22 @@ class Actuator:
     held = (i.set_plus and direction == SET_PLUS) or (i.set_minus and direction == SET_MINUS)
     his = held or self.driver_recent(direction) or self.driver_recent("RES", 0.5) or self.driver_recent("CANCEL", 0.5)
     hold_open = any(p.hold for p in ours) or (self.settling is not None and self.settling.direction == direction)
+    if not his and not ours and not hold_open:
+      # a change the other way while a press of ours is in flight (or just expired) and none of his: the stock cruise
+      # took the car's speed (JUMP_STEPS: SET- / SET+ with the car away from the set). That press's doing: OURS,
+      # never his (r3 rt 435: booked his, it blocked the raise for a new limit).
+      other = next((p for p in self.inflight if p.direction != direction and not p.hold), None)
+      if other is not None:
+        self.inflight.remove(other)
+      else:
+        other = next((p for p in self.expired if p.direction != direction), None)
+        if other is not None:
+          self.expired.remove(other)
+      if other is not None:
+        self.no_effect = 0
+        self._event(out, "ours", direction=direction, steps=n if abs(raw_steps - n) <= 0.25 else round(raw_steps, 2),
+                    jump=True, pressed=other.direction)
+        return
     at_min = abs(i.set_speed - CAR_MIN_SET) < 0.5 * self.step or abs(before - CAR_MIN_SET) < 0.5 * self.step
     if abs(raw_steps - n) > 0.25:
       if at_min and (ours or hold_open) and not his:
@@ -429,6 +453,11 @@ class Actuator:
     self.prev_buttons = buttons
     if i.gas:
       self.gas_frame = self.frame
+    near = i.set_speed > 0 and self.steps(i.v_ego) < self.steps(i.set_speed) + JUMP_STEPS
+    if not i.cruise_enabled or near:
+      self.gas_above = False
+    elif i.gas:
+      self.gas_above = True              # his gas has the car above the set (until it is back near it)
     self._observe(i, out)
     if self.hold is not None and (i.set_plus or i.set_minus or i.resume or i.cancel or i.brake or not i.cruise_enabled):
       self._stop_hold(out, "driver")
@@ -460,6 +489,9 @@ class Actuator:
     projected = cur + sum(p.remaining for p in self.inflight if p.direction == SET_PLUS) \
                     - sum(p.remaining for p in self.inflight if p.direction == SET_MINUS)
     if cmd < projected and i.allow_lower:
+      if self.gas_above:
+        return out                         # above the set from his gas: a SET- would jump UP to the car's speed. The
+                                           # cruise brings it back to the set; the SET- goes once it is near
       direction = SET_MINUS
     elif cmd > projected and cur < self.steps(self.top()) and self.steps(i.v_ego) < cur + JUMP_STEPS:
       direction = SET_PLUS                 # (not while the car is faster than the set: a SET+ would jump to its speed)
