@@ -306,3 +306,15 @@ def test_round3_the_highways_70_on_the_street_never_lifts_the_cap():
     r.step(v_mph=40, n=100, view=road(7, chain=3), slc=slc(70))
     r.step(v_mph=40, n=200, view=road(7, chain=3), slc=slc(None))
   assert r.anchor_mph == 43
+
+
+def test_round3_the_notice_number_is_the_winning_cap_when_both_start_on_one_frame():
+  sc = StreetCap(CFG, presses=True)
+  sc.since, sc.lim, sc.lim_t = 0.0, 0, 5.0                 # the exit window open, no limit for 5 s: its cap is 43
+  sc.seen = [25, 1, 50.0]                                  # 25 read on this road 50 m back: the RES cap is 28
+  ctx = {"now": 1.0, "v_ego": 20 * MPH, "cruise_enabled": True, "anchor": 55 * MPH, "owner": "engaged",
+         "act_events": [dict(resumed(), after=55 * MPH)], "view": view(1.0, cls=9), "slc": None, "contribs": {}}
+  sc.t = 0.99
+  out = sc(ctx)
+  assert sc.res is not None and sc.on                      # both started on this frame
+  assert sc.cap_to == 28 and round(out.anchor / MPH) <= 45   # the RES cap's 28 (was: 43, the exit cap's)

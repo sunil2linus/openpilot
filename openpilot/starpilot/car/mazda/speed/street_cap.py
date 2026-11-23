@@ -80,6 +80,7 @@ class StreetCap:
     self.res = None                 # [cap dash m/s, until s]: the cap after a RES (RES_CAP_TIME)
     self.seen = None                # [dash units, chain, m driven since]: the last limit reading (RES_LIMIT_M)
     self.cap_to = None              # dash units of the cap now being taken (the notice's number)
+    self.exit_tgt = None            # dash m/s: the exit cap's target while it is taken
 
   def reset(self):
     self.before = 0                 # the last road class before (0 unknown): a highway or a link from one
@@ -148,6 +149,10 @@ class StreetCap:
     caps = [x for x in (res, exit_cap) if x is not None]
     if caps:
       out.anchor = min(caps)
+      # the notice's number: the cap being taken (the lower target of the two when both are on, round 3: a RES and the
+      # exit cap starting on one frame said "Street - set to 43" with the RES cap at 28)
+      tgts = ([self.res[0]] if res is not None else []) + ([self.exit_tgt] if exit_cap is not None else [])
+      self.cap_to = round(min(tgts) / self.unit)
       self.last = ("res cap" if out.anchor == res else "cap", round(out.anchor / self.unit))
     if caps or self.on or (self.since is not None and alive and not view.get("link")):
       ctx["street_cap"] = True                       # (the merge drops a pending raise toward a highway's speed)
@@ -176,11 +181,11 @@ class StreetCap:
         return None
       self.on = True
       self.n += 1
-      self.cap_to = round(tgt / self.unit)
     if anchor is not None and anchor <= tgt + 0.5 * self.unit:
       self.on = False
       self.last = ("capped", tgt)
       return None
+    self.exit_tgt = tgt
     return self._paced(tgt, v)
 
   def _paced(self, tgt, v):
@@ -215,7 +220,6 @@ class StreetCap:
         if cap is not None and anchor is not None and anchor > cap + 0.5 * self.unit:
           self.res = [cap, now + RES_CAP_TIME]
           self.n += 1
-          self.cap_to = round(cap / self.unit)
     if self.res is None:
       return None
     if plus_minus or now > self.res[1] or cruise_off:
