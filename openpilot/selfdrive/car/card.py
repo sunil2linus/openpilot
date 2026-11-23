@@ -472,6 +472,9 @@ class Car:
       self.RI, self.CP, cp_bytes, startup_preferences.tesla_preap_radar)
     from openpilot.starpilot.car.subaru.smoothing import install as install_subaru_smoothing
     install_subaru_smoothing(self.CP, cp_bytes, startup_preferences.subaru_smoothing, self.params)
+    from openpilot.starpilot.car.mazda.model_smoothing import install as install_mazda_smoothing, supported as mazda_smoothing_car
+    if mazda_smoothing_car(self.CP):
+      install_mazda_smoothing(self.CP, cp_bytes, startup_preferences.mazda_steer_smoothing, self.params.get("CarParams"))
     self.params.put("CarParams", cp_bytes, block=True)
     put_cache(self.params, "CarParamsCache", self.CP)
     put_cache(self.params, "CarParamsPersistent", self.CP)

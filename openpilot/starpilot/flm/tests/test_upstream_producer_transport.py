@@ -10,8 +10,9 @@ from openpilot.starpilot.flm import producer_clock_equivalence as clock
 
 APPROVED = {
   'starpilot/car/volkswagen/model_smoothing.py': 'f26a0db1992a99d41b2b63626bc24ed6538cc89d9cfd4e96008e8c86126d7540',
-  'selfdrive/modeld/modeld.py': '4036ac98e5ea9735addb7924ec870e8cdb0efbb160051092c74eaaf6590b98b9',
+  'selfdrive/modeld/modeld.py': '3bff603dd5105e4adfb5a2ffe1e323d48abf99166c29c9e1fb8ded618c74ab5a',
   'starpilot/car/hyundai/model_smoothing.py': '28b1b8c64dd2d8e83f1bc71d39de7f797741d0911b39b7184a6e2d7d34d75243',
+  'starpilot/car/mazda/model_smoothing.py': 'e97171506c66daafafa96a3f0f5c2dc2d8f0589718b75877ec9a7a700d145630',
   'visionipc/visionipc_py.cc': '6c131c4f5eccb9f822f1aaae63733f26b1427c52340b61c9cdaf6cd4aee2f89d',
   'visionipc/visionipc_server.cc': 'a4325a5171eacb931eb271d06a992d2f27216040df113d92099f62cdfa67d81a',
   'visionipc/visionipc_client.cc': 'd142cd60eedabfc581e9770fcd6f0ca81b762ba9dbc608b54dd20a27a317a52d',
@@ -20,7 +21,7 @@ APPROVED = {
 
 def test_exact_installed_upstream_closure_is_checked_before_contract():
   contract = clock.pinned_default_contract()
-  assert len(clock.PRODUCER_SOURCE_HASHES) == 21
+  assert len(clock.PRODUCER_SOURCE_HASHES) == 22
   assert {relative: expected for _, relative, expected in clock.PRODUCER_SOURCE_HASHES if relative in APPROVED} == APPROVED
   assert contract.producer_revision == clock.CLOSURE_SHA256
   assert contract.proof_sha256 == clock.CLOSURE_SHA256

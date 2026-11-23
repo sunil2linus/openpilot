@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_pl
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.starpilot.car.hyundai.model_smoothing import seconds
 from openpilot.starpilot.car.subaru.smoothing import filter_action
+from openpilot.starpilot.car.mazda.model_smoothing import read_frozen as mazda_read_frozen
 
 
 def setup(alpha=True, alternate=False, offset=0):
@@ -103,10 +104,10 @@ def test_common_model_join_keeps_filter_and_lookahead_matched(alpha):
   previous = log.ModelDataV2.Action(desiredCurvature=0.)
   env = {'CP': cp, 'receipt_owner': SimpleNamespace(load=object()), 'v_ego': 18., 'subaru_smoothing': 0.,
          'subaru_smooth_seconds': lambda *args: 0., 'volkswagen_smoothing': lambda *args: 0.,
-         'kona_smoothing': seconds, 'kona_tau': seconds(cp), 'LAT_SMOOTH_SECONDS': 0.,
+         'kona_smoothing': seconds, 'kona_tau': seconds(cp), 'LAT_SMOOTH_SECONDS': 0., 'mazda_smoothing': mazda_read_frozen, 'params': None,
          'sm': {'lateralDelay': SimpleNamespace(lateralDelay=.3)}, 'action': action, 'prev_action': previous,
          'filter_action': filter_action, 'frame_delay': .05, 'action_delay': .025, 'inputs': {}, 'np': np}
-  wanted = {'kona_tau', 'subaru_tau', 'volkswagen_tau', 'lat_delay', 'lat_action_t'}
+  wanted = {'kona_tau', 'mazda_tau', 'subaru_tau', 'volkswagen_tau', 'lat_delay', 'lat_action_t'}
   nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and
            (any(isinstance(t, ast.Name) and t.id in wanted for t in n.targets) or
             any(isinstance(t, ast.Subscript) and ast.unparse(t) == "inputs['lateral_control_params']" for t in n.targets))]
@@ -118,9 +119,10 @@ def test_common_model_join_keeps_filter_and_lookahead_matched(alpha):
   loop = next(n for n in main.body if isinstance(n, ast.While) and
               any(isinstance(x, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'lat_delay' for t in x.targets)
                   for x in ast.walk(n)))
-  assert all(n.lineno < loop.lineno for n in nodes if isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'kona_tau')
+  assert all(n.lineno < loop.lineno for n in nodes if isinstance(n.targets[0], ast.Name) and n.targets[0].id in ('kona_tau', 'mazda_tau'))
   for node in sorted(nodes + filters, key=lambda n: n.lineno):
     exec(compile(ast.Module(body=[node], type_ignores=[]), filename, 'exec'), env)
+  assert env['mazda_tau'] == 0.   # the actual Mazda hook: nothing for a Kona
   assert env['lat_delay'] == pytest.approx(.4)
   assert env['lat_action_t'] == pytest.approx(.475)
   assert env['inputs']['lateral_control_params'][1] == pytest.approx(.4)
@@ -135,7 +137,7 @@ def test_controls_and_lane_centering_use_matching_cached_delay(delay):
          'CS': SimpleNamespace(vEgo=18.), 'LAT_SMOOTH_SECONDS': 0., 'subaru_smooth_seconds': lambda *args: 0.,
          'control_maximum': lambda *args: 0., 'current_delay': lambda *args: delay, 'lane_now_ns': 1}
   nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and
-           any(isinstance(t, ast.Name) and t.id in ('kona_tau', 'lat_delay') for t in n.targets)]
+           any(isinstance(t, ast.Name) and t.id in ('kona_tau', 'mazda_tau', 'lat_delay') for t in n.targets)]
   lane = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign) and
               any(isinstance(t, ast.Name) and t.id == 'lane_delay' for t in n.targets) and isinstance(n.value, ast.Call))
   guard = next((n for n in ast.walk(tree) if isinstance(n, ast.If) and ast.unparse(n.test) == 'lane_delay is not None'), None)
