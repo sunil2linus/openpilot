@@ -351,12 +351,13 @@ class LinkShapes:
   * `cuts`: the joints between the link's ways (in travel order) where a street (STREET_CLASSES) has a shape point
     within JUNCTION_VERTEX: the link meets that street there (an at-grade junction shares a node with both ways; round
     3: a street passing UNDER the joint - a bridge whose way splits right above it - is no junction: its shape only
-    passes near, 10 motorway-to-motorway ramps in the home area were cut that way). The shapes are simplified per way
-    (curve_builder.SHAPE_TOLERANCE, 2 m), so a street's node in a straight run can be gone: such a junction is not
-    seen (no cut; the record as built, and the street cap still catches a highway's speed on that street). The builder's chain joining (same class, no name) runs straight
-    through such a junction, so an exit ramp and the next on-ramp across the street are ONE chain whose record says
-    "to the motorway" (r2: M-53's exit to 23 Mile Rd; the merge armed toward 70 on the exit). Before the first cut the
-    link leads to that street; past the last cut it comes from a street.
+    passes near; 29 long motorway-to-motorway ramps in the home area were cut that way). The shapes are simplified
+    per way (curve_builder.SHAPE_TOLERANCE, 2 m), so a street's node in a straight run can be gone: such a junction
+    is not seen (no cut; the record as built, and the street cap still catches a highway's speed on that street).
+    The builder's chain joining (same class, no name) runs straight through such a junction, so an exit ramp and the
+    next on-ramp across the street are ONE chain whose record says "to the motorway" (r2: M-53's exit to 23 Mile Rd;
+    the merge armed toward 70 on the exit). Before the first cut the link leads to that street; past the last cut it
+    comes from a street.
   * `turn`: a turnaround (a Michigan left: a link from one carriageway onto the other carriageway of the same road,
     r2 rt 1085-1170 on Hall Rd): the link starts and ends on roads of the same class whose one-way shapes there run
     more than TURNAROUND_DEG apart, and it is short: at most TURNAROUND_LEN, or TURNAROUND_SAME_LEN when both ends are
