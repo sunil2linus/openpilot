@@ -469,3 +469,15 @@ r3 rt 402: the auto-resume brought back 55 at 21 mph on a 25-35 mph street (he p
   the car is on a proper road (or faster than 25 mph); his own RES there is his.
 * Difference from the request: the limit-unknown cap uses at least 25 mph as "the speed" (a RES from a stop at 10 mph
   would otherwise cap at 30, under every street limit here); so the cap is never under 45 mph.
+
+### A map jog is no curve (map_view.jogs, read time: no rebuild)
+
+r2 rt 668-686 on Schoenherr Rd: the set went 53 -> 32 for a "curve" of radius 97 m where the road is straight (the GPS
+heading changed under 1 deg/s). The cause is in the built file: where a two-way way meets a one-way way of the same
+road (the road splits into its carriageways) the map line jogs 8 m sideways, read as a 26 deg left and a 30.2 deg right
+bend 4 m apart. The builder's split_doublets drops exactly such pairs, but only up to 30 deg per bend: this one missed by
+0.2 deg. The map view now leaves out two opposite bends of one road within 20 m whose heading changes cancel (net
+under 8 deg), each at most 35 deg, the road moved sideways at most 12 m, where a one-way way meets a two-way one;
+never on a ramp. Home area (folder 42/-84): 166 of 16068 curves left out (1 %), no ramp curve, no curve under 60 m;
+the West Utica Rd curves (r 117 / 222 / 227 / 229 m) are kept. The camera veto still looks ~2 s ahead: the model's
+curvature under-reads beyond that (camera.py), so a longer veto would also veto real curves; not changed.

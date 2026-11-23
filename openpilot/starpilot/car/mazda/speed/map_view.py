@@ -83,6 +83,51 @@ JUNCTION_NEAR = 3.0           # m: a street shape this close to a joint of the l
 HWY_TRUNK_MIN = 55 * 0.44704  # m/s: a trunk road is a highway for the merge / exits only with its map speed this high
 TURNAROUND_DEG = 120.0        # deg: the carriageways a link joins run this far apart: a turnaround
 SHAPE_SEARCH = 150.0          # m between the points where the link's own shapes are looked up
+# A map jog is no curve (read time; r2 rt 668-686 on Schoenherr Rd: two map ways meet with an 8 m sideways jog, read as
+# a 26 deg left and a 30 deg right bend 4 m apart, r 97 / 99 m; the GPS heading changed under 1 deg/s): where a two-way
+# way meets a one-way way of the same road (a road splitting into its carriageways), two opposite bends within
+# JOG_GAP whose heading changes cancel (net under JOG_NET), each at most JOG_BEND, the road moved sideways at most
+# JOG_OFFSET. Never on a ramp. The builder's split_doublets has the same rule with 30 deg at most: this one's 30.2 deg
+# missed it by 0.2 deg (a builder fix would need a rebuild; this needs none).
+JOG_GAP = 20.0                # m between the first bend's exit and the second's entry
+JOG_NET = 8.0                 # deg
+JOG_BEND = 35.0               # deg
+JOG_OFFSET = 12.0             # m
+
+
+def _sideways(c1, c2):
+  """m: how far the road after c2's exit lies beside the line through c1's entry along its heading."""
+  (la1, lo1), (la2, lo2) = c1["a"], c2["b"]
+  dy = (la2 - la1) * 111195.0
+  dx = (lo2 - lo1) * 111195.0 * math.cos(math.radians(la1))
+  h = math.radians(c1["a_hdg"])
+  return abs(dx * math.cos(h) - dy * math.sin(h))
+
+
+def is_ramp_curve(c):
+  return bool(c.get("ramp")) or int(c.get("cls", 0) or 0) in MM.LINK_CLASSES
+
+
+def jogs(curves, oneway_ids=None):
+  """The (chain, s_a) keys of the curves of one chain (sorted along it) that are a map jog (JOG_*), not a curve:
+  with `oneway_ids` (the one-way ways of the loaded shapes) only where a one-way way meets a two-way way (a road
+  splitting into its carriageways, as the builder's split_doublets)."""
+  out = set()
+  for c1, c2 in zip(curves, curves[1:]):
+    try:
+      if (c1.get("dir") == c2.get("dir") or is_ramp_curve(c1) or is_ramp_curve(c2) or
+          float(c2["s_a"]) - float(c1["s_b"]) > JOG_GAP or abs(float(c1["turn"]) - float(c2["turn"])) >= JOG_NET or
+          max(float(c1["turn"]), float(c2["turn"])) > JOG_BEND or (c1.get("name") or "") != (c2.get("name") or "")):
+        continue
+      if oneway_ids is not None:
+        ws = {int(w) for w in (c1.get("ways") or []) + (c2.get("ways") or [])}
+        if not (ws & oneway_ids and ws - oneway_ids):
+          continue
+      if _sideways(c1, c2) <= JOG_OFFSET:
+        out.update(((c1.get("chain"), c1["s_a"]), (c2.get("chain"), c2["s_a"])))
+    except (KeyError, TypeError, ValueError):
+      continue
+  return out
 
 
 def directed_profile(c, increasing):
@@ -100,6 +145,16 @@ class CurvesAhead:
     self.chain = None
     self.odo = 0.0
     self._ow = None
+    self._jogs = {}             # chain id -> the jog curves' keys (cached per loaded set)
+    self._jogs_key = None
+
+  def jog_keys(self, cid):
+    key = id(self.store.curves)
+    if key != self._jogs_key:
+      self._jogs, self._jogs_key = {}, key
+    if cid not in self._jogs:
+      self._jogs[cid] = jogs(self.store.curves.get(cid, []), self.oneway_ways() if self.store.grid else None)
+    return self._jogs[cid]
 
   def oneway_ways(self):
     key = tuple(id(ri) for ri in self.store.grid)
@@ -150,7 +205,10 @@ class CurvesAhead:
     if cid != self.chain:
       self.chain, self.entered = cid, {}
     out = []
+    skip = self.jog_keys(cid)
     for c in self.store.curves.get(cid, []):
+      if (c.get("chain"), c["s_a"]) in skip:
+        continue                   # a map jog, not a curve (JOG_*)
       key = f"{cid}:{c['s_a']}:{'ab' if increasing else 'ba'}"
       entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
       s_entry, s_exit = (c["s_a"], c["s_b"]) if increasing else (c["s_b"], c["s_a"])
