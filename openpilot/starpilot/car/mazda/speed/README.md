@@ -13,7 +13,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `car_profile.py` | per-car learned button latency + hold overrun (same file as the old fork) | ported |
 | `actuator.py` | ONE button actuator: taps, phase-locked holds, attribution, "his buttons win" | rewritten, old rules |
 | `planner.py` | ONE arbitrator: `min(his anchor, contributors)`, anchor owner + proposal rules, test mode | new |
-| `limits.py` | (f) speed limit follow: 7.0's slcState reading, steady time with GPS trust, the limit proposal, 43 mph fallback | ported rules |
+| `limits.py` | (f) speed limit follow: 7.0's slcState reading (our map's tagged limit as the fallback, MapLimit), steady time with GPS trust, the limit proposal, 43 mph fallback | ported rules |
 | `merge.py` | (f) on-ramp merge: highway limit (or the ramp's destination speed), boost / taper / end, guards | ported rules |
 | `exit_plan.py` | (f) exit plan: evidence, reach bound, firm window, release, bounds, exit handover; LaneView | ported + rewritten |
 | `curve_plan.py` | map curve contributor: profile points -> envelope target, lateral limits, TI-only latch | new |
@@ -21,6 +21,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `contributors.py` | builds the contributors for the drive; private modelV2 SubMaster + view reader | new |
 | `curve_builder.py` + `offline_tiles.capnp` | map builder: spline, profiles, doublets, ramps, road shapes | ported, geometry rewritten |
 | `curve_mapd.py` | parked daemon `mazda_curve_mapd`: builds curve files from 7.0's selected map generation | ported + 4 fixes |
+| `map_diag.py` | over ssh: counts of the built curve maps (formats, tagged limits by class, link joints, named ways) | new |
 | `map_match.py` | GpsTrust, RoadIndex/RoadMatcher, MapCurveStore | ported |
 | `map_view.py` | onroad daemon `mazda_mapviewd`: curves ahead, the matched link's ramp, exits ahead -> view file for card | new (curves-ahead, shapes ported) |
 | `curve_memory.py`, `curve_memory_tool.py` | per curve+direction memory (way id key, no positions), cap + offset on the tight points, list/clear tool | simplified port |
@@ -38,6 +39,8 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 
 ## Part (f): speed limit, merge, exits (each off / test / on; test computes and logs, never presses)
 
+* **Our map as the fallback limit (round 4, format 6).** The curve files carry each way's tagged maxspeed; where 7.0
+  has no valid reading the limit rules use it (see "Round 4" below for the precedence).
 * **Where the limit comes from.** 7.0's Speed Limit Controller runs display-only on this car (no openpilot
   longitudinal) and plannerd publishes its arbitration as `slcState` (20 Hz). card reads it through the speed
   control's private SubMaster (created only when speed limit, merge or exits is on): `speedLimit` when the selected
@@ -143,8 +146,9 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   (a missing file is the default), `ls -l /data/media/0/starpilot/maps/offline/current.json`, and on a drive
   `ps aux | grep -c "[m]apd --shadow"`. The settings rows for speed limit / merge / exits say "Now: ..." with what to
   turn on when it will not run.
-* Without the map service running (items 1 or 2 off): **speed limit follow** has no map limit (only a dash reading
-  if 7.0 has one for this car; vision is not followed), so it does nothing; the **merge** uses the ramp's
+* Without the map service running (items 1 or 2 off): **speed limit follow** has only our curve files' tagged limits
+  (round 4, the fallback; areas rebuilt in format 6) and a dash reading if 7.0 has one for this car (vision is not
+  followed); the **merge** uses the ramp's
   destination speed from our curve files (no preview); the **exit handover** uses the ramp's destination speed (no
   posted street limit). **Map curves, the exit plan and the merge's curve guard still work**: our curve files are built
   by our own parked daemon (`mazda_curve_mapd`) straight from the downloaded offline tiles of the selected region; they
@@ -428,11 +432,12 @@ also a bridge whose way splits right above a street). Before it the link leads t
 ramp: `hwy` false, `spd` the street class's default speed, `street` its class; an exit ahead likewise, its profile ends
 at the junction); past it the link comes from that street (`from_hwy` false) and its record holds again (the on-ramp
 merges). Home area (folder 42/-84): 90 interchange, 23 entrance, 29 exit and 31 other links have such a junction
-(round 2's 3 m line test: 119 / 25 / 33 / 33; the 29 interchanges no longer cut are long motorway-to-motorway ramps
-over a street, now "to highway" again, e.g. M-59 490860778, I-94 17963358, I-69 443254109). Known limit: the shapes are
-simplified per way (2 m), so a street node in a straight run can be gone (at link ends onto a street ~40 % have no
+(round 2's 3 m line test: 119 / 25 / 33 / 33; the 29 interchanges no longer cut were taken for long motorway-to-motorway
+ramps over a street, e.g. M-59 490860778, I-94 17963358, I-69 443254109). Known limit of this read-time rule: the shapes
+are simplified per way (2 m), so a street node in a straight run can be gone (at link ends onto a street ~40 % have no
 street point within 1 m); such a junction inside a chain is not seen and the record holds (M-53 -> 23 Mile Rd,
-486581349, keeps its point and its cut). The link's ways are followed along their own shapes (round 3: round 2
+486581349, keeps its point and its cut). **Round 4 (format 6): the builder decides the junction by a shared node**
+and stores it ("j"); this read-time rule is only used for areas not rebuilt yet (see "Round 4"). The link's ways are followed along their own shapes (round 3: round 2
 looked only in the cells along the chord between the link's ends, which missed the middle ways of a wide loop: 60
 home-area links had missing segments, 25 a whole way missing; 5 change: 4 long I-275 / I-675 interchanges and an M-14
 exit now see their street junction). The builder itself is unchanged (no version bump, no rebuild).
@@ -498,3 +503,64 @@ under 8 deg), each at most 35 deg, the road moved sideways at most 12 m, where a
 never on a ramp. Home area (folder 42/-84): 166 of 16068 curves left out (1 %), no ramp curve, no curve under 60 m;
 the West Utica Rd curves (r 117 / 222 / 227 / 229 m) are kept. The camera veto still looks ~2 s ahead: the model's
 curvature under-reads beyond that (camera.py), so a longer veto would also veto real curves; not changed.
+
+## Round 4: our map's speed limit as a fallback (curve map format 6)
+
+**Why.** 7.0's map service says "unknown" for whole seconds where ways compete (ErrAmbiguousWay on divided roads). On
+Hall Rd (a divided trunk road tagged 45 / 50) slcState's map row was valid on ~5-18 % of the samples over several
+drives, so limit follow, match on engage, the lower-limit re-take and the "limit known" street caps hardly ever worked
+there, and after a stop the RES cap used the "limit unknown" rule (45). Our own map view matched Hall Rd with trust 0.
+
+**The files (curve_builder.py, FORMAT_VERSION 6 / BUILDER_VERSION 4).** Each road shape carries its way's TAGGED
+maxspeed as `"l"`: N for N mph, -N for N km/h (the tag's own unit and whole number), `[forward, backward]` when a
+two-way way's directions differ, no field when untagged. Never the class default. Conditional / variable limits are
+ignored. Size: +3.2 % on a full build of the home area from the old-format tiles (16.52 -> 17.05 MB). Each ramp record
+also carries `"j"` (the joints of its ways where a street shares the node: an at-grade junction) and its `to` / `from`
+roads `"h"` (their travel heading at the link's own end node, one-way roads): map_view.LinkShapes then needs no shape
+search (cuts, turnaround); the read-time 1 m / 3 m rules remain for format 5 files.
+
+**The rebuild.** curve_mapd sees format 5 / builder 3 in each area's state and rebuilds every area (within the build
+range, nearest first, ~2-3 min each, parked on power; the owner's 33 areas about 1-2 hours with "Whole map"; with the default 100 miles only the areas in range, the rest keep working as format 5). Until an
+area is rebuilt its old files keep working on the car exactly as before (curves, ramps, exits, shapes; only our
+fallback limit is missing there; map_match reads formats 5 and 6). The settings status says so while it runs:
+"curve maps: building… within 100 miles 3 of 5 built, 2 older ones still in use until rebuilt; all downloaded 3 of 33
+(parked, on power)." (whole map: "building… 12 of 33 map areas built, 21 older ones still in use until rebuilt").
+Check over ssh afterwards: `python -m openpilot.starpilot.car.mazda.speed.map_diag` (counts and ids only).
+
+**The view.** `"lim"` (m/s) + `"limu"` ("mph" / "kmh"): the matched way's tag for the direction of travel, only with
+GPS trust 0 and a match; on a link only when the link itself is tagged.
+
+**Precedence (limits.MapLimit, once per frame in contributors.Sources -> ctx["limit_in"]; SpeedLimit and StreetCap
+read it):**
+
+| 7.0 (slcState map / dash row) | our map | the reading used |
+|---|---|---|
+| valid | any | 7.0's |
+| valid, a different value | - | 7.0's; our map is not used on that road chain for 15 s after (no flipping in 7.0's gaps); one `map_limit` "disagree" line per road chain |
+| missing / unknown | tagged, trust 0, matched, view alive | ours, as a reading of the same kind: the same steady times, trust and view rules, GAP_HOLD, `live`, seq / re-take, match on engage |
+| only "possible" (mapdOut) with a different value | tagged | none this frame (a gap: the steady time holds up to GAP_HOLD); the same value: one reading |
+| missing | untagged / not trusted | none (as before; a class default is never a limit) |
+
+* street_cap's "limit known" (the exit cap and the RES cap) uses the same reading: a red light on Hall Rd resumes to
+  the limit + 3, not the unknown-limit 45.
+* The lower-limit preview ahead stays 7.0's only (our map would need the next ways along the road: not cheap; left).
+* The merge's highway limit and the exit handover's street limit still read 7.0 only (unchanged).
+* Event log: `map_limit` lines: `start` (value, unit, road class) when our map starts supplying the limit or its
+  value changes, `stop` after 10 s without it (why: 7.0 / no tag / no view), `disagree` (both values). No position.
+
+**Recorded drives (open loop; the home-area files here are format 5, so the limits were joined by way id from the
+OLD-format offline tiles: an older OSM snapshot; 91 % of the device files' ways found).** Hall Rd: a reading (7.0 or
+ours) on r2 5 % -> 99 % of the Hall Rd frames, r3 4 % -> 69 % (the rest: the first minute's trust 1), route 0000000c
+1930-1985 18 % -> 98 %. 7.0's valid values never disagreed with the tags. r2 rt 987 Hall Rd's 45 steady (was never) ->
+our 53 to 48; r2 rt 1030 the RES after the red light keeps 48 (was the unknown-limit 45); 0000000c t 1872 the RES on
+Hall Rd matches 45 -> 48 (was his 45 kept); M-53's exit cap onto 23 Mile Rd 70 -> 48 (was 43, the limit unknown); the
+M-59 raise to 55 2 s earlier; no curve plan changed.
+
+**Junctions by node (old-format tiles of the home area; the device's own tiles may differ).** Cuts stored vs the
+read-time rule: interchange 100 / 84, entrance 25 / 23, exit 33 / 29, other links 37 / 31; "to a highway" interchange
+280 / 296, entrance 593 / 595; turnarounds 3033 / 3034 (4 only stored, 5 only read-time). M-53 486581349 -> 23 Mile Rd
+cut (both); Hall Rd 1214344938 turnaround (both). **Changed:** 490860778 (M-59), 17963358 (I-94), 443260504 and
+443254109 (I-69), 8727544 (I-94) and 8729433 (Lodge) share a NODE with a street at a joint of their ways (a diamond's
+off-ramp running straight across the street onto the on-ramp, like M-53 / 23 Mile Rd), so they are cut now; 8727340
+and 8728850 (Southfield / Jeffries) are not. The two "entrances" 402416597 and 8727616 are short crossovers (23 m /
+51 m) from one carriageway of a divided street to the other, where the real on-ramp starts: cut at that joint.

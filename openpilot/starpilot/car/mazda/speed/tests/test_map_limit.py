@@ -266,3 +266,22 @@ def test_sources_fill_limit_in_and_log_through_the_event_log():
   no = Sources(want_model=False, want_view=True, sm=None, read_view=lambda: vw(0.0), clock=lambda: 0.0)
   assert "limit_in" not in no.context({"v_ego": 20.0})              # no limit option: not computed
 
+
+def test_the_device_diagnostic_prints_counts_and_ids_only(tmp_path, capsys, monkeypatch):
+  import re
+  from openpilot.starpilot.car.mazda.speed import curve_mapd as D
+  from openpilot.starpilot.car.mazda.speed import map_diag as G
+  from openpilot.starpilot.car.mazda.speed.tests.test_exit_view import pass_through_scene, write_scene
+  ways = pass_through_scene(street="straight")
+  for w in ways.values():
+    w.tag = (45, 45) if w.cls == 5 else (0, 0)
+  write_scene(str(tmp_path), ways)
+  B.write_json_atomic(str(tmp_path / "42" / "-84" / D.STATE_NAME), {"format": 6, "builder": B.BUILDER_VERSION})
+  monkeypatch.setattr(G, "name_ids", lambda folder, name: {33})
+  G.main(["--root", str(tmp_path), "--ways", "31,42"])
+  out = capsys.readouterr().out
+  assert "map areas: 1; by (format, builder): {(6, 4): 1}" in out
+  assert "class  5 primary        tagged      1" in out
+  assert "way 31: [{'type': 'interchange', 'ways': 2, 'stored': True, 'cuts': [[0, 5]], 'turn': False, 'to_highway': False}]" in out
+  assert "tagged limits on their shapes: {'45 mph': 1}" in out
+  assert not re.search(r"4[23]\.\d{3}|-8[34]\.\d{3}", out)        # no position
