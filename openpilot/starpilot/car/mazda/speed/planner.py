@@ -13,7 +13,9 @@ The driver's own speed ("anchor", dash units):
     it later), but nothing of ours lowers again until the reason is over;
   * his SET- is his new speed (we never raise above it); while a reason is on it also blocks our lowering for that
     reason ("his buttons win": the curve he slowed for himself is his);
-  * RES with the set where we left it keeps the anchor (we restore from there); main off forgets it.
+  * RES with the set where we left it keeps the anchor (we restore from there); main off forgets it. (Round 2) On a
+    trusted street the street cap (street_cap.py) then proposes an anchor above what the street allows down ("street":
+    ours, his next SET+ / SET- is his again); on a motorway, a link or an unknown road his speed stays.
   * The press that engages the cruise (SET+, SET- or RES from standby) is the engagement, not a change of his: the
     actuator reports "engaged" / "resumed" for it (also when the car shows the new set speed a few frames after the
     cruise came on). "resumed" keeps the anchor and its value; an anchor his SET+/SET- had made his becomes

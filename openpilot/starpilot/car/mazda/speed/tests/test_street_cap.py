@@ -151,3 +151,59 @@ def test_planner_street_is_down_only_and_a_limit_raise_needs_a_new_limit():
   assert round(p.anchor / MPH) == 40                       # a lower one: taken
   step([Contribution("speed_limit", None, anchor=53 * MPH, kind="limit", seq=5)])
   assert round(p.anchor / MPH) == 53                       # a limit steady after it: taken
+
+
+def resumed():
+  return {"kind": "resumed", "after": None}
+
+
+def res_on(r, cls=9, limit=None, v=20.0, anchor=55, trust=0, link=False, before_limit=None):
+  """His set `anchor` (engaged), his brake, then a RES at v mph on this road."""
+  r.step(v_mph=40, set_mph=anchor, events=[engaged(anchor)], view=road(cls, link=link, trust=trust), slc=slc(before_limit))
+  r.step(v_mph=40, n=300, view=road(cls, link=link, trust=trust), slc=slc(before_limit))
+  r.step(v_mph=v, n=200, cruise=False, view=road(cls, link=link, trust=trust), slc=slc(limit))
+  r.step(v_mph=v, events=[dict(resumed(), after=anchor * MPH)], view=road(cls, link=link, trust=trust), slc=slc(limit))
+  return r.step(v_mph=v, n=100, view=road(cls, link=link, trust=trust), slc=slc(limit))
+
+
+def test_round2_res_on_a_25_street_caps_his_55_at_28():
+  r = rig()
+  res_on(r, limit=25)
+  assert r.anchor_mph == 28 and r.p.owner == OURS and r.p.ours_why == "street"
+
+
+def test_round2_res_with_the_limit_unknown_caps_at_the_speed_plus_20_at_least_45():
+  r = rig()
+  res_on(r, v=20)                                      # (r3 rt 402: 55 back at 21 mph, the limit unknown)
+  assert r.anchor_mph == 45
+  r = rig()
+  res_on(r, cls=3, v=10, anchor=53)                    # (r2 rt 1030: Hall Rd, 53 at 10 mph)
+  assert r.anchor_mph == 45
+  r = rig()
+  res_on(r, v=40, anchor=55)
+  assert r.anchor_mph == 55                            # 40 + 20 is above his 55: his speed stays
+
+
+def test_round2_res_uses_a_limit_read_on_this_road_just_before():
+  r = rig()
+  r.step(v_mph=40, set_mph=55, events=[engaged(55)], view=road(9), slc=slc(35))
+  r.step(v_mph=40, n=300, view=road(9), slc=slc(35))
+  r.step(v_mph=10, n=300, cruise=False, view=road(9), slc=slc(None))       # 7.0 says "unknown" at the stop
+  r.step(v_mph=10, events=[dict(resumed(), after=55 * MPH)], view=road(9), slc=slc(None))
+  r.step(v_mph=10, n=100, view=road(9), slc=slc(None))
+  assert r.anchor_mph == 38
+
+
+def test_round2_res_on_a_motorway_a_link_or_an_untrusted_road_keeps_his_speed():
+  for kw in ({"cls": 1, "limit": 55}, {"cls": 2, "link": True, "limit": 25}, {"cls": 9, "trust": 1, "limit": 25}):
+    r = rig()
+    res_on(r, anchor=75, v=30, **kw)
+    assert r.anchor_mph == 75, kw
+
+
+def test_round2_his_set_plus_after_the_res_cap_is_his():
+  r = rig()
+  res_on(r, limit=25)
+  r.step(v_mph=25, events=[driver("SET_PLUS", 40)], view=road(9), slc=slc(25))
+  r.step(v_mph=25, n=300, view=road(9), slc=slc(25))
+  assert r.anchor_mph == 40 and r.p.owner == HIS

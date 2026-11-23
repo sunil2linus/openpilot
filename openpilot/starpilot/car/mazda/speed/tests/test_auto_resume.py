@@ -482,3 +482,20 @@ def test_rereview_r6_an_old_name_equal_to_the_one_at_his_brake_still_sends():
   s.brake_cancel(v_after_mph=25)
   s.step(int(2.0 * F), gas_pressed=True, road_name="", road_name_last="Main St", road_name_age=11.8)
   assert s.sent
+
+
+def test_round2_no_res_on_a_link_under_25_mph_it_waits_for_a_proper_road():
+  # (r2 rt 1166) his 46 came back at 11 mph inside Hall Rd's turnaround link (trunk_link, class 4): the car surged
+  s = Sim(set_mph=46, v_mph=30, road_class=3)
+  s.brake_cancel(v_after_mph=6)
+  s.step(int(1.5 * F), road_class=4)                 # (the road settles on the link)
+  s.step(2 * F, gas_pressed=True, v_ego=11 * MPH)
+  assert s.sent == [] and s.lg.wait_why == "slow on a link"
+  s.step(int(1.5 * F), gas_pressed=True, v_ego=20 * MPH, road_class=3)   # off the link, gas still held: it goes
+  assert s.sent and s.sent[0][1] == RES
+  # a ramp at 30 mph is no crawl in a turn: it sends
+  s = Sim(set_mph=60, v_mph=40, road_class=2)
+  s.brake_cancel(v_after_mph=30)
+  s.step(int(1.5 * F))
+  s.step(F, gas_pressed=True)
+  assert s.sent

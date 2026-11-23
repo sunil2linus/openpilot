@@ -445,3 +445,19 @@ old limit kept through a gap of readings never raises it back). Differences from
 with a known limit under 55 (the old fork never treated a trunk as a street); a street must come within 1 km after
 the highway / link (the old fork waited without a bound); the pacing is an anchor floor (the old fork pressed SET-
 taps or one hold itself).
+
+### After any RES the set is never far above the road (street_cap.py, auto_resume.py)
+
+r3 rt 402: the auto-resume brought back 55 at 21 mph on a 25-35 mph street (he pressed SET- x8); r2 rt 1167: 46 back at
+11 mph inside the turnaround link (the car surged 6 -> 28 mph in the turn); r2 rt 1044: 53 carried onto Hall Rd (45).
+* **Ownership (one rule for his RES and ours):** a RES keeps the anchor as before ("resumed"); then, on a trusted
+  street (GPS trust 0, matched, not a link; class 5-12 or a trunk road), the street cap proposes an anchor above what
+  the street allows down, as an anchor of ours (kind "street", paced like the exit cap): to the limit + offset when the
+  limit is known (read now, or on this road within 10 s; a limit above 55: no cap), else to min(his anchor, max(v,
+  25 mph) + 20 mph). His SET+ / SET- afterwards is his speed as always (not capped again until the next RES). On a
+  motorway, a link or an unknown road nothing changes (his speed back, as before). It is the same mechanism as the
+  exit cap (one contributor, one kind, the lower of the two).
+* **No auto-resume on a link under 25 mph** (a ramp, a turnaround): the press waits while his gas is held and goes once
+  the car is on a proper road (or faster than 25 mph); his own RES there is his.
+* Difference from the request: the limit-unknown cap uses at least 25 mph as "the speed" (a RES from a stop at 10 mph
+  would otherwise cap at 30, under every street limit here); so the cap is never under 45 mph.

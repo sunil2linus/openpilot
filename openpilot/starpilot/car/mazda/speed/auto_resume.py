@@ -12,7 +12,8 @@ presses RES for him, so the cruise comes back at his set speed. Port of the owne
      file the curve features read): "cls" for the class, "trust" for the GPS trust and the matched road "chain" in place
      of mapd's road name; the view counts while it is alive (view_age.py: up to VIEW_ALIVE after its GPS message, so
      a 1 Hz GPS works), and the road must also be the same in ROAD_VIEWS views in a row (known and stable, as the old
-     fork's name hold meant). Unknown, other classes or a worse trust: no.
+     fork's name hold meant). Unknown, other classes or a worse trust: no. (Round 2, new) On a link (a ramp, a
+     turnaround) slower than LINK_SLOW: no RES; the press waits (his gas held) until the car is on a proper road.
   C. Wheel calm: nothing is sent while turning (|lateral accel| from the wheel angle and the speed >= MERGE_TURN_LAT, the
      wheel winding, or |wheel angle| >= AUTO_RESUME_MAX_ANGLE); calm CALM_TIME first; AUTO_RESUME_BIG_TURN_WAIT after
      the wheel was over AUTO_RESUME_BIG_TURN. The gas may be down during the turn; the press goes out when the wheel
@@ -73,6 +74,9 @@ AUTO_RESUME_MAX_DIST = 800.0     # m driven since the brake without the cruise b
 # no frame of ours is dropped there (a crawl in traffic: 800 m at 10 mph is ~180 s)
 AUTO_RESUME_MAX_MOVING = 170.0   # s
 PUBLIC_ROAD_CLASSES = tuple(range(1, 13))    # highwayClass 1 motorway .. 10 tertiary_link, 11 unclassified, 12 residential
+LINK_CLASSES = (2, 4, 6, 8, 10)  # ramps, turnarounds and other link roads
+LINK_SLOW = 25 * MS_PER_MPH      # m/s: on a link slower than this no RES (r2 rt 1166: his 46 back at 11 mph inside the
+                                 # turnaround, the car surged 6 -> 28 mph in the turn); it waits for a proper road
 MAX_GPS_TRUST = 0                # the map view's GpsTrust status: 0 ok
 NOT_ALLOWED_TIME = 0.5           # s of CRZ_CTRL byte 4 non-zero before it disarms
 BURST_FRAMES = 4                 # RES frames per attempt
@@ -382,6 +386,8 @@ class AutoResumeLogic:
       return "gas"
     if not self.map_ok(i):
       return "map"
+    if int(i.road_class) in LINK_CLASSES and max(float(i.v_ego), 0.0) < LINK_SLOW:
+      return "slow on a link"
     if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME) or int(i.road_views) < ROAD_VIEWS:
       return "road just changed"
     last = str(i.road_name_last or i.road_name or "")
