@@ -34,8 +34,9 @@ silent shapes and no match, as without GPS:
   * Released at once (the speed comes back): "highway" from the shapes for HWY_CONFIRM, the match on the highway with
     GPS trust 0 for HWY_MATCH past HWY_MATCH_FROM with the shapes' last answer not link, the model path straight
     (along the highway, MODEL_CONFIRM) with the shapes' last answer not link; his gas held GAS_HELD; any button of his
-    (his gas / button / brake only while the plan is acting: it had a target, or the car is within SIGNAL_REACH of the
-    split or past it; further ahead the exit is only looked at and stays planned); PASSED past the split unresolved. A "link" answer is forgotten after SHAPE_QUIET_T / SHAPE_QUIET_M of silent
+    (his gas / button / brake only while the plan is acting: it had a target, his exit-side blinker, the reach
+    profile, confirmed, or the car past the split; before that the exit is only looked at and stays planned, and his
+    gas held then does not count); PASSED past the split unresolved. A "link" answer is forgotten after SHAPE_QUIET_T / SHAPE_QUIET_M of silent
     shapes (scattered link frames never add up to a confirmation, one frame never blocks the release).
   * A confirmation is overturned (everything released: the ramp target, the handover, his speed restored) by the
     shapes saying highway for HWY_CONFIRM, the trusted highway match (as above), or his gas held GAS_HELD unless the
@@ -358,7 +359,8 @@ class ExitPlan:
       self.last = ("watch", None)
       return out
     d = p.at - self.odo              # m to the split (negative: past it)
-    p.gas_t = p.gas_t + dt if ctx.get("gas") else 0.0
+    acting = self._acting(p, d)
+    p.gas_t = p.gas_t + dt if (ctx.get("gas") and acting) else 0.0   # (gas held before it acts is not about it)
     ctx["exit_busy"] = bool((p.handover and not (p.handed or p.cancelled)) or
                             (not p.released and (p.confirmed or (d <= SIGNAL_REACH and (p.signal or p.lane or p.model)))))
     if p.confirmed and not p.released and d < -PASSED:
@@ -371,8 +373,7 @@ class ExitPlan:
       if d < -PASSED or (e is None and alive):
         self.plan = None
       return out
-    # ---- his decisions (only for a plan that is acting: far ahead it is only looked at) ----
-    acting = self._acting(p, d)
+    # ---- his decisions (only for a plan that is acting: before that it is only looked at) ----
     if (self._his(ctx) or ctx.get("brake")) and acting:
       p.cancelled = True             # (a handover is cancelled for good; the ramp's curves stay the curve plan's)
       self._end("his button" if self._his(ctx) else "brake")
@@ -471,12 +472,14 @@ class ExitPlan:
 
   @staticmethod
   def _acting(p, d):
-    """The plan acts on this exit: it has had a target (our presses for it), it is confirmed / handing over, or the
-    car is within SIGNAL_REACH of the split or past it. Before that (up to EXIT_LOOK ahead) the exit is only looked
-    at: his button, gas or brake there is about his own speed (the planner makes his set his as always), not about
-    this exit, and must not mark it done (r3: his SET+ ~500 m before the split released it for good; at the split
-    nothing slowed and he braked on the ramp)."""
-    return bool(p.confirmed or p.handover or p.reach_on or p.acted or d <= SIGNAL_REACH)
+    """The plan acts on this exit: it has had a target (our presses for it), his exit-side blinker is latched for it,
+    the car is on the reach profile, it is confirmed / handing over, or the car is past the split. Before that the
+    exit is only looked at: his button, gas or brake there is about his own speed (the planner makes his set his as
+    always), not about this exit, and must not mark it done (r3: his SET+ ~500 m before the split released it for
+    good; at the split nothing slowed and he braked on the ramp. Round 3: also inside SIGNAL_REACH: r2 rt 1044, his
+    SET+ 227 m before the split with no blinker and no slowing yet released the exit), and his gas held there does
+    not count toward GAS_HELD (r2 rt 987: gas held across the 400 m line released it at once)."""
+    return bool(p.confirmed or p.handover or p.reach_on or p.acted or p.signal or d <= 0.0)
 
   @staticmethod
   def _hwy_shapes(p):
