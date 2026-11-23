@@ -63,8 +63,14 @@ def build_text(value):
   if state == NO_MAP:
     return "curve maps: no offline map downloaded (download one in Maps settings)."
   failed_words = f", {failed} failed (see build_log.txt)" if failed else ""
+  try:
+    older = int(value.get("older", 0) or 0)
+  except (TypeError, ValueError):
+    older = 0
+  # (a new curve-map format: the areas built before it keep working until they are rebuilt, nearest first)
+  older_words = f", {older} older {'one' if older == 1 else 'ones'} still in use until rebuilt" if older > 0 else ""
   if rng > 0 and "all_total" in value:
-    counts = f"within {rng} miles {built} of {total} built{{failed}}; all downloaded {all_built} of {all_total}"
+    counts = f"within {rng} miles {built} of {total} built{older_words}{{failed}}; all downloaded {all_built} of {all_total}"
     if state == UP_TO_DATE:
       return "curve maps: " + counts.format(failed="") + "."
     if state == BUILDING:
@@ -75,9 +81,9 @@ def build_text(value):
   if state == UP_TO_DATE:
     return f"curve maps: up to date ({total} of {total} map areas built)." if total else "curve maps: up to date."
   if state == BUILDING:
-    return f"curve maps: building… {built} of {total} map areas built (parked, on power)."
+    return f"curve maps: building… {built} of {total} map areas built{older_words} (parked, on power)."
   if state == PARTIAL:
-    return f"curve maps: {built} of {total} map areas built" + failed_words + "; the rest are built while parked."
+    return f"curve maps: {built} of {total} map areas built{older_words}{failed_words}; the rest are built while parked."
   return ""
 
 

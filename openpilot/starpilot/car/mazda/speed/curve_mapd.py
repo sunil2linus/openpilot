@@ -21,7 +21,10 @@ starpilot/system/curve_mapd.py, pointed at 7.0's offline maps).
     before each folder: a change stops the pass after the folder being built, so it applies without a reboot.
   * Status: <mazda_speed>/curve_build_status.json (status.py: "within 100 miles 3 of 5 built; all downloaded 3 of 33",
     "building", "no offline map downloaded"), read by the settings rows; counts and the range only, never a position.
-    Folders out of range are counted as built from their state alone (no curve file is opened for them).
+    Folders out of range are counted as built from their state alone (no curve file is opened for them). A folder
+    built by an older builder / format the car still reads (curve_builder.READ_FORMATS / READ_MIN_BUILDER: format 5,
+    before the tagged limits) is rebuilt like any stale one, nearest first, and counted as "older, still in use until
+    rebuilt" meanwhile (its curves, ramps and shapes keep working; only the map's own speed limit is missing there).
   * A MemoryError on a dense folder: gc.collect() and one retry; a second failure skips that folder for the rest of
     this parked session (logged) instead of retrying it forever. gc.collect() between folders.
   * Log: <curve root>/build_log.txt (size capped), never a GPS position.
@@ -165,6 +168,18 @@ def state_current(folder, tiles, curve_root=CURVE_ROOT):
     return False
 
 
+def older_in_use(folder, tiles, curve_root=CURVE_ROOT):
+  """Built for these tiles by an older builder / format that the car still reads (format 5 before the tagged limits):
+  it is rebuilt, and works as before until then. From the state alone."""
+  try:
+    state = read_state(os.path.join(curve_root, folder))
+    return (state is not None and int(state.get("format", 0)) in B.READ_FORMATS and
+            int(state.get("builder", 0)) >= B.READ_MIN_BUILDER and state.get("signature") == signature(tiles) and
+            not state_current(folder, tiles, curve_root))
+  except (TypeError, ValueError):
+    return False
+
+
 def in_scope(near, folder, range_miles):
   """The folder is built: no position or no range (whole map), or its box within range_miles."""
   return near is None or range_miles is None or folder_box_distance_miles(near, folder) <= range_miles
@@ -227,11 +242,14 @@ def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=l
   scope = set(scope)
   outside = sum(state_current(f, folders[f]["tiles"], curve_root) for f in folders if f not in scope)
   shown_range = range_miles if (near is not None and range_miles is not None) else None   # None: all in scope
+  older = {f for f, _w in stale if older_in_use(f, folders[f]["tiles"], curve_root)}
 
   def status(n, **kw):
-    return build_status(n, total, range_miles=shown_range, all_built=n + outside, all_total=len(folders), **kw)
+    return build_status(n, total, range_miles=shown_range, all_built=n + outside, all_total=len(folders),
+                        older=len(older - built_now), **kw)
 
   done = 0
+  built_now = set()
   for folder, why in todo:
     if should_stop():
       break
@@ -242,6 +260,7 @@ def run_once(folders, curve_root=CURVE_ROOT, near=None, log=print, should_stop=l
       try:
         build_folder(folder, folders[folder], curve_root, log, builder)
         failed.pop(folder, None)
+        built_now.add(folder)
         done += 1
         break
       except MemoryError:
@@ -362,10 +381,11 @@ def build_range(params):
   return C.read(params).curve_range_miles
 
 
-def build_status(built, total, building=False, failed=0, range_miles=None, all_built=None, all_total=None):
+def build_status(built, total, building=False, failed=0, range_miles=None, all_built=None, all_total=None, older=0):
   """The status file's dict (status.build_text says it in words); counts and the range only, never a position.
   built / total: the folders in scope; range: its miles (0: everything is in scope: the whole map or no position);
-  all_built / all_total: every folder of the selected map."""
+  all_built / all_total: every folder of the selected map; older: folders in scope not built yet that still work
+  from an older format (older_in_use)."""
   from openpilot.starpilot.car.mazda.speed import status as ST
   if total is None:
     return {"state": ST.NO_MAP, "built": 0, "total": 0, "failed": 0}
@@ -373,6 +393,8 @@ def build_status(built, total, building=False, failed=0, range_miles=None, all_b
   out = {"state": state, "built": int(built), "total": int(total), "failed": int(failed)}
   if all_total is not None:
     out.update({"range": int(range_miles or 0), "all_built": int(all_built), "all_total": int(all_total)})
+  if older and state != ST.UP_TO_DATE:
+    out["older"] = int(older)
   return out
 
 

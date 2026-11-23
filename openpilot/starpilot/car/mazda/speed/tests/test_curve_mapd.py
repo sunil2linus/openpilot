@@ -329,3 +329,116 @@ def test_a_curve_file_that_parsed_is_only_looked_at_again_when_it_changes(tmp_pa
   p.write_text("")
   assert not D.file_ok(str(p))
   assert not D.file_ok(str(tmp_path / "missing.json"))
+
+
+def test_a_format_bump_rebuilds_nearest_first_and_the_old_areas_keep_working(tmp_path):
+  # format 6 (the tagged limits): every area built as format 5 / builder 3 is rebuilt, nearest first; until then it
+  # still loads on the car (curves, ramps, shapes; no map limit) and the status says so
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  root = str(tmp_path)
+  folders = range_folders()
+  calls = []
+  D.run_once(folders, root, near=NEAR, log=lambda _: None, builder=fake_builder(calls), range_miles=None)
+  for f in RANGE_FOLDERS:                                   # as the device has them now: built by the format 5 builder
+    st = D.read_state(os.path.join(root, f))
+    B.write_json_atomic(os.path.join(root, f, D.STATE_NAME), dict(st, format=5, builder=3))
+  assert all(D.check_folder(f, TILES, root) == "format 5" for f in RANGE_FOLDERS)
+  assert all(D.older_in_use(f, TILES, root) for f in RANGE_FOLDERS)
+  calls, reports = [], []
+  D.run_once(folders, root, near=NEAR, log=lambda _: None, builder=fake_builder(calls), report=reports.append,
+             range_miles=None, should_stop=lambda: len(calls) >= 3)
+  assert calls == list(RANGE_FOLDERS[:3])                   # nearest first, stopped half way
+  assert [r["older"] for r in reports[:3]] == [7, 6, 5] and reports[-1]["older"] == 4
+  assert ST.build_text(reports[1]) == \
+    "curve maps: building… 1 of 7 map areas built, 6 older ones still in use until rebuilt (parked, on power)."
+  assert ST.build_text(reports[-1]) == \
+    "curve maps: 3 of 7 map areas built, 4 older ones still in use until rebuilt; the rest are built while parked."
+  # a half-rebuilt set: the rebuilt ones are current, the rest still stale, the next pass goes on nearest first
+  assert [D.check_folder(f, TILES, root) is None for f in RANGE_FOLDERS] == [True] * 3 + [False] * 4
+  assert [f for f, _ in D.plan(folders, root, near=NEAR, range_miles=None)] == list(RANGE_FOLDERS[3:])
+  reports = []
+  D.run_once(folders, root, near=NEAR, log=lambda _: None, builder=fake_builder(calls), report=reports.append,
+             range_miles=100)
+  # within 100 miles only the 3 nearest, already rebuilt: up to date there; the 4 older ones out of range stay as they
+  # are (they still load) and are not counted as built
+  assert calls == list(RANGE_FOLDERS[:3]) and len(reports) == 1
+  assert ST.build_text(reports[0]) == "curve maps: within 100 miles 3 of 3 built; all downloaded 3 of 7."
+  D.run_once(folders, root, near=NEAR, log=lambda _: None, builder=fake_builder(calls), report=reports.append,
+             range_miles=None)
+  assert calls == list(RANGE_FOLDERS) and "older" not in reports[-1] and reports[-1]["state"] == "up_to_date"
+  # a folder of the old fork (format 4) is not "in use": it is only stale
+  st = D.read_state(os.path.join(root, RANGE_FOLDERS[-1]))
+  B.write_json_atomic(os.path.join(root, RANGE_FOLDERS[-1], D.STATE_NAME), dict(st, format=4, builder=1))
+  assert not D.older_in_use(RANGE_FOLDERS[-1], TILES, root)
+
+
+def test_status_text_with_older_areas_in_range():
+  from openpilot.starpilot.car.mazda.speed import status as ST
+  assert ST.build_text(D.build_status(3, 5, building=True, range_miles=100, all_built=3, all_total=33, older=2)) == \
+    "curve maps: building… within 100 miles 3 of 5 built, 2 older ones still in use until rebuilt; " + \
+    "all downloaded 3 of 33 (parked, on power)."
+  assert ST.build_text(D.build_status(4, 5, range_miles=100, all_built=4, all_total=33, older=1)) == \
+    "curve maps: within 100 miles 4 of 5 built, 1 older one still in use until rebuilt; all downloaded 4 of 33; " + \
+    "the rest within 100 miles are built while parked."
+  assert "older" not in D.build_status(5, 5, range_miles=100, all_built=5, all_total=33, older=3)
+
+
+def write_tile_ways(path, ways):
+  """A synthetic 7.0 tile: ways = [dict(id, pts, cls, name, ref, speed, fwd, bwd, oneway, cond)] (speeds m/s)."""
+  schema = B.load_schema()
+  t = schema.Offline.new_message()
+  t.minLat, t.minLon, t.maxLat, t.maxLon = 42.25, -83.75, 42.5, -83.5
+  lst = t.init("ways", len(ways))
+  for w, d in zip(lst, ways, strict=True):
+    w.id, w.name, w.ref, w.highwayClass = d["id"], d.get("name", ""), d.get("ref", ""), d.get("cls", 7)
+    w.maxSpeed, w.maxSpeedForward, w.maxSpeedBackward = d.get("speed", 0.0), d.get("fwd", 0.0), d.get("bwd", 0.0)
+    w.oneWay = d.get("oneway", False)
+    w.maxSpeedConditional = d.get("cond", "")
+    ns = w.init("nodes", len(d["pts"]))
+    for n, (la, lo) in zip(ns, d["pts"], strict=True):
+      n.latitude, n.longitude = la, lo
+  with open(path, "wb") as f:
+    f.write(t.to_bytes_packed())
+
+
+def line(lat0, lon0, dn, de, n, step=20.0):
+  mlat, mlon = 1 / 111195.0, 1 / (111195.0 * math.cos(math.radians(lat0)))
+  return [(lat0 + dn * step * i * mlat, lon0 + de * step * i * mlon) for i in range(n)]
+
+
+def test_a_real_build_carries_the_tagged_limits_and_never_a_class_default(tmp_path):
+  tiles = tmp_path / "tiles" / "42" / "-84"
+  tiles.mkdir(parents=True)
+  name = "42.250000_-83.750000_42.500000_-83.500000"
+  kph = 0.277778                                             # 7.0's tile maker: a number without unit or km/h
+  write_tile_ways(str(tiles / name), [
+    {"id": 1, "pts": line(42.30, -83.60, 1, 0, 30), "cls": 3, "name": "Hall Road", "speed": 45 * B.MPH, "oneway": True,
+         "cond": "35 mph @ (07:00-09:00)"},
+    {"id": 2, "pts": line(42.30, -83.62, 1, 0, 30), "cls": 7, "name": "Two Way Road", "speed": 40 * B.MPH, "fwd": 45 * B.MPH},
+    {"id": 3, "pts": line(42.30, -83.64, 1, 0, 30), "cls": 5, "name": "Untagged Road"},
+    {"id": 4, "pts": line(42.30, -83.66, 1, 0, 30), "cls": 9, "name": "Metric Road", "speed": 50 * kph},
+    {"id": 5, "pts": line(42.30, -83.68, 1, 0, 30), "cls": 7, "name": "Knots Road", "speed": 20 * 0.514444},
+  ])
+  stats = B.build(str(tiles), str(tmp_path / "out"), quiet=True)
+  assert stats["tagged"] == 3
+  data = json.load(open(tmp_path / "out" / (name + ".json")))
+  assert data["version"] == 6 and data["builder"] == B.BUILDER_VERSION
+  lim = {r["w"]: r.get("l") for r in data["roads"]}
+  assert lim[1] == 45                                        # one-way: one value (the conditional tag ignored)
+  assert lim[2] == [45, 40]                                  # maxspeed:forward differs from maxspeed (backward)
+  assert lim[3] is None and "l" not in next(r for r in data["roads"] if r["w"] == 3)   # untagged: no class default
+  assert lim[4] == -50                                       # 50 km/h stays 50 km/h
+  assert lim[5] is None                                      # knots (20 kn = 10.3 m/s): neither whole mph nor km/h
+
+
+def test_tag_codes_keep_the_unit_and_the_whole_number():
+  kph = 0.277778
+  for mph in (15, 25, 35, 45, 50, 55, 70, 75):
+    assert B.tag_code(mph * B.MPH) == mph and B.code_mps(mph) == mph * B.MPH
+  for k in (30, 40, 50, 60, 80, 100, 110):
+    assert B.tag_code(k * kph) == -k and abs(B.code_mps(-k) - k / 3.6) < 1e-9
+    assert B.tag_code(k / 3.6) == -k
+  assert B.tag_code(0.0) == 0 and B.tag_code(-1) == 0 and B.tag_code(float("nan")) == 0 and B.tag_code(13.0) == 0
+  assert B.way_tags(45 * B.MPH, 0.0, 0.0) == (45, 45)
+  assert B.way_tags(45 * B.MPH, 50 * B.MPH, 0.0) == (50, 45)
+  assert B.way_tags(0.0, 0.0, 35 * B.MPH) == (0, 35)
