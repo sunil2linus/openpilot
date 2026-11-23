@@ -254,3 +254,18 @@ def test_a_link_onto_a_slow_trunk_road_is_no_highway_link(tmp_path):
   assert not lk.leads(rec)[0]
   lk.cache[42] = {"cuts": [], "turn": False, "cut_s": None}
   assert lk.leads(dict(rec, to=dict(rec["to"], speed=65 * B.MPH)))[0]
+
+
+def test_round3_a_long_interchange_between_two_freeways_is_no_turnaround(tmp_path):
+  # the same shapes as the Michigan left, but the record is a long interchange between two differently named roads
+  # (I-75 -> Fisher Fwy, 739 m, the freeways there run more than 120 deg apart): no turnaround
+  ways = turnaround_scene()
+  mv, ramps = scene_view(tmp_path, ways)
+  drive(mv, [(float(x), 0.0, 90.0) for x in range(-300, -100, 3)])
+  rec = next(r for r in ramps if r["chain"] == 42)
+  assert mv.links.info(rec)["turn"]                               # (Hall Rd: 79.5 m in the home area, flagged)
+  for length, to_name, turn in ((260.0, "Fisher Freeway", False), (240.0, "Fisher Freeway", True),
+                                (380.0, "Hall Road", True), (420.0, "Hall Road", False)):
+    lk = V.LinkShapes(mv.store)
+    r = dict(rec, len=length, to=dict(rec["to"], name=to_name))      # (a fresh LinkShapes: no cache)
+    assert lk.info(r)["turn"] is turn, (length, to_name)

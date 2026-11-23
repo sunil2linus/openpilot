@@ -440,8 +440,12 @@ handover) only when it ends on a motorway, or on a trunk road whose map speed is
 meeting a street, and it is no turnaround. A turnaround: the link starts and ends on roads of the same class whose
 one-way shapes there run more than 120 deg apart (read from the shapes in the files). The link's own heading is no
 test: Hall Rd's turnaround itself turns only ~45 deg (the rest is the turn onto the other carriageway at its end),
-and ~90 real on-ramps in the home area start and end more than 120 deg apart. Home area: 493 interchange-type and
-~2590 street-to-street turnarounds found; 38 interchanges and 28 entrances end on a trunk road under 55.
+and ~90 real on-ramps in the home area start and end more than 120 deg apart. Round 3: a turnaround is also short,
+at most 250 m (400 m when both ends are the same road by name): two freeways can run more than 120 deg apart where a
+long interchange joins them (I-75 -> Fisher Fwy 739 m, Herb Gray Pkwy -> E.C. Row 396 m, M-14 <-> M-153 593 / 1057 m
+were flagged). Home area: 488 interchange-type (round 2: 493) and 2592 street-to-street turnarounds found (3078 of
+round 2's 3085 were 250 m or shorter; Hall Rd's 1214344938 is 80 m); 38 interchanges and 28 entrances end on a trunk
+road under 55.
 
 ### The street cap (street_cap.py, kind "street")
 

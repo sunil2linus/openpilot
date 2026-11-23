@@ -83,6 +83,8 @@ JUNCTION_NEAR = 3.0           # m: a one-way road shape this close to a link's s
 JUNCTION_VERTEX = 1.0         # m: a street shape POINT this close to a joint of the link's ways: the link meets it there
 HWY_TRUNK_MIN = 55 * 0.44704  # m/s: a trunk road is a highway for the merge / exits only with its map speed this high
 TURNAROUND_DEG = 120.0        # deg: the carriageways a link joins run this far apart: a turnaround
+TURNAROUND_LEN = 250.0        # m: a turnaround is at most this long (home area: 3078 of the 3085 links round 2 flagged)
+TURNAROUND_SAME_LEN = 400.0   # m: ... or this long when it joins the same road (its name at both ends; Fort St 268 m)
 SHAPE_SEARCH = 150.0          # m between the points where the link's own shapes are looked up
 # A map jog is no curve (read time; r2 rt 668-686 on Schoenherr Rd: two map ways meet with an 8 m sideways jog, read as
 # a 26 deg left and a 30 deg right bend 4 m apart, r 97 / 99 m; the GPS heading changed under 1 deg/s): where a two-way
@@ -356,9 +358,11 @@ class LinkShapes:
     link leads to that street; past the last cut it comes from a street.
   * `turn`: a turnaround (a Michigan left: a link from one carriageway onto the other carriageway of the same road,
     r2 rt 1085-1170 on Hall Rd): the link starts and ends on roads of the same class whose one-way shapes there run
-    more than TURNAROUND_DEG apart. (The link's own heading is no test: Hall Rd's turnaround itself turns only ~45 deg,
+    more than TURNAROUND_DEG apart, and it is short: at most TURNAROUND_LEN, or TURNAROUND_SAME_LEN when both ends are
+    the same road (one name). (The link's own heading is no test: Hall Rd's turnaround itself turns only ~45 deg,
     the rest is the turn onto the other carriageway at its end; and ~90 real on-ramps in the home area start and end
-    more than 120 deg apart.)
+    more than 120 deg apart. Round 3: two freeways can also run more than 120 deg apart where a long interchange
+    joins them, I-75 -> Fisher Fwy 739 m, Herb Gray Pkwy -> E.C. Row 396 m: no turnaround.)
   Never raises: a link whose shapes are not loaded gives no cuts and no turn (the record as built)."""
 
   def __init__(self, store):
@@ -474,7 +478,10 @@ class LinkShapes:
     travel = [p for line in (lines if increasing else [ln[::-1] for ln in reversed(lines)]) for p in line]
     turn = False
     to, frm = r.get("to") or {}, r.get("from") or {}
-    if to.get("cls") and to.get("cls") == frm.get("cls"):
+    length = float(r.get("len", 0.0) or 0.0)
+    same_road = bool(to.get("name")) and to.get("name") == frm.get("name")
+    short = length <= (TURNAROUND_SAME_LEN if same_road else TURNAROUND_LEN)
+    if short and to.get("cls") and to.get("cls") == frm.get("cls"):
       # a link from one carriageway onto the other carriageway of the same kind of road (it may itself turn only
       # ~45 deg, the rest is the turn onto that carriageway at its end): their directions of travel are opposite
       c0 = self._carriageway(travel[0], int(frm["cls"]), set(wids))
