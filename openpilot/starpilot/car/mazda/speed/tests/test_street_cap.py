@@ -207,3 +207,45 @@ def test_round2_his_set_plus_after_the_res_cap_is_his():
   r.step(v_mph=25, events=[driver("SET_PLUS", 40)], view=road(9), slc=slc(25))
   r.step(v_mph=25, n=300, view=road(9), slc=slc(25))
   assert r.anchor_mph == 40 and r.p.owner == HIS
+
+
+# ---- round 3: the set stuck at 45 after a red light on a 45-55 mph road ----
+HALL_RD = [0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0]   # ~18 % valid 1 s fixes
+
+
+def both(cfg=CFG):
+  from openpilot.starpilot.car.mazda.speed.limits import SpeedLimit
+  return Rig([StreetCap(cfg, presses=True), SpeedLimit(cfg, presses=True)], dt=0.05)
+
+
+def red_light(r, limit=55, set_mph=58, stop_s=20.0, cls=3, creep_m=0.0, pattern=HALL_RD, after_s=60):
+  """(the reviewer's sequence) his set on a `limit` road read clean for a minute, a stop at a red light with 7.0's
+  limit gone (slc None, his brake: cruise off), a RES at 15 mph, then the limit back in Hall Rd's dropout pattern (one
+  1 s fix in ~5 valid). creep_m: metres crept in the stop (stop and go) before the RES."""
+  rd = road(cls)
+  r.step(v_mph=set_mph - 3, set_mph=set_mph, events=[engaged(set_mph)], view=rd, slc=slc(limit))
+  r.step(v_mph=set_mph - 3, n=1200, view=rd, slc=slc(limit))
+  r.step(v_mph=0, n=int(stop_s * 20), cruise=False, view=rd, slc=slc(None))
+  if creep_m:
+    r.step(v_mph=5, n=int(creep_m / (5 * MPH) * 20), cruise=False, view=rd, slc=slc(None))
+  r.step(v_mph=15, events=[dict(resumed(), after=set_mph * MPH)], view=rd, slc=slc(None))
+  at_res = r.anchor_mph
+  for k in range(after_s):
+    r.step(v_mph=min(15 + 2 * k, set_mph - 3), n=20, view=rd, slc=slc(limit if pattern[k % len(pattern)] else None))
+  return at_res
+
+
+def test_round3_a_red_light_of_any_length_keeps_the_roads_limit_for_the_res():
+  for stop_s in (20.0, 60.0, 300.0):                 # (SpeedLimit: steady kept <= 30 s, `known` 30-90 s, then gone)
+    r = both()
+    at_res = red_light(r, stop_s=stop_s)
+    assert at_res == 58 and r.anchor_mph == 58, stop_s         # (was: 45 at the RES, 45 for good)
+  r = both()
+  at_res = red_light(r, limit=45, set_mph=53, stop_s=40.0, cls=9)
+  assert at_res == 48 and r.anchor_mph == 48                   # a 45 street, his 53: limit + offset, not 45
+
+
+def test_round3_the_remembered_limit_ages_by_distance_not_time():
+  r = both()
+  at_res = red_light(r, stop_s=5.0, creep_m=500.0, pattern=[0])   # 500 m of stop and go, no reading: not known now
+  assert at_res == 45

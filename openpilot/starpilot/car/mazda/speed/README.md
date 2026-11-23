@@ -461,8 +461,8 @@ r3 rt 402: the auto-resume brought back 55 at 21 mph on a 25-35 mph street (he p
 * **Ownership (one rule for his RES and ours):** a RES keeps the anchor as before ("resumed"); then, on a trusted
   street (GPS trust 0, matched, not a link; class 5-12 or a trunk road), the street cap proposes an anchor above what
   the street allows down, as an anchor of ours (kind "street", paced like the exit cap): to the limit + offset when the
-  limit is known (read now, or on this road within 10 s; a limit above 55: no cap), else to min(his anchor, max(v,
-  25 mph) + 20 mph). His SET+ / SET- afterwards is his speed as always (not capped again until the next RES). On a
+  limit is known (read now, or last read on this road chain with at most 400 m driven since: a red light of any length
+  keeps it; a limit above 55: no cap), else to min(his anchor, max(v, 25 mph) + 20 mph). His SET+ / SET- afterwards is his speed as always (not capped again until the next RES). On a
   motorway, a link or an unknown road nothing changes (his speed back, as before). It is the same mechanism as the
   exit cap (one contributor, one kind, the lower of the two).
 * **No auto-resume on a link under 25 mph** (a ramp, a turnaround): the press waits while his gas is held and goes once

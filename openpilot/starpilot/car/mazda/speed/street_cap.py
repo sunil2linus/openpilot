@@ -25,8 +25,11 @@ The cap after a RES (round 2, item 10; r3 rt 402: the auto-resume brought back 5
 r2 rt 1044: 53 carried onto Hall Rd's 45): after ANY RES (his on the wheel or our auto-resume's, the planner's
 "resumed") on a trusted street (GPS trust 0, matched, not a link; class 5-12 or a trunk road) with the anchor above
 what the street allows, the anchor is proposed down (paced, kind "street", ours): to the limit + offset when the
-limit is known (read now or on this road within RES_LIMIT_RECENT; above STREET_LIMIT_MAX: no cap), else to
-min(his anchor, max(v, RES_V_MIN) + RES_OVER) (a RES at 10 mph: 45). His SET+ / SET- afterwards is his speed as
+limit is known (read now, or last read on this road chain with at most RES_LIMIT_M driven since; above
+STREET_LIMIT_MAX: no cap), else to min(his anchor, max(v, RES_V_MIN) + RES_OVER) (a RES at 10 mph: 45). (Round 3: the
+remembered limit ages by distance, not by the clock: a red light of any length on Hall Rd keeps its 45, where 7.0's
+mapd says "not sure which road" for most of the stop; r2 rt 1030. SpeedLimit's steady limit is no source here: it
+carries no road and is held 30 s across a gap, so after an exit it can be the highway's 70.) His SET+ / SET- afterwards is his speed as
 always. On a motorway, a link or an unknown road his RES keeps his speed (as before). (The auto-resume itself sends
 no RES on a link under 25 mph: auto_resume.py.)
 Pure (tests/test_street_cap.py).
@@ -55,7 +58,7 @@ LOWER_GAP = 2.4                 # m/s: never more than this under the car's dash
 HWY_RESET = 1.0                 # s back on a highway: the sequence starts over (old HWY_RESET)
 EXIT_FIND_M = 1000.0            # m off the highway / link without a trusted street: no exit street any more (new)
 RES_CAP_TIME = 30.0             # s after a RES its cap is proposed (until the planner has it at the cap)
-RES_LIMIT_RECENT = 10.0         # s: a limit read on this road this recently is known at the RES
+RES_LIMIT_M = 400.0             # m driven since the limit was last read on this road chain: still known at the RES
 RES_V_MIN = 25 * MPH            # m/s: the limit unknown, the cap is at least this ...
 RES_OVER = 20 * MPH             # ... + this over the car's speed (and never above his anchor)
 
@@ -75,7 +78,7 @@ class StreetCap:
     self.lim, self.lim_t = None, 0.0     # the street's reading (dash units, 0: none) and s unchanged
     self.n = 0                      # caps this drive (the notice's key)
     self.res = None                 # [cap dash m/s, until s]: the cap after a RES (RES_CAP_TIME)
-    self.seen = None                # (dash units, s, chain): the last limit reading on a street (RES_LIMIT_RECENT)
+    self.seen = None                # [dash units, chain, m driven since]: the last limit reading (RES_LIMIT_M)
     self.cap_to = None              # dash units of the cap now being taken (the notice's number)
 
   def reset(self):
@@ -136,8 +139,10 @@ class StreetCap:
       if self.since > EXIT_STREET_TIME and not self.on:
         self.since, self.exited, self.on = None, False, False
     plus_minus, cruise_off = self._his(ctx)
+    if self.seen is not None:
+      self.seen[2] += v * dt                         # ages by distance only: a stop of any length keeps it
     if limit is not None and alive:
-      self.seen = (limit, now, view.get("chain"))
+      self.seen = [limit, view.get("chain"), 0.0]
     res = self._res(ctx, view, alive, limit, v, now, plus_minus, cruise_off)
     exit_cap = self._exit(ctx, view, alive, v, plus_minus, cruise_off)
     caps = [x for x in (res, exit_cap) if x is not None]
@@ -185,15 +190,15 @@ class StreetCap:
 
   def res_cap(self, view, alive, limit, v, anchor, now):
     """dash m/s the set speed may be after a RES here, or None (no cap: not a trusted street; a highway keeps his
-    speed). A street (class 5-12, or a trunk road): its limit + offset when known (now, or seen on this road within
-    RES_LIMIT_RECENT; a limit above STREET_LIMIT_MAX: no cap); unknown: min(his anchor, max(v, RES_V_MIN) + RES_OVER)."""
+    speed). A street (class 5-12, or a trunk road): its limit + offset when known (now, or last read on this road
+    chain at most RES_LIMIT_M back; a limit above STREET_LIMIT_MAX: no cap); unknown: min(his anchor, max(v,
+    RES_V_MIN) + RES_OVER)."""
     if not (alive and view.get("matched") and not view.get("link") and view.get("trust") == TRUST_OK):
       return None
     cls = int(view.get("cls", 0) or 0)
     if cls not in STREET_CLASSES and cls != TRUNK:
       return None
-    if limit is None and self.seen is not None and now - self.seen[1] <= RES_LIMIT_RECENT and \
-        self.seen[2] == view.get("chain"):
+    if limit is None and self.seen is not None and self.seen[2] <= RES_LIMIT_M and self.seen[1] == view.get("chain"):
       limit = self.seen[0]
     if limit is not None:
       return None if limit > STREET_LIMIT_MAX[self.k] else (limit + self.offset) * self.unit
