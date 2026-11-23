@@ -9,7 +9,10 @@ selfdriveState as always (no capnp change; the same way 7.0 adds its blindspot /
     changed. Anything wrong (missing, too big, not JSON, an unknown field or kind, a wrong type, text too long, past
     its "until") -> no alert. A new (sid, seq) becomes ONE alert; the AlertManager then keeps it for its duration.
   * Low priority (Priority.LOWER: every stock alert of LOW or above wins) and, on top, never put up while any other
-    alert is on screen: it waits for a free screen until its "until" (a stock alert never gets covered).
+    alert is on screen: it waits for a free screen until its "until" (a stock alert never gets covered). "On screen"
+    is an alert with a size (AlertSize.none draws nothing: the UI skips alertSize 0): the silent override alerts
+    (steerOverride, gasPressedOverride: no text, size none, Priority.LOWEST) never block a notice (r2: a "Stop ahead"
+    with sound waited behind his steering and was never shown).
   * Sound: an existing AudibleAlert only (prompt), only when the notice asks for it AND notice_sound is on.
 Never raises.
 """
@@ -47,6 +50,18 @@ def make(CP, params):
     except Exception:
       pass
     return None
+
+
+def on_screen(alert):
+  """True when that (current) alert shows something: another alert than ours with a size (text box). A silent one
+  (AlertSize.none, e.g. the steer / gas override alerts) does not take the screen."""
+  if alert is None or getattr(alert, "alert_type", "") in ("", ALERT_TYPE):
+    return False
+  from openpilot.selfdrive.selfdrived.events import AlertSize
+  try:
+    return alert.alert_size != AlertSize.none
+  except AttributeError:
+    return True                    # (not an Alert as 7.0 has it: never cover it)
 
 
 def parse(raw, now):
@@ -116,8 +131,7 @@ class NoticeReader:
       if doc["until"] < now:
         self.pending = None
         return []
-      busy = current is not None and getattr(current, "alert_type", "") not in ("", ALERT_TYPE)
-      if busy:
+      if on_screen(current):
         return []                  # never over a stock alert: wait for a free screen (until its "until")
       self.pending = None
       self.made += 1

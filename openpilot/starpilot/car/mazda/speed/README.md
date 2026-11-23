@@ -196,7 +196,9 @@ the blindspot / departure / Tesla extension alerts): `notice_alert.make()` is `N
 control, notices and one feature Test / On (read once per drive); `poll()` stats the file at most every 0.1 s, reads
 it only when its mtime / size changed, and turns a new (sid, seq) into one `Alert` (Priority.LOWER, small or mid,
 alert type `mazdaSpeedNotice/notice`); any error -> no alert. It is never put up while another alert is on screen
-(it waits for a free screen until its `until`, 3 s), and every stock alert of LOW or above replaces it.
+(it waits for a free screen until its `until`, 3 s), and every stock alert of LOW or above replaces it. "Another alert
+on screen" is one with a size: the silent override alerts (steerOverride, gasPressedOverride: no text, AlertSize.none)
+never hold a notice back (r2 rt 992: a "Stop ahead" with sound waited 3 s behind his steering and was never shown).
 Sound: only `AudibleAlert.prompt`, only for the warnings, only with `notice_sound` on.
 
 | notice | when | sound |

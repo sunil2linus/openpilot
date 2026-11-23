@@ -295,6 +295,54 @@ def test_reader_polls_at_10_hz_parses_only_on_change_and_waits_for_a_free_screen
   assert r.poll(EMPTY, now=3.1) == []                                       # past its "until": dropped
 
 
+def stock_alert(event, et):
+  """A real 7.0 Alert from selfdrived's EVENTS table, typed as the AlertManager types it."""
+  import copy
+  from openpilot.selfdrive.selfdrived.events import EVENTS
+  alert = copy.copy(EVENTS[event][et])
+  alert.alert_type, alert.event_type = f"{event}/{et}", et
+  return alert
+
+
+def test_silent_override_alerts_do_not_block_a_notice_but_a_stock_alert_with_text_does(tmp_path):
+  # r2 rt 992: a "Stop ahead" with sound waited behind steerOverride (no text, AlertSize.none) and was never shown
+  from openpilot.cereal import log
+  from openpilot.selfdrive.selfdrived.events import ET, AlertSize
+  EventName = log.OnroadEvent.EventName
+  steer = stock_alert(EventName.steerOverride, ET.OVERRIDE_LATERAL)
+  gas = stock_alert(EventName.gasPressedOverride, ET.OVERRIDE_LONGITUDINAL)
+  assert steer.alert_size == AlertSize.none and not steer.alert_text_1 and gas.alert_size == AlertSize.none
+  assert not A.on_screen(steer) and not A.on_screen(gas) and not A.on_screen(EMPTY) and not A.on_screen(None)
+  with_text = stock_alert(EventName.preEnableStandstill, ET.PRE_ENABLE)            # LOWEST, but text on screen
+  assert with_text.alert_size != AlertSize.none and A.on_screen(with_text)
+  path = str(tmp_path / "n.json")
+  r = A.NoticeReader(path=path, sound=True)
+  put(path)
+  got = r.poll(steer, now=1.0)
+  assert len(got) == 1 and got[0].alert_text_1 == "Stop ahead"
+  put(path, seq=2)
+  assert r.poll(with_text, now=1.2) == []                                        # waits behind text
+  assert len(r.poll(gas, now=1.4)) == 1                                          # then shows
+
+
+def test_selfdrived_shows_the_notice_over_a_silent_steer_override(tmp_path):
+  from openpilot.cereal import log
+  from openpilot.selfdrive.selfdrived.events import ET
+  EventName = log.OnroadEvent.EventName
+  drive, cs, now = selfdrived_fixture()
+  with patch('openpilot.selfdrive.selfdrived.selfdrived.time.monotonic_ns', return_value=now):
+    steer = stock_alert(EventName.steerOverride, ET.OVERRIDE_LATERAL)
+    drive.AM.add_many(drive.sm.frame, [steer])
+    drive.AM.process_alerts(drive.sm.frame, set())
+    assert drive.AM.current_alert.alert_type == steer.alert_type
+    path = str(tmp_path / "n.json")
+    drive.mazda_speed_notice = A.NoticeReader(path=path, sound=True, clock=lambda: 10.0)
+    put(path, until=20.0)
+    drive.sm.frame += 1
+    drive.update_alerts(cs)
+    assert drive.AM.current_alert.alert_text_1 == "Stop ahead"                    # LOWER beats the silent LOWEST
+
+
 def test_make_is_inert_unless_a_mazda_with_the_notices_on(tmp_path):
   from openpilot.common.params import Params
   params = Params(str(tmp_path / "p"))
