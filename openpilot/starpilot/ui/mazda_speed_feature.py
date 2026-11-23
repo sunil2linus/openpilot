@@ -74,6 +74,10 @@ STEER_700_ROW = ("ti_steer_700", "Steering limit test (700)",
                  "The steering for a given curve stays the same, only the most it " +
                  "may ask for goes up. Watch for steering faults; turn it off if any appear. It sets a Panda safety " +
                  "setting when the car starts, so a change applies at the next drive (the next car start).")
+# (v8) shown without the master switch on every Mazda that has these rows: a steering setting, on by default
+SMOOTHING_ROW = ("steer_smoothing", "Mazda steering smoothing (0.10 s)",
+                 "Smooths the driving model's steering path as the previous build did. On by default; turn it off only " +
+                 "to compare. Applies at the next drive.")
 CONFIRM_ON = ("enabled", "auto_resume", "ti_steer_700")   # turning these on needs the confirmation question
 UNITS = {"limit_offset_mph": "mph", "curve_offset_mph": "mph", "curve_offset_lat": "m/s²", "plan_lat": "m/s²", "ramp_lat": "m/s²", "ti_only_lat": "m/s²"}
 
@@ -229,6 +233,9 @@ class MazdaSpeedFeature:
                        reason="Presses the cruise SET+/SET- buttons for curves, speed limits, merges, exits and stops. Off by " +
                        "default; applies at the next drive.",
                        **common)]
+    field, label, reason = SMOOTHING_ROW
+    rows.append(FeatureRow(PREFIX + field, label, _shown(cfg.steer_smoothing), choices=("Off", "On"),
+                           default_value="On", reason=reason, **common))
     if self._ti_car():
       field, label, reason = STEER_700_ROW
       rows.append(FeatureRow(PREFIX + field, label, _shown(cfg.ti_steer_700), choices=("Off", "On"),

@@ -21,15 +21,15 @@ MPH = M.MPH
 
 
 def test_version_7_tag_button_field():
-  assert C.VERSION == 7 and 7 in C.VERSIONS and C.Config().tag_button is False
+  assert C.VERSION == 8 and 7 in C.VERSIONS and C.Config().tag_button is False
   cfg = C.decode(b'{"version":7,"enabled":true,"tag_button":true}')
   assert cfg.tag_button and cfg.tag_on and not cfg.any_active and not cfg.needs_view and not cfg.shows_notices
-  assert C.encode(cfg) == b'{"enabled":true,"tag_button":true,"version":7}' and C.decode(C.encode(cfg)) == cfg
+  assert C.encode(cfg) == b'{"enabled":true,"tag_button":true,"version":8}' and C.decode(C.encode(cfg)) == cfg
   assert not C.decode(b'{"version":7,"tag_button":true}').tag_on               # needs the master switch
   for version in C.VERSIONS:                                                  # every older version still reads
     assert C.decode(json.dumps({"version": version, "enabled": True}).encode()).tag_button is False
   for raw in (b'{"version":6,"tag_button":true}', b'{"version":7,"tag_button":1}', b'{"version":7,"tag":true}',
-              b'{"version":7,"tag_button":"on"}', b'{"version":8,"tag_button":true}'):
+              b'{"version":7,"tag_button":"on"}', b'{"version":9,"tag_button":true}'):
     with pytest.raises(C.ConfigError):
       C.decode(raw)
   with tempfile.TemporaryDirectory() as d:

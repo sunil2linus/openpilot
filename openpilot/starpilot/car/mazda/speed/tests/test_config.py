@@ -34,7 +34,7 @@ def test_sub_features_need_the_master_switch():
 
 
 @pytest.mark.parametrize("raw", [
-  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 8}).encode(), json.dumps({"version": 0}).encode(),
+  b"", b"{", b"[]", b"null", doc()[:-1], json.dumps({"version": 9}).encode(), json.dumps({"version": 0}).encode(),
   json.dumps({"version": 5, "curve_range_mi": 200}).encode(), json.dumps({"version": 1, "curve_range_mi": 0}).encode(),
   json.dumps({"version": 6, "curve_range_mi": 150}).encode(), json.dumps({"version": 6, "curve_range_mi": -1}).encode(),
   json.dumps({"version": 6, "curve_range_mi": "100"}).encode(), json.dumps({"version": 6, "curve_range_mi": 100.0}).encode(),
@@ -49,6 +49,9 @@ def test_sub_features_need_the_master_switch():
   json.dumps({"version": 3, "notices": True}).encode(), json.dumps({"version": 2, "notice_sound": True}).encode(),
   json.dumps({"version": 4, "stops": "yes"}).encode(), json.dumps({"version": 4, "notices": "on"}).encode(),
   json.dumps({"version": 4, "notice_sound": 1}).encode(), json.dumps({"version": 4, "stop_warnings": "on"}).encode(),
+  json.dumps({"version": 7, "steer_smoothing": False}).encode(), json.dumps({"version": 8, "steer_smoothing": 0}).encode(),
+  json.dumps({"version": 8, "steer_smoothing": "off"}).encode(), json.dumps({"version": 8, "steer_smoothing": None}).encode(),
+  json.dumps({"version": 8, "model_smoothing": False}).encode(),
   json.dumps({"version": "1"}).encode(),
   json.dumps({"version": True}).encode(), doc(enabled=1), doc(enabled="true"), doc(curves="yes"), doc(nope=1),
   doc(curve_offset_mph=6), doc(curve_offset_lat=4.5), doc(side_force_cap=3.0), doc(speed_limit_follow="on"), doc(plan_lat=3.6), doc(ti_only_lat=1.79),
@@ -76,14 +79,14 @@ def test_encode_roundtrip_is_canonical():
   cfg = C.with_value(C.Config(), "enabled", True)
   cfg = C.with_value(cfg, "curves", "test")
   raw = C.encode(cfg)
-  assert raw == b'{"curves":"test","enabled":true,"version":7}'
+  assert raw == b'{"curves":"test","enabled":true,"version":8}'
   assert C.decode(b'{"curves":"test","enabled":true,"version":1}') == cfg     # a version 1 document still reads
   assert C.decode(b'{"curves":"test","enabled":true,"version":2}') == cfg     # ... and a version 2 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":3}') == cfg     # ... and a version 3 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":4}') == cfg     # ... and a version 4 one
   assert C.decode(b'{"curves":"test","enabled":true,"version":5}') == cfg     # ... and a version 5 one
   assert C.decode(raw) == cfg
-  assert C.encode(C.Config()) == b'{"version":7}'
+  assert C.encode(C.Config()) == b'{"version":8}'
   with pytest.raises(C.ConfigError):
     C.with_value(cfg, "plan_lat", 9.0)
   with pytest.raises(C.ConfigError):
@@ -165,7 +168,7 @@ def test_version_5_stage3_options_default_off():
   # the steering limit test is its own switch (not under the master switch) and starts nothing of the speed control
   cfg = C.decode(json.dumps({"version": 5, "ti_steer_700": True}).encode())
   assert cfg.steer_700_on and not cfg.any_active and not cfg.needs_view
-  assert C.encode(cfg) == b'{"ti_steer_700":true,"version":7}'
+  assert C.encode(cfg) == b'{"ti_steer_700":true,"version":8}'
 
 
 def test_version_6_curve_map_build_range():
@@ -179,8 +182,8 @@ def test_version_6_curve_map_build_range():
     assert cfg.curve_range_mi == miles and C.decode(C.encode(cfg)) == cfg
     assert cfg.curve_range_miles == (None if miles == C.WHOLE_MAP else float(miles))
     assert cfg.presses("curves") and cfg.needs_view
-  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 0)) == b'{"curve_range_mi":0,"version":7}'
-  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 100)) == b'{"version":7}'    # the default is not written
+  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 0)) == b'{"curve_range_mi":0,"version":8}'
+  assert C.encode(C.with_value(C.Config(), "curve_range_mi", 100)) == b'{"version":8}'    # the default is not written
   # the range alone starts nothing
   assert not C.decode(b'{"version":6,"enabled":true,"curve_range_mi":300}').any_active
   with pytest.raises(C.ConfigError):
@@ -189,3 +192,20 @@ def test_version_6_curve_map_build_range():
     params = Params(d)
     Path(params.get_param_path(C.KEY)).write_bytes(b'{"version":6,"curve_range_mi":0,"extra":1}')
     assert not C.read(params).valid and C.read(params).curve_range_mi == 100       # unknown field: invalid, default
+
+
+def test_version_8_steering_smoothing_is_on_by_default_and_its_own_switch():
+  for version in C.VERSIONS:                                   # every document without the field: on
+    assert C.decode(json.dumps({"version": version}).encode()).steer_smoothing_on
+  assert C.Config().steer_smoothing_on and C.Config.off(valid=False).steer_smoothing_on   # missing / invalid: on
+  cfg = C.decode(b'{"version":8,"steer_smoothing":false}')
+  assert not cfg.steer_smoothing_on and not cfg.any_active and not cfg.needs_view and not cfg.enabled
+  assert C.encode(cfg) == b'{"steer_smoothing":false,"version":8}' and C.decode(C.encode(cfg)) == cfg
+  assert C.encode(C.with_value(cfg, "steer_smoothing", True)) == b'{"version":8}'          # the default is not written
+  cfg = C.decode(b'{"version":8,"enabled":true,"steer_smoothing":false,"curves":"on"}')     # independent of the master
+  assert not cfg.steer_smoothing_on and cfg.presses("curves")
+  assert C.decode(b'{"version":8,"enabled":true}').steer_smoothing_on
+  with tempfile.TemporaryDirectory() as d:
+    params = Params(d)
+    Path(params.get_param_path(C.KEY)).write_bytes(b'{"version":8,"steer_smoothing":false,"extra":1}')
+    assert not C.read(params).valid and C.read(params).steer_smoothing_on    # invalid: speed control off, smoothing on

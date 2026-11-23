@@ -4,7 +4,7 @@ document (the ConditionalModeConfig / CurveComfortData pattern).
 Rules:
   * Missing key, unreadable, not JSON, wrong version, unknown field, wrong type or out of bounds -> the whole
     document is INVALID and everything is OFF (`Config.off()`). There is no partial reading.
-  * Every field is optional; a missing field takes its default. Defaults are all off.
+  * Every field is optional; a missing field takes its default. Defaults are all off (except `steer_smoothing`, v8).
   * Sub-features only run with `enabled` (the master switch) on.
   * Modes: "off" / "test" (computes and logs, never presses) / "on".
   * Only what is built and tested has a field: version 2 added the curve speed offset (with its per-curve memory),
@@ -15,6 +15,11 @@ Rules:
   * Stage 3: `auto_resume` (with the master switch) and `ti_steer_700` (without it: it is a steering setting, used only
     with the Torque Interceptor) also set panda safety param bits at car start (vehicle_preferences.py ->
     opendbc/car/mazda/speed_flags.py), so they apply from the next drive (the next car start).
+  * Version 8: `steer_smoothing`, the Mazda steering smoothing (openpilot/starpilot/car/mazda/model_smoothing.py: the
+    previous build's 0.10 s filter on the driving model's steering path). It is not a speed control option: it is
+    not under the master switch, and it is the one field whose default is ON. A missing or invalid document leaves
+    it at its default (on): only a valid document with `"steer_smoothing": false` turns it off. Card reads it once
+    at car start and freezes it for the drive (vehicle_preferences.py).
 No openpilot imports beyond the saved-value reader, so it is unit tested offline.
 """
 import json
@@ -22,9 +27,9 @@ import math
 from dataclasses import dataclass, fields, replace
 
 KEY = "MazdaSpeedControlConfig"
-VERSION = 7                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
-VERSIONS = (1, 2, 3, 4, 5, 6, 7)  # merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700;
-                                #    6: + curve_range_mi; 7: + tag_button (older documents still read)
+VERSION = 8                     # 2: + curve_offset_mph / curve_offset_lat; 3: + speed_limit / limit_offset_mph /
+VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)  # merge / exits; 4: + stops / notices / notice_sound; 5: + auto_resume / ti_steer_700;
+                                #    6: + curve_range_mi; 7: + tag_button; 8: + steer_smoothing (older documents still read)
 MAX_BYTES = 4096
 
 MODES = ("off", "test", "on")
@@ -52,6 +57,7 @@ SCHEMA = {
   "ti_steer_700": ("bool", False, None),            # (v5) TI steering limit test 600 -> 700 (not under the master switch)
   "curve_range_mi": ("choice", 100, CURVE_RANGES),  # (v6) the parked curve-map builder's range (curve_mapd.py), 0 = all
   "tag_button": ("bool", False, None),              # (v7) a TAG button on the driving screen (a Bookmark: our tag line)
+  "steer_smoothing": ("bool", True, None),          # (v8) steering smoothing 0.10 s (not under the master switch; ON)
 }
 V2_FIELDS = frozenset(("curve_offset_mph", "curve_offset_lat"))
 V3_FIELDS = frozenset(("speed_limit", "limit_offset_mph", "merge", "exits"))
@@ -59,6 +65,7 @@ V4_FIELDS = frozenset(("stops", "notices", "notice_sound"))
 V5_FIELDS = frozenset(("auto_resume", "ti_steer_700"))
 V6_FIELDS = frozenset(("curve_range_mi",))
 V7_FIELDS = frozenset(("tag_button",))
+V8_FIELDS = frozenset(("steer_smoothing",))
 
 
 class ConfigError(ValueError):
@@ -86,6 +93,7 @@ class Config:
   ti_steer_700: bool = False
   curve_range_mi: int = 100
   tag_button: bool = False
+  steer_smoothing: bool = True  # (v8) the one default-on field (not a speed control option)
   valid: bool = True            # False: the saved document was invalid (everything is off)
 
   @classmethod
@@ -137,6 +145,11 @@ class Config:
     return bool(self.ti_steer_700)
 
   @property
+  def steer_smoothing_on(self):
+    """(v8) the Mazda steering smoothing: its own switch only, on by default (also for a missing or invalid document)."""
+    return bool(self.steer_smoothing)
+
+  @property
   def curve_range_miles(self):
     """(v6) miles around the last known position the curve maps are built for, or None: the whole map."""
     return None if self.curve_range_mi == WHOLE_MAP else float(self.curve_range_mi)
@@ -171,7 +184,8 @@ def decode(raw):
     raise ConfigError("version")
   if ((doc["version"] < 2 and V2_FIELDS & set(doc)) or (doc["version"] < 3 and V3_FIELDS & set(doc)) or
       (doc["version"] < 4 and V4_FIELDS & set(doc)) or (doc["version"] < 5 and V5_FIELDS & set(doc)) or
-      (doc["version"] < 6 and V6_FIELDS & set(doc)) or (doc["version"] < 7 and V7_FIELDS & set(doc))):
+      (doc["version"] < 6 and V6_FIELDS & set(doc)) or (doc["version"] < 7 and V7_FIELDS & set(doc)) or
+      (doc["version"] < 8 and V8_FIELDS & set(doc))):
     raise ConfigError("field of a later version")
   values = {}
   for k, v in doc.items():

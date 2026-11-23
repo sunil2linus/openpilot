@@ -19,6 +19,16 @@ def mazda_stage3_requested(params) -> tuple[bool, bool]:
     return False, False
 
 
+def mazda_smoothing_requested(params) -> bool:
+  """The Mazda steering smoothing switch (MazdaSpeedControlConfig steer_smoothing): on by default, also for a missing or
+  invalid document; only a failure to read the setting at all leaves it off (7.0's behavior)."""
+  try:
+    from openpilot.starpilot.car.mazda.speed.config import read
+    return read(params).steer_smoothing_on
+  except Exception:
+    return False
+
+
 def bolt_disable_supported(cp) -> bool:
   from opendbc.car.gm.values import is_bolt_cc_profile, is_bolt_pedal_profile, is_bolt_pedal_stock_denied
   identities = ("CHEVROLET_BOLT_CC_2017", "CHEVROLET_BOLT_CC_2018_2021", "CHEVROLET_BOLT_CC_2022_2023",
@@ -65,6 +75,9 @@ class VehicleStartupPreferences:
   # and the TI steering limit test 700 (opendbc/car/mazda/speed_flags.py)
   mazda_auto_resume: bool = field(default=False, kw_only=True)
   mazda_ti_steer_700: bool = field(default=False, kw_only=True)
+  # Mazda steering smoothing (0.10 s on the model's steering path) from the same document: frozen by card for the drive
+  # (openpilot/starpilot/car/mazda/model_smoothing.py install, before CarParams is published)
+  mazda_steer_smoothing: bool = field(default=False, kw_only=True)
 
   @classmethod
   def read(cls, params, *, enabled: bool):
@@ -84,6 +97,7 @@ class VehicleStartupPreferences:
     except (OSError, TypeError, ValueError):
       mazda_ti = False
     mazda_auto_resume, mazda_steer_700 = mazda_stage3_requested(params)
+    mazda_smoothing = mazda_smoothing_requested(params)
     try:
       raw_radar, radar_readable = read_saved(params, "HondaBoschARadar", 8)
       honda_radar = radar_readable and raw_radar in (None, b"1")
@@ -108,7 +122,7 @@ class VehicleStartupPreferences:
                             readable and safe in (None, b"0"))
     except (OSError, TypeError, ValueError):
       return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
-                 mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700,
+                 mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700, mazda_steer_smoothing=mazda_smoothing,
                  subaru_smoothing=smoothing, disable_bolt_long=disable_bolt, honda_bosch_a_radar=honda_radar, tesla_preap_stock=preap_stock,
                  tesla_preap_radar=radar, tesla_preap_pedal=pedal,
                  gm_camera_pedal=False, toyota_filter=False)
@@ -129,7 +143,7 @@ class VehicleStartupPreferences:
                        read_saved(params, "TeslaCoopSteering", 8) == (b"1", True))
     screen_brake = read_saved(params, 'TeslaAOLDisengageOnBrake', 8) == (b'1', True)
     return cls(vw_stock_long=vw_stock_long, mazda_torque_interceptor=mazda_ti,
-               mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700,
+               mazda_auto_resume=mazda_auto_resume, mazda_ti_steer_700=mazda_steer_700, mazda_steer_smoothing=mazda_smoothing,
                subaru_smoothing=smoothing, subaru_avh_startup=bool(enabled and readable and safe in (None, b"0") and
                     read_saved(params, "IsReleaseBranch", 8) in ((None, True), (b"0", True)) and
                     read_saved(params, "SubaruAvhStartup", 8) == (b"1", True)),
