@@ -421,11 +421,16 @@ The builder joins link ways of the same class without a name into one chain, str
 street. At M-53 / 23 Mile Rd the exit ramp and the on-ramp across the street are ONE chain (4 ways, 1.1 km) whose
 record says "motorway to motorway": no exit handover, the merge armed toward 70 on the exit, and his 70 stayed the
 anchor on 23 Mile Rd. The map view now reads the road shapes already in the files: a joint between two of the link's
-ways with a street shape (class 5-12) within 3 m is a junction. Before it the link leads to that street (the view's
+ways with a street shape POINT (class 5-12) within 1 m is a junction (round 3: within 3 m of the street's line was
+also a bridge whose way splits right above a street). Before it the link leads to that street (the view's
 ramp: `hwy` false, `spd` the street class's default speed, `street` its class; an exit ahead likewise, its profile ends
 at the junction); past it the link comes from that street (`from_hwy` false) and its record holds again (the on-ramp
-merges). Home area (folder 42/-84): 119 interchange, 25 entrance, 33 exit and 33 other links have such a junction.
-The builder itself is unchanged (no version bump, no rebuild).
+merges). Home area (folder 42/-84): 90 interchange, 23 entrance, 29 exit and 31 other links have such a junction
+(round 2's 3 m line test: 119 / 25 / 33 / 33; the 29 interchanges no longer cut are long motorway-to-motorway ramps
+over a street, now "to highway" again, e.g. M-59 490860778, I-94 17963358, I-69 443254109). Known limit: the shapes are
+simplified per way (2 m), so a street node in a straight run can be gone (at link ends onto a street ~40 % have no
+street point within 1 m); such a junction inside a chain is not seen and the record holds (M-53 -> 23 Mile Rd,
+486581349, keeps its point and its cut). The builder itself is unchanged (no version bump, no rebuild).
 
 ### Turnarounds and slow trunk roads are no merge (map_view.LinkShapes.leads)
 

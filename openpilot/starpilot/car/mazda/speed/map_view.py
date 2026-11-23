@@ -79,7 +79,8 @@ COARSE = 50                   # ramp index cells of 1/50 deg (~2.2 km)
 # Where a link really leads (read from the road shapes already in the files; no rebuild): see LinkShapes
 STREET_CLASSES = (5, 7, 9, 11, 12)    # primary .. residential (not links, not motorway / trunk)
 STREET_SPEED_MPH = {5: 50, 7: 45, 9: 45, 11: 40, 12: 25}   # (curve_builder.DEFAULT_SPEED_MPH: the map has no limit here)
-JUNCTION_NEAR = 3.0           # m: a street shape this close to a joint of the link's ways: the link meets it there
+JUNCTION_NEAR = 3.0           # m: a one-way road shape this close to a link's start / end: the carriageway it joins
+JUNCTION_VERTEX = 1.0         # m: a street shape POINT this close to a joint of the link's ways: the link meets it there
 HWY_TRUNK_MIN = 55 * 0.44704  # m/s: a trunk road is a highway for the merge / exits only with its map speed this high
 TURNAROUND_DEG = 120.0        # deg: the carriageways a link joins run this far apart: a turnaround
 SHAPE_SEARCH = 150.0          # m between the points where the link's own shapes are looked up
@@ -344,8 +345,12 @@ def _heading(p, q):
 class LinkShapes:
   """Where a link (ramp chain) really leads, from the road shapes the curve files already carry (cached per ramp):
 
-  * `cuts`: the joints between the link's ways (in travel order) where a street (STREET_CLASSES) passes within
-    JUNCTION_NEAR: the link meets that street there. The builder's chain joining (same class, no name) runs straight
+  * `cuts`: the joints between the link's ways (in travel order) where a street (STREET_CLASSES) has a shape point
+    within JUNCTION_VERTEX: the link meets that street there (an at-grade junction shares a node with both ways; round
+    3: a street passing UNDER the joint - a bridge whose way splits right above it - is no junction: its shape only
+    passes near, 10 motorway-to-motorway ramps in the home area were cut that way). The shapes are simplified per way
+    (curve_builder.SHAPE_TOLERANCE, 2 m), so a street's node in a straight run can be gone: such a junction is not
+    seen (no cut; the record as built, and the street cap still catches a highway's speed on that street). The builder's chain joining (same class, no name) runs straight
     through such a junction, so an exit ramp and the next on-ramp across the street are ONE chain whose record says
     "to the motorway" (r2: M-53's exit to 23 Mile Rd; the merge armed toward 70 on the exit). Before the first cut the
     link leads to that street; past the last cut it comes from a street.
@@ -395,7 +400,8 @@ class LinkShapes:
     return out
 
   def _street_near(self, p, exclude):
-    """The class of a street shape within JUNCTION_NEAR of micro-degree point p (0 none)."""
+    """The class of a street whose shape has a point (a node: a segment's end) within JUNCTION_VERTEX of micro-degree
+    point p (0 none). Not the segment's interior: a street passing under a bridge there is no junction."""
     la, lo = p[0] / 1e6, p[1] / 1e6
     to_xy = _local(la, lo)
     cla, clo = int(math.floor(la * MM.MATCH_CELL)), int(math.floor(lo * MM.MATCH_CELL))
@@ -405,8 +411,7 @@ class LinkShapes:
           for la1, lo1, la2, lo2, wid, cid, _one, cls in ri.segments(MM.cell_key(cla + dla, clo + dlo)):
             if cls not in STREET_CLASSES or int(wid) in exclude:
               continue
-            near = _nearest([(la1, lo1, la2, lo2, 0)], to_xy)
-            if near is not None and near[0] <= JUNCTION_NEAR:
+            if min(math.hypot(*to_xy(la1, lo1)), math.hypot(*to_xy(la2, lo2))) <= JUNCTION_VERTEX:
               return int(cls)
     return 0
 

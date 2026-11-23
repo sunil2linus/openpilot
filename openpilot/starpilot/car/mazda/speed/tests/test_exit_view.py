@@ -117,10 +117,12 @@ def test_the_view_is_small(tmp_path):
   assert V.VIEW_VERSION == 2
 
 
-def pass_through_scene():
+def pass_through_scene(street="split"):
   """(r2, M-53 at 23 Mile Rd) a motorway north; its exit ramp (no name) leaves at y = 0 heading 20 deg right, meets a
   primary street running east-west at one node, and runs straight on across it as the on-ramp back to the motorway:
-  the builder joins both ramp ways into ONE chain whose record says motorway to motorway."""
+  the builder joins both ramp ways into ONE chain whose record says motorway to motorway. street: "split" (the
+  street's way splits at that node, as at 23 Mile Rd), "straight" (one straight way through it: the shape
+  simplification drops its node there), "bridge" (no shared node: the street passes under the ramps' joint)."""
   import math
   mw = way(30, straight(0, -500, 0, 2000), name="", cls=1, speed_mph=70)
   mw.ref = "M 53"
@@ -130,20 +132,30 @@ def pass_through_scene():
   b_pts = [(jx - math.sin(h) * s, jy + math.cos(h) * s) for s in range(0, 201, 20)]
   ex = way(31, a_pts, name="", cls=2, speed_mph=45, oneway=True)
   on = way(32, b_pts, name="", cls=2, speed_mph=45, oneway=True)
-  st_pts = [(jx + d, jy) for d in range(-300, 301, 20)]
+  shift = 10 if street == "bridge" else 0
+  st_pts = [(jx + d + shift, jy) for d in range(-300, 301, 20)]
   st = way(33, st_pts, name="23 Mile Road", cls=5, speed_mph=45)
   # shared nodes: the exit's start on the motorway, the joint on the street, the on-ramp's end on the motorway
   k0 = 25
   ex.lat[0], ex.lon[0] = mw.lat[k0], mw.lon[k0]
   ex.start = B.key(mw.lat[k0], mw.lon[k0])
-  j = st_pts.index((jx + 0, jy))
   on.lat[0], on.lon[0] = ex.lat[-1], ex.lon[-1]
-  st.lat[j], st.lon[j] = ex.lat[-1], ex.lon[-1]
   on.start = ex.end
+  extra = []
+  if street != "bridge":
+    j = st_pts.index((jx + 0, jy))
+    st.lat[j], st.lon[j] = ex.lat[-1], ex.lon[-1]
+    if street == "split":
+      st2 = way(34, st_pts[j:], name="23 Mile Road", cls=5, speed_mph=45)
+      st2.lat, st2.lon = st.lat[j:].copy(), st.lon[j:].copy()
+      st.lat, st.lon = st.lat[:j + 1].copy(), st.lon[:j + 1].copy()
+      for w in (st, st2):
+        w.start, w.end = B.key(w.lat[0], w.lon[0]), B.key(w.lat[-1], w.lon[-1])
+      extra = [st2]
   k1 = min(range(len(mw.lat)), key=lambda k: abs(mw.lat[k] - on.lat[-1]))
   on.lat[-1], on.lon[-1] = mw.lat[k1], mw.lon[k1]
   on.end = B.key(mw.lat[k1], mw.lon[k1])
-  return {w.id: w for w in (mw, ex, on, st)}
+  return {w.id: w for w in [mw, ex, on, st] + extra}
 
 
 def test_an_exit_whose_chain_runs_on_across_a_street_leads_to_that_street(tmp_path):
@@ -169,6 +181,24 @@ def test_an_exit_whose_chain_runs_on_across_a_street_leads_to_that_street(tmp_pa
   mv, _ = scene_view(tmp_path / "b", ways)
   v = drive(mv, pts)[-1]
   assert v["link"] and v["ramp"]["hwy"] and not v["ramp"]["from_hwy"] and "street" not in v["ramp"]
+
+
+def test_round3_a_street_under_the_ramps_joint_is_no_junction(tmp_path):
+  # a bridge: the ramps' ways split right above a street that shares no node with them (r3 review: 10 motorway to
+  # motorway ramps in the home area were cut that way): no cut, the record (motorway to motorway) holds
+  mv, ramps = scene_view(tmp_path, pass_through_scene(street="bridge"))
+  rec = next(r for r in ramps if r["chain"] in (31, 32))
+  drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  assert mv.links.info(rec)["cuts"] == [] and mv.links.leads(rec)[0]
+
+
+def test_round3_a_junction_node_dropped_by_the_shape_simplification_is_not_seen(tmp_path):
+  # (the known limit) the street's way runs straight through the junction: the 2 m shape simplification drops its
+  # node there, so the junction looks like a bridge and the record holds (the street cap still caps on that street)
+  mv, ramps = scene_view(tmp_path, pass_through_scene(street="straight"))
+  rec = next(r for r in ramps if r["chain"] in (31, 32))
+  drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  assert mv.links.info(rec)["cuts"] == []
 
 
 def test_an_ordinary_exit_and_entrance_keep_their_records(tmp_path):
