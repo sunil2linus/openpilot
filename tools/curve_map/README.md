@@ -96,6 +96,9 @@ StarPilot), so no new download is needed.
 
 Each file also has `ramps`: every ramp (by its start square) with its `type`, `start`, `end`, `len`, `to`, `from`
 and `wdir`, also for ramps without a curve, so the car knows what road a ramp merges into.
+Since builder 2 a ramp also has `cuts`: `[k, street class, street speed m/s, s m along the chain, lat, lon]` for every
+joint between two of its ways that is also a street's node (an exit ramp to a street joined with the on-ramp across it:
+map_curves.LinkShapes makes the part before it an exit to that street and the part after it an on-ramp from it).
 
 Format 4 (this version) adds `roads`: the shape of every road the curves use (no residential streets) in that
 square, `{"w": way id, "p": [lat, lon, dlat, dlon, ...]}` in micro-degrees (first point, then differences), in the

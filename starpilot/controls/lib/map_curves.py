@@ -1055,6 +1055,192 @@ class MapCurveStore:
     self.ramps_all = list(ramps.values())
 
 
+# Round V, V1 (7.0 drive r2, the M-53 exit to 23 Mile Rd, way 486581349): where a link (a ramp chain) really leads. The
+# builder joins unnamed links of the same class straight through a junction, so an exit ramp that ends at a street and the
+# on-ramp across that street become ONE chain whose record says "from the motorway to the motorway" (interchange): no
+# street cap, no exit to a street, the fast restore back toward his highway speed on the exit. A joint between two ways of
+# the chain that is also a node of a street (STREET_CLASSES) is where the link meets that street: before the first such
+# joint the link is an exit to that street (its class and speed, the joint its end; the curves past it are not on this
+# exit); past the last one it comes from that street. Builder 2 finds them by the shared OSM node and writes them into the
+# record ("cuts", build_curve_map.JUNCTION_CLASSES: exact, a bridge has nodes of its own). Files of builder 1 (until the
+# folder is rebuilt) fall back to the road shapes: a street shape VERTEX within JUNCTION_VERTEX of the joint (never a
+# street shape merely passing close: that is a ramp on a bridge over it). The shapes are simplified to 2 m, so this
+# fallback misses a junction where the street's node lies in a straight run (home area: 167 of the 202 links builder 2
+# cuts; it cuts none that builder 2 does not). The fallback street's speed is its class default
+# (build_curve_map.DEFAULT_SPEED_MPH, as the builder's own record of an untagged road).
+STREET_CLASSES = (5, 7, 9, 11, 12)    # primary .. residential (no links, no motorway / trunk)
+STREET_SPEED_MPH = {5: 50, 7: 45, 9: 45, 11: 40, 12: 25}
+JUNCTION_VERTEX = 1.0      # m
+WALK_MAX = 5000            # shape points walked along one chain at most
+
+
+def ramp_to_highway(r):
+  """The link of ramp record r leads to a highway (a motorway or a trunk road; LinkShapes.view's "hwy" when it has one:
+  the link meets a street first)."""
+  if r is None:
+    return False
+  if "hwy" in r:
+    return bool(r["hwy"])
+  return (r.get("to") or {}).get("cls") in HIGHWAY_CLASSES
+
+
+def _xy_at(lat0, lon0):
+  kx = math.radians(1.0) * EARTH_R * math.cos(math.radians(lat0))
+  ky = math.radians(1.0) * EARTH_R
+  return lambda la, lo: ((lo - lon0) * kx, (la - lat0) * ky)
+
+
+class LinkShapes:
+  """Where a link really leads (V1: the streets it meets at shared vertices), from the loaded road
+  shapes, cached per ramp chain (and per loaded set of squares). Never raises: a link whose shapes are not loaded gives
+  nothing (the record as built)."""
+
+  def __init__(self, store):
+    self.store = store
+    self.cache = {}
+    self._key = None
+
+  def _cells(self, p):
+    """micro-degree point p -> its match cell and the 8 around it."""
+    cla, clo = int(math.floor(p[0] * MATCH_CELL / 1e6)), int(math.floor(p[1] * MATCH_CELL / 1e6))
+    return [cell_key(cla + a, clo + b) for a in (-1, 0, 1) for b in (-1, 0, 1)]
+
+  def _near_vertex(self, p, wid, fwd, tol=JUNCTION_VERTEX):
+    """The vertex of way wid's shape within tol m of micro-degree point p where a segment leaves in the chain's direction
+    (fwd: the way's node order), or None."""
+    to_xy = _xy_at(p[0] / 1e6, p[1] / 1e6)
+    best = None
+    for ri in self.store.grid:
+      for cell in self._cells(p):
+        for i in ri.cells.get(cell, ()):
+          if ri.way[i] != wid:
+            continue
+          q = (ri.lat1[i], ri.lon1[i]) if fwd else (ri.lat2[i], ri.lon2[i])
+          d = math.hypot(*to_xy(q[0] / 1e6, q[1] / 1e6))
+          if d <= tol and (best is None or d < best[0]):
+            best = (d, q)
+    return best[1] if best is not None else None
+
+  def _next(self, p, wid, fwd):
+    cla, clo = int(math.floor(p[0] * MATCH_CELL / 1e6)), int(math.floor(p[1] * MATCH_CELL / 1e6))
+    cell = cell_key(cla, clo)
+    for ri in self.store.grid:
+      for i in ri.cells.get(cell, ()):
+        if ri.way[i] != wid:
+          continue
+        a, b = (ri.lat1[i], ri.lon1[i]), (ri.lat2[i], ri.lon2[i])
+        if fwd and a == p and b != p:
+          return b
+        if not fwd and b == p and a != p:
+          return a
+    return None
+
+  def joints(self, ch, first):
+    """[micro-degree point] where way k of chain record ch ends (k = 0 .. n - 2), walked along the shapes from the chain's
+    first point `first` (lat, lon), or None (shapes missing)."""
+    p = (int(round(first[0] * 1e6)), int(round(first[1] * 1e6)))
+    out, steps = [], 0
+    w = ch["w"]
+    for k, (wid, fwd, _s0) in enumerate(w):
+      q = self._near_vertex(p, int(wid), bool(fwd))
+      if q is None:
+        return None
+      p, seen = q, {q}
+      while steps < WALK_MAX:
+        n = self._next(p, int(wid), bool(fwd))
+        if n is None or n in seen:
+          break
+        p = n
+        seen.add(n)
+        steps += 1
+      if k < len(w) - 1:
+        out.append(p)
+    return out
+
+  def street_at(self, p, exclude):
+    """The class of a street with a shape vertex within JUNCTION_VERTEX of micro-degree point p (0 none)."""
+    to_xy = _xy_at(p[0] / 1e6, p[1] / 1e6)
+    for ri in self.store.grid:
+      for cell in self._cells(p):
+        for i in ri.cells.get(cell, ()):
+          cls = int(ri.cls[i])
+          if cls not in STREET_CLASSES or int(ri.way[i]) in exclude:
+            continue
+          for la, lo in ((ri.lat1[i], ri.lon1[i]), (ri.lat2[i], ri.lon2[i])):
+            if math.hypot(*to_xy(la / 1e6, lo / 1e6)) <= JUNCTION_VERTEX:
+              return cls
+    return 0
+
+  def info(self, r):
+    """{"cuts": [(chain index k of the way before the joint, street class, (lat, lon) of the joint, s m along the chain,
+    street speed m/s)]} of ramp record r (cached): the builder's (builder 2) or found in the shapes (older files)."""
+    key = tuple(id(ri) for ri in self.store.grid)
+    if key != self._key:
+      self.cache, self._key = {}, key
+    cid = r.get("chain")
+    if cid not in self.cache:
+      out = {"cuts": []}
+      try:
+        out = self._info(r) or out
+      except Exception:
+        pass
+      self.cache[cid] = out
+    return self.cache[cid]
+
+  def _info(self, r):
+    if r.get("travel") == "both":
+      return None
+    if isinstance(r.get("cuts"), list):
+      return {"cuts": [(int(c[0]), int(c[1]), (float(c[4]), float(c[5])), float(c[3]), float(c[2])) for c in r["cuts"]]}
+    ch = self.store.chains.get(r.get("chain"))
+    if ch is None or not r.get("start") or not r.get("end") or not self.store.grid:
+      return None
+    ids = {int(w) for w, _f, _s in ch["w"]}
+    cuts = []
+    if len(ch["w"]) > 1:
+      first = r["start"] if r.get("travel") != "ba" else r["end"]      # the chain's own first point
+      js = self.joints(ch, first)
+      if js is None:
+        return None
+      for k, p in enumerate(js):
+        cls = self.street_at(p, ids)
+        if cls:
+          cuts.append((k, cls, (p[0] / 1e6, p[1] / 1e6), float(ch["w"][k + 1][2]), STREET_SPEED_MPH.get(cls, 45) * MPH))
+    return {"cuts": cuts}
+
+  def view(self, r, way_index=None):
+    """Ramp record r as a car on its chain's way `way_index` (chain order; None: at the link's start) sees it: the
+    street met ahead (V1: type "exit" from a highway / "link", "to" that street, "end" the junction, "cut_s" its m along
+    the chain), the street behind ("from" that street, type "entrance" / "link"), each with "hwy" (ramp_to_highway).
+    The record itself when nothing changes."""
+    if r is None:
+      return None
+    inf = self.info(r)
+    if not inf["cuts"]:
+      return r
+    v = dict(r)
+    increasing = r.get("travel") != "ba"
+    cuts = sorted(inf["cuts"], reverse=not increasing)                    # in travel order
+    ahead_ = [c for c in cuts if way_index is None or (way_index <= c[0] if increasing else way_index > c[0])]
+    behind = [c for c in cuts if c not in ahead_]
+    frm_hwy = (r.get("from") or {}).get("cls") in HIGHWAY_CLASSES
+    if behind:
+      _k, cls, _pt, _s, spd = behind[-1]
+      v["from"] = {"cls": cls, "speed": round(spd, 2), "name": ""}
+      frm_hwy = False
+    if ahead_:
+      _k, cls, pt, s, spd = ahead_[0]
+      v["to"] = {"cls": cls, "speed": round(spd, 2), "name": ""}
+      v["end"], v["hwy"], v["street"] = pt, False, cls
+      length = float((self.store.chains.get(r["chain"]) or {}).get("len", r.get("len", 0.0)) or 0.0)
+      v["cut_s"] = s if increasing else length - s
+      v["type"] = "exit" if frm_hwy else "link"
+    else:
+      v["hwy"] = ramp_to_highway(r)
+      v["type"] = "entrance" if v["hwy"] else "link"
+    return v
+
+
 MEMORY_PATH = "/data/media/0/curve_memory.json"
 MEMORY_MATCH = 20.0        # m between a curve's apex and a remembered one to be the same curve (curve files rebuilt)
 MEMORY_SAME_PASS = 60.0    # s: passes this close in time are one pass (a divided road is two curve records ~20 m apart)
@@ -1826,6 +2012,8 @@ class MapCurves:
     self.offset_lat = CURVE_OFFSET_LAT   # m/s^2: the cap (MazdaCurveOffsetLat, set with it)
     self._ofs = {}               # id(curve) -> this update's (granted m/s, state, cap radius m)
     self._ofs_mem = {}           # (id(curve), direction, id(memory), setting) -> (memory gen, curve, the memory's part)
+    self.links = LinkShapes(self.store)   # (round V, V1) where a link really leads
+    self.way_k = None            # the matched way's index in its chain this update (LinkShapes.view)
     self.reset()
 
   def reset(self):
@@ -1891,6 +2079,13 @@ class MapCurves:
   def _curves_ahead(self, cid, increasing, s0, s1, lat, lon, bearing):
     out = []
     inside_exit = float("inf")
+    # (round V, V1) the junction with a street ahead on this link, m along the chain (None: none)
+    rv = self.links.view(self.store.ramps.get(cid), self.way_k) if cid in self.store.ramps else None
+    cut = None
+    if rv is not None and rv.get("cut_s") is not None and rv.get("travel") != "both" and \
+       (rv.get("travel") == "ab") == bool(increasing):
+      ch = self.store.chains.get(cid) or {}
+      cut = float(rv["cut_s"]) if increasing else float(ch.get("len", 0.0) or 0.0) - float(rv["cut_s"])
     for c in self.store.curves.get(cid, []):
       if self.odo_ok and c.get("ramp") and c["s_a"] in self.entered:
         left = c["len"] - (self.odo - self.entered[c["s_a"]])
@@ -1915,8 +2110,8 @@ class MapCurves:
             self.geom.pop(id(c), None)            # (unknown: not the stale view from before the entry)
         else:
           self.geom.pop(id(c), None)
-        r_here = self.store.ramps.get(cid)          # (on_ramp is only known after this, each update)
-        to_hwy = bool(r_here is not None and ((r_here.get("to") or {}).get("cls") in HIGHWAY_CLASSES))
+        r_here = self.links.view(self.store.ramps.get(cid), self.way_k)   # (on_ramp is only known after this, each update)
+        to_hwy = ramp_to_highway(r_here)
         if left > (RAMP_HWY_RELEASE if to_hwy else 0.0):
           out.append((c, 0.0))    # in it by the distance driven since its entry (a loop's exit is not "ahead")
         continue                  # entered once: never ahead again on this ramp (a loop's own entry comes back ahead)
@@ -1926,6 +2121,8 @@ class MapCurves:
         continue
       if not increasing and (s_exit > s1 or s_entry < s0 - LOOKAHEAD):
         continue
+      if cut is not None and (s_entry > cut + 1.0 if increasing else s_entry < cut - 1.0):
+        continue                  # (round V, V1) past the street this link meets ahead: not on this exit
       on_this_way = (s0 <= s_entry <= s1)
       ent_ahead, d_entry = ahead(lat, lon, bearing, *entry)
       ex_ahead, d_exit = ahead(lat, lon, bearing, *exit_)
@@ -2142,6 +2339,8 @@ class MapCurves:
     if road is not None:
       cid, increasing, s0, s1 = road
       self.chain_id, self.increasing = cid, increasing
+      hit = self.store.way_chain.get(way_id)
+      self.way_k = hit[1] if hit is not None and hit[0] == cid else None
       if cid != self.entered_chain:
         self.entered, self.entered_chain = {}, cid      # another road: its ramp curves are new
         self.apex_seen = {}
@@ -2169,7 +2368,7 @@ class MapCurves:
         self.veto_radius = r_cam if r_cam != float("inf") else MEMORY_MAX_R
       elif self.curve is not None and self.veto.flips((cid, self.curve["s_a"])) > 0:
         self.veto_status = 2
-      ramp = self.store.ramps.get(cid)
+      ramp = self.links.view(self.store.ramps.get(cid), self.way_k)   # (round V, V1: the street it meets)
       if ramp is not None and (ramp["travel"] == "both" or (ramp["travel"] == "ab") == increasing) and \
          not (trust is not None and trust.low):
         self.on_ramp, self.ramp = True, ramp
@@ -2239,6 +2438,8 @@ class MapCurves:
       ok, d = ahead(lat, lon, bearing, *start)
       if not ok or d > ONRAMP_NAV_RANGE:
         continue
+      if not ramp_to_highway(self.links.view(r)):
+        continue                  # (round V) it meets a street first
       chain_len = self.store.chains.get(r["chain"], {}).get("len", 0.0)
       firsts = sorted(((c["s_a"] if r["travel"] == "ab" else chain_len - c["s_b"]), c)
                       for c in self.store.curves.get(r["chain"], []))
@@ -2300,7 +2501,7 @@ class MapCurves:
     if best is None:
       self.nav_exit, self.nav_exit_dist = NAV_EXIT_NO_DATA, distance
       return
-    self.nav_ramp, self.nav_exit_dist = best, distance
+    self.nav_ramp, self.nav_exit_dist = self.links.view(best), distance   # (round V, V1: an exit to the street it meets)
     w = self._watch_add(best)
     curves = self.store.curves.get(best["chain"], [])
     chain_len = self.store.chains.get(best["chain"], {}).get("len", 0.0)
@@ -3102,7 +3303,7 @@ class MapCurvesPlanner:
       plan.mapRampType = RAMP_TYPES.get(r["type"], 4)
       to = r.get("to") or {}
       plan.mapRampToSpeed = float(to.get("speed", 0.0) or 0.0)
-      plan.mapRampToHighway = to.get("cls") in HIGHWAY_CLASSES
+      plan.mapRampToHighway = ramp_to_highway(r)
       plan.mapRampEndDistance = float(mc.ramp_end_dist)
     plan.mapRoadClass = int(getattr(self, "road_class", 0))
     plan.mapCurveVeto = int(mc.veto_status)

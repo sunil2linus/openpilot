@@ -145,10 +145,17 @@ def test_laptop_files_are_adopted_not_rebuilt(tmp_path):
   folder = os.path.join(cm, "42", "-84")
   os.makedirs(folder)
   laptop = os.path.join(folder, square_of(LAT0, LON0) + ".json")
+  # (round V: BUILDER_VERSION 2) a laptop file with no builder field is builder 1's: rebuilt, as any older builder's
   with open(laptop, "w") as f:
     json.dump({"version": B.FORMAT_VERSION, "keep_lat": 2.2, "curves": [{"fake": 1}], "ramps": [], "chains": [], "roads": []}, f,
               separators=(",", ":"))
   assert D.file_versions(laptop) == (B.FORMAT_VERSION, D.LEGACY_BUILDER)
+  assert D.LEGACY_BUILDER < B.BUILDER_VERSION and D.plan(osm, cm).todo == [("42/-84", "older builder 1")]
+  # ... one from the laptop's current builder (the field written) is adopted
+  with open(laptop, "w") as f:
+    json.dump({"version": B.FORMAT_VERSION, "builder": B.BUILDER_VERSION, "keep_lat": 2.2, "curves": [{"fake": 1}],
+               "ramps": [], "chains": [], "roads": []}, f, separators=(",", ":"))
+  assert D.file_versions(laptop) == (B.FORMAT_VERSION, B.BUILDER_VERSION)
   assert D.plan(osm, cm).todo == []                      # adopted
   state = D.read_state(folder)
   assert state["source"] == "adopted" and state["files"] == [square_of(LAT0, LON0)]

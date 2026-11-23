@@ -72,7 +72,8 @@ FORMAT_VERSION = 4          # 3: curves, ramps, chains; 4: + road shapes ("roads
 # BUILDER_VERSION: how the curves are found. Written into every file ("builder"); the device rebuilds a folder whose
 # files were made by an older builder. Bump it when a change here should rebuild the existing curve files (files
 # without the field were made by builder 1: the same algorithm, before the field existed).
-BUILDER_VERSION = 1
+# 2 (round V, V1): ramp records carry "cuts", the streets a link meets at a shared node between two of its ways
+BUILDER_VERSION = 2
 KEY_SCALE = 4_000_000_000   # node key = round(lat * 1e7) * KEY_SCALE + round(lon * 1e7) (one int, lon fits below the scale)
 
 
@@ -493,6 +494,14 @@ def split_doublets(curves, ways_by_id):
 
 HIGHWAY_CLASSES = {1, 3}
 LINK_FOLLOW_HOPS = 4
+# Round V, V1 (the M-53 exit to 23 Mile Rd, way 486581349): chains join unnamed links of the same class straight through a
+# junction, so an exit ramp that ends at a street and the on-ramp across that street are ONE chain ("interchange").
+# A joint between two ways of a link chain that is also a node of a street (JUNCTION_CLASSES: the same position to 1e-7 deg,
+# i.e. the same OSM node: the tiles carry full precision; a bridge has nodes of its own) is where the link meets that
+# street: the record's "cuts" [[k: chain index of the way before the joint, street class, its speed m/s, s m along the
+# chain, lat, lon of the joint], ...] (map_curves.LinkShapes reads them). The road shapes cannot tell: they are simplified to SHAPE_TOLERANCE,
+# which drops a street's node in a straight run (home area: 23 of 202 such joints).
+JUNCTION_CLASSES = {5, 7, 9, 11, 12}
 
 
 def node_index(ways, only=None):
@@ -575,7 +584,17 @@ def ramp_record(chain, nidx, ways):
     kind = "link"
   s_pt = (round(float(lat[0]), 6), round(float(lon[0]), 6))
   e_pt = (round(float(lat[-1]), 6), round(float(lon[-1]), 6))
-  return {"type": kind, "travel": travel, "len": round(length, 1), "to": to, "from": frm,
+  cuts, s0 = [], 0.0
+  for k, (w, rev) in enumerate(chain[:-1]):
+    x, y = to_xy(w.lat, w.lon, float(w.lat[0]), float(w.lon[0]))
+    s0 += float(np.sum(np.hypot(np.diff(x), np.diff(y))))
+    joint = w.start if rev else w.end
+    streets = [o for o, _m in nidx.get(joint, []) if o.id not in ids and o.cls in JUNCTION_CLASSES]
+    if streets:
+      st = min(streets, key=lambda o: o.cls)
+      j = 0 if rev else len(w.lat) - 1
+      cuts.append([k, int(st.cls), round(st.speed, 2), round(s0, 1), round(float(w.lat[j]), 6), round(float(w.lon[j]), 6)])
+  return {"type": kind, "travel": travel, "len": round(length, 1), "to": to, "from": frm, "cuts": cuts,
           "start": e_pt if travel == "ba" else s_pt, "end": s_pt if travel == "ba" else e_pt,
           "wdir": [[w.id, 0 if rev else 1] for w, rev in chain], "cls": min(w.cls for w, _ in chain),
           "chain": int(chain[0][0].id),
