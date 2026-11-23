@@ -218,7 +218,7 @@ def both(cfg=CFG):
   return Rig([StreetCap(cfg, presses=True), SpeedLimit(cfg, presses=True)], dt=0.05)
 
 
-def red_light(r, limit=55, set_mph=58, stop_s=20.0, cls=3, creep_m=0.0, pattern=HALL_RD, after_s=60):
+def red_light(r, limit=55, set_mph=58, stop_s=20.0, cls=3, creep_m=0.0, pattern=HALL_RD, after_s=60, creep_mph=5):
   """(the reviewer's sequence) his set on a `limit` road read clean for a minute, a stop at a red light with 7.0's
   limit gone (slc None, his brake: cruise off), a RES at 15 mph, then the limit back in Hall Rd's dropout pattern (one
   1 s fix in ~5 valid). creep_m: metres crept in the stop (stop and go) before the RES."""
@@ -227,7 +227,7 @@ def red_light(r, limit=55, set_mph=58, stop_s=20.0, cls=3, creep_m=0.0, pattern=
   r.step(v_mph=set_mph - 3, n=1200, view=rd, slc=slc(limit))
   r.step(v_mph=0, n=int(stop_s * 20), cruise=False, view=rd, slc=slc(None))
   if creep_m:
-    r.step(v_mph=5, n=int(creep_m / (5 * MPH) * 20), cruise=False, view=rd, slc=slc(None))
+    r.step(v_mph=creep_mph, n=int(creep_m / (creep_mph * MPH) * 20), cruise=False, view=rd, slc=slc(None))
   r.step(v_mph=15, events=[dict(resumed(), after=set_mph * MPH)], view=rd, slc=slc(None))
   at_res = r.anchor_mph
   for k in range(after_s):
@@ -249,3 +249,60 @@ def test_round3_the_remembered_limit_ages_by_distance_not_time():
   r = both()
   at_res = red_light(r, stop_s=5.0, creep_m=500.0, pattern=[0])   # 500 m of stop and go, no reading: not known now
   assert at_res == 45
+
+
+def test_round3_a_limit_read_now_on_the_street_raises_our_street_cap_with_the_same_seq():
+  p = Planner()
+
+  def step(contribs, events=()):
+    return p.update(PlanInputs(v_ego=15 * MPH, set_speed=58 * MPH, cruise_enabled=True, main_on=True,
+                               events=list(events), contributions=contribs))
+  step([Contribution("speed_limit", None, anchor=58 * MPH, kind="limit", seq=1)], [engaged(58)])
+  step([Contribution("street", None, anchor=45 * MPH, kind="street"),
+        Contribution("speed_limit", None, anchor=58 * MPH, kind="limit", seq=1)])
+  assert round(p.anchor / MPH) == 45 and p.ours_why == "street" and p.ours_seq == 1
+  step([Contribution("speed_limit", None, anchor=58 * MPH, kind="limit", seq=1)])
+  assert round(p.anchor / MPH) == 45                       # held in a gap, not read now: no raise (round 2)
+  step([Contribution("speed_limit", None, anchor=58 * MPH, kind="limit", seq=1, live=True)])
+  assert round(p.anchor / MPH) == 58 and p.ours_why == "limit"   # read now on this street: raised
+
+
+def test_round3_after_the_res_cap_the_roads_55_read_again_takes_the_set_back_to_58():
+  # 30-90 s in stop and go (500 m at 15 mph, no reading): the RES caps at 45; SpeedLimit's steady 55 is forgotten,
+  # its `known` 55 comes back as the same limit (no new seq); read again on this road it raises the cap to 58
+  r = both()
+  at_res = red_light(r, stop_s=5.0, creep_m=500.0, creep_mph=15, pattern=[0, 0] + [1] * 40, after_s=40)
+  assert at_res == 45 and r.cs[1].seq == 1 and r.anchor_mph == 58     # (was: 45 for good)
+  r = both()
+  at_res = red_light(r, stop_s=5.0, creep_m=500.0, creep_mph=15, pattern=[0, 0] + HALL_RD * 3, after_s=90)
+  assert at_res == 45 and r.anchor_mph == 45               # the dropout pattern alone never makes the limit steady
+
+
+def test_round3_the_exit_cap_43_goes_to_the_streets_limit_once_it_is_read():
+  # the street's 45 became steady on the exit link (its seq is older than our cap), then 2 s without a limit on the
+  # street: the cap is 43 (limit unknown); then the 45 is read again: 48
+  from openpilot.starpilot.car.mazda.speed.limits import SpeedLimit
+  r = Rig([StreetCap(CFG, presses=True), SpeedLimit(CFG, presses=True)])
+  r.step(v_mph=70, set_mph=70, events=[engaged(70)], view=road(1), slc=slc(70))
+  r.step(v_mph=70, n=600, view=road(1), slc=slc(70))
+  r.step(v_mph=45, n=1000, view=road(2, link=True, chain=2), slc=slc(45))
+  r.step(v_mph=40, n=600, view=road(7, chain=3), slc=slc(None))
+  assert r.anchor_mph == 43
+  r.step(v_mph=40, n=500, view=road(7, chain=3), slc=slc(45))
+  assert r.anchor_mph == 48                                # (was: 43 for good)
+
+
+def test_round3_the_highways_70_on_the_street_never_lifts_the_cap():
+  from openpilot.starpilot.car.mazda.speed.limits import SpeedLimit
+  # (round 2) the motorway's steady 70 is held through the gap of readings on the street; mapd still reads it now
+  # and then on the street: the same seq, and a 70 is no street's limit (never live): the cap stays
+  r = Rig([StreetCap(CFG, presses=True), SpeedLimit(CFG, presses=True)])
+  r.step(v_mph=70, set_mph=70, events=[engaged(70)], view=road(1), slc=slc(70))
+  r.step(v_mph=70, n=600, view=road(1), slc=slc(70))
+  r.step(v_mph=45, n=500, view=road(2, link=True, chain=2), slc=slc(None))
+  r.step(v_mph=40, n=600, view=road(7, chain=3), slc=slc(None))
+  assert r.anchor_mph == 43 and r.cs[1].steady == 70
+  for _ in range(10):
+    r.step(v_mph=40, n=100, view=road(7, chain=3), slc=slc(70))
+    r.step(v_mph=40, n=200, view=road(7, chain=3), slc=slc(None))
+  assert r.anchor_mph == 43

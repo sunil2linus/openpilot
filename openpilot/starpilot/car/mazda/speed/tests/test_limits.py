@@ -277,3 +277,28 @@ def test_sources_read_slcstate_and_mapdout_through_the_private_submaster():
   t[0] = 1.0
   ctx = src.context({"v_ego": 20.0})
   assert ctx["slc"] is None and ctx["preview"] is None           # older than 0.5 s: no reading
+
+
+def test_round3_live_is_the_steady_limit_read_now_on_this_street():
+  r = rig()
+  r.step(v_mph=50, set_mph=58, events=[engaged(58)], slc=slc(55), view=lambda t: view(t, cls=3))
+  out = drive(r, 9.0, 55, cls=3)                         # steady after 5 s, live 3 s later
+  live = lambda: r.ctx["contribs"]["speed_limit"].live  # noqa: E731
+  assert r.cs[0].steady == 55 and live()                 # a trunk road (Hall Rd) is a street here
+  drive(r, 1.0, None, cls=3)
+  assert not live()                                      # not read now
+  drive(r, 0.5, 55, cls=3)
+  assert live()                                          # read again: live at once (its time on this chain held)
+  drive(r, 2.0, 55, cls=3, chain=2)
+  assert not live()                                      # a new chain starts over (3 s in all on it)
+  drive(r, 1.5, 55, cls=3, chain=2)
+  assert live()
+  drive(r, 4.0, 55, cls=3, chain=2, trust=1)
+  assert not live()                                      # bad trust
+  r2 = rig()
+  drive(r2, 8.0, 55, cls=HIGHWAY)
+  assert r2.cs[0].steady == 55 and not r2.ctx["contribs"]["speed_limit"].live   # a motorway's limit is never live
+  r3 = rig()
+  drive(r3, 8.0, 60, cls=STREET)
+  assert r3.cs[0].steady == 60 and not r3.ctx["contribs"]["speed_limit"].live   # above 55: no street's
+  assert out is not None

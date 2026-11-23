@@ -41,7 +41,8 @@ units, whole steps, no margin: Contribution.anchor); the planner takes it only b
     proposal's band: his SET- in a ramp curve); down (the taper, the end) only from our merge anchor;
   * "handover" (exit onto a street): only down, any owner (the contributor ends it for good on his gas / buttons);
   * "street" (street_cap.py: a highway's speed carried onto a street): only down, any owner; our street anchor (this
-    or a handover) is raised by a "limit" proposal only for a limit that became steady after it (its seq);
+    or a handover) is raised by a "limit" proposal only for a limit that became steady after it (its seq), or for
+    one that is being read now on this street (Contribution.live, limits.py: never a highway's limit held in a gap);
   * "restore" (a handover overturned: the exit was not taken): only up, only from our handover anchor;
   * never in a frame with his own change (his buttons win), never with the cruise off.
 The first proposal in the order restore, handover, street, merge, limit, fallback that passes is taken.
@@ -80,6 +81,7 @@ class Contribution:
   seq: int = 0                    # "limit" / "fallback": the id of the steady limit (it grows with each limit change)
   retake: bool = False            # "limit": this proposal may re-take his own speed (the limit change rule above)
   keep_his: bool = False          # "limit": a RES this frame off a street: a speed of his stays his (no engagement)
+  live: bool = False              # "limit": its limit is being read now on the street the car is on (limits.py)
 
 
 @dataclass
@@ -154,8 +156,9 @@ class Planner:
     if c.kind == "limit":
       if self.owner == OURS:
         # our street speed (the exit handover, the street cap) is raised only by a limit that became steady after it
-        # (not by the highway's old limit still kept through a gap of readings on the street)
-        return not (c.anchor > a and self.ours_why in ("handover", "street") and c.seq <= self.ours_seq)
+        # (not by the highway's old limit still kept through a gap of readings on the street), or by one that is being
+        # read now on this street (c.live: the 55 of the trunk road he stopped on, read again after a cap at his RES)
+        return not (c.anchor > a and self.ours_why in ("handover", "street") and c.seq <= self.ours_seq and not c.live)
       in_band = c.band is not None and c.band[0] - half <= a <= c.band[1] + half
       if self.owner == ENGAGED and in_band:
         return True

@@ -449,7 +449,10 @@ car's dash speed (the old pacing), until the planner has it. The planner takes "
 the anchor is then ours ("Street - set to NN"). His SET+ / SET- is his speed again (not capped again on that street);
 after his brake and RES it goes on (old rule). While it is open on a street the merge drops a pending raise, and a
 limit raise takes our street anchor (or a handover's) only for a limit that became steady after it (the highway's
-old limit kept through a gap of readings never raises it back). Differences from the old fork: trunk roads count only
+old limit kept through a gap of readings never raises it back), or for one that is being read now on this street
+(round 3, `live`: a valid reading this frame equal to the steady limit, clean trust, a matched street, at most 55, read
+3 s in all on this road chain; so the trunk road's 55 read again after a cap at his RES, or a street's 45 after the
+43 "limit unknown" cap, takes the set to the limit + offset). Differences from the old fork: trunk roads count only
 with a known limit under 55 (the old fork never treated a trunk as a street); a street must come within 1 km after
 the highway / link (the old fork waited without a bound); the pacing is an anchor floor (the old fork pressed SET-
 taps or one hold itself).

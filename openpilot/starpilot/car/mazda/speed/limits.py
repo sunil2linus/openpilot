@@ -44,6 +44,11 @@ Rules (ported from the old fork's speed_limit_follow, written as one contributor
     the band of an older one (`matched`, within MATCH_KEEP) - only when no old limit is known or the change from the
     known old one is itself a raise: a stale lower `matched` never turns a drop into a raise (his 35 road, then a 50
     road at his own 57, then 50 -> 40 is a drop from 50). The same limit back after a gap is no change.
+  * Live (round 3): the proposal says whether its limit is being read NOW on the street the car is on (a valid
+    reading this frame equal to the steady limit, clean trust, a matched street, not a link, at most LIVE_MAX) and has
+    been read on this road chain for LIVE_STEADY in all (gaps of any length hold it; a new chain starts over). The
+    planner lets such a limit raise our street cap / exit handover anchor even with the same seq (the 55 of the
+    trunk road he stopped on, after a cap at the RES); a highway's limit kept through a gap is never live.
   * Only on roads: nothing on a link (the merge / exit own it) nor while the merge or the exit plan are busy.
   * Match on engage (the old fork's rule 8): only on a STREET (the last known class a street, a live view with trust
     0, not a link): he engages (SET / RES) with the set inside the band of an already-known steady limit -> the
@@ -95,6 +100,8 @@ HIGHWAY_CLASSES = (1,)               # for the limit rules only a motorway is a 
                                      # engage and the lower-limit re-take apply. Exits and merges keep map_view's (1, 3).
 LINK_CLASSES = (2, 4, 6, 8, 10)      # map_match.LINK_CLASSES
 GAP_HOLD = 2.5                       # s without a reading the steady time holds (two missed 1 Hz fixes; view_age)
+LIVE_STEADY = 3.0                    # s the steady limit has been read on this road chain (any gaps): "live" (planner)
+LIVE_MAX = (55, 90)                  # dash units: a limit above this is no street's: never "live"
 
 
 def map_preview(road, valid=True, warn=None):
@@ -203,6 +210,8 @@ class SpeedLimit:
     self.gap_t = 0.0               # s without a reading (the steady time holds up to GAP_HOLD)
     self.road_cls = 0              # the last known road class of a live map view (0: never known)
     self.road_link = False         # ... and whether the view says the car is on a link
+    self.live_key = None           # (steady limit, chain) the live time is for
+    self.live_t = 0.0              # s that limit has been read with clean trust on that street chain (gaps hold it)
 
   def street(self):
     """On a street (the offset applies): the last known road class known, not a highway, not a link."""
@@ -303,6 +312,18 @@ class SpeedLimit:
         self.matched = (self.steady, now)
     if raw is None and now - self.last_seen > LIMIT_KEEP:
       self.steady = self.prev = self.steady_t = None
+    # "live": the steady limit is being read NOW on the street the car is on (a valid reading this frame, clean trust,
+    # the matched road a street, not a link), and has been read there for LIVE_STEADY in all (any gaps: Hall Rd's
+    # mapd is valid on ~1 fix in 5; a chain change starts over: a highway's limit still read at the exit is not it)
+    on_street = bool(clean and view.get("matched", True) and not view.get("link") and
+                     int(view.get("cls", 0) or 0) not in (0,) + HIGHWAY_CLASSES + LINK_CLASSES)
+    key = (self.steady, chain if alive else (self.live_key[1] if self.live_key else None))
+    if self.live_key != key:
+      self.live_key, self.live_t = key, 0.0
+    reading_now = bool(on_street and self.steady is not None and raw == self.steady)
+    if reading_now and live != LATE:
+      self.live_t += dt
+    live_now = bool(reading_now and self.steady <= LIVE_MAX[self.k] and self.live_t >= LIVE_STEADY - 1e-6)
     up = whole_limit(up_mps, self.metric) if up_mps else None
     if up is not None and (self.preview is None or self.preview[0] != up):
       self.preview = (up, chain)
@@ -315,7 +336,8 @@ class SpeedLimit:
     fallback = bool(self.steady is None and raw is None and ctx.get("no_gps") and self.engaged_t is not None and
                     now - self.engaged_t <= FALLBACK_WINDOW and not busy)
     self.fast_t = self.fast_t + dt if (fallback and v >= FALLBACK_FROM) else 0.0
-    out = Contribution("speed_limit", None, presses=self.presses, kind="limit", seq=self.seq, keep_his=keep_his)
+    out = Contribution("speed_limit", None, presses=self.presses, kind="limit", seq=self.seq, keep_his=keep_his,
+                       live=live_now)
     if self.steady is not None:
       if busy:
         self.last = ("busy", self.steady)
