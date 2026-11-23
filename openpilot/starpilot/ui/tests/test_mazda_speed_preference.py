@@ -169,6 +169,13 @@ def test_stage3_rows_confirmed_on_and_the_steering_test_only_with_the_ti():
     steer = {r.key: r for r in rows(owner)}[PREFIX + 'ti_steer_700']
     assert steer.value == 'Off' and steer.choices == ('Off', 'On') and 'Test only' in steer.reason
     assert '600 to 700' in steer.reason and 'next drive' in steer.reason
+    # (round 2) the warning from the owner's test drive comes first, on the row and in the Galaxy description
+    assert 'Warning: tested on this car on 2026-11-22' in steer.reason.split('Test only.')[1][:220]
+    assert 'Leave it off' in steer.reason
+    assert 'Torque Interceptor fault' in steer.reason and 'about 30 s' in steer.reason
+    from openpilot.starpilot.galaxy.setting_descriptions import DESCRIPTIONS
+    gd = DESCRIPTIONS['mazda_speed:ti_steer_700']
+    assert 'Warning: tested on this car on 2026-11-22' in gd and 'Torque Interceptor fault' in gd and 'Leave it off' in gd
     request = row_change(steer)
     assert request.key in VEHICLE_BOOL_KEYS and '700' in confirmation_question(request)
     assert not owner.apply(request)

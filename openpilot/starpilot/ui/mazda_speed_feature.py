@@ -66,9 +66,12 @@ SUB_ROWS = (
    "sets a Panda safety setting when the car starts: change it before you start the car.", 0.),
 )
 # (Stage 3) shown without the master switch, only on a car with the Torque Interceptor: a steering setting
+STEER_700_WARNING = ("Warning: tested on this car on 2026-11-22, it caused a Torque Interceptor fault and loss of " +
+                     "steering assist for about 30 s. Leave it off. ")
 STEER_700_ROW = ("ti_steer_700", "Steering limit test (700)",
                  "Test only. With the Torque Interceptor it raises the maximum steering command from 600 to 700 " +
-                 "(the Panda and StarPilot together); the steering for a given curve stays the same, only the most it " +
+                 "(the Panda and StarPilot together). " + STEER_700_WARNING +
+                 "The steering for a given curve stays the same, only the most it " +
                  "may ask for goes up. Watch for steering faults; turn it off if any appear. It sets a Panda safety " +
                  "setting when the car starts, so a change applies at the next drive (the next car start).")
 CONFIRM_ON = ("enabled", "auto_resume", "ti_steer_700")   # turning these on needs the confirmation question
