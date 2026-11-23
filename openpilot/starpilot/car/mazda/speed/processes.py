@@ -35,7 +35,11 @@ def _persistent(params, now=None):
       if payload is not None:
         with car_capnp.CarParams.from_bytes(payload) as cp:
           car = (str(cp.brand), bool(cp.notCar))
-  except Exception:
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(None, "CarParamsPersistent brand/notCar", e)
+    car = ("", False)
+  except Exception:                # a broken / foreign cache: no car
     car = ("", False)
   _cache["raw"], _cache["car"] = raw, car
   return car

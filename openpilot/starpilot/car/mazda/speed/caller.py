@@ -37,9 +37,9 @@ def _cancel_frame(f):
     return False
 
 
-def _gear_drive(CS):
+def _gear_drive(gear):
   from opendbc.car import structs
-  return getattr(CS, "gearShifter", None) == structs.CarState.GearShifter.drive    # (as card.py compares it)
+  return gear == structs.CarState.GearShifter.drive    # (as card.py compares it)
 
 
 def _plain(v):
@@ -49,11 +49,17 @@ def _plain(v):
 
 
 def eligible(CP) -> bool:
+  if CP is None:
+    return False
   try:
     from opendbc.car.mazda.values import MazdaFlags
     return bool(CP.brand == "mazda" and not CP.notCar and int(CP.flags) & int(MazdaFlags.GEN1) and CP.pcmCruise and
                 not CP.openpilotLongitudinalControl and not CP.passive)
-  except (AttributeError, TypeError, ValueError):
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(None, "carParams (brand/notCar/flags/pcmCruise/openpilotLongitudinalControl/passive)", e)
+    return False
+  except (TypeError, ValueError):
     return False
 
 
@@ -93,6 +99,7 @@ class SpeedControl:
     self.cruise_was = False
     self.packer = None
     self.gps_key = None
+    self.missing = set()             # cereal fields found missing this drive (one "schema" line each)
     if profile is not None:
       profile.note_drive()
     self._log("start", config=C.encode(cfg).decode(), metric=self.metric,
@@ -102,8 +109,26 @@ class SpeedControl:
     if self.log is not None:
       self.log.log(kind, **kw)
 
+  def warn(self, what, err=None):
+    """A carState / carControl field we read is not in this schema: one "schema" event-log line per field per drive."""
+    if what in self.missing:
+      return
+    self.missing.add(what)
+    self._log("schema", field=what, error=str(err)[:160])
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(None, what, err)
+
+  def _cs(self, CS, name, default):
+    """A carState field (7.0's schema has all of these); missing -> the default, reported once (never silent)."""
+    try:
+      return getattr(CS, name)
+    except AttributeError as e:
+      self.warn("carState." + name, e)
+      return default
+
   def inputs(self, card, CS, CC, can_sends):
-    ocs = card.CI.CS
+    ocs = card.CI.CS      # (carstate's own Python attributes: CAN reads, not cereal fields)
+    f = self._cs
     other = bool(CC.cruiseControl.cancel or CC.cruiseControl.resume or
                  any(f[0] == CRZ_BTNS for f in can_sends))
     return {"cruise_enabled": bool(CS.cruiseState.enabled), "main_on": bool(CS.cruiseState.available),
@@ -112,18 +137,18 @@ class SpeedControl:
                 "set_plus": bool(ocs.crz_set_plus), "set_minus": bool(ocs.crz_set_minus), "resume": bool(ocs.crz_resume),
                 "cancel": bool(ocs.crz_cancel), "wheel_counter": int(ocs.crz_btns_counter), "other_button": other,
                 "engaged": bool(CC.enabled), "lkas_blocked": bool(getattr(ocs, "lkas_blocked", False)),
-                "blinker": bool(getattr(CS, "leftBlinker", False) or getattr(CS, "rightBlinker", False)),
-                "left_blinker": bool(getattr(CS, "leftBlinker", False)), "right_blinker": bool(getattr(CS, "rightBlinker", False)),
+                "blinker": bool(f(CS, "leftBlinker", False) or f(CS, "rightBlinker", False)),
+                "left_blinker": bool(f(CS, "leftBlinker", False)), "right_blinker": bool(f(CS, "rightBlinker", False)),
                 "radar_lead": bool(getattr(ocs, "radar_has_lead", False)),
                 "lat_active": bool(CC.latActive), "torque": float(CC.actuators.torque),
                 "steer_alert": str(CC.hudControl.visualAlert).endswith("steerRequired"),
                 "angle": float(CS.steeringAngleDeg), "steering_pressed": bool(CS.steeringPressed),
                 "stop_sign_raw": getattr(ocs, "dashboard_stop_sign", None), **self._camera(ocs),
                 # (Stage 3) the gas auto-resume's inputs
-                "steer_rate": float(getattr(CS, "steeringRateDeg", 0.0) or 0.0), "gear_drive": _gear_drive(CS),
-                "door_open": bool(getattr(CS, "doorOpen", False)),
-                "seatbelt_unlatched": bool(getattr(CS, "seatbeltUnlatched", False)),
-                "can_valid": bool(getattr(CS, "canValid", False)),
+                "steer_rate": float(f(CS, "steeringRateDeg", 0.0) or 0.0), "gear_drive": _gear_drive(f(CS, "gearShifter", None)),
+                "door_open": bool(f(CS, "doorOpen", False)),
+                "seatbelt_unlatched": bool(f(CS, "seatbeltUnlatched", False)),
+                "can_valid": bool(f(CS, "canValid", False)),
                 "set_allowed": bool(getattr(ocs, "crz_set_allowed", False)),
                 "not_allowed": bool(getattr(ocs, "crz_not_allowed", False)),
                 "op_cancel": bool(CC.cruiseControl.cancel), "op_resume": bool(CC.cruiseControl.resume),

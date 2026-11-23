@@ -97,7 +97,7 @@ LINK_CLASSES = (2, 4, 6, 8, 10)      # map_match.LINK_CLASSES
 GAP_HOLD = 2.5                       # s without a reading the steady time holds (two missed 1 Hz fixes; view_age)
 
 
-def map_preview(road, valid=True):
+def map_preview(road, valid=True, warn=None):
   """{"speed": m/s, "dist": m} of the map's next limit ahead from a mapdOut reader (v2, as
   speed_limits.map_observation checks it: finite >= 1 m/s, 0 < distance <= 500 m, a way, not the current limit),
   or None; never raises."""
@@ -107,7 +107,10 @@ def map_preview(road, valid=True):
       return None
     speed = repair_legacy_map_speed(float(road.previewSpeedLimit))
     dist, way, cur = float(road.previewDistance), int(road.previewWayId), float(road.speedLimit)
-  except (AttributeError, TypeError, ValueError, ImportError):
+  except (AttributeError, ImportError) as e:
+    _miss(warn, "mapdOut.preview", e)
+    return None
+  except (TypeError, ValueError):
     return None
   if not (math.isfinite(speed) and speed >= 1.0 and math.isfinite(dist) and 0 < dist <= 500 and way > 0 and
           abs(speed - cur) > 0.02):
@@ -115,7 +118,7 @@ def map_preview(road, valid=True):
   return {"speed": speed, "dist": dist}
 
 
-def map_possible(road, valid=True):
+def map_possible(road, valid=True, warn=None):
   """mapdOut's own limit (m/s) on a "possible" fix (the first fix of a new match: slcState is not "valid" then), or
   None; never raises. Only a v2 sample with roadStatus matchedLimit and waySelectionType possible."""
   try:
@@ -124,12 +127,15 @@ def map_possible(road, valid=True):
         str(road.waySelectionType) != "possible"):
       return None
     speed = repair_legacy_map_speed(float(road.speedLimit))
-  except (AttributeError, TypeError, ValueError, ImportError):
+  except (AttributeError, ImportError) as e:
+    _miss(warn, "mapdOut.roadStatus/waySelectionType", e)
+    return None
+  except (TypeError, ValueError):
     return None
   return speed if math.isfinite(speed) and speed >= 1.0 else None
 
 
-def reading(state):
+def reading(state, warn=None):
   """(limit m/s or None, upcoming m/s or 0.0) from an slcState reader; never raises. (The upcoming value is
   always 0 on this car's display-only SLC; it is not used.)"""
   try:
@@ -147,8 +153,16 @@ def reading(state):
       limit = None
     up = float(state.upcomingSpeedLimit)
     return limit, (up if math.isfinite(up) and up > 0 else 0.0)
-  except (AttributeError, TypeError, ValueError):
+  except AttributeError as e:
+    _miss(warn, "slcState", e)
     return None, 0.0
+  except (TypeError, ValueError):
+    return None, 0.0
+
+
+def _miss(warn, what, err):
+  from openpilot.starpilot.car.mazda.speed.events import schema_miss
+  schema_miss(warn, what, err)
 
 
 def whole_limit(mps, metric=False):

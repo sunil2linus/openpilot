@@ -41,13 +41,16 @@ CAM_MIN_SPEED = 25 * MPH
 CAM_MIN_K = 1.0 / 1000.0
 
 
-def model_path(model):
-  """(xs m ahead, kappas 1/m) from a modelV2 reader, or None when it is broken."""
+def model_path(model, warn=None):
+  """(xs m ahead, kappas 1/m) from a modelV2 reader, or None when it is broken (a field missing from the schema is
+  reported once: events.schema_miss)."""
   try:
     xs = list(model.position.x)
     rz = list(model.orientationRate.z)
     vx = list(model.velocity.x)
-  except AttributeError:
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(warn, "modelV2.position/orientationRate/velocity", e)
     return None
   n = min(len(xs), len(rz), len(vx))
   if n < 2:

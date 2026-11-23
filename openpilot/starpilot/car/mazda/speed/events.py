@@ -8,6 +8,7 @@ import threading
 import time
 
 LOG_DIR = "/data/media/0/mazda_speed"
+_MISSED = set()                 # cereal fields already reported missing in this process (schema_miss)
 MAX_BYTES = 20_000_000          # per drive file
 KEEP_FILES = 30
 QUEUE = 2000
@@ -102,3 +103,20 @@ class EventLog:
   def close(self):
     self.flush()
     self.closed = True
+
+
+def schema_miss(warn, what, err=None):
+  """A cereal field our code reads is not in this build's schema (a renamed field): never silent. warn: the drive's
+  reporter (contributors.Sources.warn: one event-log line per field per drive); None: one cloudlog warning per field
+  per process. Never raises."""
+  try:
+    if warn is not None:
+      warn(what, err)
+      return
+    if what in _MISSED:
+      return
+    _MISSED.add(what)
+    from openpilot.common.swaglog import cloudlog
+    cloudlog.warning(f"mazda speed control: cereal field missing: {what} ({str(err)[:160]})")
+  except Exception:
+    pass

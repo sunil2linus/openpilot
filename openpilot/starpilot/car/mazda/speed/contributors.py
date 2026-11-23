@@ -10,12 +10,15 @@ The private SubMaster also reads userBookmark (the onroad Bookmark button, for t
 while the speed control runs this drive): ctx["bookmark"] is True on a frame with a new one.
 Stage 3: with the gas auto-resume it also reads selfdriveState (ctx["engageable"]: openpilot has no no-entry now; False
 when not received) and radarState (its creep guard), and the map view (its map guard).
+Field names are 7.0's schema (tests/test_cereal_fields.py builds real messages for every service read here). A field
+that is not in the schema is never silent: one "schema" line per field per drive in the event log (Sources.warn).
 """
 import math
 import time
 
 from openpilot.starpilot.car.mazda.speed.camera import CameraCurve, CameraVeto, model_path
 from openpilot.starpilot.car.mazda.speed.curve_plan import CurvePlan
+from openpilot.starpilot.car.mazda.speed.events import schema_miss
 from openpilot.starpilot.car.mazda.speed.view_age import GONE, ViewClock
 
 VIEW_EVERY = 10               # frames (10 Hz) between two reads of the map view file
@@ -23,11 +26,12 @@ MODEL_DT = 0.05
 SLC_STALE = 0.5               # s: an older slcState is no limit reading
 
 
-def model_path_y(model):
+def model_path_y(model, warn=None):
   """(xs, ys) of the model's path (y right positive), or None."""
   try:
     xs, ys = list(model.position.x), list(model.position.y)
-  except AttributeError:
+  except AttributeError as e:
+    schema_miss(warn, "modelV2.position", e)
     return None
   n = min(len(xs), len(ys))
   if n < 2 or not all(math.isfinite(v) for v in xs[:n] + ys[:n]):
@@ -35,18 +39,35 @@ def model_path_y(model):
   return xs[:n], ys[:n]
 
 
-def radar_lead(radar):
-  """The lead radard publishes (on this car from the camera's leads), or None."""
+def lead_present(lead, warn=None):
+  """radarState's LeadData "a lead is present": `present` in 7.0 (`status` in older schemas), or None (neither)."""
+  for name in ("present", "status"):
+    try:
+      return bool(getattr(lead, name))
+    except AttributeError:
+      continue
+  schema_miss(warn, "radarState.leadOne.present", "neither present nor status")
+  return None
+
+
+def radar_lead(radar, warn=None):
+  """The lead radard publishes (on this car from the camera's leads), or None. The dict's "status" is LeadData's
+  present (the consumers' key)."""
   try:
     lead = radar.leadOne
-    out = {"status": bool(lead.status), "v": float(lead.vLead), "vrel": float(lead.vRel), "d": float(lead.dRel)}
-  except AttributeError:
+    out = {"v": float(lead.vLead), "vrel": float(lead.vRel), "d": float(lead.dRel)}
+  except AttributeError as e:
+    schema_miss(warn, "radarState.leadOne", e)
     return None
+  present = lead_present(lead, warn)
+  if present is None:
+    return None
+  out["status"] = present
   try:
     prob = float(lead.modelProb)
     out["prob"] = prob if math.isfinite(prob) else 0.0
-  except (AttributeError, TypeError, ValueError):
-    pass
+  except AttributeError as e:
+    schema_miss(warn, "radarState.leadOne.modelProb", e)
   return out if all(math.isfinite(out[k]) for k in ("v", "vrel", "d")) else None
 
 
@@ -55,7 +76,9 @@ class Sources:
   unchanged) and the map view file. Fills the ctx every contributor reads."""
 
   def __init__(self, want_model=True, want_view=True, sm=None, read_view=None, clock=time.monotonic, map_presses=True,
-               want_slc=False, want_radar=False, want_bookmark=False, want_selfdrive=False):
+               want_slc=False, want_radar=False, want_bookmark=False, want_selfdrive=False, log=None):
+    self.log = log
+    self.missing = set()      # cereal fields found missing this drive (warn: one event-log line each)
     self.want_model, self.want_view = want_model, want_view
     self.want_slc, self.want_radar = want_slc, want_radar
     self.want_bookmark = want_bookmark
@@ -86,6 +109,20 @@ class Sources:
     self.veto = CameraVeto(MODEL_DT)
     self.view_clock = ViewClock()
 
+  def warn(self, what, err=None):
+    """A field our readers need is not in this schema: one "schema" event-log line (and cloudlog) per field per
+    drive, never silent, never raises."""
+    if what in self.missing:
+      return
+    self.missing.add(what)
+    try:
+      if self.log is not None:
+        self.log.log("schema", field=what, error=str(err)[:160])
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.warning(f"mazda speed control: cereal field missing: {what} ({str(err)[:160]})")
+    except Exception:
+      pass
+
   def context(self, d):
     """d: the caller's per-frame dict (v_ego, blinker, lkas_blocked, ...). Returns the ctx for contributors."""
     now = self.clock()
@@ -98,30 +135,30 @@ class Sources:
       self.sm.update(0)
       if self.want_model and self.sm.updated["modelV2"]:
         model = self.sm["modelV2"]
-        self.path = model_path(model)
-        self.path_y = model_path_y(model)
+        self.path = model_path(model, warn=self.warn)
+        self.path_y = model_path_y(model, warn=self.warn)
         from openpilot.starpilot.car.mazda.speed.exit_plan import model_lanes
-        self.lanes = model_lanes(model)
+        self.lanes = model_lanes(model, warn=self.warn)
         self.model_t = now
         model_new = True
       if self.want_slc and self.sm.updated["slcState"]:
         from openpilot.starpilot.car.mazda.speed.limits import reading
-        limit, upcoming = reading(self.sm["slcState"]) if self.sm.valid["slcState"] else (None, 0.0)
+        limit, upcoming = reading(self.sm["slcState"], warn=self.warn) if self.sm.valid["slcState"] else (None, 0.0)
         self.slc = {"limit": limit, "upcoming": upcoming, "t": now}
       if self.want_slc and self.sm.updated["mapdOut"]:
         from openpilot.starpilot.car.mazda.speed.limits import map_possible, map_preview
-        pv = map_preview(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]))
+        pv = map_preview(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]), warn=self.warn)
         self.preview = None if pv is None else dict(pv, t=now)
-        poss = map_possible(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]))
+        poss = map_possible(self.sm["mapdOut"], bool(self.sm.valid["mapdOut"]), warn=self.warn)
         self.possible = None if poss is None else {"limit": poss, "t": now}
       if self.want_radar and self.sm.updated["radarState"]:
-        lead = radar_lead(self.sm["radarState"])
+        lead = radar_lead(self.sm["radarState"], warn=self.warn)
         self.lead = None if lead is None else dict(lead, t=now)
       if self.want_bookmark and self.sm.updated["userBookmark"]:
         bookmark = True
       if self.want_selfdrive:
         self.engageable = bool(self.sm.seen["selfdriveState"] and self.sm.alive["selfdriveState"] and
-                               getattr(self.sm["selfdriveState"], "engageable", False))
+                               self._engageable(self.sm["selfdriveState"]))
     if self.want_view and self.frame % VIEW_EVERY == 1:
       self.view = self.read_view()
     ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
@@ -139,6 +176,13 @@ class Sources:
     self.veto.update(ctx)
     ctx["map_covers_camera"] = bool(self.map_presses and view_ok and not self.view.get("held") and self._covers(ctx))
     return ctx
+
+  def _engageable(self, state):
+    try:
+      return bool(state.engageable)
+    except AttributeError as e:
+      self.warn("selfdriveState.engageable", e)
+      return False
 
   def _covers(self, ctx):
     v = ctx.get("v_ego", 0.0)
@@ -180,4 +224,4 @@ def build(cfg, CP, log=None, memory=None, metric=False, auto_resume=False):
   return out, Sources(want_model=bool(out), want_view=cfg.needs_view, map_presses=cfg.presses("curves"),
                       want_slc=any(cfg.active(n) for n in ("speed_limit", "merge", "exits")),
                       want_radar=cfg.active("merge") or cfg.active("stops") or auto_resume, want_bookmark=True,
-                      want_selfdrive=auto_resume)
+                      want_selfdrive=auto_resume, log=log)

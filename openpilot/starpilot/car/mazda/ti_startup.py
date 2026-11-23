@@ -33,6 +33,7 @@ from openpilot.common.swaglog import cloudlog
 MAZDA_NAME = 'mazda'
 MAZDA_RAW = int(structs.CarParams.SafetyModel.mazda)  # 13
 HANDSHAKE_TIMEOUT_S = 2.0
+_schema_warned = False
 
 
 def panda_ti_configured(panda_states) -> bool:
@@ -44,7 +45,13 @@ def panda_ti_configured(panda_states) -> bool:
     model = state.safetyModel
     mazda = str(model) == MAZDA_NAME or getattr(model, 'raw', model) == MAZDA_RAW
     return bool(mazda and int(state.safetyParam) & int(MazdaSafetyFlags.TORQUE_INTERCEPTOR))
-  except (AttributeError, IndexError, TypeError, ValueError):
+  except AttributeError as e:
+    global _schema_warned
+    if not _schema_warned:   # a renamed pandaStates field: say it once (the TI startup then never configures)
+      _schema_warned = True
+      cloudlog.warning(f"Mazda TI startup: pandaStates field missing: {e}")
+    return False
+  except (IndexError, TypeError, ValueError):
     return False
 
 

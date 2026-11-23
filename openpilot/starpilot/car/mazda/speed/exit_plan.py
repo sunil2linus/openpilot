@@ -120,15 +120,19 @@ LANE_HALF = 1.8
 LANE_NEAR_X = 20.0
 
 
-def model_lanes(model):
+def model_lanes(model, warn=None):
   """(probs[4], lines_y[4], edges_y[2], edge_stds[2]): the y (right positive) of each at the car (mean up to
-  LANE_NEAR_X), from a modelV2 reader; None when missing."""
+  LANE_NEAR_X), from a modelV2 reader; None when missing (a field missing from the schema is reported once)."""
   try:
     probs = [float(p) for p in model.laneLineProbs]
     lines = [_near_y(line) for line in model.laneLines]
     edges = [_near_y(e) for e in model.roadEdges]
     stds = [float(s) for s in model.roadEdgeStds]
-  except (AttributeError, TypeError, ValueError):
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(warn, "modelV2.laneLines/roadEdges", e)
+    return None
+  except (TypeError, ValueError):
     return None
   if len(probs) < 4 or len(lines) < 4 or len(edges) < 2 or None in lines or None in edges:
     return None

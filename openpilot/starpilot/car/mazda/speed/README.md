@@ -292,6 +292,13 @@ position-like keys are dropped even though the log has none).
   fallback fired with a good fix.)
 * card subscribes to modelV2 / slcState / radarState through a private SubMaster created only when an option that
   needs it is on (card's own subscription list is unchanged). The view file is version 2 (part f: ramp, exits).
+* **Message fields are 7.0's** (`tests/test_cereal_fields.py` builds real capnp messages of every service read here -
+  radarState, modelV2, slcState, mapdOut, selfdriveState, userBookmark, gpsLocation(External), carState, carControl,
+  carParams, pandaStates - and runs our readers on them). A field missing from the schema is never silent: one
+  `schema` line per field per drive in the event log (else one cloudlog warning). Until this check the radar lead was
+  never read on the car: LeadData's "a lead is there" is `present` in 7.0 (`status` in older schemas, still read as a
+  fallback), so G1, the "Stop ahead" lead block, the auto-resume creep guard, the merge's lead wait and the RES restore
+  never saw a car.
 * The button frame is appended after `CI.apply()` and only when that frame has no CRZ_BTNS of its own
   (openpilot's CANCEL/RESUME always win). mazda.h lets CRZ_BTNS through while controls are allowed (cruise engaged);
   with the cruise off only CANCEL, and (Stage 3, bit 256 only) RES inside the panda's auto-resume window.

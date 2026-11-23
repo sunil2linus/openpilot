@@ -484,7 +484,9 @@ def gps_sample(g, stamp, now, valid=True):
   lat, lon = num(g.latitude, math.nan), num(g.longitude, math.nan)
   try:
     src = str(g.source)
-  except Exception:
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(None, "gpsLocation.source", e)      # (7.0 has it on both services: tests/test_cereal_fields.py)
     src = ""
   fix = bool(valid and g.hasFix and 0.0 <= now - stamp < GPS_STALE and math.isfinite(lat) and math.isfinite(lon) and
              abs(lat) <= 90.0 and abs(lon) <= 180.0 and not (lat == 0.0 and lon == 0.0))

@@ -305,7 +305,11 @@ def parse_position(raw):
       if not g.hasFix:
         return None
       return _position(g.latitude, g.longitude)
-  except Exception:
+  except AttributeError as e:
+    from openpilot.starpilot.car.mazda.speed.events import schema_miss
+    schema_miss(None, "LastGPSPosition gpsLocation(External).hasFix/latitude/longitude", e)
+    return None
+  except Exception:                # not a capnp Event: the older JSON form
     try:
       g = json.loads(raw)
       return _position(g["latitude"], g["longitude"])

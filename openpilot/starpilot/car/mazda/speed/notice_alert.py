@@ -41,6 +41,11 @@ def make(CP, params):
       return None
     return NoticeReader(sound=cfg.notice_sound)
   except Exception:
+    try:
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.exception("mazda speed notices: off for this drive")
+    except Exception:
+      pass
     return None
 
 
