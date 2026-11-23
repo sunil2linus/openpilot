@@ -39,6 +39,16 @@ def model_path_y(model, warn=None):
   return xs[:n], ys[:n]
 
 
+def model_end_speed(model, warn=None):
+  """The model's planned speed at the end of its path (velocity.x[-1], m/s), or None."""
+  try:
+    vx = list(model.velocity.x)
+  except AttributeError as e:
+    schema_miss(warn, "modelV2.velocity", e)
+    return None
+  return float(vx[-1]) if vx and math.isfinite(vx[-1]) else None
+
+
 def lead_present(lead, warn=None):
   """radarState's LeadData "a lead is present": `present` in 7.0 (`status` in older schemas), or None (neither)."""
   for name in ("present", "status"):
@@ -68,6 +78,11 @@ def radar_lead(radar, warn=None):
     out["prob"] = prob if math.isfinite(prob) else 0.0
   except AttributeError as e:
     schema_miss(warn, "radarState.leadOne.modelProb", e)
+  try:
+    a = float(lead.aLeadK)
+    out["a"] = a if math.isfinite(a) else None
+  except AttributeError as e:
+    schema_miss(warn, "radarState.leadOne.aLeadK", e)
   return out if all(math.isfinite(out[k]) for k in ("v", "vrel", "d")) else None
 
 
@@ -100,6 +115,7 @@ class Sources:
     self.path = None
     self.model_t = -1e9
     self.path_y = None
+    self.path_v = None
     self.lanes = None
     self.slc = None
     self.preview = None
@@ -137,6 +153,7 @@ class Sources:
         model = self.sm["modelV2"]
         self.path = model_path(model, warn=self.warn)
         self.path_y = model_path_y(model, warn=self.warn)
+        self.path_v = model_end_speed(model, warn=self.warn)
         from openpilot.starpilot.car.mazda.speed.exit_plan import model_lanes
         self.lanes = model_lanes(model, warn=self.warn)
         self.model_t = now
@@ -161,7 +178,7 @@ class Sources:
                                self._engageable(self.sm["selfdriveState"]))
     if self.want_view and self.frame % VIEW_EVERY == 1:
       self.view = self.read_view()
-    ctx.update(view=self.view, path=self.path, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
+    ctx.update(view=self.view, path=self.path, path_v=self.path_v, model_new=model_new, model_age=now - self.model_t, bookmark=bookmark,
                path_y=self.path_y, lanes=self.lanes, lead=self.lead, engageable=self.engageable,
                slc=self.slc if self.slc is not None and now - self.slc["t"] <= SLC_STALE else None,
                preview=self.preview if self.preview is not None and now - self.preview["t"] <= SLC_STALE else None,

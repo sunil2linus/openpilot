@@ -175,6 +175,14 @@ warns ("Stopped car ahead" / "Stop ahead"); **the driver brakes**. Test mode com
   model-only guess never drops the set more than 3 mph (the old fork's 53 -> 30 drop with nothing ahead).
   7.0's own stop-light detector (conditional_mode/stop.py) is not used: its host only runs with openpilot
   longitudinal (planner_host.py checks `CP.openpilotLongitudinalControl`), which this car does not have.
+  (Round 2) Above 45 mph the flag also needs the model's planned end speed (velocity.x[-1]) at most 75 % of ours
+  (80 % to stay on); a lead inside the path no longer blocks it when the model plans a stop (end speed <= 4.5 m/s:
+  the car ahead at our speed stops too); no guard taps while the exit plan or a curve explains the short path; a
+  guard within 5 s of the last goes on from it (never more than 3 mph in all). G1 needs only 0.5 confidence within
+  60 m closing by 4 m/s or more, holds its window through a 0.5 s dropout, and takes a stopping car (braking at
+  -1.5 m/s^2 or harder, 1 m/s slower than us, the model planning a stop). Replay (true = the car stops or goes under
+  8 mph within 20 s): r2 2 true / 7 false -> 5 true / 4 false (3 of the 4 slowed to 11-30 mph); r3 1 / 6 -> 1 / 1;
+  0000000c 2 / 0 -> 2 / 0.
 * **Stop sign (G3)**: carstate's `dashboard_stop_sign` (CAM_TRAFFIC_SIGNS STOP_SIGN == 9; its parser runs for Gen1
   and Gen1 + TI) seen within 2 s shortens G2's confirmation to 0.5 s. Never a trigger without a short model path.
   No map stop sign: neither our curve files nor 7.0's `mapdOut` have a stop node (not added).

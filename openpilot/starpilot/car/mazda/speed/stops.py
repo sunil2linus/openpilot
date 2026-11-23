@@ -12,18 +12,28 @@ Triggers (each from 20 mph up; nothing starts in test mode either, it only logs 
     ctx["radar_lead"], which lowers the lead's needed probability but is never required: it is weak on stationary
     cars) that is stopped (LEAD_STOPPED) or much slower than us (LEAD_SLOW_SHARE of our speed), closing by at least
     LEAD_CLOSING, within LEAD_MAX_D, for LEAD_CONFIRM without a break (a distance jump of LEAD_JUMP is another car and
-    starts over; the lead's speed is the HIGHEST of the window: a short window never looks slow).
+    starts over; the lead's speed is the HIGHEST of the window: a short window never looks slow). (Round 2) Within
+    LEAD_NEAR_D and closing by LEAD_NEAR_CLOSING it needs only LEAD_MIN_PROB_NEAR (a stopping car's confidence falls to
+    0.53-0.66 as we close); a lead missing up to LEAD_DROPOUT holds the window; a "stopping car" counts too: braking
+    (the window's mean aLeadK) at LEAD_BRAKING or harder, LEAD_BRAKING_SLOWER slower than us, with the model planning
+    a stop (its end speed at most STOP_END_V): the target is the floor where it will stand.
     Target: reach the lead's speed (the cruise's floor for a stopped car) MARGIN behind it with the planning decel
     after the cruise's lag (cruise_model.envelope); a stopped car within FLOOR_DISTANCE: the floor at once (one hold).
   * G2 "stop ahead": the old fork's stop-light flag, computed here from modelV2 (the old starpilot planner's CEM
     stop_sign_and_light): the model's planned path (position.x[-1]) is shorter than v x the planner time (8 s, x1.2
     from 45 mph, capped at 9 s), on with ON_MARGIN, off with OFF_MARGIN; not above 75 mph, not in a turn at a
-    crawl, not with a lead inside the path (that short path is the lead's: G1's job). Confirmed after SHORT_CONFIRM
-    without a break. Target: the floor at the path's end (STOP_MARGIN before it), the floor at once within
+    crawl, not with a lead inside the path (that short path is the lead's: G1's job) unless the model plans a stop
+    (its end speed velocity.x[-1] at most STOP_END_V: the lead at our speed stops too; r2 rt 416 / 901 had no warning
+    before his brake). Above GUARD_SPEED it also needs the model's end speed at most END_SHARE of ours (the path alone
+    is ~10 s long and dips under 9 s on 3-6 % of the frames at a steady 50 mph: 22 false 1-3 mph guards on r2 / r3).
+    Confirmed after SHORT_CONFIRM without a break. Target: the floor at the path's end (STOP_MARGIN before it), the floor at once within
     FLOOR_DISTANCE.
     Far guess guard: above GUARD_SPEED with the path's end GUARD_FAR or more ahead, the flag (confirmed or not) only
     gives 1 mph guard taps (from GUARD_START, one per GUARD_EVERY, at most GUARD_MAX under the set where it began);
     the full target only once the stop is nearer than GUARD_FAR. A short flag (< GUARD_START) does nothing at all.
+    No guard taps while the exit plan is busy or a map / camera curve or the exit plan wants less than v + CURVE_NEAR
+    (the short path is theirs: no taking turns with them); a guard within GUARD_REARM of the last one goes on from
+    it (its set and its steps: never more than GUARD_MAX under the first one's set, however often the flag flaps).
   * G3 "stop sign": the car camera's dashboard stop sign (carstate dashboard_stop_sign from CAM_TRAFFIC_SIGNS, read
     on this car with or without the TI) seen within SIGN_RECENT shortens G2's confirmation to SIGN_CONFIRM; it is
     never a trigger without a short model path. (Neither our curve files nor 7.0's mapdOut have a stop sign node.)
@@ -56,6 +66,12 @@ LEAD_CLOSING = 3.0            # m/s
 LEAD_MAX_D = 160.0            # m
 LEAD_MIN_PROB = 0.6           # radard's lead (camera) probability ...
 LEAD_MIN_PROB_RADAR = 0.4     # ... with the stock radar's "has lead" bit on
+LEAD_MIN_PROB_NEAR = 0.5      # ... or a lead this close, closing this fast (r2 rt 418-420: a stopping car ahead fell to
+LEAD_NEAR_D = 60.0            # 0.53-0.66 while we closed at 5-6 m/s; following at our speed it is mostly 0.9-1.0)
+LEAD_NEAR_CLOSING = 4.0       # m/s
+LEAD_DROPOUT = 0.5            # s: the lead missing this long (one or two radarState frames) holds the window, no restart
+LEAD_BRAKING = -1.5           # m/s^2 (aLeadK, the window's mean): a lead braking this hard ...
+LEAD_BRAKING_SLOWER = 1.0     # m/s ... and slower than us by this, with the model planning a stop: a stopping car (G1)
 LEAD_CONFIRM = 0.5            # s
 LEAD_JUMP = 20.0              # m: another car
 LEAD_STALE = 0.5              # s
@@ -76,6 +92,10 @@ LEAD_BLOCK = 15.0             # m
 TURN_ANGLE = 45.0             # deg ...
 TURN_SPEED = 15 * MPH         # ... below this: a turn, not a stop
 MODEL_STALE = 0.3             # s
+END_SHARE = 0.75              # above GUARD_SPEED the flag needs the model's end speed at most this share of ours ...
+END_SHARE_OFF = 0.80          # ... (and stays on up to this): the path alone is ~10 s long (median 10.0 s) and
+                              # dips under 9 s on 3-6 % of the frames at a steady 50 mph (r2 / r3: 22 false guards)
+STOP_END_V = 4.5              # m/s: the model's end speed this low is a planned stop (a lead at our speed then stops too)
 SHORT_CONFIRM = 1.0           # s
 SIGN_CONFIRM = 0.5            # s with the dashboard stop sign seen
 SIGN_RECENT = 2.0             # s
@@ -86,6 +106,9 @@ GUARD_FAR = 140.0             # m
 GUARD_START = 0.5             # s of the flag before the first guard tap
 GUARD_EVERY = 0.5             # s per further guard step
 GUARD_MAX = 3                 # dash steps
+GUARD_REARM = 5.0             # s: a new guard this soon after one ended goes on from it (never re-dips from a raised set)
+CURVE_NEAR = 5 * MPH          # m/s: a map / camera curve or the exit plan wanting less than v + this explains a short
+                              # path: no guard taps then (the exit plan or the curve governs; no taking turns with it)
 
 # his inputs / the restore after his RES
 GAS_HELD = 1.0                # s
@@ -128,6 +151,9 @@ class StopSlowdown:
     self.lead_t = 0.0              # s the lead has been a candidate
     self.lead_prev = None          # (t, d) of the last fresh lead frame
     self.lead_v = deque()          # (t, vLead) of the candidate window
+    self.lead_a = deque()          # (t, aLeadK) of the candidate window
+    self.lead_missing = 0.0        # s the lead has been missing (LEAD_DROPOUT)
+    self.lead_stopping = False     # the candidate is a stopping car (braking, the model planning a stop)
     self.lead_gone = 0.0
     self.away_t = 0.0
     # G2
@@ -135,6 +161,7 @@ class StopSlowdown:
     self.short_t = 0.0
     self.long_t = 0.0
     self.path_len = None
+    self.guard_last = None         # (guard_set, guard_t, t) of the last guard that ended (GUARD_REARM)
     self.sign_t = -1e9             # last frame the dashboard showed a stop sign
     self.sign_stamp = None
     # the episode
@@ -156,12 +183,25 @@ class StopSlowdown:
       return None
     return lead
 
+  @staticmethod
+  def _model_stop(ctx):
+    """The model plans a stop: its path's end speed (velocity.x[-1]) at most STOP_END_V on a fresh frame."""
+    ve = ctx.get("path_v")
+    return bool(ve is not None and ctx.get("model_age", 1e9) <= MODEL_STALE and ve <= STOP_END_V)
+
   def _lead_candidate(self, ctx, lead, now, dt, v):
-    """Advance the G1 window. True once the lead has been a stopped / slow closing car for LEAD_CONFIRM."""
+    """Advance the G1 window. True once the lead has been a stopped / slow closing car (or a stopping one: braking,
+    slower than us, the model planning a stop) for LEAD_CONFIRM. A missing lead up to LEAD_DROPOUT holds the window."""
     if lead is None:
+      self.lead_missing += dt
+      if self.lead_missing <= LEAD_DROPOUT + 1e-6 and self.lead_t > 0.0:
+        return self.lead_t >= LEAD_CONFIRM - 1e-6       # one or two missing radarState frames: held, no restart
       self.lead_t, self.lead_prev = 0.0, None
       self.lead_v.clear()
+      self.lead_a.clear()
+      self.lead_stopping = False
       return False
+    self.lead_missing = 0.0
     d, vrel = float(lead["d"]), float(lead.get("vrel", 0.0))
     prev = self.lead_prev
     jump = prev is not None and abs(d - (prev[1] + vrel * max(now - prev[0], 0.0))) > LEAD_JUMP
@@ -169,14 +209,23 @@ class StopSlowdown:
     if jump:
       self.lead_t = 0.0
       self.lead_v.clear()
+      self.lead_a.clear()
     min_prob = LEAD_MIN_PROB_RADAR if ctx.get("radar_lead") else LEAD_MIN_PROB
+    if d <= LEAD_NEAR_D and -vrel >= LEAD_NEAR_CLOSING:
+      min_prob = min(min_prob, LEAD_MIN_PROB_NEAR)    # close and closing fast: a stopping car's confidence drops
     prob = float(lead.get("prob", 1.0))
     self.lead_v.append((now, float(lead["v"])))
-    while self.lead_v and now - self.lead_v[0][0] > LEAD_CONFIRM + 1e-6:
-      self.lead_v.popleft()
+    if lead.get("a") is not None:
+      self.lead_a.append((now, float(lead["a"])))
+    for q in (self.lead_v, self.lead_a):
+      while q and now - q[0][0] > LEAD_CONFIRM + 1e-6:
+        q.popleft()
     v_lead = max(x for _, x in self.lead_v)
     slow = v_lead <= LEAD_STOPPED or v_lead <= LEAD_SLOW_SHARE * v
-    ok = bool(prob >= min_prob and d <= LEAD_MAX_D and slow and -vrel >= LEAD_CLOSING)
+    a_lead = sum(x for _, x in self.lead_a) / len(self.lead_a) if self.lead_a else 0.0
+    stopping = bool(a_lead <= LEAD_BRAKING and -vrel >= LEAD_BRAKING_SLOWER and self._model_stop(ctx))
+    self.lead_stopping = bool(stopping and not (slow and -vrel >= LEAD_CLOSING))
+    ok = bool(prob >= min_prob and d <= LEAD_MAX_D and ((slow and -vrel >= LEAD_CLOSING) or stopping))
     self.lead_t = self.lead_t + dt if ok else 0.0
     return self.lead_t >= LEAD_CONFIRM - 1e-6
 
@@ -194,11 +243,28 @@ class StopSlowdown:
     if v > MAX_SPEED or (abs(ctx.get("angle", 0.0)) >= TURN_ANGLE and v < TURN_SPEED):
       self.short = False
       return length
-    if lead is not None and float(lead["d"]) < length + LEAD_BLOCK:
-      self.short = False           # the short path is the lead's (G1's job)
-      return length
+    if lead is not None and float(lead["d"]) < length + LEAD_BLOCK and not self._model_stop(ctx):
+      self.short = False           # the short path is the lead's (G1's job), unless the model plans a stop: then the
+      return length                # lead at our speed stops too (r2 rt 416 / 901: no warning before his brake)
+    if v > GUARD_SPEED:
+      ve = ctx.get("path_v")
+      if ve is None or ve > (END_SHARE_OFF if self.short else END_SHARE) * v:
+        self.short = False         # a short path with the model's end speed near ours is no stop (false dips)
+        return length
     self.short = length < (thr + OFF_MARGIN if self.short else max(thr - ON_MARGIN, 0.0))
     return length
+
+  @staticmethod
+  def _explained(ctx, v):
+    """A map / camera curve or the exit plan wants less than v + CURVE_NEAR (or the exit plan is busy): the short path
+    is theirs; the far guard does not tap (no taking turns with them)."""
+    if ctx.get("exit_busy"):
+      return True
+    for name in ("map_curve", "camera_curve", "exit"):
+      c = (ctx.get("contribs") or {}).get(name)
+      if c is not None and c.target is not None and c.target < v + CURVE_NEAR:
+        return True
+    return False
 
   def _sign(self, ctx, now):
     raw = ctx.get("stop_sign_raw")
@@ -291,9 +357,10 @@ class StopSlowdown:
       self.declined = False
     quiet = now - self.res_t < RES_QUIET
 
+    explained = self._explained(ctx, v)
     if ep is None and not self.declined and not quiet and ctx.get("cruise_enabled", False) and v >= START_SPEED:
       far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR and not sign
-      guard_due = stop_on and far and self.short_t >= GUARD_START - 1e-6
+      guard_due = stop_on and far and self.short_t >= GUARD_START - 1e-6 and not explained
       if lead_ok or (stop_confirmed and not far) or guard_due:
         ep = self._start(now, set_speed)
 
@@ -303,15 +370,23 @@ class StopSlowdown:
                                         (self.lead_gone >= LOST_RELEASE - 1e-6 and not self.short)):
         ep["lead"] = False
       if (ep["stop"] or ep["guard_set"] is not None) and not self.short and self.long_t >= LONG_RELEASE - 1e-6:
+        if ep["guard_set"] is not None:
+          ep["guard_was"] = ep["guard_set"]
         ep["stop"], ep["guard_set"] = False, None
       if lead_ok:
         ep["lead"] = True
       far = length is not None and v > GUARD_SPEED and length - STOP_MARGIN >= GUARD_FAR and not sign
       if stop_confirmed and not far:
         ep["stop"], ep["guard_set"] = True, None
-      elif stop_on and far and not ep["stop"] and self.short_t >= GUARD_START - 1e-6 and ep["guard_set"] is None:
+      elif (stop_on and far and not ep["stop"] and self.short_t >= GUARD_START - 1e-6 and ep["guard_set"] is None and
+            not explained):
         ep["guard_set"] = set_speed
+        g = self.guard_last
+        if g is not None and now - g[2] <= GUARD_REARM:
+          ep["guard_set"], ep["guard_t"] = g[0], g[1]    # goes on from the last guard: never deeper than its bound
       if not ep["lead"] and not ep["stop"] and ep["guard_set"] is None:
+        if ep.get("guard_was") is not None:
+          self.guard_last = (ep["guard_was"], ep["guard_t"], now)
         self._end("cause gone")
         ep = None
 
@@ -323,7 +398,11 @@ class StopSlowdown:
     if ep["lead"] and lead is not None:
       v_lead = max(x for _, x in self.lead_v) if self.lead_v else float(lead["v"])
       d = float(lead["d"])
-      if v_lead <= LEAD_STOPPED and d <= FLOOR_DISTANCE:
+      a_lead = sum(x for _, x in self.lead_a) / len(self.lead_a) if self.lead_a else 0.0
+      if self.lead_stopping and a_lead < -0.1:
+        stop_d = d + float(lead["v"]) ** 2 / (2.0 * -a_lead)   # where the braking car will stand
+        tl = FLOOR_TRUE if stop_d <= FLOOR_DISTANCE else M.envelope(FLOOR_TRUE, max(stop_d - MARGIN, 0.0), v)
+      elif v_lead <= LEAD_STOPPED and d <= FLOOR_DISTANCE:
         tl = FLOOR_TRUE
       else:
         v_point = max(v_lead if v_lead > LEAD_STOPPED else 0.0, FLOOR_TRUE)

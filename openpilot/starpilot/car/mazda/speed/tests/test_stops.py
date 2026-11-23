@@ -146,11 +146,11 @@ def test_path_long_again_for_one_second_releases():
 
 def test_above_45_mph_and_far_only_guard_taps_then_the_full_target_when_near():
   r, st = rig(set_mph=55)
-  r.step(55, 55, n=300, path=path(200), model_age=0.0)             # 3 s, flagged, 195 m away
+  r.step(55, 55, n=300, path=path(200), path_v=3.0, model_age=0.0)   # 3 s, flagged (a planned stop), 195 m away
   assert r.out.target is None and r.out.reason == "stop"
   assert 55 - 3 - 1e-6 <= cmd_mph(r) <= 54 + 1e-6                  # at most 3 mph of guard taps
   assert "stop_ahead" not in st.active["warned"]
-  r.step(55, n=20, path=path(120), model_age=0.0)                 # near now: the full target
+  r.step(55, n=20, path=path(120), path_v=2.0, model_age=0.0)     # near now: the full target
   assert r.out.target is not None and abs(r.out.target - S.FLOOR_TRUE) < 1e-6
 
 
@@ -369,10 +369,10 @@ def test_a_dashboard_stop_sign_is_not_held_back_by_the_far_guard():
     stamp["n"] += 1
     return (True, stamp["n"])
   r, st = rig(set_mph=55)
-  r.step(55, 55, n=60, path=path(200), model_age=0.0, stop_sign_raw=sign)     # 0.6 s, 195 m away, with the sign
+  r.step(55, 55, n=60, path=path(200), path_v=3.0, model_age=0.0, stop_sign_raw=sign)   # 0.6 s, 195 m, the sign
   assert r.out.reason == "stop" and r.out.target is not None                  # the full target, not guard taps
   r2, st2 = rig(set_mph=55)
-  r2.step(55, 55, n=300, path=path(200), model_age=0.0)                       # no sign: guard taps only (as before)
+  r2.step(55, 55, n=300, path=path(200), path_v=3.0, model_age=0.0)          # no sign: guard taps only (as before)
   assert r2.out.target is None
 
 
@@ -380,3 +380,79 @@ def test_the_guard_ceiling_is_never_below_the_cars_minimum_set():
   r, st = rig(set_mph=19)
   r.step(50, 19, n=400, path=path(200), model_age=0.0, gas=False)
   assert r.out.command is None or r.out.command >= CAR_MIN_SET - 1e-6
+
+
+# ---------------- round 2 (item 7) ----------------
+def test_round2_above_45_a_short_path_needs_the_models_end_speed_low():
+  # (r2 / r3: 22 false 1-3 mph dips) the path ~8.6-9 s long at 50-53 mph with the model ending near our speed: no stop
+  r, st = rig(set_mph=53)
+  r.step(53, 53, n=400, path=path(205), path_v=46 * MPH, model_age=0.0)
+  assert st.active is None and abs(cmd_mph(r) - 53) < 1e-6
+  r.step(53, n=400, path=path(205), path_v=None, model_age=0.0)       # no end speed (schema): no far guard either
+  assert st.active is None
+  r.step(53, n=300, path=path(205), path_v=30 * MPH, model_age=0.0)   # a planned slowdown to 30: the guard taps
+  assert st.active is not None and cmd_mph(r) < 53
+  # at 45 mph and under the end speed is not needed (as before)
+  r, st = rig(set_mph=40)
+  r.step(40, 40, n=150, path=path(120), path_v=None, model_age=0.0)
+  assert st.active is not None and st.active["stop"]
+
+
+def test_round2_a_lead_at_our_speed_does_not_hide_a_stop_the_model_plans():
+  # (r2 rt 416 / 901) the car ahead at our speed 45 m ahead, the model's path 58 m ending at 2 mph: a stop for both
+  r, st = rig(set_mph=30)
+  r.step(23, 30, n=150, path=path(58), path_v=0.9, model_age=0.0, lead=lead(45.0, v=21 * MPH, vrel=-0.5, prob=0.6))
+  assert st.active is not None and st.active["stop"] and r.out.reason == "stop"
+  assert st.notice == "stop_ahead" or "stop_ahead" in st.active["warned"]
+  # the same short path ending at 20 mph behind a car at our speed: the lead's gap (G1's job), nothing
+  r, st = rig(set_mph=30)
+  r.step(23, 30, n=300, path=path(58), path_v=20 * MPH, model_age=0.0, lead=lead(45.0, v=21 * MPH, vrel=-0.5, prob=0.6))
+  assert st.active is None
+
+
+def test_round2_a_close_fast_closing_lead_needs_less_confidence_and_a_dropout_is_held():
+  def flicker(t):          # a stopped car 50 m ahead at 0.55, missing for 0.2 s in the middle of the window
+    if 0.25 < (t % 10.0) < 0.45:
+      return None
+    return {"status": True, "d": 50.0, "v": 0.5, "vrel": -11.0, "prob": 0.55, "t": t}
+  r, st = rig(set_mph=30)
+  r.step(25, 30, n=80, lead=flicker, path=path(300), model_age=0.0)
+  assert st.active is not None and st.active["lead"]
+  # far away (120 m) the same 0.55 is not enough
+  r, st = rig(set_mph=30)
+  r.step(25, 30, n=150, lead=lead(120.0, v=0.5, vrel=-11.0, prob=0.55), path=path(300), model_age=0.0)
+  assert st.active is None
+
+
+def test_round2_a_braking_lead_with_a_planned_stop_is_a_stopping_car():
+  # a car at 18 mph braking at 2 m/s^2, 40 m ahead, we at 25 mph, the model planning a stop: G1 (not blocked)
+  braking = lambda t: {"status": True, "d": 40.0, "v": 8.0, "vrel": -3.2, "prob": 0.9, "a": -2.0, "t": t}  # noqa: E731
+  r, st = rig(set_mph=30)
+  r.step(25, 30, n=80, lead=braking, path=path(60), path_v=1.0, model_age=0.0)
+  assert st.active is not None and st.active["lead"] and r.out.target is not None
+  assert abs(r.out.target - S.FLOOR_TRUE) < 1e-6                     # it stands ~56 m ahead: the floor at once
+  # braking without the model planning a stop (a turn ahead): not a stopping car
+  r, st = rig(set_mph=30)
+  r.step(25, 30, n=150, lead=braking, path=path(200), path_v=9.0, model_age=0.0)
+  assert st.active is None
+
+
+def test_round2_no_guard_taps_while_the_exit_plan_or_a_curve_explains_the_short_path():
+  from openpilot.starpilot.car.mazda.speed.planner import Contribution
+  st = S.StopSlowdown(CFG, presses=True)
+  ramp = Contribution("exit", 50 * MPH, presses=True, episode="x1")
+  r = Rig([lambda ctx: ramp, st])
+  r.step(60, 60, events=[engaged(60)])
+  r.step(58, n=300, path=path(205), path_v=30 * MPH, model_age=0.0, exit_busy=True)
+  assert st.active is None and r.out.reason == "exit"
+
+
+def test_round2_a_guard_soon_after_another_goes_on_from_it_never_deeper_than_3_mph():
+  r, st = rig(set_mph=55)
+  lows = []
+  for _ in range(4):                 # the flag flaps: 2 s on, 2 s off (the planner restores in between)
+    r.step(55, n=200, path=path(200), path_v=30 * MPH, model_age=0.0)
+    lows.append(cmd_mph(r))
+    r.set = r.out.command            # (the set follows the command)
+    r.step(55, n=150, path=path(400), path_v=55 * MPH, model_age=0.0)
+  assert min(lows) >= 55 - 3 - 1e-6, lows

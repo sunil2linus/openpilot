@@ -76,7 +76,7 @@ def radar(present=True, d=42.0, v=3.0, vrel=-9.0, prob=0.8):
 
 def test_radar_lead_reads_7_0s_present():
   out = K.radar_lead(radar())
-  assert out == {"status": True, "v": 3.0, "vrel": -9.0, "d": 42.0, "prob": out["prob"]}
+  assert out == {"status": True, "v": 3.0, "vrel": -9.0, "d": 42.0, "prob": out["prob"], "a": 0.0}
   assert abs(out["prob"] - 0.8) < 1e-6
   assert K.radar_lead(radar(present=False))["status"] is False
   assert "status" not in capnp_log.RadarState.LeadData.schema.fieldnames      # why the old read always failed
@@ -85,7 +85,7 @@ def test_radar_lead_reads_7_0s_present():
 def test_radar_lead_falls_back_to_status_and_reports_a_missing_field_once_per_drive():
   log = Log()
   src = K.Sources(want_model=False, want_view=False, sm=SM({}), read_view=lambda: None, log=log)
-  old = NS(leadOne=NS(status=True, dRel=10.0, vLead=1.0, vRel=-2.0, modelProb=0.9))
+  old = NS(leadOne=NS(status=True, dRel=10.0, vLead=1.0, vRel=-2.0, modelProb=0.9, aLeadK=0.0))
   assert K.radar_lead(old, warn=src.warn)["status"] is True                    # an older schema's name
   assert log.rows == []
   neither = NS(leadOne=NS(dRel=10.0, vLead=1.0, vRel=-2.0, modelProb=0.9))
