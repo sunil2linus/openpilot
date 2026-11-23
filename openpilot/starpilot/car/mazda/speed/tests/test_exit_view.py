@@ -10,7 +10,18 @@ from openpilot.starpilot.car.mazda.speed.tests.test_curve_builder import arc, ra
 from openpilot.starpilot.car.mazda.speed.tests.test_map_view import gps_at
 
 
-def write_scene(root, ways):
+def as_format5(ramp):
+  """A ramp record as a format 5 file has it (no stored joints "j", no to / from heading "h")."""
+  r = {k: v for k, v in ramp.items() if k != "j"}
+  for k in ("to", "from"):
+    if isinstance(r.get(k), dict):
+      r[k] = {kk: vv for kk, vv in r[k].items() if kk != "h"}
+  return r
+
+
+def write_scene(root, ways, fmt=B.FORMAT_VERSION):
+  """The builder's records of `ways` as curve files. fmt 5: as an area not rebuilt yet (no stored joints / headings,
+  no tagged limits: the read-time rules)."""
   chains = B.build_chains(ways)
   nidx = B.node_index(ways)
   curves, ramps, recs = [], [], {}
@@ -25,18 +36,21 @@ def write_scene(root, ways):
       recs[rec["id"]] = rec
   chain_of = {w.id: int(ch[0][0].id) for ch in chains for w, _ in ch}
   shapes = B.road_shapes(ways, chain_of)
+  if fmt == 5:
+    ramps = [as_format5(r) for r in ramps]
+    shapes = {n: [{k: v for k, v in rec.items() if k != "l"} for rec in roads] for n, roads in shapes.items()}
   d = os.path.join(root, "42", "-84")
   os.makedirs(d, exist_ok=True)
   for name, roads in shapes.items():
     B.write_json_atomic(os.path.join(d, name + ".json"), {
-      "version": B.FORMAT_VERSION, "builder": B.BUILDER_VERSION,
+      "version": fmt, "builder": B.BUILDER_VERSION if fmt == B.FORMAT_VERSION else 3,
       "curves": [c for c in curves if B.tile_of(*c["apex"]) == name],
       "ramps": [r for r in ramps if B.tile_of(*r["start"]) == name], "chains": list(recs.values()), "roads": roads})
   return ramps
 
 
-def scene_view(tmp_path, ways=None):
-  ramps = write_scene(str(tmp_path), ways or ramp_scene())
+def scene_view(tmp_path, ways=None, fmt=B.FORMAT_VERSION):
+  ramps = write_scene(str(tmp_path), ways or ramp_scene(), fmt)
   store = MM.MapCurveStore(root=str(tmp_path), background=False)
   return V.MapView(store), ramps
 
@@ -192,13 +206,52 @@ def test_round3_a_street_under_the_ramps_joint_is_no_junction(tmp_path):
   assert mv.links.info(rec)["cuts"] == [] and mv.links.leads(rec)[0]
 
 
-def test_round3_a_junction_node_dropped_by_the_shape_simplification_is_not_seen(tmp_path):
-  # (the known limit) the street's way runs straight through the junction: the 2 m shape simplification drops its
-  # node there, so the junction looks like a bridge and the record holds (the street cap still caps on that street)
-  mv, ramps = scene_view(tmp_path, pass_through_scene(street="straight"))
+def test_a_junction_node_dropped_by_the_shape_simplification_is_found_by_the_builder(tmp_path):
+  # the street's way runs straight through the junction: the 2 m shape simplification drops its node there. Format 6:
+  # the builder found the shared NODE and stored the joint ("j"): cut. Format 5 (an area not rebuilt yet): the
+  # read-time rule cannot see it (the known limit before format 6) and the record holds
+  ways = pass_through_scene(street="straight")
+  mv, ramps = scene_view(tmp_path / "f6", ways)
   rec = next(r for r in ramps if r["chain"] in (31, 32))
+  assert rec["j"] == [[0, 5]]
   drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
-  assert mv.links.info(rec)["cuts"] == []
+  assert mv.links.info(rec)["cuts"] == [(0, 5)] and mv.links.info(rec)["stored"]
+  assert not mv.links.leads(rec)[0]
+  mv, ramps = scene_view(tmp_path / "f5", ways, fmt=5)
+  rec = next(r for r in ramps if r["chain"] in (31, 32))
+  assert "j" not in rec
+  drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  assert mv.links.info(rec)["cuts"] == [] and "stored" not in mv.links.info(rec)
+
+
+def test_format5_files_keep_the_read_time_link_rules(tmp_path):
+  # an area not rebuilt yet: the shapes decide as before (a split street at the joint: cut; a bridge: no cut; the
+  # Michigan left: a turnaround; a long interchange between two named freeways: none)
+  for street, cut in (("split", [5]), ("bridge", [])):
+    mv, ramps = scene_view(tmp_path / street, pass_through_scene(street=street), fmt=5)
+    rec = next(r for r in ramps if r["chain"] in (31, 32))
+    drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+    assert [c for _k, c in mv.links.info(rec)["cuts"]] == cut and "stored" not in mv.links.info(rec)
+  mv, ramps = scene_view(tmp_path / "turn", turnaround_scene(), fmt=5)
+  drive(mv, [(float(x), 0.0, 90.0) for x in range(-300, -100, 3)])
+  rec = next(r for r in ramps if r["chain"] == 42)
+  assert mv.links.info(rec)["turn"] and "stored" not in mv.links.info(rec)
+  lk = V.LinkShapes(mv.store)
+  assert not lk.info(dict(rec, len=260.0, to=dict(rec["to"], name="Fisher Freeway")))["turn"]
+
+
+def test_format6_turnaround_and_highway_from_the_stored_headings(tmp_path):
+  # the builder stored each end road's travel heading ("h", one-way roads at the link's own end): the turnaround
+  # needs no shape search; a two-way end road has no heading (no turnaround, as the read-time rule)
+  ways = turnaround_scene()
+  mv, ramps = scene_view(tmp_path, ways)
+  rec = next(r for r in ramps if r["chain"] == 42)
+  assert abs(rec["from"]["h"] - 90) <= 1 and abs(rec["to"]["h"] - 270) <= 1 and rec["j"] == []
+  drive(mv, [(float(x), 0.0, 90.0) for x in range(-300, -100, 3)])
+  inf = mv.links.info(rec)
+  assert inf["turn"] and inf["stored"] and not mv.links.leads(rec)[0]
+  two_way = dict(rec, to={k: v for k, v in rec["to"].items() if k != "h"})
+  assert not V.LinkShapes(mv.store).info(two_way)["turn"]
 
 
 def test_an_ordinary_exit_and_entrance_keep_their_records(tmp_path):

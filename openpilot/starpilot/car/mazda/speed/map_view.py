@@ -8,6 +8,9 @@ Protocol: VIEW_PATH on tmpfs, one JSON object, replaced atomically (tmp + rename
   {"v": 2, "t": monotonic s of the position (the GPS sample minus GPS_LAG), "gps": "ok" | "none" (no GPS position),
    "trust": GpsTrust status (0 ok ...), "start_ok": bool, "held": bool, "matched": bool, "cls": road class,
    "link": bool, "data": bool (curve files cover here), "chain": matched road (chain id, 0 none), "acc": GPS error m,
+   "lim": m/s, the matched way's TAGGED speed limit for the direction of travel (format 6 files; only with trust 0 and
+          a match; on a link only when the link itself is tagged; never a class default; absent: unknown),
+   "limu": "mph" | "kmh" the tag's own unit (with "lim"),
    "src": the GPS service used ("gpsLocation" qcomgpsd / "gpsLocationExternal" ubloxd), "why": with "gps": "none",
           why there is no position (status.GPS_NO_MESSAGES / GPS_NO_FIX / GPS_STALE),
    "curves": [{"id", "pts": [[d, r], ...], "ramp", "adv", "len"}],
@@ -51,6 +54,7 @@ from openpilot.starpilot.car.mazda.speed.curve_memory import way_place
 from openpilot.starpilot.car.mazda.speed.view_age import GPS_LAG, VIEW_ALIVE
 
 VIEW_PATH = "/dev/shm/mazda_speed_view.json"
+MPH = 0.44704
 VIEW_VERSION = 2
 # GPS_LAG (view_age.py): the position is this old when it arrives (0.7-1.0 s measured)
 GPS_STALE = VIEW_ALIVE        # s without a new fix: "none" (as long as a reader keeps a view alive: one missed 1 Hz fix)
@@ -346,7 +350,10 @@ def _heading(p, q):
 
 
 class LinkShapes:
-  """Where a link (ramp chain) really leads, from the road shapes the curve files already carry (cached per ramp):
+  """Where a link (ramp chain) really leads (cached per ramp). A format 6 ramp record carries what the builder found by
+  shared NODES ("j": the joints with a street; "to" / "from" "h": the one-way road's travel heading at the link's end):
+  then those are used and no shape is searched. A format 5 record (an area not rebuilt yet): the read-time rules from
+  the road shapes the curve files carry, below.
 
   * `cuts`: the joints between the link's ways (in travel order) where a street (STREET_CLASSES) has a shape point
     within JUNCTION_VERTEX: the link meets that street there (an at-grade junction shares a node with both ways; round
@@ -471,10 +478,38 @@ class LinkShapes:
     self.cache[cid] = out
     return out
 
+  def _stored(self, r, ch):
+    """The format 6 answer from the record alone (builder: shared nodes), or None (a format 5 record)."""
+    joints = r.get("j")
+    if not isinstance(joints, list):
+      return None
+    n = len(ch["w"])
+    cuts = [(int(k), int(c)) for k, c in joints if 0 <= int(k) < n - 1 and int(c) in STREET_CLASSES]
+    to, frm = r.get("to") or {}, r.get("from") or {}
+    length = float(r.get("len", 0.0) or 0.0)
+    same_road = bool(to.get("name")) and to.get("name") == frm.get("name")
+    short = length <= (TURNAROUND_SAME_LEN if same_road else TURNAROUND_LEN)
+    turn = False
+    if short and to.get("cls") and to.get("cls") == frm.get("cls") and "h" in to and "h" in frm:
+      turn = abs((float(to["h"]) - float(frm["h"]) + 180.0) % 360.0 - 180.0) > TURNAROUND_DEG
+    return {"cuts": cuts, "turn": bool(turn), "cut_s": self._cut_s(r, ch, cuts), "stored": True}
+
+  @staticmethod
+  def _cut_s(r, ch, cuts):
+    if not cuts:
+      return None
+    s0 = [float(s) for _w, _f, s in ch["w"]]
+    js = [s0[k + 1] for k, _c in cuts]
+    length = float(ch.get("len", 0.0) or 0.0)
+    return min(js) if r.get("travel") != "ba" else length - max(js)
+
   def _info(self, r):
     ch = self.store.chains.get(r.get("chain"))
     if ch is None or not r.get("start") or not r.get("end") or r.get("travel") == "both":
       return None
+    stored = self._stored(r, ch)
+    if stored is not None:
+      return stored
     wids = [int(w) for w, _f, _s in ch["w"]]
     (la0, lo0), (la1, lo1) = r["start"], r["end"]
     n = max(1, int(float(r.get("len", 0.0) or 0.0) / SHAPE_SEARCH) + 1)
@@ -504,13 +539,7 @@ class LinkShapes:
       c0 = self._carriageway(travel[0], int(frm["cls"]), set(wids))
       c1 = self._carriageway(travel[-1], int(to["cls"]), set(wids))
       turn = bool(c0 is not None and c1 is not None and abs((c1 - c0 + 180.0) % 360.0 - 180.0) > TURNAROUND_DEG)
-    cut_s = None
-    if cuts:
-      s0 = [float(s) for _w, _f, s in ch["w"]]
-      js = [s0[k + 1] for k, _c in cuts]
-      length = float(ch.get("len", 0.0) or 0.0)
-      cut_s = min(js) if increasing else length - max(js)
-    return {"cuts": cuts, "turn": turn, "cut_s": cut_s}
+    return {"cuts": cuts, "turn": turn, "cut_s": self._cut_s(r, ch, cuts)}
 
   def leads(self, r, way_index=None):
     """(to a highway, m/s of the road it leads to, from a highway, turnaround, the street class it meets ahead (0 none))
@@ -721,6 +750,10 @@ class MapView:
     view.update(gps="ok", trust=self.trust.status, matched=matched, cls=self.matcher.road_class,
                 link=bool(self.matcher.on_link), data=data, chain=int(self.matcher.chain_id) if matched else 0,
                 acc=round(acc, 1))
+    if matched and self.trust.status == MM.TRUST_OK:
+      code = self.store.way_limit(way_id, fwd)       # the way's own tag (a link: only its own; untagged: none)
+      if code:
+        view["lim"], view["limu"] = round(code * MPH if code > 0 else -code / 3.6, 4), ("mph" if code > 0 else "kmh")
     ramp = self.store.ramps.get(self.matcher.chain_id) if matched and self.matcher.on_link else None
     if ramp is not None:
       hit = self.store.way_chain.get(way_id)
