@@ -115,3 +115,66 @@ def test_the_view_is_small(tmp_path):
   v = drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -10, 3)])[-1]
   assert len(json.dumps(v, separators=(",", ":"))) < 4096
   assert V.VIEW_VERSION == 2
+
+
+def pass_through_scene():
+  """(r2, M-53 at 23 Mile Rd) a motorway north; its exit ramp (no name) leaves at y = 0 heading 20 deg right, meets a
+  primary street running east-west at one node, and runs straight on across it as the on-ramp back to the motorway:
+  the builder joins both ramp ways into ONE chain whose record says motorway to motorway."""
+  import math
+  mw = way(30, straight(0, -500, 0, 2000), name="", cls=1, speed_mph=70)
+  mw.ref = "M 53"
+  h = math.radians(20)
+  a_pts = [(math.sin(h) * s, math.cos(h) * s) for s in range(0, 201, 20)]
+  jx, jy = a_pts[-1]
+  b_pts = [(jx - math.sin(h) * s, jy + math.cos(h) * s) for s in range(0, 201, 20)]
+  ex = way(31, a_pts, name="", cls=2, speed_mph=45, oneway=True)
+  on = way(32, b_pts, name="", cls=2, speed_mph=45, oneway=True)
+  st_pts = [(jx + d, jy) for d in range(-300, 301, 20)]
+  st = way(33, st_pts, name="23 Mile Road", cls=5, speed_mph=45)
+  # shared nodes: the exit's start on the motorway, the joint on the street, the on-ramp's end on the motorway
+  k0 = 25
+  ex.lat[0], ex.lon[0] = mw.lat[k0], mw.lon[k0]
+  ex.start = B.key(mw.lat[k0], mw.lon[k0])
+  j = st_pts.index((jx + 0, jy))
+  on.lat[0], on.lon[0] = ex.lat[-1], ex.lon[-1]
+  st.lat[j], st.lon[j] = ex.lat[-1], ex.lon[-1]
+  on.start = ex.end
+  k1 = min(range(len(mw.lat)), key=lambda k: abs(mw.lat[k] - on.lat[-1]))
+  on.lat[-1], on.lon[-1] = mw.lat[k1], mw.lon[k1]
+  on.end = B.key(mw.lat[k1], mw.lon[k1])
+  return {w.id: w for w in (mw, ex, on, st)}
+
+
+def test_an_exit_whose_chain_runs_on_across_a_street_leads_to_that_street(tmp_path):
+  import math
+  ways = pass_through_scene()
+  mv, ramps = scene_view(tmp_path, ways)
+  rec = next(r for r in ramps if r["chain"] in (31, 32))
+  assert rec["to"]["cls"] == 1 and rec["from"]["cls"] == 1 and len(rec["wdir"]) == 2   # (the record as built)
+  views = drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  info = mv.links.info(rec)
+  assert [c for _k, c in info["cuts"]] == [5] and 190 < info["cut_s"] < 210
+  # on the motorway before the split: the exit leads to the street (no "to highway"), its profile ends there
+  ex = views[-1]["exits"][0]
+  assert not ex["hwy"] and abs(ex["spd"] - V.STREET_SPEED_MPH[5] * B.MPH) < 0.1
+  assert all(d <= ex["d"] + info["cut_s"] + 1 for d, _r in ex["pts"])
+  # on the exit half of the link: to the street; on the on-ramp half past the street: to the motorway, from a street
+  h = math.radians(20)
+  pts = [(math.sin(h) * s, math.cos(h) * s, 20.0) for s in range(20, 180, 3)]
+  v = drive(mv, pts)[-1]
+  assert v["link"] and v["ramp"]["street"] == 5 and not v["ramp"]["hwy"] and v["ramp"]["from_hwy"]
+  jx, jy = math.sin(h) * 200, math.cos(h) * 200
+  pts = [(jx - math.sin(h) * s, jy + math.cos(h) * s, 340.0) for s in range(20, 180, 3)]
+  mv, _ = scene_view(tmp_path / "b", ways)
+  v = drive(mv, pts)[-1]
+  assert v["link"] and v["ramp"]["hwy"] and not v["ramp"]["from_hwy"] and "street" not in v["ramp"]
+
+
+def test_an_ordinary_exit_and_entrance_keep_their_records(tmp_path):
+  mv, ramps = scene_view(tmp_path)
+  drive(mv, [(0.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  for r in ramps:
+    assert mv.links.info(r)["cuts"] == []
+  ent = next(r for r in ramps if r["type"] == "entrance")
+  assert mv.links.leads(ent)[0] is True

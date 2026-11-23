@@ -38,9 +38,11 @@ units, whole steps, no margin: Contribution.anchor); the planner takes it only b
   * "merge": up from an anchor that is ours, a street's (MERGE_SURFACE_MAX), or his curve speed on that link (the
     proposal's band: his SET- in a ramp curve); down (the taper, the end) only from our merge anchor;
   * "handover" (exit onto a street): only down, any owner (the contributor ends it for good on his gas / buttons);
+  * "street" (street_cap.py: a highway's speed carried onto a street): only down, any owner; our street anchor (this
+    or a handover) is raised by a "limit" proposal only for a limit that became steady after it (its seq);
   * "restore" (a handover overturned: the exit was not taken): only up, only from our handover anchor;
   * never in a frame with his own change (his buttons win), never with the cruise off.
-The first proposal in the order handover, merge, limit, fallback that passes is taken.
+The first proposal in the order restore, handover, street, merge, limit, fallback that passes is taken.
 
 A contributor may also give a CEILING (dash units, Contribution.ceiling) instead of, or with, a target: the command
 never goes above it while it governs. The stop slowdown uses it for its 1 mph guard taps (a ceiling one step under
@@ -57,7 +59,7 @@ SET_MINUS = "SET_MINUS"
 
 
 HIS, ENGAGED, OURS = "his", "engaged", "ours"
-KINDS = ("restore", "handover", "merge", "limit", "fallback")
+KINDS = ("restore", "handover", "street", "merge", "limit", "fallback")
 MERGE_SURFACE_MAX = (55 * M.MPH, 90 * M.KPH)   # an anchor at or under this is a street's: a merge may raise it
 
 
@@ -112,6 +114,7 @@ class Planner:
     self.owner = None               # HIS / ENGAGED / OURS (None: no anchor)
     self.ours_why = ""              # the rule that made it ours
     self.own_seq = 0                # the limit seq when the anchor last became the driver's (engaged / his)
+    self.ours_seq = 0               # the limit seq when the anchor last became ours by another rule
 
   def _set_anchor(self, value, why):
     if self.anchor is None or abs(value - self.anchor) >= 0.5 * self.step:
@@ -137,7 +140,7 @@ class Planner:
     a, half = self.anchor, 0.5 * self.step
     if c.anchor is None or abs(c.anchor - a) < half:
       return False
-    if c.kind == "handover":
+    if c.kind in ("handover", "street"):
       return c.anchor < a
     if c.kind == "restore":
       return c.anchor > a and self.owner == OURS and self.ours_why == "handover"
@@ -148,7 +151,9 @@ class Planner:
       return self.owner == OURS and self.ours_why == "merge"
     if c.kind == "limit":
       if self.owner == OURS:
-        return True
+        # our street speed (the exit handover, the street cap) is raised only by a limit that became steady after it
+        # (not by the highway's old limit still kept through a gap of readings on the street)
+        return not (c.anchor > a and self.ours_why in ("handover", "street") and c.seq <= self.ours_seq)
       in_band = c.band is not None and c.band[0] - half <= a <= c.band[1] + half
       if self.owner == ENGAGED and in_band:
         return True
@@ -238,6 +243,8 @@ class Planner:
       prop = self._proposals(i.contributions, dry=False, slowing=bool(anchor_wish))
       if prop is not None:
         self._set_anchor(prop.anchor, prop.kind)
+        if not (self.owner == OURS and self.ours_why == prop.kind):
+          self.ours_seq = seq
         self.owner, self.ours_why = OURS, prop.kind
       dry_prop = self._proposals(i.contributions, dry=True, slowing=bool(anchor_wish))
       if dry_prop is not None:

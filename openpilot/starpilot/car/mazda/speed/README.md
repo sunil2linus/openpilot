@@ -34,6 +34,7 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
 | `notice_alert.py` | (h) selfdrived side: reads the notice file at <= 10 Hz, one low-priority Alert per new notice | new |
 | `tag_tool.py` | (t) `list` / `pack` the Bookmark tags of the event log | new |
 | `auto_resume.py` | (Stage 3) gas auto-resume after a brake cancel: the old fork's logic + the map view adapter | ported |
+| `street_cap.py` | (round 2) a highway's speed carried onto a street is capped (the old fork's "exit street") | ported rules |
 
 ## Part (f): speed limit, merge, exits (each off / test / on; test computes and logs, never presses)
 
@@ -403,3 +404,33 @@ within max_torque; it no longer touches the limiter.
 The panda window on the bus (the fall comes with BRAKE_ON in the same CRZ_CTRL frame; the 16 logged brake cancels of
 the old fork say yes), RES accepted from standby at 7.0's card timing, openpilot engaging on our RES with the gas down,
 the 700 limit without TI / EPS faults.
+
+## Round 2 (drives r2 / r3 of 2026-11-22)
+
+### Where a link really leads (map_view.LinkShapes, read time: no curve map rebuild)
+
+The builder joins link ways of the same class without a name into one chain, straight through a junction with a
+street. At M-53 / 23 Mile Rd the exit ramp and the on-ramp across the street are ONE chain (4 ways, 1.1 km) whose
+record says "motorway to motorway": no exit handover, the merge armed toward 70 on the exit, and his 70 stayed the
+anchor on 23 Mile Rd. The map view now reads the road shapes already in the files: a joint between two of the link's
+ways with a street shape (class 5-12) within 3 m is a junction. Before it the link leads to that street (the view's
+ramp: `hwy` false, `spd` the street class's default speed, `street` its class; an exit ahead likewise, its profile ends
+at the junction); past it the link comes from that street (`from_hwy` false) and its record holds again (the on-ramp
+merges). Home area (folder 42/-84): 119 interchange, 25 entrance, 33 exit and 33 other links have such a junction.
+The builder itself is unchanged (no version bump, no rebuild).
+
+### The street cap (street_cap.py, kind "street")
+
+A safety net that does not need the ramp marking (the old fork's "exit to a street, completed" + its street
+speed): after a motorway, or a link entered from a highway (50 m on it), a street matched with GPS trust 0 for 2 s
+(class 5-12, or a trunk road whose posted limit is known and below 55) opens a 60 s window. Its cap is the street's
+limit + the offset (unchanged 2 s), or 43 mph with no limit (2 s), no cap for a limit above 55. Once per street, with
+the car under 55 mph and the anchor above the cap, the anchor is proposed down, never more than 2.4 m/s under the
+car's dash speed (the old pacing), until the planner has it. The planner takes "street" only down, from any owner;
+the anchor is then ours ("Street - set to NN"). His SET+ / SET- is his speed again (not capped again on that street);
+after his brake and RES it goes on (old rule). While it is open on a street the merge drops a pending raise, and a
+limit raise takes our street anchor (or a handover's) only for a limit that became steady after it (the highway's
+old limit kept through a gap of readings never raises it back). Differences from the old fork: trunk roads count only
+with a known limit under 55 (the old fork never treated a trunk as a street); a street must come within 1 km after
+the highway / link (the old fork waited without a bound); the pacing is an anchor floor (the old fork pressed SET-
+taps or one hold itself).

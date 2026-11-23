@@ -32,7 +32,8 @@ Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), wi
     STALE_KEEP / STALE_KEEP_M; it starts over only on another link or after really leaving (the highway HWY_KEEP,
     a street STREET_END, or a longer gap). A one-shot anchor (the end at T, a boost dropped to T, the way down at a
     street) is proposed again until the planner has it (PENDING_MAX), so his change in that frame cannot lose it;
-    anchors are whole dash steps (down). His SET+ / RES / SET: decided again from his speed
+    anchors are whole dash steps (down); dropped while the street cap is open on a street (street_cap.py). His SET+ /
+    RES / SET: decided again from his speed
     (the planner raises only a street's speed, not his own highway speed).
 Pure (tests/test_merge.py).
 """
@@ -136,6 +137,8 @@ class Merge:
     return out
 
   def _pending(self, out, ctx, now):
+    if ctx.get("street_cap"):
+      self.pending = None            # the street cap is taking a highway's speed off a street: no raise toward it
     if self.pending is None:
       return out
     value, until = self.pending

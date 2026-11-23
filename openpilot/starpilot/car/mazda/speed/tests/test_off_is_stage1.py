@@ -122,7 +122,8 @@ def test_the_part_f_options_without_a_map_or_a_limit_never_press(doc, tmp_path, 
     want = {"speed_limit": "SpeedLimit", "merge": "Merge", "exits": "ExitPlan", "curves": "CurvePlan",
             "stops": "StopSlowdown"}
     assert card.mazda_speed.notices is None          # notices off: nothing decides or writes a notice
-    assert names == {want[k] for k in doc} | ({"CurvePlan"} if "merge" in doc else set())
+    street = {"StreetCap"} if ("speed_limit" in doc or "exits" in doc) else set()   # (round 2: the street cap)
+    assert names == {want[k] for k in doc} | ({"CurvePlan"} if "merge" in doc else set()) | street
     for c in card.mazda_speed.contributors:
       if type(c).__name__ == "CurvePlan" and "curves" not in doc:
         assert c.presses is False             # the merge's curve guard only: never pressed for

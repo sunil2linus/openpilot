@@ -2,8 +2,8 @@
 
 Each contributor is a callable(ctx) -> planner.Contribution or None, run in this order (a later one may read an
 earlier one's contribution in ctx["contribs"] and its "busy" flag): the map curve profile (curves), the camera-only
-curve (camera_curves), the exit plan (exits), the merge (merge), the speed limit (speed_limit), the stop slowdown
-(stops). Test mode builds them with presses=False: computed and logged, never commanded / never taken as an anchor.
+curve (camera_curves), the exit plan (exits), the street cap (street_cap.py: with speed_limit or exits), the merge
+(merge), the speed limit (speed_limit), the stop slowdown (stops). Test mode builds them with presses=False: computed and logged, never commanded / never taken as an anchor.
 With the limit follow it also keeps mapdOut's own limit on a "possible" fix (ctx["slc_possible"], limits.map_possible):
 the first fix of a new match, when slcState is not "valid" yet.
 The private SubMaster also reads userBookmark (the onroad Bookmark button, for the speed control's tag line; only
@@ -210,6 +210,10 @@ def build(cfg, CP, log=None, memory=None, metric=False, auto_resume=False):
   if cfg.active("exits"):
     from openpilot.starpilot.car.mazda.speed.exit_plan import ExitPlan
     out.append(ExitPlan(cfg, presses=cfg.presses("exits"), metric=metric))
+  if cfg.active("speed_limit") or cfg.active("exits"):
+    from openpilot.starpilot.car.mazda.speed.street_cap import StreetCap
+    out.append(StreetCap(cfg, presses=cfg.presses("speed_limit") if cfg.active("speed_limit") else cfg.presses("exits"),
+                         metric=metric))
   if cfg.active("merge"):
     from openpilot.starpilot.car.mazda.speed.merge import Merge
     out.append(Merge(cfg, presses=cfg.presses("merge"), metric=metric))

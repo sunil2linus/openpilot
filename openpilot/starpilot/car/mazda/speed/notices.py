@@ -19,6 +19,7 @@ The texts (plain, short; old fork wording where it had one):
   "Exit ramp - brake for the curve"              the exit plan cannot reach the ramp's speed inside its bound
   "Stop ahead" / "Stopped car ahead"             the stop slowdown (stops.py), "Cruise may not stop, brake"
   "Speed limit NN - set to NN"                   the limit rule changes OUR set (no sound)
+  "Street - set to NN"                           the street cap lowers a highway's speed on a street (street_cap.py)
   "Merging - set speed high"                     the merge boost starts (once per ramp)
   "Mazda speed control: no GPS position"         once per drive
   "Curve maps not built here"                    once per drive (the view has no curve files for the area)
@@ -58,6 +59,7 @@ TEXTS = {
   "stopped_car": ("Stopped car ahead", "Cruise may not stop, brake"),
   "limit": ("Speed limit {n} - set to {m}", ""),
   "limit_unknown": ("Speed limit unknown - set to {m}", ""),
+  "street": ("Street - set to {m}", ""),
   "merge": ("Merging - set speed high", ""),
   "no_gps": ("Mazda speed control: no GPS position", ""),
   "no_data": ("Curve maps not built here", ""),
@@ -279,6 +281,10 @@ class Notices:
         lim = getattr(by_name.get("SpeedLimit"), "steady", None)
         if lim is not None:
           self.fire("limit", now, n=int(lim), m=self._n(after))   # each real change (changes only holds those)
+      elif why == "street":
+        sc = by_name.get("StreetCap")
+        if sc is not None and sc.cap_to is not None:
+          self.fire("street", now, key=f"street:{sc.n}", m=int(sc.cap_to))   # once per cap (its paced steps too)
       elif why == "fallback":
         self.fire("limit_unknown", now, key=f"fallback:{self._n(after)}", m=self._n(after))
       elif why == "merge" and before is not None and after > before:
