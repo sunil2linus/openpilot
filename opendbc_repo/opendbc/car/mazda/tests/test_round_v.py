@@ -159,3 +159,58 @@ def test_v1_navigation_and_the_on_ramp_search_see_the_exit_to_the_street():
   assert not MC.ramp_to_highway(m.nav_ramp)
   # an ordinary on-ramp record still leads to the highway
   assert MC.ramp_to_highway({"to": {"cls": 1}}) and not MC.ramp_to_highway({"to": {"cls": 7}})
+
+
+# ---- V2: a turnaround (a Michigan left on Hall Rd) and a link to a trunk road under 55 are no on-ramps ----
+
+def turnaround_scene(gap=30.0, cls=3, link_cls=4, speed=50, name2="Hall Road", long_link=False):
+  """A divided road (one-way carriageways, northbound at x 0, southbound at x -gap); a link leaves the northbound one,
+  goes 20 m on, turns around (radius gap / 2) and joins the southbound one. long_link: 600 m on before turning."""
+  nb = G.way(50, G.straight(0, -600, 0, 1200), name="Hall Road", cls=cls, speed_mph=speed, oneway=True)
+  sb = G.way(51, G.straight(-gap, 600, 180, 1200), name=name2, cls=cls, speed_mph=speed, oneway=True)
+  run = 600.0 if long_link else 20.0
+  pts = G.straight(0, 0, 0, run) + G.arc(-gap / 2, run, gap / 2, 0, 180)[1:] + G.straight(-gap, run, 180, run)[1:]
+  ln = G.way(52, pts, name="", cls=link_cls, speed_mph=45, oneway=True)
+  _set_node(ln, 0, nb, 30)                       # nb's node at y 0
+  _set_node(ln, len(ln.lat) - 1, sb, 30)         # sb's node at y 0
+  return {w.id: w for w in (nb, sb, ln)}
+
+
+def test_v2_a_michigan_left_is_a_turnaround_not_an_on_ramp():
+  root, curves, ramps = _write(turnaround_scene())
+  r = [x for x in ramps if x["wdir"][0][0] == 52][0]
+  assert r["type"] == "interchange" and r["to"]["cls"] == 3          # as built: "to the trunk road"
+  m = TM.planner(root)
+  _on(m, 52, 10.0, heading=0.0)
+  assert m.on_ramp and m.ramp.get("turn") and not MC.ramp_to_highway(m.ramp)
+  # its curve is kept while driven (before, as a ramp to a highway it was let go RAMP_HWY_RELEASE before the link's end)
+  c = [x for x in curves if x["chain"] == r["chain"]]
+  assert c
+  la, lo = TM.pos(0, 19)
+  for _ in range(3):
+    m.update(la, lo, 0.0, 52, True, gps={"dt": 0.05, "v_ego": 5.0})
+  ax, ay = -15.0 + 15.0 * math.cos(math.radians(60)), 20.0 + 15.0 * math.sin(math.radians(60))
+  la, lo = TM.pos(ax, ay)
+  m.update(la, lo, 330.0, 52, True, gps={"dt": 0.05, "v_ego": 5.0})
+  assert m.curve is not None and m.status == MC.STATUS_RAMP_CURVE
+
+
+def test_v2_the_turnaround_rule_negatives():
+  # a long link joining two motorways running opposite ways (a freeway interchange, 600 m on before it turns): no turnaround
+  root, _, ramps = _write(turnaround_scene(gap=200.0, cls=1, link_cls=2, speed=70, name2="M 59", long_link=True))
+  m = _on(TM.planner(root), 52, 10.0, heading=0.0)
+  assert m.on_ramp and not m.ramp.get("turn") and MC.ramp_to_highway(m.ramp)
+  # the same short link between two-way roads (no carriageways): no turnaround
+  ways = turnaround_scene()
+  for w in (50, 51):
+    ways[w].oneway = False
+  root, _, _ = _write(ways)
+  m = _on(TM.planner(root), 52, 10.0, heading=0.0)
+  assert not m.ramp.get("turn")
+
+
+def test_v2_a_trunk_road_under_55_is_no_highway_for_a_link():
+  assert not MC.ramp_to_highway({"to": {"cls": 3, "speed": 50 * MC.MPH}})
+  assert MC.ramp_to_highway({"to": {"cls": 3, "speed": 55 * MC.MPH}})
+  assert MC.ramp_to_highway({"to": {"cls": 3, "speed": 65 * MC.MPH}})   # (an untagged trunk: the builder's 65)
+  assert MC.ramp_to_highway({"to": {"cls": 1, "speed": 45 * MC.MPH}})   # a motorway is one whatever its speed

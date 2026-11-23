@@ -1071,17 +1071,33 @@ class MapCurveStore:
 STREET_CLASSES = (5, 7, 9, 11, 12)    # primary .. residential (no links, no motorway / trunk)
 STREET_SPEED_MPH = {5: 50, 7: 45, 9: 45, 11: 40, 12: 25}
 JUNCTION_VERTEX = 1.0      # m
+# Round V, V2 (7.0 drive r2 rt 1085-1170, a Michigan left on Hall Rd, way 1214344938: "interchange", to the trunk road): a
+# link is no link to a highway (mapRampToHighway: the merge, the fast restore, its curve let go RAMP_HWY_RELEASE before the
+# end) when it ends on a trunk road whose map speed is under HWY_TRUNK_MIN (Hall Rd's 50), or when it is a turnaround: it
+# starts and ends on one-way roads of the same class whose directions of travel there are more than TURNAROUND_DEG apart
+# (the two carriageways of one road; the link itself may turn only ~45 deg), and it is at most TURNAROUND_LEN long, or
+# TURNAROUND_SAME_LEN with the same road name at both ends. Home area (old files): 3042 links start and end more than 120
+# deg apart; 3032 are at most 250 m (Michigan lefts), two more are 268 / 336 m with the same road at both ends (Fort St,
+# County Road 22); the other 8 are 396-2851 m freeway interchanges (e.g. 739 m, 396 m, I-275 to I-275 1470 m) and an
+# unnamed 420 m trunk interchange: no turnarounds (the 7.0 port's rule).
+HWY_TRUNK_MIN = 55 * MPH   # m/s
+TURNAROUND_DEG = 120.0     # deg
+TURNAROUND_LEN = 250.0     # m
+TURNAROUND_SAME_LEN = 400.0  # m
+CARRIAGEWAY_NEAR = 3.0     # m: the one-way road whose shape passes this close to the link's start / end
 WALK_MAX = 5000            # shape points walked along one chain at most
 
 
 def ramp_to_highway(r):
-  """The link of ramp record r leads to a highway (a motorway or a trunk road; LinkShapes.view's "hwy" when it has one:
-  the link meets a street first)."""
+  """The link of ramp record r leads to a highway: a motorway, or (V2) a trunk road with a map speed of HWY_TRUNK_MIN or
+  more (LinkShapes.view's "hwy" when it has one: the link meets a street first, or it is a turnaround)."""
   if r is None:
     return False
   if "hwy" in r:
     return bool(r["hwy"])
-  return (r.get("to") or {}).get("cls") in HIGHWAY_CLASSES
+  to = r.get("to") or {}
+  cls = to.get("cls")
+  return cls == 1 or (cls == 3 and float(to.get("speed", 0.0) or 0.0) >= HWY_TRUNK_MIN - 0.05)
 
 
 def _xy_at(lat0, lon0):
@@ -1091,7 +1107,7 @@ def _xy_at(lat0, lon0):
 
 
 class LinkShapes:
-  """Where a link really leads (V1: the streets it meets at shared vertices), from the loaded road
+  """Where a link really leads (V1: the streets it meets, V2: a turnaround), from the ramp records and the loaded road
   shapes, cached per ramp chain (and per loaded set of squares). Never raises: a link whose shapes are not loaded gives
   nothing (the record as built)."""
 
@@ -1171,15 +1187,52 @@ class LinkShapes:
               return cls
     return 0
 
+  def carriageway(self, pt, cls, exclude):
+    """(V2) Travel heading (deg) of the one-way road of class `cls` whose shape passes within CARRIAGEWAY_NEAR of point
+    pt (lat, lon), or None (none, or the nearest one two-way)."""
+    to_xy = _xy_at(pt[0], pt[1])
+    p = (int(round(pt[0] * 1e6)), int(round(pt[1] * 1e6)))
+    best = None
+    for ri in self.store.grid:
+      for cell in self._cells(p):
+        for i in ri.cells.get(cell, ()):
+          if int(ri.cls[i]) != cls or int(ri.way[i]) in exclude:
+            continue
+          ax, ay = to_xy(ri.lat1[i] / 1e6, ri.lon1[i] / 1e6)
+          bx, by = to_xy(ri.lat2[i] / 1e6, ri.lon2[i] / 1e6)
+          dx, dy = bx - ax, by - ay
+          ll = dx * dx + dy * dy
+          if ll < 1e-6:
+            continue
+          t = max(0.0, min(1.0, -(ax * dx + ay * dy) / ll))
+          d = math.hypot(ax + t * dx, ay + t * dy)
+          if d <= CARRIAGEWAY_NEAR and (best is None or d < best[0]):
+            best = (d, bool(ri.oneway[i]), math.degrees(math.atan2(dx, dy)) % 360.0)
+    return best[2] if best is not None and best[1] else None
+
+  def turnaround(self, r, ids):
+    """(V2) Ramp record r is a turnaround (see TURNAROUND_*)."""
+    to, frm = r.get("to") or {}, r.get("from") or {}
+    if not to.get("cls") or to.get("cls") != frm.get("cls") or not self.store.grid:
+      return False
+    length = float(r.get("len", 0.0) or 0.0)
+    same = bool(to.get("name")) and to.get("name") == frm.get("name")
+    if length > (TURNAROUND_SAME_LEN if same else TURNAROUND_LEN):
+      return False
+    c0 = self.carriageway(r["start"], int(frm["cls"]), ids)
+    c1 = self.carriageway(r["end"], int(to["cls"]), ids)
+    return bool(c0 is not None and c1 is not None and abs((c1 - c0 + 180.0) % 360.0 - 180.0) > TURNAROUND_DEG)
+
   def info(self, r):
     """{"cuts": [(chain index k of the way before the joint, street class, (lat, lon) of the joint, s m along the chain,
-    street speed m/s)]} of ramp record r (cached): the builder's (builder 2) or found in the shapes (older files)."""
+    street speed m/s)], "turn": bool} of ramp record r (cached): the cuts the builder's (builder 2) or found in the
+    shapes (older files); a turnaround (V2) only without cuts."""
     key = tuple(id(ri) for ri in self.store.grid)
     if key != self._key:
       self.cache, self._key = {}, key
     cid = r.get("chain")
     if cid not in self.cache:
-      out = {"cuts": []}
+      out = {"cuts": [], "turn": False}
       try:
         out = self._info(r) or out
       except Exception:
@@ -1188,14 +1241,19 @@ class LinkShapes:
     return self.cache[cid]
 
   def _info(self, r):
-    if r.get("travel") == "both":
+    if r.get("travel") == "both" or not r.get("start") or not r.get("end"):
       return None
-    if isinstance(r.get("cuts"), list):
-      return {"cuts": [(int(c[0]), int(c[1]), (float(c[4]), float(c[5])), float(c[3]), float(c[2])) for c in r["cuts"]]}
     ch = self.store.chains.get(r.get("chain"))
-    if ch is None or not r.get("start") or not r.get("end") or not self.store.grid:
+    ids = {int(w) for w, _f, _s in ch["w"]} if ch is not None else set()
+    if isinstance(r.get("cuts"), list):
+      cuts = [(int(c[0]), int(c[1]), (float(c[4]), float(c[5])), float(c[3]), float(c[2])) for c in r["cuts"]]
+    else:
+      cuts = self._shape_cuts(r, ch, ids) or []      # (None: its shapes not walked; nothing known)
+    return {"cuts": cuts, "turn": not cuts and self.turnaround(r, ids)}
+
+  def _shape_cuts(self, r, ch, ids):
+    if ch is None or not self.store.grid:
       return None
-    ids = {int(w) for w, _f, _s in ch["w"]}
     cuts = []
     if len(ch["w"]) > 1:
       first = r["start"] if r.get("travel") != "ba" else r["end"]      # the chain's own first point
@@ -1206,19 +1264,22 @@ class LinkShapes:
         cls = self.street_at(p, ids)
         if cls:
           cuts.append((k, cls, (p[0] / 1e6, p[1] / 1e6), float(ch["w"][k + 1][2]), STREET_SPEED_MPH.get(cls, 45) * MPH))
-    return {"cuts": cuts}
+    return cuts
 
   def view(self, r, way_index=None):
     """Ramp record r as a car on its chain's way `way_index` (chain order; None: at the link's start) sees it: the
     street met ahead (V1: type "exit" from a highway / "link", "to" that street, "end" the junction, "cut_s" its m along
-    the chain), the street behind ("from" that street, type "entrance" / "link"), each with "hwy" (ramp_to_highway).
-    The record itself when nothing changes."""
+    the chain), the street behind ("from" that street, type "entrance" / "link"), a turnaround (V2: "turn"), each with
+    "hwy" (ramp_to_highway). The record itself when nothing changes."""
     if r is None:
       return None
     inf = self.info(r)
-    if not inf["cuts"]:
+    if not inf["cuts"] and not inf["turn"]:
       return r
     v = dict(r)
+    if inf["turn"]:
+      v["hwy"], v["turn"] = False, True              # (V2) a turnaround: onto the other carriageway, no on-ramp
+      return v
     increasing = r.get("travel") != "ba"
     cuts = sorted(inf["cuts"], reverse=not increasing)                    # in travel order
     ahead_ = [c for c in cuts if way_index is None or (way_index <= c[0] if increasing else way_index > c[0])]
