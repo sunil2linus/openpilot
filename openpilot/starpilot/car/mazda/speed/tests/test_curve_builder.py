@@ -326,7 +326,8 @@ def test_squares_only_in_their_own_folder_and_versions(tmp_path):
   assert B.folder_box("/x/43/-84") is None and B.folder_box("/x/y") is None
   assert B.in_box(B.tile_of(42.1, -83.9), (42, -84)) and B.in_box(B.tile_of(43.9, -82.1), (42, -84))
   assert not B.in_box(B.tile_of(44.05, -83.0), (42, -84)) and not B.in_box(B.tile_of(42.5, -81.9), (42, -84))
-  assert B.FORMAT_VERSION == 5 and B.BUILDER_VERSION >= 3
+  assert B.FORMAT_VERSION == 6 and B.BUILDER_VERSION >= 4
+  assert B.READ_FORMATS == (5, 6) and B.READ_MIN_BUILDER == 3         # a format 5 area works until it is rebuilt
 
 
 def test_files_are_written_atomically_and_synced(tmp_path, monkeypatch):

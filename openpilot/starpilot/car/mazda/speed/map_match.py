@@ -1,9 +1,11 @@
 """Onroad map side of the Mazda speed control, ported from the old fork's starpilot/controls/lib/map_curves.py:
 the curve files around the car (MapCurveStore), the road the car is on (RoadIndex / RoadMatcher, from the road
 shapes in the curve files, never through a one-way road's closed direction) and whether the GPS is good enough to
-slow early (GpsTrust). Behaviour unchanged except: curve files of another FORMAT_VERSION or an older builder are
-ignored (no map curves there until curve_mapd rebuilds them: the camera curves still work), the folder is 7.0's
-curve root. The GPS error estimate is used as before (only with USE_GPS_ACCURACY; logged otherwise).
+slow early (GpsTrust). Behaviour unchanged except: curve files of a format the car does not read (READ_FORMATS:
+5 and 6) or an older builder (READ_MIN_BUILDER) are ignored (no map curves there until curve_mapd rebuilds them: the
+camera curves still work), the folder is 7.0's curve root. Format 6 road shapes carry the way's tagged speed limit
+(RoadIndex.limits; a format 5 square simply has none until its area is rebuilt). The GPS error estimate is used as
+before (only with USE_GPS_ACCURACY; logged otherwise).
 Pure Python + threads, no openpilot imports (tests/test_map_match.py)."""
 import glob
 import json
@@ -13,7 +15,7 @@ import threading
 import time
 from array import array
 
-from openpilot.starpilot.car.mazda.speed.curve_builder import FORMAT_VERSION, BUILDER_VERSION
+from openpilot.starpilot.car.mazda.speed.curve_builder import READ_FORMATS, READ_MIN_BUILDER
 from openpilot.starpilot.car.mazda.speed.events import leave_caller_priority
 
 CURVE_DIR = "/data/media/0/mazda_curve_map"
@@ -265,6 +267,7 @@ class RoadIndex:
     self.lat1, self.lon1, self.lat2, self.lon2 = array("i"), array("i"), array("i"), array("i")
     self.way, self.chain = array("q"), array("q")
     self.oneway, self.cls = array("b"), array("b")
+    self.limits = {}            # way id -> (forward code, backward code): its tagged limit (curve_builder.tag_code)
     cells = {}
     for shape in shapes:
       p = shape.get("p", [])
@@ -274,6 +277,14 @@ class RoadIndex:
       cid = int(shape.get("c", wid))
       one = 1 if shape.get("o") else 0
       cls = int(shape.get("k", 0))
+      lim = shape.get("l")
+      if lim is not None:
+        try:
+          f, b = (lim, lim) if isinstance(lim, int) else (int(lim[0]), int(lim[1]))
+          if f or b:
+            self.limits[wid] = (f, b)
+        except (TypeError, ValueError, IndexError):
+          pass
       lat, lon = p[0], p[1]
       for k in range(2, len(p) - 1, 2):
         la2, lo2 = lat + p[k], lon + p[k + 1]
@@ -296,6 +307,13 @@ class RoadIndex:
             cells.setdefault(c, array("i")).append(i)
         lat, lon = la2, lo2
     self.cells = cells
+
+  def limit(self, way_id, is_forward):
+    """The way's tagged limit code for the direction of travel (0: untagged or not in this square)."""
+    got = self.limits.get(int(way_id))
+    if got is None:
+      return 0
+    return int(got[0] if is_forward else got[1])
 
   def segments(self, cell):
     for i in self.cells.get(cell, ()):
@@ -475,6 +493,14 @@ class MapCurveStore:
     finally:
       self.loading = False
 
+  def way_limit(self, way_id, is_forward):
+    """The tagged limit code (curve_builder.tag_code) of a loaded way for the direction of travel, 0 none."""
+    for ri in self.grid:
+      code = ri.limit(way_id, is_forward)
+      if code:
+        return code
+    return 0
+
   @property
   def has_files(self):
     return bool(self.index)
@@ -510,7 +536,7 @@ class MapCurveStore:
             d = load_json_in_steps(text) if self.background else json.loads(text)
           except (OSError, ValueError):
             continue
-          if d.get("version") != FORMAT_VERSION or int(d.get("builder", 0)) < BUILDER_VERSION:
+          if d.get("version") not in READ_FORMATS or int(d.get("builder", 0)) < READ_MIN_BUILDER:
             self.stale_files += 1      # (an old builder's file: ignored until curve_mapd rebuilds the folder)
             continue
           curves += d.get("curves", [])

@@ -18,6 +18,17 @@ What changed against the old builder (FORMAT_VERSION 4 / BUILDER_VERSION 1):
   * Files are written with flush + fsync before the rename (a power cut left 0-byte files); a square is written
     only into its own 2 x 2 degree folder (squares that overhang the folder edge were orphan files).
 
+Format 6 / builder 4 (the owner's one-time rebuild of his map areas):
+  * Every road shape carries its way's TAGGED speed limit "l" (tag_code: N mph, -N km/h, the tag's own unit and
+    whole number; [forward, backward] when a two-way way's directions differ; no field when untagged). Never the
+    class default (DEFAULT_SPEED_MPH only decides which curves are kept). The conditional tags are not read. The car
+    uses it only where 7.0's map service has no valid limit (limits.MapLimit). About +3 % file size.
+  * Every ramp record carries "j": the joints between its ways where a street (STREET_CLASSES) shares the NODE (an
+    at-grade junction; a bridge shares none), found from the tiles' exact node coordinates (key()); and its "to" /
+    "from" roads carry "h", their travel heading at the link's own end node when one-way. map_view.LinkShapes uses
+    them instead of searching the simplified shapes (the 2 m simplification dropped ~40 % of the street nodes at link
+    ends). A format 5 file (an area not rebuilt yet) still loads; the car then uses the read-time rules there.
+
 VERSIONS: bump BUILDER_VERSION on ANY change to how curves, profiles, ramps or road shapes are computed (geometry,
 thresholds, smoothing, simplification), and FORMAT_VERSION on any change to the file layout. curve_mapd rebuilds
 every folder whose files are older in either; the car ignores files whose FORMAT_VERSION is not its own (no map
@@ -68,11 +79,16 @@ DEFAULT_SPEED_MPH = {1: 70, 2: 45, 3: 65, 4: 45, 5: 50, 6: 35, 7: 45, 8: 35, 9: 
 LINK_CLASSES = {2, 4, 6, 8, 10}
 SKIP_CLASSES = {12}         # residential streets: 25 mph, cul-de-sacs and courts; the slowdown works from 25 mph up
 SHAPE_TOLERANCE = 2.0       # m: road shapes for the car's own road matching are simplified to this
-FORMAT_VERSION = 5          # 3: curves, ramps, chains; 4: + road shapes; 5: + distance profiles ("prof")
+FORMAT_VERSION = 6          # 3: curves, ramps, chains; 4: + road shapes; 5: + distance profiles ("prof");
+                            # 6: + the tagged speed limit on road shapes ("l") and the link joints ("j", to / from "h")
+READ_FORMATS = (5, 6)       # the car reads these (a format 5 file has no limits and no joints: the read-time rules)
 # BUILDER_VERSION: how the curves are found. Written into every file ("builder"); the device rebuilds a folder whose
 # files were made by an older builder. Bump it when a change here should rebuild the existing curve files (files
 # without the field were made by builder 1: the same algorithm, before the field existed).
-BUILDER_VERSION = 3          # 1: old fork; 2: (old fork, split_doublets, never bumped); 3: spline + profiles
+BUILDER_VERSION = 4          # 1: old fork; 2: (old fork, split_doublets, never bumped); 3: spline + profiles;
+                             # 4: tagged limits + link joints by shared node
+READ_MIN_BUILDER = 3         # the car reads files of this builder and newer (curve_mapd rebuilds anything older than
+                             # BUILDER_VERSION / FORMAT_VERSION; until then a format 5 / builder 3 file still works)
 KEY_SCALE = 4_000_000_000   # node key = round(lat * 1e7) * KEY_SCALE + round(lon * 1e7) (one int, lon fits below the scale)
 
 
@@ -229,7 +245,7 @@ def curvature(x, y, step, half):
 # ---------------- road chains ----------------
 
 class Way:
-  __slots__ = ("id", "name", "ref", "cls", "speed", "advisory", "oneway", "lat", "lon", "start", "end")
+  __slots__ = ("id", "name", "ref", "cls", "speed", "advisory", "oneway", "lat", "lon", "start", "end", "tag")
 
 
 def key(lat, lon):
@@ -253,9 +269,51 @@ def keys_in(keys, sorted_keys):
   return np.nonzero(sorted_keys[pos] == keys)[0]
 
 
+# The tagged speed limit (format 6). 7.0's tile maker stores maxspeed in m/s: "45 mph" as 45 x 0.44704, a number
+# without a unit or with km/h as N x 0.277778 (mapd maps/generate_offline.go ParseMaxSpeed; knots and anything it
+# cannot parse: 0). The code keeps the tag's own unit and whole number: N for N mph, -N for N km/h, 0 untagged (or not
+# a whole mph / km/h, e.g. knots). Never the class default (DEFAULT_SPEED_MPH is only for the curves' keep test).
+KPH_TILE = 0.277778         # the tile maker's km/h factor (1 / 3.6 = 0.2777778 reads the same within TAG_TOL)
+TAG_TOL = 0.005             # whole units
+
+
+def tag_code(mps):
+  """The limit code (above) of a tile's maxSpeed value in m/s."""
+  try:
+    v = float(mps)
+  except (TypeError, ValueError):
+    return 0
+  if not math.isfinite(v) or v <= 0:
+    return 0
+  best = None
+  for unit, sign in ((MPH, 1), (KPH_TILE, -1)):
+    n = v / unit
+    err = abs(n - round(n))
+    if err <= TAG_TOL and 1 <= round(n) <= 200 and (best is None or err < best[0]):
+      best = (err, sign * int(round(n)))
+  return best[1] if best else 0
+
+
+def code_mps(code):
+  """m/s of a limit code (0: None)."""
+  code = int(code or 0)
+  if code == 0:
+    return None
+  return code * MPH if code > 0 else -code / 3.6
+
+
+def way_tags(max_speed, forward, backward):
+  """(forward code, backward code) of a way: the direction's own tag (maxspeed:forward / :backward) when set, else
+  maxspeed (mapd's CurrentWay._maxSpeed rule; the conditional tags are not read)."""
+  base = tag_code(max_speed)
+  f, b = tag_code(forward), tag_code(backward)
+  return (f or base, b or base)
+
+
 def _make_way(meta, lat, lon):
   wy = Way()
-  wy.id, wy.name, wy.ref, wy.cls, speed, advisory, wy.oneway = meta
+  wy.id, wy.name, wy.ref, wy.cls, speed, advisory, wy.oneway = meta[:7]
+  wy.tag = meta[7] if len(meta) > 7 else (0, 0)
   wy.speed = speed if speed > 0 else DEFAULT_SPEED_MPH[wy.cls] * MPH
   wy.advisory = advisory if advisory > 0 else 0.0
   wy.lat, wy.lon = lat, lon
@@ -302,7 +360,8 @@ def load_ways(schema, files):
       if w.id in seen or cls not in CLASS_NAMES or len(w.nodes) < 2:
         continue
       nodes = w.nodes
-      meta = (w.id, sys.intern(w.name), sys.intern(w.ref), cls, w.maxSpeed, w.advisorySpeed, bool(w.oneWay))
+      meta = (w.id, sys.intern(w.name), sys.intern(w.ref), cls, w.maxSpeed, w.advisorySpeed, bool(w.oneWay),
+              way_tags(w.maxSpeed, w.maxSpeedForward, w.maxSpeedBackward))
       if cls in SKIP_CLASSES:
         if len(wanted_arr):
           rpend.append((meta, len(rla), len(nodes)))
@@ -572,6 +631,8 @@ def split_doublets(curves, ways_by_id):
 
 HIGHWAY_CLASSES = {1, 3}
 LINK_FOLLOW_HOPS = 4
+STREET_CLASSES = (5, 7, 9, 11, 12)   # primary .. residential: a link joint on one of these is a junction (map_view)
+HEADING_SPAN = 10.0                  # m along a road from the node where its travel heading ("h") is measured
 
 
 def node_index(ways, only=None):
@@ -592,15 +653,42 @@ def node_index(ways, only=None):
   return idx
 
 
-def road_info(w):
-  return {"cls": w.cls, "speed": round(w.speed, 2), "name": w.name or w.ref}
+def road_info(w, m=None):
+  """The road a ramp leads to / comes from. With m (the node's position on w, found at the link's own end) and w
+  one-way: "h", its travel heading there (deg; format 6: the turnaround test without a shape search)."""
+  out = {"cls": w.cls, "speed": round(w.speed, 2), "name": w.name or w.ref}
+  if m is not None and w.oneway:
+    h = heading_at(w, m)
+    if h is not None:
+      out["h"] = round(h)
+  return out
+
+
+def heading_at(w, m):
+  """Travel heading (deg, node order) of way w at its node m: towards the first node HEADING_SPAN on (or from the
+  one HEADING_SPAN back at the way's last node), or None (a way too short)."""
+  x, y = to_xy(w.lat, w.lon, float(w.lat[m]), float(w.lon[m]))
+  n = len(x)
+  if m < n - 1:
+    j = m + 1
+    while j < n - 1 and math.hypot(x[j] - x[m], y[j] - y[m]) < HEADING_SPAN:
+      j += 1
+    dx, dy = x[j] - x[m], y[j] - y[m]
+  else:
+    j = m - 1
+    while j > 0 and math.hypot(x[m] - x[j], y[m] - y[j]) < HEADING_SPAN:
+      j -= 1
+    dx, dy = x[m] - x[j], y[m] - y[j]
+  if math.hypot(dx, dy) < 0.5:
+    return None
+  return bearing_deg(float(dx), float(dy))
 
 
 def connected(nidx, node, exclude, ways, leaving, hops=LINK_FOLLOW_HOPS):
   """The road reached at `node`: the most important non-link road through it (motorway first). When only
   ramps continue there, follow them (in their direction of travel, up to `hops` ramps) to where they lead.
   leaving=True: roads we can continue onto from this node (destination); False: roads arriving (origin)."""
-  best = None
+  best = best_m = None
   links = []
   for o, m in nidx.get(node, []):
     if o.id in exclude:
@@ -613,9 +701,9 @@ def connected(nidx, node, exclude, ways, leaving, hops=LINK_FOLLOW_HOPS):
         links.append((o, o.start if m == last else (o.end if m == 0 else None)))
       continue
     if best is None or o.cls < best.cls:
-      best = o
+      best, best_m = o, m
   if best is not None:
-    return road_info(best)
+    return road_info(best, best_m if hops == LINK_FOLLOW_HOPS else None)
   if hops > 0:
     for o, far in links:
       if far is None:
@@ -652,12 +740,21 @@ def ramp_record(chain, nidx, ways):
     kind = "exit"
   else:
     kind = "link"
+  # the joints between the link's ways (chain order: k = the joint after the k-th way) where a street shares the NODE:
+  # an at-grade junction (a bridge over a street shares none). [[k, the most important street class there], ...]
+  joints = []
+  for k in range(len(chain) - 1):
+    w, rev = chain[k]
+    node = w.start if rev else w.end
+    cls = min((o.cls for o, _m in nidx.get(node, []) if o.id not in ids and o.cls in STREET_CLASSES), default=0)
+    if cls:
+      joints.append([k, int(cls)])
   s_pt = (round(float(lat[0]), 6), round(float(lon[0]), 6))
   e_pt = (round(float(lat[-1]), 6), round(float(lon[-1]), 6))
   return {"type": kind, "travel": travel, "len": round(length, 1), "to": to, "from": frm,
           "start": e_pt if travel == "ba" else s_pt, "end": s_pt if travel == "ba" else e_pt,
           "wdir": [[w.id, 0 if rev else 1] for w, rev in chain], "cls": min(w.cls for w, _ in chain),
-          "chain": int(chain[0][0].id),
+          "chain": int(chain[0][0].id), "j": joints,
           "name": next((w.name or w.ref for w, _ in chain if w.name or w.ref), "")}
 
 
@@ -690,9 +787,21 @@ def simplify(x, y, tol):
   return [i for i in range(n) if keep[i]]
 
 
+def limit_field(w):
+  """The road shape's "l" (format 6): the way's tagged limit code (tag_code) for both directions, or [forward,
+  backward] when a two-way way's directions differ (0: that direction untagged); None (no field): untagged."""
+  f, b = getattr(w, "tag", None) or (0, 0)
+  if w.oneway:
+    b = f
+  if not f and not b:
+    return None
+  return int(f) if f == b else [int(f), int(b)]
+
+
 def road_shapes(ways, chain_of=None):
   """Road shapes for matching the car to a road: {tile name: [{"w": way id, "c": chain id, "k": road class,
-  "o": 1 if one-way, "p": [lat0, lon0, dlat, dlon, ...]}]} with each way in its OSM node order (so the direction of travel gives
+  "o": 1 if one-way, "l": tagged limit (limit_field; absent: untagged), "p": [lat0, lon0, dlat, dlon, ...]}]} with
+  each way in its OSM node order (so the direction of travel gives
   FrogPilot's is_forward), simplified to SHAPE_TOLERANCE, in micro-degrees (first point absolute, then
   differences), split by 0.25 deg square with one point of overlap. All classes the chains use (no residential
   streets). The chain id (the road the way belongs to) lets the car stay on a road across its way splits."""
@@ -720,6 +829,9 @@ def road_shapes(ways, chain_of=None):
         rec = {"w": int(w.id), "c": int(chain_of.get(w.id, w.id)), "k": int(w.cls), "p": flat}
         if w.oneway:
           rec["o"] = 1
+        lim = limit_field(w)
+        if lim is not None:
+          rec["l"] = lim
         out.setdefault(t, []).append(rec)
   return out
 
@@ -850,9 +962,11 @@ def build(tiles_dir, out_dir, schema_path=None, quiet=False, progress=None, extr
   kinds = {}
   for r in ramps:
     kinds[r["type"]] = kinds.get(r["type"], 0) + 1
+  tagged = sum(1 for w in ways.values() if w.cls not in SKIP_CLASSES and limit_field(w) is not None)
   stats = {"tiles": len(files), "roads": len(ways), "chains": n_chains, "curves": len(curves), "ramps": len(ramps),
            "kinds": kinds, "files": written, "outside": outside, "bytes": size, "seconds": round(time.monotonic() - t0, 1),
-           "load_s": round(t_load, 1), "curves_s": round(t_curves - t_load, 1)}
+           "load_s": round(t_load, 1), "curves_s": round(t_curves - t_load, 1), "tagged": tagged,
+           "joints": sum(len(r["j"]) for r in ramps)}
   if not quiet:
     msg = f"{stats['tiles']} tiles, {stats['roads']} roads, {n_chains} chains, {stats['curves']} curves, {stats['ramps']} ramps {kinds}, "
     msg += f"{len(written)} output files, {size / 1e6:.2f} MB, {stats['seconds']:.0f} s (load {stats['load_s']:.0f}, curves {stats['curves_s']:.0f})"
