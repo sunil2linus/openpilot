@@ -61,6 +61,20 @@ Rules (ported from the old fork's speed_limit_follow, written as one contributor
   * A raise waits while the map's preview limit ahead is lower (mapdOut previewSpeedLimit / previewDistance, read
     directly: published whenever 7.0's map provider runs, checked as map_observation does), but only a preview
     seen on the current road (a road change, the matched chain, drops it); a preview never holds a lowering.
+  * Our map as a FALLBACK source (format 6 curve files carry each way's TAGGED maxspeed; never a class default):
+    7.0's mapd says "unknown" for whole seconds where ways compete (ErrAmbiguousWay on divided roads: on Hall Rd
+    slcState's map row was valid on ~5-18 % of the samples). The map view then gives the matched way's tagged limit
+    for the direction of travel ("lim", only with trust 0 and a match; a link only with its own tag). MapLimit
+    (once per frame, ctx["limit_in"]) decides the reading every limit rule here uses:
+      1. 7.0's valid reading (slcState map / dash row) always wins.
+      2. Missing / unknown: our map's limit counts as a reading of the same kind: the same steady times, clean trust,
+         view-alive rules, GAP_HOLD, "live", seq / re-take and match on engage.
+      3. 7.0 valid with a DIFFERENT value than our map: 7.0 wins, and our map is not used on that road chain for
+         DISAGREE_HOLD after it (no flipping between the two values in 7.0's gaps); logged once per road chain.
+      4. 7.0 only "possible" (mapdOut, the first fix of a new match) with a different value than our map: neither
+         is used on that frame (a gap: the steady time holds up to GAP_HOLD). The same value: one reading.
+    The map's preview (a lower limit ahead) stays 7.0's only. Event log: "map_limit" lines (start / stop with the
+    value and the road class; "disagree" with both values). Never a position.
   * F5 fallback: no GPS position (the map view's "none": ctx no_gps) and the limit unknown, the car at
     FALLBACK_FROM or more for FALLBACK_AFTER without a break (any frame with the view alive, a known limit, below
     FALLBACK_FROM restarts it), within FALLBACK_WINDOW of engaging: FALLBACK (43 mph) as a "fallback" proposal (up
@@ -172,6 +186,93 @@ def _miss(warn, what, err):
   schema_miss(warn, what, err)
 
 
+DISAGREE_HOLD = 15.0                 # s our map is not used on a road chain after 7.0 read another value there
+DIFFERENT = 0.3                      # m/s: two readings this far apart are different limits (< 1 mph / 2 km/h)
+STOP_AFTER = 10.0                    # s without our map supplying the limit: the "stop" line
+
+
+def view_limit(view):
+  """m/s of our map's tagged limit in the view (map_view "lim": trust 0, matched), or None. Not the view's age."""
+  if not view or view.get("gps") != "ok" or view.get("trust") != TRUST_OK or not view.get("matched"):
+    return None
+  lim = view.get("lim")
+  if not isinstance(lim, (int, float)) or not math.isfinite(lim) or lim <= 0:
+    return None
+  return float(lim)
+
+
+def limit_in(ctx):
+  """{"limit": m/s or None, "src": "7.0" | "map" | None} for this frame: MapLimit's (ctx["limit_in"], set by
+  contributors.Sources) or, without it (tests, replays), the same rules without the disagreement memory."""
+  got = ctx.get("limit_in")
+  if got is not None:
+    return got
+  return MapLimit().decide(ctx, log=False)
+
+
+class MapLimit:
+  """Which reading the limit rules use this frame (module doc: our map as a fallback). Holds the disagreement memory
+  and writes the "map_limit" event-log lines through `log(kind, **fields)`."""
+
+  def __init__(self, log=None):
+    self.log = log
+    self.view_clock = ViewClock()
+    self.disagree = None           # (chain, our m/s, until s): 7.0 read another value on this chain
+    self.logged = set()            # chains whose disagreement was logged (once per road chain per drive)
+    self.supplying = None          # (our m/s, road class) while our map supplies the limit
+    self.used_t = None             # s our map last supplied it
+
+  def _log(self, kind, **kw):
+    if self.log is not None:
+      try:
+        self.log(kind, **kw)
+      except Exception:
+        pass
+
+  def decide(self, ctx, log=True):
+    now = ctx.get("now", 0.0)
+    view = ctx.get("view")
+    alive = self.view_clock.update(view, now) != GONE
+    slc = ctx.get("slc")
+    theirs = slc.get("limit") if slc else None
+    ours = view_limit(view) if alive else None
+    chain = view.get("chain") if alive else None
+    cls = int(view.get("cls", 0) or 0) if alive else 0
+    out = {"limit": None, "src": None, "ours": ours}
+    if theirs is not None:
+      out.update(limit=theirs, src="7.0")
+      if ours is not None and abs(theirs - ours) > DIFFERENT:
+        self.disagree = (chain, ours, now + DISAGREE_HOLD)
+        if log and chain not in self.logged:
+          self.logged.add(chain)
+          self._log("map_limit", event="disagree", theirs_mph=round(theirs / MPH, 1), ours_mph=round(ours / MPH, 1),
+                    unit=view.get("limu", ""), cls=cls)
+      elif ours is not None:
+        self.disagree = None       # they agree here
+    else:
+      use = ours
+      d = self.disagree
+      if use is not None and d is not None and d[0] == chain and now <= d[2] and abs(d[1] - use) <= DIFFERENT:
+        use = None                 # 7.0 read another value on this road just now: it wins
+      poss = ctx.get("slc_possible")
+      if use is not None and poss is not None and abs(float(poss["limit"]) - use) > DIFFERENT:
+        use = None                 # 7.0's "possible" fix says another value: no reading this frame (a gap)
+      if use is not None:
+        out.update(limit=use, src="map")
+    if log:
+      if out["src"] == "map":
+        self.used_t = now
+        key = (round(out["limit"], 2), cls)
+        if self.supplying is None or self.supplying[0] != key[0]:
+          self._log("map_limit", event="start", mph=round(out["limit"] / MPH, 1), unit=view.get("limu", ""), cls=cls)
+        self.supplying = key
+      elif self.supplying is not None and (self.used_t is None or now - self.used_t > STOP_AFTER):
+        self._log("map_limit", event="stop", mph=round(self.supplying[0] / MPH, 1), cls=self.supplying[1],
+                  why="7.0" if theirs is not None else ("no view" if not alive else "no tag"))
+        self.supplying = None
+    return out
+
+
 def whole_limit(mps, metric=False):
   """The limit in dash units (int) when it is a whole multiple within bounds, else None."""
   if mps is None:
@@ -212,6 +313,7 @@ class SpeedLimit:
     self.road_link = False         # ... and whether the view says the car is on a link
     self.live_key = None           # (steady limit, chain) the live time is for
     self.live_t = 0.0              # s that limit has been read with clean trust on that street chain (gaps hold it)
+    self.src = None                # this frame's reading: "7.0", "map" (our map's fallback) or None
 
   def street(self):
     """On a street (the offset applies): the last known road class known, not a highway, not a link."""
@@ -263,8 +365,9 @@ class SpeedLimit:
           keep_his = True          # his RES (or ours) off a street: a speed of his stays his (planner)
     if not ctx.get("cruise_enabled", False):
       self.engaged_t = None
-    slc = ctx.get("slc")
-    limit_mps = slc["limit"] if slc else None
+    lin = limit_in(ctx)            # 7.0's valid reading, else our map's tagged limit (MapLimit)
+    limit_mps = lin["limit"]
+    self.src = lin["src"]
     pv = ctx.get("preview")
     up_mps = pv["speed"] if pv else 0.0
     raw = whole_limit(limit_mps, self.metric)

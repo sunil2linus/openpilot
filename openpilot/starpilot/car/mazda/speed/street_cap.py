@@ -12,7 +12,8 @@ _exit_street / street_target / _street_cmd):
   * Then a street is matched with GPS trust 0 for EXIT_STREET_STEADY (grows on CURRENT views, holds while LATE): road
     class 5-12 (primary .. residential), or a trunk road whose posted limit is known and below STREET_LIMIT_MAX (Hall Rd
     with its 45). The window stays open EXIT_STREET_TIME after that (never closed while it is taking the set down).
-  * Its target: the street's posted limit (7.0's reading, unchanged EXIT_STREET_LIMIT_STEADY) + the street offset;
+  * Its target: the street's posted limit (7.0's reading, else our map's tagged limit: limits.limit_in, the same
+    fallback rules as the limit follow; unchanged EXIT_STREET_LIMIT_STEADY) + the street offset;
     a limit above STREET_LIMIT_MAX is no street's (no cap); no limit reported for EXIT_STREET_LIMIT_STEADY: the old
     fork's STREET_FALLBACK (43 mph, no offset).
   * Once per street, only with the car under EXIT_STREET_MAX_V, only when the anchor is above the target: the anchor is
@@ -25,7 +26,8 @@ The cap after a RES (round 2, item 10; r3 rt 402: the auto-resume brought back 5
 r2 rt 1044: 53 carried onto Hall Rd's 45): after ANY RES (his on the wheel or our auto-resume's, the planner's
 "resumed") on a trusted street (GPS trust 0, matched, not a link; class 5-12 or a trunk road) with the anchor above
 what the street allows, the anchor is proposed down (paced, kind "street", ours): to the limit + offset when the
-limit is known (read now, or last read on this road chain with at most RES_LIMIT_M driven since; above
+limit is known (7.0's reading or our map's tagged limit, limits.limit_in; read now, or last read on this road chain
+with at most RES_LIMIT_M driven since; above
 STREET_LIMIT_MAX: no cap), else to min(his anchor, max(v, RES_V_MIN) + RES_OVER) (a RES at 10 mph: 45). (Round 3: the
 remembered limit ages by distance, not by the clock: a red light of any length on Hall Rd keeps its 45, where 7.0's
 mapd says "not sure which road" for most of the stop; r2 rt 1030. SpeedLimit's steady limit is no source here: it
@@ -37,7 +39,7 @@ Pure (tests/test_street_cap.py).
 import math
 
 from openpilot.starpilot.car.mazda.speed import cruise_model as M
-from openpilot.starpilot.car.mazda.speed.limits import whole_limit
+from openpilot.starpilot.car.mazda.speed.limits import limit_in, whole_limit
 from openpilot.starpilot.car.mazda.speed.planner import Contribution
 from openpilot.starpilot.car.mazda.speed.view_age import GONE, LATE, ViewClock
 
@@ -128,8 +130,7 @@ class StreetCap:
     view = ctx.get("view")
     live = self.view_clock.update(view, now)
     alive = live != GONE
-    slc = ctx.get("slc")
-    limit = whole_limit(slc["limit"], self.metric) if slc else None
+    limit = whole_limit(limit_in(ctx)["limit"], self.metric)   # 7.0's reading, else our map's tagged limit
     if live != LATE:
       self.lim_t = self.lim_t + dt if (limit or 0) == (self.lim or 0) else 0.0
       self.lim = limit or 0

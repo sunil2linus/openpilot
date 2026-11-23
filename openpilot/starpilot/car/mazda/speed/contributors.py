@@ -6,7 +6,8 @@ curve (camera_curves), the exit plan (exits), the street cap (street_cap.py: wit
 (merge), the speed limit (speed_limit), the stop slowdown (stops). Test mode builds them with presses=False: computed and
 logged, never commanded / never taken as an anchor.
 With the limit follow it also keeps mapdOut's own limit on a "possible" fix (ctx["slc_possible"], limits.map_possible):
-the first fix of a new match, when slcState is not "valid" yet.
+the first fix of a new match, when slcState is not "valid" yet; and the frame's limit reading ctx["limit_in"]
+(limits.MapLimit: 7.0's valid reading, else our map's tagged limit from the view; its "map_limit" event-log lines).
 The private SubMaster also reads userBookmark (the onroad Bookmark button, for the speed control's tag line; only
 while the speed control runs this drive): ctx["bookmark"] is True on a frame with a new one.
 Stage 3: with the gas auto-resume it also reads selfdriveState (ctx["engageable"]: openpilot has no no-entry now; False
@@ -125,6 +126,10 @@ class Sources:
     self.engageable = False
     self.veto = CameraVeto(MODEL_DT)
     self.view_clock = ViewClock()
+    self.map_limit = None
+    if want_slc:
+      from openpilot.starpilot.car.mazda.speed.limits import MapLimit
+      self.map_limit = MapLimit(log=(lambda kind, **kw: self.log.log(kind, **kw)) if log is not None else None)
 
   def warn(self, what, err=None):
     """A field our readers need is not in this schema: one "schema" event-log line (and cloudlog) per field per
@@ -190,6 +195,8 @@ class Sources:
     ctx["view_live"], ctx["view_new"] = live, bool(self.want_view and self.view_clock.new)
     ctx["gps_ok"] = view_ok if self.want_view else True
     ctx["no_gps"] = bool(self.want_view and not view_ok)   # F5: no GPS position (the camera-only curve is more careful)
+    if self.map_limit is not None:
+      ctx["limit_in"] = self.map_limit.decide(ctx)        # 7.0's limit, else our map's (limits.MapLimit)
     ctx["veto"] = self.veto
     self.veto.update(ctx)
     ctx["map_covers_camera"] = bool(self.map_presses and view_ok and not self.view.get("held") and self._covers(ctx))
