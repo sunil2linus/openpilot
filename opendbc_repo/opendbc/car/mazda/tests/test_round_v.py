@@ -255,3 +255,52 @@ def test_v3_real_bends_stay():
   # a sharper S-bend (~40 deg each way): a curve
   m, curves = _curve_ahead(jog_scene(along=16.0, side=14.0))
   assert curves and max(c["turn"] for c in curves) > 35.0 and m.curve is not None
+
+
+# ---- V4: no auto-resume RES on a slow link; rule 8 on a trunk road with a street's limit ----
+
+TA = _load("tar_round_v", os.path.join(HERE, "test_auto_resume.py"))
+TS = _load("tss_round_v", os.path.join(HERE, "test_street_speed.py"))
+
+
+def test_v4_no_res_inside_a_turnaround_until_the_car_is_on_a_proper_road():
+  ar = TA.ar
+  s = TA.Sim(set_mph=46, v_mph=30, road_class=3)
+  s.brake_cancel(v_after_mph=6)
+  assert s.lg.state == ar.ARMED
+  s.step(2 * TA.F, road_class=4, v_ego=10 * TA.MPH, gas_pressed=True)    # the turnaround link at 10 mph, his gas held
+  assert s.sent == [] and s.lg.wait_why == "slow on a link"
+  s.step(2 * TA.F, road_class=3, v_ego=14 * TA.MPH, gas_pressed=True)    # back on Hall Rd: it goes
+  assert s.sent and s.sent[0][1] == TA.RES
+  # a link at 25 mph or more: as before
+  s = TA.Sim(set_mph=60, v_mph=40, road_class=2)
+  s.brake_cancel(v_after_mph=28)
+  s.step(2 * TA.F, gas_pressed=True)
+  assert s.sent
+  # an on-ramp to a highway (his gas after a stop at its light, round k's ramp start): as before, also slow
+  s = TA.Sim(set_mph=45, v_mph=20, road_class=2, ramp_to_highway=True)
+  s.brake_cancel(v_after_mph=0)
+  s.step(2 * TA.F, v_ego=12 * TA.MPH, gas_pressed=True)
+  assert s.sent
+
+
+def _trunk_res(limit, set_mph, road=3, **kw):
+  return TS.street_sim(4000, lambda f: limit, set_mph, road=lambda f: road, **TS._engage(**kw))
+
+
+def test_v4_res_on_a_trunk_road_with_a_streets_limit_comes_down_to_it():
+  # his 53 back on Hall Rd (a trunk road, posted 45): down to 50 (+5), then his
+  r = _trunk_res(45, 53)
+  assert abs(r["sets"][-1] - 50) < 1e-6 and TS._minus(r, TS.ENGAGE), (r["sets"][-1], TS._reasons(r))
+  assert any("(trunk road)" in x for x in TS._reasons(r))
+  # never up there, no fallback without a limit, nothing at a highway's limit
+  for limit, set_mph in ((45, 40), (0, 60), (55, 70), (65, 75)):
+    r = _trunk_res(limit, set_mph)
+    assert r["presses"] == [] and abs(r["sets"][-1] - set_mph) < 1e-6, (limit, set_mph, TS._reasons(r))
+  # (before round V the trunk road was left alone)
+  TS.slf.ENGAGE_TRUNK = False
+  try:
+    r = _trunk_res(45, 53)
+    assert r["presses"] == []
+  finally:
+    TS.slf.ENGAGE_TRUNK = True

@@ -65,6 +65,8 @@ limit only moves the driver's speed (the controller's anchor, the speed its rest
    to NAV_ALONE_MAX) only down, to the higher of it plus the offset and STREET_FALLBACK; nothing known: only down, to
    STREET_FALLBACK; the fallback only with the car at most FALLBACK_MAX_SPEED. His SET within ENGAGE_WINDOW first:
    his. This also covers his RES after an exit (map_curve_control's street rule while cruise is on). Rules 8 and 9 act only with Map Curves On (street_active).
+   (Round V, V4) On a trunk road with a street's posted limit (under ENGAGE_TRUNK_MAX: Hall Rd's 45) rule 8 also acts,
+   only down and only with that limit known (steady, GPS trust 0 as above): to it plus the offset (no fallback there).
    No target under STREET_FLOOR (the controller's 25 mph curve floor: a 20 mph / 30 km/h zone ends at 25 / 41).
 9. Slow for a lower limit (setting MazdaSlowLowerLimit, default on): on a street a lower limit steady LOWER_STEADY
    (LOWER_BIG_STEADY for a drop of more than LOWER_BIG_DROP) with GPS trust 0 on every frame, the road name unchanged
@@ -282,6 +284,13 @@ ENGAGE_SET_QUIET = 0.5       # s: his SET press that engaged the cruise is not "
 # the limit itself steady this long with GPS trust 0 on every frame of it (drive 55, t 627: his RES at a junction while the
 # cross road's 35 had been reported 3 s; it went after 4 s)
 ENGAGE_LIMIT_STEADY = 5.0    # s
+# Round V, V4 (7.0 drive r2 rt 1030-1046: his RES / our auto-resume brought back 53 onto Hall Rd, a divided trunk road with
+# a 45 limit; trunk roads are highways here, so rule 8 did nothing and the 53 stayed): rule 8 on a trunk road (TRUNK) whose
+# steady posted limit is under ENGAGE_TRUNK_MAX, only down, to that limit plus the Street Speed offset. The limit unknown:
+# nothing (a trunk road without a limit may be a 65 one). The 7.0 port's "cap after RES" does the same on such roads.
+ENGAGE_TRUNK = True
+ENGAGE_TRUNK_MAX = (55, 90)  # mph / km/h (map_curve_control.STREET_LIMIT_MAX)
+TRUNK = 3
 # Round R, R8 (drive 76 t 77-93, onto W Utica Rd from a subdivision: he engaged at 19 with no GPS fix yet; rule 8 waits for a
 # street matched with GPS trust 0, and its 43 fallback only ever lowers, so nothing happened; he held SET+ to 48 by hand).
 # Owner: "if there is no GPS our fallback speed was 43". When the cruise comes on (his SET / RES or our auto resume) with NO
@@ -428,6 +437,7 @@ class Offer:
   band: bool = True
   tgt: object = None        # steps: the driver's speed it asks for (the limit plus the Street Speed offset), None: new
   own: bool = True          # rule 9: `driver` was his own set speed (False: a pending restore's, not his choice)
+  trunk: bool = False       # (ENGAGE_TRUNK) rule 8's match on a trunk road with a street's limit
 
   @property
   def target(self):
@@ -443,6 +453,7 @@ class SpeedLimitFollower:
     self.big_drop = LOWER_BIG_DROP[m]
     self.nav_min, self.nav_agree, self.nav_street_max = NAV_LIMIT_MIN[m], NAV_AGREE[m], NAV_STREET_MAX[m]
     self.nav_alone_max, self.fallback_max, self.street_floor = NAV_ALONE_MAX[m], FALLBACK_MAX_SPEED[m], STREET_FLOOR[m]
+    self.trunk_max = ENGAGE_TRUNK_MAX[m]  # (ENGAGE_TRUNK)
     self.street_active = True      # rules 8 / 9 act (the wrapper: Speed Limit Follow and Map Curves On)
     offs = STREET_OFFSETS[1 if is_metric else 0]
     self.street_add = offs[street_mode] if street_mode in range(len(offs)) else offs[STREET_OFFSET_DEFAULT]  # steps
@@ -817,7 +828,7 @@ class SpeedLimitFollower:
       if self.pause_frames >= _frames(LOWER_PAUSE_MAX):
         self.lower, self.pause_frames = None, 0
         self._log(kind, "cancel: paused too long", lw.new, lw.target, d)
-      elif not self._street() and self.frame - self.road_since >= _frames(LOWER_NOT_STREET_TIME):
+      elif not self._street() and not self._trunk_match(lw) and self.frame - self.road_since >= _frames(LOWER_NOT_STREET_TIME):
         self.lower = None              # (a later RES re-opens rule 8, as after cruise off)
         self._log(kind, "cancel: not on a street", lw.new, lw.target, d)
       elif lw.kind == "lower" and reported != lw.new and reported is not None and reported > lw.new:
@@ -847,6 +858,7 @@ class SpeedLimitFollower:
       self.engage_frame = None         # (too late, or his own SET since: his)
       return
     steady = _frames(ENGAGE_ROAD_STEADY)
+    trunk = ENGAGE_TRUNK and not self._street() and self.road == TRUNK
     if (NOGPS_FALLBACK and i.no_gps and not i.road_class and self.nogps_open is None and
         self.frame - self.engage_frame <= _frames(ENGAGE_SET_QUIET) + 1):
       # (NOGPS_FALLBACK) no usable position at the engagement: the fallback, up only, the match kept open
@@ -856,7 +868,7 @@ class SpeedLimitFollower:
         self.offer = Offer(None, tgt, "no GPS", self.frame, "match", d, tgt=tgt)
         self._log("speedLimitMatch", "start: cruise on, up (no GPS: the fallback)", None, tgt, d, "none: no GPS")
       return
-    if not self._street() or self.frame - self.road_since < steady or self.trust0_frames < steady:
+    if not (self._street() or trunk) or self.frame - self.road_since < steady or self.trust0_frames < steady:
       return
     nav = self.nav
     if (reported is not None and reported == self.stable and reported == self.candidate and
@@ -864,6 +876,9 @@ class SpeedLimitFollower:
         # GPS trust 0 over the recent ENGAGE_LIMIT_STEADY (drive 69 t 890: trust 2 for 5 s long before his RES kept the
         # limit's worst-ever trust at 2 and the match never came: back to his 41, not 50 + his offset)
         (self.candidate_trust <= LIMIT_FIRM_TRUST_MAX or self.trust0_frames >= _frames(ENGAGE_LIMIT_STEADY))):
+      if trunk and reported >= self.trunk_max:
+        self.engage_frame = None       # (ENGAGE_TRUNK) a highway's limit: his speed
+        return
       lo = hi = reported
       sources = "map"
       if nav is not None:
@@ -872,15 +887,18 @@ class SpeedLimitFollower:
         else:
           lo, hi = min(nav, reported), max(nav, reported)
           sources = f"map {reported}, nav {nav}: between"
-      add = self._add()
+      add = self.street_add if trunk else self._add()
       if d > hi + add + 0.5:
         tgt, limit = hi + add, hi
+      elif trunk:
+        self.engage_frame = None       # (ENGAGE_TRUNK) only down
+        return
       elif d < lo + add - 0.5:
         tgt, limit = lo + add, lo
       else:
         self.engage_frame = None
         return
-    elif reported is None and self.unknown_frames >= steady:
+    elif reported is None and self.unknown_frames >= steady and not trunk:
       # no map limit: only down, to the fallback; navigation's alone (NAV_LIMIT_MIN up to NAV_ALONE_MAX) only keeps him
       # at or above it, at its limit plus the offset (third review: drive 54, t 1155-1225, its 25 lingered ~70 s over
       # three roads, a primary road at 31 mph: never under the fallback on it). The fallback only at a street's speed:
@@ -904,8 +922,9 @@ class SpeedLimitFollower:
     if tgt > d:
       self.offer = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt)
     else:
-      self.lower = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt)
-    self._log("speedLimitMatch", "start: cruise on, " + ("up" if tgt > d else "down"), limit, tgt, d, sources)
+      self.lower = Offer(None, limit, i.source or "Map Data", self.frame, "match", d, tgt=tgt, trunk=trunk)
+    self._log("speedLimitMatch", "start: cruise on, " + ("up" if tgt > d else "down") + (" (trunk road)" if trunk else ""),
+              limit, tgt, d, sources)
 
   def _slow_lower(self, i, d, reported):
     """Rule 9: a lower limit steady LOWER_STEADY (navigation agreeing: LOWER_NAV_STEADY) with GPS trust 0 throughout."""
@@ -962,7 +981,11 @@ class SpeedLimitFollower:
   def paused(self):
     """Rules 8 / 9's slowdown waits (third review: the planner's map curve mode flipped mid-way): kept, nothing
     pressed (the wrapper holds the restore), carried on when they act again."""
-    return self.lower is not None and (not self.street_active or not self._street())
+    return self.lower is not None and (not self.street_active or not (self._street() or self._trunk_match(self.lower)))
+
+  def _trunk_match(self, lw):
+    """(ENGAGE_TRUNK) rule 8's match on a trunk road goes on while on a trunk road."""
+    return bool(lw is not None and lw.trunk and self.road == TRUNK)
 
   @property
   def lower_speed(self):

@@ -10,6 +10,9 @@ The owner's design (round n):
      residential: PUBLIC_ROAD_CLASSES) with GPS trust MAX_GPS_TRUST, AT THE SEND, and the road (class and mapd's name)
      unchanged for MAP_STABLE_TIME before it (mapd keeps the old road a few seconds through a turn). Unknown, other
      classes or a worse trust: no. (Review of round n: no allowance for a lost map any more, drive 6f t 980.8.)
+     (Round V, V4) On a link (a turnaround, a slip lane, an exit ramp) slower than LINK_SLOW: no RES; the press waits (his
+     gas held) until the car is on a proper road or faster. Not on a link that leads to a highway (the planner's
+     mapOnRamp and mapRampToHighway: his gas after a stop at an on-ramp's light, round k's ramp start).
   C. Wheel calm: nothing is sent while turning (|lateral accel| from the wheel angle and the speed >= MERGE_TURN_LAT, the
      wheel winding: curve_slowdown.MergeTurnGate's formula and constants, or |wheel angle| >= AUTO_RESUME_MAX_ANGLE: the
      lateral accel is ~0 at junction speeds); calm CALM_TIME first. The gas may be down during the turn; the press goes
@@ -75,6 +78,11 @@ AUTO_RESUME_MAX_DIST = 800.0     # m driven since the brake without the cruise b
 # no frame of ours is dropped there (a crawl in traffic: 800 m at 10 mph is ~180 s)
 AUTO_RESUME_MAX_MOVING = 170.0   # s
 PUBLIC_ROAD_CLASSES = tuple(range(1, 13))    # highwayClass 1 motorway .. 10 tertiary_link, 11 unclassified, 12 residential
+# Round V, V4 (7.0 drive r2 rt 1166, a Michigan left on Hall Rd: RES at ~10 mph inside the turnaround, class 4, brought back
+# his 46 and the car surged 6 -> 28 mph in the turn)
+LINK_CLASSES = (2, 4, 6, 8, 10)  # ramps, turnarounds and other link roads (map_curves.LINK_CLASSES)
+LINK_SLOW = 25 * MS_PER_MPH      # m/s: on a link slower than this no RES (it waits for a proper road), unless the link leads
+                                 # to a highway (an on-ramp: the ramp start; a turnaround never does, map_curves V2)
 MAX_GPS_TRUST = 0                # starpilotPlan.mapGpsTrust: 0 ok (as the street speed's rule 8)
 NOT_ALLOWED_TIME = 0.5           # s of CRZ_CTRL byte 4 non-zero before it disarms
 BURST_FRAMES = 4                 # RES frames per attempt
@@ -121,6 +129,7 @@ class AutoResumeInputs:
   other_button_active: bool = False   # openpilot's RESUME (stop and go) this frame
   plan_alive: bool = False        # starpilotPlan
   road_class: int = 0             # starpilotPlan.mapRoadClass
+  ramp_to_highway: bool = False   # (V4) starpilotPlan.mapOnRamp and mapRampToHighway
   road_name: str = ""             # mapdOut.roadName ("" unknown)
   road_name_age: float = 0.0      # s since that name was received (M6)
   road_name_last: str = ""        # the last name received, however old (R6: compared with the name at his brake)
@@ -371,6 +380,8 @@ class AutoResumeLogic:
       return "gas"
     if not self.map_ok(i):
       return "map"
+    if int(i.road_class) in LINK_CLASSES and max(float(i.v_ego), 0.0) < LINK_SLOW and not i.ramp_to_highway:
+      return "slow on a link"
     if not self.road_stable() or self.good_frames < _frames(MAP_STABLE_TIME):
       return "road just changed"
     last = str(i.road_name_last or i.road_name or "")
@@ -575,6 +586,7 @@ class AutoResume:
       set_allowed=bool(getattr(CS, "crz_set_allowed", False)), not_allowed=bool(getattr(CS, "crz_not_allowed", False)),
       op_cancel=bool(CC.cruiseControl.cancel), cancel_sent=bool(cancel_sent), other_button_active=bool(CC.cruiseControl.resume),
       plan_alive=plan_alive, road_class=int(getattr(plan, "mapRoadClass", 0) or 0) if plan_alive else 0, road_name=road_name,
+      ramp_to_highway=bool(plan_alive and getattr(plan, "mapOnRamp", False) and getattr(plan, "mapRampToHighway", False)),
       road_name_age=road_age, road_name_last=self.road_name,
       lead_status=bool(lead is not None and lead.status), lead_d=float(lead.dRel) if lead is not None else 0.0,
       lead_v=float(lead.vLead) if lead is not None else 0.0, can_valid=bool(getattr(out, "canValid", False)),
