@@ -178,3 +178,49 @@ def test_an_ordinary_exit_and_entrance_keep_their_records(tmp_path):
     assert mv.links.info(r)["cuts"] == []
   ent = next(r for r in ramps if r["type"] == "entrance")
   assert mv.links.leads(ent)[0] is True
+
+
+def turnaround_scene(trunk_mph=65):
+  """(r2 rt 1085-1170, Hall Rd) a divided trunk road: the eastbound carriageway at y = 0, the westbound one at y = 30
+  (one-way each); a Michigan-left turnaround link leaves eastbound at x = 0, heads north-east, then north, and joins
+  westbound. The link itself turns only ~45 deg; the turn onto the other carriageway is at its end."""
+  eb = way(40, straight(-500, 0, 90, 1000), name="Hall Road", cls=3, speed_mph=trunk_mph, oneway=True)
+  wb = way(41, straight(500, 30, 270, 1000), name="Hall Road", cls=3, speed_mph=trunk_mph, oneway=True)
+  link = way(42, [(0, 0), (10, 10), (20, 20), (20, 30)], name="", cls=4, speed_mph=25, oneway=True)
+  k0 = 25                                   # eb's node at x = 0
+  link.lat[0], link.lon[0] = eb.lat[k0], eb.lon[k0]
+  link.start = B.key(eb.lat[k0], eb.lon[k0])
+  k1 = 24                                   # wb's node at x = 20
+  link.lat[-1], link.lon[-1] = wb.lat[k1], wb.lon[k1]
+  link.end = B.key(wb.lat[k1], wb.lon[k1])
+  return {w.id: w for w in (eb, wb, link)}
+
+
+def test_a_michigan_left_turnaround_is_no_highway_link(tmp_path):
+  ways = turnaround_scene()
+  mv, ramps = scene_view(tmp_path, ways)
+  rec = next(r for r in ramps if r["chain"] == 42)
+  assert rec["type"] == "interchange" and rec["to"]["cls"] == 3 and rec["to"]["speed"] > 55 * B.MPH   # (as built)
+  views = drive(mv, [(float(x), 0.0, 90.0) for x in range(-300, -100, 3)])
+  ex = views[-1]["exits"][0]
+  assert ex["id"] == "x42" and not ex["hwy"]
+  info = mv.links.info(rec)
+  assert info["turn"] and not info["cuts"]
+  v = drive(mv, [(12.0 + 0.1 * k, 12.0 + 0.1 * k, 45.0) for k in range(30)])[-1]
+  assert v["link"] and v["ramp"]["id"] == 42 and v["ramp"]["turn"] and not v["ramp"]["hwy"]
+
+
+def test_a_link_onto_a_slow_trunk_road_is_no_highway_link(tmp_path):
+  # the same link onto a 50 mph trunk road (Hall Rd's map speed): not a highway's, turnaround or not
+  ways = turnaround_scene(trunk_mph=50)
+  mv, ramps = scene_view(tmp_path, ways)
+  drive(mv, [(float(x), 0.0, 90.0) for x in range(-300, -100, 3)])
+  rec = next(r for r in ramps if r["chain"] == 42)
+  hwy, spd, _frm, _turn, _street = mv.links.leads(dict(rec, travel="ab"))
+  assert not hwy and abs(spd - 50 * B.MPH) < 0.1
+  # the record without its turnaround shape (shapes not loaded): the trunk's speed alone decides
+  lk = V.LinkShapes(mv.store)
+  lk.cache, lk._key = {42: {"cuts": [], "turn": False, "cut_s": None}}, tuple(id(ri) for ri in mv.store.grid)
+  assert not lk.leads(rec)[0]
+  lk.cache[42] = {"cuts": [], "turn": False, "cut_s": None}
+  assert lk.leads(dict(rec, to=dict(rec["to"], speed=65 * B.MPH)))[0]

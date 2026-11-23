@@ -419,6 +419,17 @@ at the junction); past it the link comes from that street (`from_hwy` false) and
 merges). Home area (folder 42/-84): 119 interchange, 25 entrance, 33 exit and 33 other links have such a junction.
 The builder itself is unchanged (no version bump, no rebuild).
 
+### Turnarounds and slow trunk roads are no merge (map_view.LinkShapes.leads)
+
+r2 rt 1085-1170: the merge armed (target 50, a boost toward 70) inside Hall Rd's Michigan-left turnaround (a
+trunk_link from one carriageway onto the other). A link now leads "to a highway" (the merge; an exit without a
+handover) only when it ends on a motorway, or on a trunk road whose map speed is 55 mph or more, without first
+meeting a street, and it is no turnaround. A turnaround: the link starts and ends on roads of the same class whose
+one-way shapes there run more than 120 deg apart (read from the shapes in the files). The link's own heading is no
+test: Hall Rd's turnaround itself turns only ~45 deg (the rest is the turn onto the other carriageway at its end),
+and ~90 real on-ramps in the home area start and end more than 120 deg apart. Home area: 493 interchange-type and
+~2590 street-to-street turnarounds found; 38 interchanges and 28 entrances end on a trunk road under 55.
+
 ### The street cap (street_cap.py, kind "street")
 
 A safety net that does not need the ramp marking (the old fork's "exit to a street, completed" + its street

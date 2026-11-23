@@ -5,7 +5,9 @@ planner.py takes them by its rules: up from our anchor or a street's, down only 
 presses and gives no slowing target.
 
 Ported from the old fork (speed_limit_follow rule 5, curve_slowdown MERGE_*), without its patch layers:
-  * Where: the map view matched a link whose ramp record leads to a highway, with GPS trust 0, or the start of the
+  * Where: the map view matched a link that leads to a highway (map_view.LinkShapes: it ends on a motorway, or on a
+    trunk road whose map speed is 55 mph or more, without first meeting a street, and it is no turnaround: a Michigan
+    left from one carriageway onto the other, r2 rt 1085 on Hall Rd), with GPS trust 0, or the start of the
     drive's trust on that link with the GPS error at most START_ACC (the view's start_ok); kept HWY_KEEP after the
     car is on the highway; a street matched for STREET_END ends it.
   * The highway's limit H (whole multiple, at least H_MIN): the map's preview limit ahead (mapdOut previewSpeedLimit,
@@ -159,7 +161,7 @@ class Merge:
     alive = live != GONE             # view_age.py
     late = live == LATE
     ramp = (view.get("ramp") or {}) if alive else {}
-    on_link = bool(alive and view.get("link") and ramp.get("hwy"))
+    on_link = bool(alive and view.get("link") and ramp.get("hwy") and not ramp.get("turn"))
     if on_link and ramp.get("id") != self.link:
       pending = self.pending
       self.link = ramp.get("id")

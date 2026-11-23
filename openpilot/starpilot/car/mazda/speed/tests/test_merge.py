@@ -190,3 +190,14 @@ def test_his_set_minus_in_an_interchange_loop_above_street_speed_is_a_curve_spee
   curve_target["v"] = None                  # the loop is behind
   on_link(r, 0.2, 55, limit=70, spd=70)
   assert r.anchor_mph == 90                 # his 60 was a curve speed: the merge raises it
+
+
+def test_no_merge_on_a_turnaround_or_a_link_the_view_does_not_call_a_highways():
+  # (r2 rt 1085-1170) the view marks Hall Rd's turnaround link: no "hwy", so the merge never arms there
+  r = merge_rig()
+  r.step(v_mph=40, set_mph=48, events=[engaged(48)], view=lambda t: view(t, cls=3, chain=8))
+  turn = {"id": 9, "hwy": False, "spd": 22.35, "from_hwy": True, "turn": True}
+  r.step(v_mph=20, n=500, slc={"limit": 45 * MPH, "upcoming": 0.0, "t": 0.0}, path=PATH, model_age=0.0,
+         view=lambda t: view(t, link=True, cls=4, chain=9, ramp=turn))
+  m = r.cs[0]
+  assert m.link is None and r.anchor_mph == 48 and m.last[0] == "idle"
