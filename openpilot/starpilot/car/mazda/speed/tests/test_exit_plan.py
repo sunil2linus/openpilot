@@ -176,6 +176,50 @@ def test_his_gas_held_or_his_button_releases_the_plan():
   assert plan.done.get("x0") is not None
 
 
+def test_his_button_far_before_the_exit_does_not_cancel_it():
+  # r3 (M-59): his SET+ ~500 m before the split released the exit for good; at the split nothing slowed.
+  # Now a press while the exit is only looked at (beyond SIGNAL_REACH, no target yet) is ignored by the exit plan.
+  for far in (1400.0, 900.0, E.SIGNAL_REACH + 100.0):
+    def button(k, d, road, far=far):
+      if SPLIT - far <= road.s < SPLIT - far + 2:
+        d["set_plus"] = True
+    road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT - 300)
+    trace, ctl, plan = run(road, every=button)
+    p = plan.plan if plan.plan is not None and plan.plan.id == "x0" else plan.ended
+    assert p is not None and p.confirmed and not p.cancelled and p.released != "his button", (far, vars(p))
+    whys = {x[3] for x in trace if SPLIT - 300 <= x[0] < SPLIT}
+    assert "reach" in whys or "reach signal" in whys, (far, whys)
+    assert at(trace, SPLIT + 250)[1] / MPH <= 50.0                    # the same slowdown as without his press
+
+
+def test_his_gas_far_before_the_exit_does_not_cancel_it():
+  def gas(k, d, road):
+    if SPLIT - 1200 <= road.s < SPLIT - 900:
+      d["gas"] = True                                                  # held ~9 s, far ahead
+  road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT - 300)
+  _, _, plan = run(road, every=gas)
+  p = plan.plan if plan.plan is not None and plan.plan.id == "x0" else plan.ended
+  assert p is not None and p.confirmed and p.released != "his gas", vars(p)
+
+
+def test_his_button_releases_an_acting_plan_as_before():
+  # within SIGNAL_REACH of the split (here before any target: no blinker yet) and once a target is set
+  for at_m, blink in ((E.SIGNAL_REACH - 50.0, None), (SPLIT - (SPLIT - 250.0), lambda s: SPLIT - 380 <= s < SPLIT - 300)):
+    def button(k, d, road, at_m=at_m):
+      if SPLIT - at_m <= road.s < SPLIT - at_m + 2:
+        d["cancel"] = True
+    road = ExitRoad(set_mph=72, take=False, blink=blink)
+    _, _, plan = run(road, frames=int(2600 / 32 / 0.01), every=button)
+    assert plan.done.get("x0") is not None and plan.ended.released == "his button", at_m
+  # an acting plan far out: its target was set (the flag stays once set)
+  cfg = C.Config(enabled=True, exits="on")
+  ex = E.ExitPlan(cfg)
+  p = E.Plan("x0", 1000.0, 1)
+  assert not ex._acting(p, 1000.0)
+  p.acted = True
+  assert ex._acting(p, 1000.0) and ex._acting(E.Plan("x1", 0.0, 1), E.SIGNAL_REACH)
+
+
 def test_the_handover_to_the_streets_limit():
   road = ExitRoad(set_mph=72, blink=lambda s: SPLIT - 370 <= s < SPLIT - 300, slc_mph=35, street_from=420.0)
   trace, ctl, plan = run(road, frames=int(2950 / 30 / 0.01) + 2500)

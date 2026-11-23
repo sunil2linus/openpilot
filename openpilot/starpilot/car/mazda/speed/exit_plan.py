@@ -33,8 +33,9 @@ silent shapes and no match, as without GPS:
     (the curve contributor takes the ramp's curves over once the match is on the link).
   * Released at once (the speed comes back): "highway" from the shapes for HWY_CONFIRM, the match on the highway with
     GPS trust 0 for HWY_MATCH past HWY_MATCH_FROM with the shapes' last answer not link, the model path straight
-    (along the highway, MODEL_CONFIRM) with the shapes' last answer not link; his gas held GAS_HELD; any button of his;
-    PASSED past the split unresolved. A "link" answer is forgotten after SHAPE_QUIET_T / SHAPE_QUIET_M of silent
+    (along the highway, MODEL_CONFIRM) with the shapes' last answer not link; his gas held GAS_HELD; any button of his
+    (his gas / button / brake only while the plan is acting: it had a target, or the car is within SIGNAL_REACH of the
+    split or past it; further ahead the exit is only looked at and stays planned); PASSED past the split unresolved. A "link" answer is forgotten after SHAPE_QUIET_T / SHAPE_QUIET_M of silent
     shapes (scattered link frames never add up to a confirmation, one frame never blocks the release).
   * A confirmation is overturned (everything released: the ramp target, the handover, his speed restored) by the
     shapes saying highway for HWY_CONFIRM, the trusted highway match (as above), or his gas held GAS_HELD unless the
@@ -220,6 +221,7 @@ class Plan:
     self.hwy_n, self.hwy_match_n = ViewCount(), ViewCount()        # views saying highway / matched on it past HWY_MATCH_FROM
     self.blink_t = None         # s of his last exit-side blinker frame before the split (BLINKER_GRACE)
     self.last_target = None     # the plan's target of the frame before (the bound never raises it)
+    self.acted = False          # it has had a target (ExitPlan._acting)
     self.pts = []               # [(odometer m, radius)] of the ramp's profile
     self.hwy = False
     self.spd = 0.0
@@ -369,13 +371,14 @@ class ExitPlan:
       if d < -PASSED or (e is None and alive):
         self.plan = None
       return out
-    # ---- his decisions ----
-    if self._his(ctx) or ctx.get("brake"):
+    # ---- his decisions (only for a plan that is acting: far ahead it is only looked at) ----
+    acting = self._acting(p, d)
+    if (self._his(ctx) or ctx.get("brake")) and acting:
       p.cancelled = True             # (a handover is cancelled for good; the ramp's curves stay the curve plan's)
       self._end("his button" if self._his(ctx) else "brake")
       self.last = ("released", p.released)
       return out
-    if p.gas_t >= GAS_HELD - 1e-6 and not p.confirmed:
+    if p.gas_t >= GAS_HELD - 1e-6 and not p.confirmed and acting:
       self._end("his gas")
       return out
     # ---- evidence ----
@@ -454,6 +457,7 @@ class ExitPlan:
     if target is not None and full is not None and p.confirmed:
       target = full
     p.last_target = target
+    p.acted = p.acted or target is not None
     # (part H) the bound keeps the set higher than the ramp needs: the exit brake notice (notices.py)
     self.brake_needed = bool(target is not None and unbounded is not None and not p.confirmed and
                              target > unbounded + BRAKE_GAP)
@@ -464,6 +468,15 @@ class ExitPlan:
     if p.confirmed and not p.hwy and not p.cancelled:
       p.handover = True
     return self._handover(ctx, out) if p.handover else out
+
+  @staticmethod
+  def _acting(p, d):
+    """The plan acts on this exit: it has had a target (our presses for it), it is confirmed / handing over, or the
+    car is within SIGNAL_REACH of the split or past it. Before that (up to EXIT_LOOK ahead) the exit is only looked
+    at: his button, gas or brake there is about his own speed (the planner makes his set his as always), not about
+    this exit, and must not mark it done (r3: his SET+ ~500 m before the split released it for good; at the split
+    nothing slowed and he braked on the ramp)."""
+    return bool(p.confirmed or p.handover or p.reach_on or p.acted or d <= SIGNAL_REACH)
 
   @staticmethod
   def _hwy_shapes(p):

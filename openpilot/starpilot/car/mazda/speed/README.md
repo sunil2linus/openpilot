@@ -109,7 +109,9 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
   split with his blinker (or the camera's edge lane and the model path toward the link together) the full ramp plan
   runs for at most 3 s without a "link" confirmation (the edge lane or the model alone only hold the speed); until confirmed the cruise's set never goes more than 12 mph under the speed where our slowing began (the
   reach profile taking over, else the split). Released at once on "highway" (shapes, trusted match, model path), his
-  gas held 1.5 s, any button; a confirmation is overturned by the same highway evidence or his gas held (unless the
+  gas held 1.5 s, any button - his gas / button / brake only once the plan acts (it had a target, or the car is within
+  400 m of the split or past it): further ahead (up to 1.5 km) the exit is only looked at, his press there is about his
+  own speed and the exit stays planned (r3: his SET+ ~500 m before an exit released it for good); a confirmation is overturned by the same highway evidence or his gas held (unless the
   car is matched on the ramp with trust 0), and our handover then gives his speed back. His blinker to the other
   side cancels the exit blinker. **Trust a blinker that is still on**: while his signal toward the exit is on (1.0 s grace for the lamp's
   flash gaps / a self-cancel), or it was on for this exit and the camera says the car is in the lane next to the road
