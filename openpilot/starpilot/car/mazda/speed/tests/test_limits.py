@@ -57,8 +57,8 @@ def test_engaged_in_the_band_follows_a_change_and_then_it_is_ours():
   r = rig()
   drive(r, 6, 70, v=70, cls=HIGHWAY)
   r.step(set_mph=73, events=[engaged(73)])
-  drive(r, 2.5, 55, v=70, cls=HIGHWAY)
-  assert r.anchor_mph == 73 and r.p.owner == ENGAGED   # a lower limit needs its steady time first
+  drive(r, 4.5, 55, v=70, cls=HIGHWAY)
+  assert r.anchor_mph == 73 and r.p.owner == ENGAGED   # a lower limit needs its steady time first (a highway: 5 s)
   drive(r, 1.0, 55, v=70, cls=HIGHWAY)
   assert r.anchor_mph == 55 and r.p.owner == OURS and r.p.ours_why == "limit"   # (A5: engaged in band, a drop)
   drive(r, 4.0, 65, v=58, cls=HIGHWAY)

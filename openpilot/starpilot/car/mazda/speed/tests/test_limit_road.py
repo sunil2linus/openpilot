@@ -72,7 +72,7 @@ def test_matched_still_bridges_a_detour_when_the_change_is_a_raise():
 
 # ---------------- A2: the offset only on a street ----------------
 
-@pytest.mark.parametrize("cls,link,want", ((STREET, False, 48), (7, False, 48), (HIGHWAY, False, 45), (3, False, 45),
+@pytest.mark.parametrize("cls,link,want", ((STREET, False, 48), (7, False, 48), (HIGHWAY, False, 45), (3, False, 48),   # (a trunk road is a street here)
                                            (UNKNOWN, False, 45)))
 def test_the_offset_is_a_streets_only(cls, link, want):
   r, sl = rig()
@@ -299,13 +299,36 @@ def test_a_highway_drop_lowers_ours_and_engaged_in_band_never_his():
       r.p.owner, r.p.ours_why = OURS, "limit"
     drive(r, 0.5, 70, v=72, cls=HIGHWAY)
     assert r.anchor_mph == (70 if owner == OURS else 72) and r.p.owner == owner   # (ours: the limit itself at once)
-    drive(r, L.LOWER_STEADY - 0.2, 60, v=72, cls=HIGHWAY)
+    drive(r, L.LOWER_STEADY + 0.5, 60, v=72, cls=HIGHWAY)
+    assert r.anchor_mph == (70 if owner == OURS else 72)     # off a street LOWER_STEADY is not enough (an overpass)
+    drive(r, L.RETAKE_LOWER - L.LOWER_STEADY - 0.7, 60, v=72, cls=HIGHWAY)
     assert r.anchor_mph == (70 if owner == OURS else 72)
     drive(r, 0.4, 60, v=72, cls=HIGHWAY)
-    assert r.anchor_mph == 60, owner                         # after LOWER_STEADY, the posted limit itself
+    assert r.anchor_mph == 60, owner                         # after RETAKE_LOWER, the posted limit itself
   r, _ = rig()
   drive(r, 6, 70, v=70, cls=HIGHWAY)
   drive(r, 0.01, 70, v=70, cls=HIGHWAY, set_mph=70, events=[engaged(70)])
   r.step(v_mph=70, set_mph=72, events=[driver("SET_PLUS", 72)], slc=slc(70), view=lambda t: view(t, cls=HIGHWAY))
   drive(r, 20, 60, v=72, cls=HIGHWAY)
   assert r.anchor_mph == 72 and r.p.owner == HIS
+
+
+def test_a_big_highway_drop_of_ours_waits_the_long_time_and_a_street_drop_stays_quick():
+  r, _ = rig()
+  drive(r, 6, 70, v=70, cls=HIGHWAY)
+  drive(r, 0.01, 70, v=70, cls=HIGHWAY, set_mph=70, events=[engaged(70)])
+  r.p.owner, r.p.ours_why = OURS, "limit"
+  drive(r, L.RETAKE_LOWER + 1.0, 45, v=70, cls=HIGHWAY)     # 70 -> 45: more than BIG_DROP
+  assert r.anchor_mph == 70
+  drive(r, L.RETAKE_LOWER_BIG - L.RETAKE_LOWER - 0.8, 45, v=70, cls=HIGHWAY)
+  assert r.anchor_mph == 45
+  r, _ = rig()                                              # a street (a trunk road too): LOWER_STEADY as before
+  for cls in (STREET, 3):
+    r, _ = rig()
+    drive(r, 6, 45, v=45, cls=cls)
+    drive(r, 0.01, 45, v=45, cls=cls, set_mph=45, events=[engaged(45)])
+    r.p.owner, r.p.ours_why = OURS, "limit"
+    drive(r, 0.5, 45, v=45, cls=cls)
+    assert r.anchor_mph == 48
+    drive(r, L.LOWER_STEADY + 0.3, 35, v=45, cls=cls)
+    assert r.anchor_mph == 38, cls

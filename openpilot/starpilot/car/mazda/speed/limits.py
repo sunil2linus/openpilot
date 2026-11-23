@@ -90,7 +90,9 @@ RETAKE_WINDOW = 30.0                 # s after a limit became steady it may re-t
 RETAKE_LOWER = 5.0                   # s unchanged with clean trust before a lower limit re-takes his speed (old rule 9)
 RETAKE_LOWER_BIG = 8.0               # s ... for a drop of more than BIG_DROP (old LOWER_BIG_STEADY)
 BIG_DROP = (20, 32)                  # mph / km/h
-HIGHWAY_CLASSES = (1, 3)             # map_view.HIGHWAY_CLASSES
+HIGHWAY_CLASSES = (1,)               # for the limit rules only a motorway is a highway. A trunk road (class 3: Hall Rd,
+                                     # a divided surface road with lights) is a STREET here: the offset, the match on
+                                     # engage and the lower-limit re-take apply. Exits and merges keep map_view's (1, 3).
 LINK_CLASSES = (2, 4, 6, 8, 10)      # map_match.LINK_CLASSES
 GAP_HOLD = 2.5                       # s without a reading the steady time holds (two missed 1 Hz fixes; view_age)
 
@@ -260,7 +262,12 @@ class SpeedLimit:
       elif not clean:
         self.cand_t = 0.0                                  # holds through the gap, but trust / view rules still apply
     if self.cand is not None and self.cand != self.steady:
-      need = LOWER_STEADY if self.steady is not None and self.cand < self.steady else RAISE_STEADY
+      need = RAISE_STEADY
+      if self.steady is not None and self.cand < self.steady:
+        need = LOWER_STEADY
+        if not self.street():      # off a street (a motorway, a link, unknown): the re-take times, also for a speed of
+          # ours (a wrong reading under an overpass or beside a ramp must not drop 70 to 55 after 3 s)
+          need = RETAKE_LOWER_BIG if self.steady - self.cand > BIG_DROP[self.k] else RETAKE_LOWER
       if self.cand_t >= need - 1e-6:
         new, old = self.cand, self.steady
         if old is None and self.known is not None and now - self.known[1] <= MATCH_KEEP:

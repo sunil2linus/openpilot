@@ -85,6 +85,10 @@ behaves exactly like the Stage 1 branch (`s7-mazda-ti`); `tests/test_off_is_stag
     one inside the old limit's band, after the lower limit's 3 s steady time, to the new posted limit; an anchor his
     SET+ / SET- made his is never lowered on a highway (only a raise in the old limit's band re-takes it).
 * **Limit**: steady 3 s (lower) / 5 s (higher, first) with GPS trust 0 on every frame (restarts at a bad frame);
+  For the limit rules only a motorway (road class 1) is a highway: a trunk road (class 3, e.g. a divided surface road
+  with lights such as Hall Rd) is a street, so it gets the offset, match on engage and the lower-limit re-take. Exits
+  and merges still treat trunk roads as highways (map_view). Off a street a LOWER limit needs 5 s (8 s for a drop of
+  more than 20 mph) before it lowers even a speed of ours (a wrong reading under an overpass); on a street 3 s.
   the target is the limit + offset (default 3 mph) **on a street only** (the last known road class of the map view
   is known and not a highway nor a link; the owner's "street speed: limit + 3", the old build's Street Speed); on a
   highway, a link or a road whose class was never known it is the posted limit itself. Whole dash steps, no margin;
