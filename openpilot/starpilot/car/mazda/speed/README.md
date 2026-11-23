@@ -430,7 +430,10 @@ merges). Home area (folder 42/-84): 90 interchange, 23 entrance, 29 exit and 31 
 over a street, now "to highway" again, e.g. M-59 490860778, I-94 17963358, I-69 443254109). Known limit: the shapes are
 simplified per way (2 m), so a street node in a straight run can be gone (at link ends onto a street ~40 % have no
 street point within 1 m); such a junction inside a chain is not seen and the record holds (M-53 -> 23 Mile Rd,
-486581349, keeps its point and its cut). The builder itself is unchanged (no version bump, no rebuild).
+486581349, keeps its point and its cut). The link's ways are followed along their own shapes (round 3: round 2
+looked only in the cells along the chord between the link's ends, which missed the middle ways of a wide loop: 60
+home-area links had missing segments, 25 a whole way missing; 5 change: 4 long I-275 / I-675 interchanges and an M-14
+exit now see their street junction). The builder itself is unchanged (no version bump, no rebuild).
 
 ### Turnarounds and slow trunk roads are no merge (map_view.LinkShapes.leads)
 

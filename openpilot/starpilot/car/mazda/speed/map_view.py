@@ -86,6 +86,7 @@ TURNAROUND_DEG = 120.0        # deg: the carriageways a link joins run this far 
 TURNAROUND_LEN = 250.0        # m: a turnaround is at most this long (home area: 3078 of the 3085 links round 2 flagged)
 TURNAROUND_SAME_LEN = 400.0   # m: ... or this long when it joins the same road (its name at both ends; Fort St 268 m)
 SHAPE_SEARCH = 150.0          # m between the points where the link's own shapes are looked up
+SEGS_CELLS = 400              # match cells (~220 m) at most while a link's ways are followed along their shapes
 # A map jog is no curve (read time; r2 rt 668-686 on Schoenherr Rd: two map ways meet with an 8 m sideways jog, read as
 # a 26 deg left and a 30 deg right bend 4 m apart, r 97 / 99 m; the GPS heading changed under 1 deg/s): where a two-way
 # way meets a one-way way of the same road (a road splitting into its carriageways), two opposite bends within
@@ -371,20 +372,35 @@ class LinkShapes:
     self._key = None
 
   def _segs(self, wids, pts):
-    """{way id: set of (a, b) micro-degree segments} of the given ways near the given points."""
+    """{way id: set of (a, b) micro-degree segments} of the given ways: looked up around the given points (deg), then
+    followed along the ways' own shapes, cell by cell around each segment end found (round 3: the cells along the
+    chord between the link's ends missed the middle ways of a wide loop ramp, a 270 deg cloverleaf). At most
+    SEGS_CELLS cells."""
     out = {w: set() for w in wids}
-    cells = set()
-    for la, lo in pts:
-      cla, clo = int(math.floor(la * MM.MATCH_CELL)), int(math.floor(lo * MM.MATCH_CELL))
+    done, todo = set(), []
+
+    def near(cla, clo):
       for dla in (-1, 0, 1):
         for dlo in (-1, 0, 1):
-          cells.add(MM.cell_key(cla + dla, clo + dlo))
-    for ri in self.store.grid:
-      for cell in cells:
+          c = MM.cell_key(cla + dla, clo + dlo)
+          if c not in done:
+            done.add(c)
+            todo.append(c)
+    for la, lo in pts:
+      near(int(math.floor(la * MM.MATCH_CELL)), int(math.floor(lo * MM.MATCH_CELL)))
+    while todo and len(done) <= SEGS_CELLS:
+      cell = todo.pop()
+      for ri in self.store.grid:
         for i in ri.cells.get(cell, ()):
           w = int(ri.way[i])
-          if w in out:
-            out[w].add(((ri.lat1[i], ri.lon1[i]), (ri.lat2[i], ri.lon2[i])))
+          if w not in out:
+            continue
+          seg = ((ri.lat1[i], ri.lon1[i]), (ri.lat2[i], ri.lon2[i]))
+          if seg in out[w]:
+            continue
+          out[w].add(seg)
+          for la, lo in seg:
+            near(int(math.floor(la * MM.MATCH_CELL / 1e6)), int(math.floor(lo * MM.MATCH_CELL / 1e6)))
     return out
 
   @staticmethod

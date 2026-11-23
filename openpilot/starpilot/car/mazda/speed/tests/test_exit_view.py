@@ -6,7 +6,7 @@ import os
 from openpilot.starpilot.car.mazda.speed import curve_builder as B
 from openpilot.starpilot.car.mazda.speed import map_match as MM
 from openpilot.starpilot.car.mazda.speed import map_view as V
-from openpilot.starpilot.car.mazda.speed.tests.test_curve_builder import ramp_scene, way, straight
+from openpilot.starpilot.car.mazda.speed.tests.test_curve_builder import arc, ramp_scene, way, straight
 from openpilot.starpilot.car.mazda.speed.tests.test_map_view import gps_at
 
 
@@ -269,3 +269,40 @@ def test_round3_a_long_interchange_between_two_freeways_is_no_turnaround(tmp_pat
     lk = V.LinkShapes(mv.store)
     r = dict(rec, len=length, to=dict(rec["to"], name=to_name))      # (a fresh LinkShapes: no cache)
     assert lk.info(r)["turn"] is turn, (length, to_name)
+
+
+def wide_loop_scene(r=400.0):
+  """A motorway north at x = r; a 270 deg loop ramp (three link ways, no name: one chain) leaves it at (r, 0) heading
+  north, turns left round (0, 0) and ends on a street at (0, -r); a cross street meets the loop at the joint of its
+  2nd and 3rd ways, (-r, 0): ~570 m off the chord between the loop's ends."""
+  mw = way(50, straight(r, -1000, 0, 2000), name="", cls=1, speed_mph=70)
+  mw.ref = "I 96"
+  parts = [arc(0, 0, r, 0, 90), arc(0, 0, r, 90, 180), arc(0, 0, r, 180, 270)]
+  ws = [way(51 + k, pts, name="", cls=2, speed_mph=35, oneway=True) for k, pts in enumerate(parts)]
+  for a, b in zip(ws, ws[1:], strict=False):
+    b.lat[0], b.lon[0] = a.lat[-1], a.lon[-1]
+    b.start = a.end = B.key(a.lat[-1], a.lon[-1])
+  k0 = 50                                    # mw's node at y = 0
+  ws[0].lat[0], ws[0].lon[0] = mw.lat[k0], mw.lon[k0]
+  ws[0].start = B.key(mw.lat[k0], mw.lon[k0])
+  end_st = way(55, straight(0, -r, 90, 600), name="Grand River Avenue", cls=5, speed_mph=45)
+  end_st.lat[0], end_st.lon[0] = ws[2].lat[-1], ws[2].lon[-1]
+  end_st.start = ws[2].end = B.key(ws[2].lat[-1], ws[2].lon[-1])
+  west = way(56, straight(-r - 300, 0, 90, 300), name="Novi Road", cls=7, speed_mph=40)
+  east = way(57, straight(-r, 0, 90, 300), name="Novi Road", cls=7, speed_mph=40)
+  west.lat[-1], west.lon[-1] = east.lat[0], east.lon[0] = ws[1].lat[-1], ws[1].lon[-1]
+  west.end = east.start = B.key(ws[1].lat[-1], ws[1].lon[-1])
+  return {w.id: w for w in [mw, end_st, west, east] + ws}
+
+
+def test_round3_a_wide_loop_ramps_middle_ways_are_found_along_its_own_shape(tmp_path):
+  # (round 2 looked only in the cells along the chord between the link's ends: the middle ways of a 270 deg
+  # cloverleaf were missed, so the link had no shapes at all: no cuts, no turnaround test)
+  mv, ramps = scene_view(tmp_path, wide_loop_scene())
+  rec = next(r for r in ramps if r["chain"] in (51, 52, 53))
+  assert rec["len"] > 1800
+  drive(mv, [(400.0, float(y), 0.0) for y in range(-480, -300, 3)])
+  lk = V.LinkShapes(mv.store)
+  segs = lk._segs({51, 52, 53}, [tuple(rec["start"]), tuple(rec["end"])])
+  assert all(len(segs[w]) >= 3 for w in (51, 52, 53))
+  assert [c for _k, c in lk.info(rec)["cuts"]] == [7]       # Novi Rd at the joint ~570 m off the chord
