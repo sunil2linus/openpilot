@@ -92,15 +92,44 @@ TURNAROUND_SAME_LEN = 400.0   # m: ... or this long when it joins the same road 
 SHAPE_SEARCH = 150.0          # m between the points where the link's own shapes are looked up
 SEGS_CELLS = 400              # match cells (~220 m) at most while a link's ways are followed along their shapes
 # A map jog is no curve (read time; r2 rt 668-686 on Schoenherr Rd: two map ways meet with an 8 m sideways jog, read as
-# a 26 deg left and a 30 deg right bend 4 m apart, r 97 / 99 m; the GPS heading changed under 1 deg/s): where a two-way
-# way meets a one-way way of the same road (a road splitting into its carriageways), two opposite bends within
-# JOG_GAP whose heading changes cancel (net under JOG_NET), each at most JOG_BEND, the road moved sideways at most
-# JOG_OFFSET. Never on a ramp. The builder's split_doublets has the same rule with 30 deg at most: this one's 30.2 deg
-# missed it by 0.2 deg (a builder fix would need a rebuild; this needs none).
+# a 26 deg left and a 30 deg right bend 4 m apart, r 97 / 99 m; the GPS heading changed under 1 deg/s; Round W, W3:
+# Half Day Road / West Half Day Road chain 1267268335 had 42.5/40.7 deg bends, gap 4.0 m, sideways 7.1 m): where a
+# two-way way meets a one-way way of the same road (ignoring a leading directional prefix like "West ": a road
+# splitting into its carriageways), two opposite bends within JOG_GAP whose heading changes cancel (net under JOG_NET),
+# each at most JOG_BEND, the road moved sideways at most JOG_OFFSET. Never on a ramp. The builder's split_doublets has
+# the same rule with 30 deg at most (this rebuilds nothing).
 JOG_GAP = 20.0                # m between the first bend's exit and the second's entry
 JOG_NET = 8.0                 # deg
-JOG_BEND = 35.0               # deg
+JOG_BEND = 45.0               # deg
 JOG_OFFSET = 12.0             # m
+_JOG_DIR_PREFIXES = ("north ", "south ", "east ", "west ", "n ", "s ", "e ", "w ", "n. ", "s. ", "e. ", "w. ")
+
+# Round W, W2 (Chicago drive, Tri-State Tollway 44 m / 12.1 deg; plus similar 26-52 m / 12-16 deg OSM kinks on
+# I-96, I-80, Kingery Hwy, M-14, Jane Addams, Edens Spur): a short shallow kink on a motorway mainline (cls 1,
+# non-ramp, no advisory sign) is an OSM polyline artifact, not a curve to slow for. Filtered at read time (no
+# map rebuild). Real corridor motorway curves are >= 62 m or > 18 deg.
+MOTORWAY_KINK_LEN = 55.0      # m
+MOTORWAY_KINK_TURN = 18.0     # deg
+
+
+def motorway_kink(c):
+  """(W2) Short shallow OSM kink on a motorway mainline (cls 1, non-ramp, no advisory sign): not a curve."""
+  try:
+    return (int(c.get("cls", 0) or 0) == 1 and not is_ramp_curve(c) and
+            float(c.get("adv", 0.0) or 0.0) <= 0.0 and
+            float(c.get("len", 0.0) or 0.0) <= MOTORWAY_KINK_LEN and
+            float(c.get("turn", 0.0) or 0.0) <= MOTORWAY_KINK_TURN)
+  except (KeyError, TypeError, ValueError):
+    return False
+
+
+def _jog_name(name):
+  """Normalized road name for carriageway-split jogs (strips a leading directional prefix like 'West ')."""
+  s = " ".join((name or "").strip().lower().split())
+  for p in _JOG_DIR_PREFIXES:
+    if s.startswith(p):
+      return s[len(p):]
+  return s
 
 
 def _sideways(c1, c2):
@@ -125,7 +154,8 @@ def jogs(curves, oneway_ids=None):
     try:
       if (c1.get("dir") == c2.get("dir") or is_ramp_curve(c1) or is_ramp_curve(c2) or
           float(c2["s_a"]) - float(c1["s_b"]) > JOG_GAP or abs(float(c1["turn"]) - float(c2["turn"])) >= JOG_NET or
-          max(float(c1["turn"]), float(c2["turn"])) > JOG_BEND or (c1.get("name") or "") != (c2.get("name") or "")):
+          max(float(c1["turn"]), float(c2["turn"])) > JOG_BEND or
+          _jog_name(c1.get("name")) != _jog_name(c2.get("name"))):
         continue
       if oneway_ids is not None:
         ws = {int(w) for w in (c1.get("ways") or []) + (c2.get("ways") or [])}
@@ -217,6 +247,8 @@ class CurvesAhead:
     for c in self.store.curves.get(cid, []):
       if (c.get("chain"), c["s_a"]) in skip:
         continue                   # a map jog, not a curve (JOG_*)
+      if motorway_kink(c):
+        continue                   # short shallow motorway OSM kink, not a curve (MOTORWAY_KINK_*)
       key = f"{cid}:{c['s_a']}:{'ab' if increasing else 'ba'}"
       entry, exit_ = (c["a"], c["b"]) if increasing else (c["b"], c["a"])
       s_entry, s_exit = (c["s_a"], c["s_b"]) if increasing else (c["s_b"], c["s_a"])

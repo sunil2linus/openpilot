@@ -9,8 +9,8 @@ The camera (modelV2) in the speed control, two narrow jobs only:
   * CameraCurve: a careful target for curves the map does not have: the model's curvature between CAM_T0 and CAM_T1 s
     ahead (it under-reads beyond ~2 s) planned at CAM_LAT (min with the road lateral; CAM_NO_GPS_LAT without a GPS
     position) with the same braking envelope; the least demanding value of the last CAM_CONFIRM s (one curved model
-    frame does not slow the car). Not at all below CAM_MIN_SPEED, with a blinker on, or where a map curve covers
-    the camera's range (the map governs there).
+    frame does not slow the car). Not at all below CAM_MIN_SPEED, when the target is more than CAM_ABOVE_V above the
+    car's speed, with a blinker on, or where a map curve covers the camera's range (the map governs there).
 No in-curve taps, no post-apex logic, no RampTail: the map profile does that job now. Pure (tests/test_camera.py).
 """
 import math
@@ -39,6 +39,11 @@ CAM_NO_GPS_LAT = 1.8          # m/s^2 without a GPS position: more careful
 CAM_CONFIRM = 0.5             # s
 CAM_MIN_SPEED = 25 * MPH
 CAM_MIN_K = 1.0 / 1000.0
+# Round W, W1 (Chicago drive 18:08-18:10, 18:31, 18:55): crawling in traffic at 25-35 mph with anchor 80-85 mph,
+# gentle bends / path wiggles at CAM_LAT (2.0 m/s^2) give 65-80 mph camera targets, repeatedly tapping SET- far
+# above v_ego. Camera lookahead is only CAM_T1 (2 s) ahead, so a camera target more than CAM_ABOVE_V above the
+# car's actual speed cannot need slowing now.
+CAM_ABOVE_V = 10.0 * MPH
 
 
 def model_path(model, warn=None):
@@ -161,6 +166,9 @@ class CameraCurve:
         e = M.envelope(vp, x, v)
         best = e if best is None else min(best, e)
         self.raw_vmin = vp if self.raw_vmin is None else min(self.raw_vmin, vp)
+    if best is not None and best > v + CAM_ABOVE_V:
+      self.raw_vmin = None
+      return None
     return best
 
   def __call__(self, ctx):

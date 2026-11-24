@@ -159,9 +159,9 @@ def test_round2_a_jog_where_a_road_splits_into_carriageways_is_no_curve():
   oneway = {2}
   assert V.jogs(jog_pair(), oneway) == {(1, 100.0), (1, 136.0)}
   assert V.jogs(jog_pair(), None) == {(1, 100.0), (1, 136.0)}        # (no shapes: the shape rule alone)
-  # kept: a real S-bend (40 deg bends), far apart (30 m), not cancelling (net 12 deg), moved 15 m, on a ramp, both
+  # kept: a real S-bend (50 deg bends), far apart (30 m), not cancelling (net 12 deg), moved 15 m, on a ramp, both
   # ways one-way (no split), two roads
-  for kw in ({"turn1": 40.0, "turn2": 40.0}, {"gap": 30.0}, {"turn2": 38.3}, {"offset_m": 15.0}, {"ramp": True},
+  for kw in ({"turn1": 50.0, "turn2": 50.0}, {"gap": 30.0}, {"turn2": 38.3}, {"offset_m": 15.0}, {"ramp": True},
              {"ways1": (2,), "ways2": (2,)}):
     pair = jog_pair(**kw)
     if "name" in kw:
@@ -196,3 +196,60 @@ def test_round2_the_view_leaves_a_jog_out_and_keeps_a_real_curve(tmp_path):
   rmins = [min(r for _, r in c["pts"]) for c in out["curves"]]
   assert not any(abs(r - 97.0) < 1 or abs(r - 99.0) < 1 for r in rmins), rmins
   assert any(abs(r - 80) / 80 < 0.12 for r in rmins)                  # the real 80 m curve is kept
+
+
+def test_round_w_half_day_rd_directional_prefix_and_steep_jog_skipped():
+  oneway = {2}
+  pair = jog_pair(turn1=42.5, turn2=40.7, gap=4.0, offset_m=7.1)
+  pair[0]["name"] = "Half Day Road"
+  pair[1]["name"] = "West Half Day Road"
+  assert V.jogs(pair, oneway) == {(1, 100.0), (1, 136.0)}
+  pair = jog_pair(turn1=22.2, turn2=22.0, gap=6.0, offset_m=8.9)
+  pair[0]["name"] = "South Hope Street"
+  pair[1]["name"] = "North Hope Street"
+  assert V.jogs(pair, oneway) == {(1, 100.0), (1, 138.0)}
+  # genuinely different road names stay
+  pair = jog_pair(turn1=42.5, turn2=40.7, gap=4.0, offset_m=7.1)
+  pair[0]["name"] = "Half Day Road"
+  pair[1]["name"] = "Milwaukee Avenue"
+  assert V.jogs(pair, oneway) == set()
+  # sideways > 12 m real S-bend stays
+  assert V.jogs(jog_pair(turn1=42.5, turn2=40.7, gap=4.0, offset_m=15.0), oneway) == set()
+
+
+def test_round_w_motorway_short_kink_skipped_at_read_time(tmp_path):
+  assert V.motorway_kink({"cls": 1, "len": 44.0, "turn": 12.1, "adv": 0.0})
+  assert V.motorway_kink({"cls": 1, "len": 30.0, "turn": 15.0, "adv": 0.0})
+  assert not V.motorway_kink({"cls": 1, "len": 190.0, "turn": 30.0, "adv": 0.0})
+  assert not V.motorway_kink({"cls": 1, "len": 30.0, "turn": 21.7, "adv": 0.0})
+  assert not V.motorway_kink({"cls": 1, "len": 44.0, "turn": 12.1, "adv": 22.35})
+  assert not V.motorway_kink({"cls": 2, "ramp": {"type": "exit"}, "len": 30.0, "turn": 15.0, "adv": 0.0})
+  assert not V.motorway_kink({"cls": 3, "len": 30.0, "turn": 15.0, "adv": 0.0})
+  assert not V.motorway_kink({"cls": 7, "len": 30.0, "turn": 15.0, "adv": 0.0})
+
+  # Real 265 m / 30 deg motorway curve stays while a short shallow kink is omitted and an advisory bend stays
+  a = straight(0, -400, 0, 400, step=10)
+  c = arc_m(-265, 0, 265, 0, 30, 3.0)
+  ex, ey = c[-1]
+  h = math.radians(-30)
+  b = [(ex + math.sin(h) * 10 * i, ey + math.cos(h) * 10 * i) for i in range(1, 41)]
+  mw = way(1, a + c[1:] + b, name="Tri-State Tollway", cls=1, speed_mph=70, oneway=True)
+  mv, store = make_view(tmp_path, {1: mw})
+  for k, y in enumerate(range(-380, -300, 2)):
+    mv.update(k * 0.1, gps_at(0.0, float(y), 0.0))
+  cid = next(iter(store.curves))
+  real = store.curves[cid][0]
+  assert not V.motorway_kink(real)
+  kink = {"chain": cid, "s_a": 150.0, "s_b": 194.0, "dir": "R", "cls": 1, "len": 44.0, "turn": 12.1,
+          "r": 266.5, "adv": 0.0, "a": (LAT0 - 250 * M_LAT, LON0), "b": (LAT0 - 206 * M_LAT, LON0),
+          "a_hdg": 0.0, "b_hdg": 180.0, "name": "Tri-State Tollway", "ways": [1],
+          "prof": [[0.0, 400.0], [22.0, 266.5], [44.0, 400.0]]}
+  signed = dict(kink, s_a=220.0, s_b=264.0, r=260.0, adv=20.0,
+                a=(LAT0 - 180 * M_LAT, LON0), b=(LAT0 - 136 * M_LAT, LON0),
+                prof=[[0.0, 400.0], [22.0, 260.0], [44.0, 400.0]])
+  store.curves[cid] = [kink, signed, real]
+  out = mv.update(10.0, gps_at(0.0, -300.0, 0.0))
+  rmins = [min(r for _, r in cv["pts"]) for cv in out["curves"]]
+  assert not any(abs(r - 266.5) < 0.2 for r in rmins), rmins
+  assert any(abs(r - 260.0) < 0.2 for r in rmins), rmins
+  assert any(abs(r - real["r"]) / real["r"] < 0.05 for r in rmins), rmins

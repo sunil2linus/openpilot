@@ -190,3 +190,20 @@ def test_sources_camera_steps_aside_only_for_pressed_map_curves():
   far = view([[400.0, 80.0]])
   src = Sources(want_model=False, sm=None, read_view=lambda: far, clock=lambda: 0.0)
   assert not src.context({"v_ego": 25.0})["map_covers_camera"]        # beyond the camera's range: the camera acts
+
+
+def test_camera_curve_ignores_targets_far_above_v_ego():
+  cam = CameraCurve(CFG, dt=0.01)
+  ctx = {"path": path(1 / 500.0), "v_ego": 28 * MPH, "model_age": 0.0, "gps_ok": True}
+  assert cam.raw_target(ctx) is None and cam.raw_vmin is None
+  for _ in range(60):
+    assert cam(dict(ctx)).target is None
+  # tight curve near or below v_ego still activates after CAM_CONFIRM
+  tight = dict(ctx, path=path(1 / 50.0))
+  for _ in range(60):
+    t = cam(dict(tight)).target
+  assert t is not None
+  # moderate ~45 mph curve acts at 40 mph (<= 40 + 10) and is ignored at 30 mph (> 30 + 10)
+  mod_k = 2.0 / (45 * MPH) ** 2
+  assert CameraCurve(CFG).raw_target({"path": path(mod_k), "v_ego": 40 * MPH, "model_age": 0.0, "gps_ok": True}) is not None
+  assert CameraCurve(CFG).raw_target({"path": path(mod_k), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}) is None
