@@ -118,10 +118,11 @@ def test_carstate_stock_unchanged():
   assert state.invalidLkasSetting
 
 
-def control(latActive=True, torque=1.0):
+def control(latActive=True, torque=1.0, visual_alert=structs.CarControl.HUDControl.VisualAlert.none):
   CC = structs.CarControl()
   CC.latActive = latActive
   CC.actuators.torque = torque
+  CC.hudControl.visualAlert = visual_alert
   return CC
 
 
@@ -164,3 +165,50 @@ def test_carcontroller_stock_no_ti_message():
     assert not [m for m in can_sends if m[0] == 0x249]
     last = actuators.torqueOutputCan
   assert last == 800
+
+
+def test_carcontroller_ti_hides_dash_steer_required_below_stock_lkas_speed():
+  packer = CANPacker("mazda_2017")
+  hud_parser = CANParser("mazda_2017", [("CAM_LANEINFO", float("nan"))], 0)
+  alert = structs.CarControl.HUDControl.VisualAlert.steerRequired
+  tick = [1]
+
+  def apply_hud(ci, **kwargs):
+    msgs = frames(packer, **kwargs) + ([ti_feedback(packer)] if ci.CS.torque_interceptor else [])
+    t_ns = tick[0] * 10_000_000
+    tick[0] += 1
+    state = ci.update([(t_ns, msgs)])
+    ci.CC.frame = 0
+    _, can_sends = ci.apply(control(visual_alert=alert).as_reader(), t_ns)
+    hud = sent(can_sends, 0x440, 0)
+    assert len(hud) == 1
+    hud_parser.update([(t_ns, [(0x440, hud[0], 0)])])
+    return state, hud_parser.vl["CAM_LANEINFO"]
+
+  # TI car (minSteerSpeed = 0): dash steer_required chime suppressed below stock LKAS speed while
+  # lkas_allowed_speed stays True so low-speed TI-dropout steerFaultTemporary still works.
+  ci = CarInterface(ti_params(CAR.MAZDA_CX5))
+  for speed, blk, want in ((35.0, 1, 0), (48.0, 1, 0), (55.0, 1, 0), (55.0, 0, 1), (48.0, 0, 1), (40.0, 1, 0)):
+    _, hud = apply_hud(ci, speed=speed, lkas_block=blk)
+    assert ci.CS.lkas_allowed_speed is True
+    assert ci.CS.hud_lkas_allowed_speed is bool(want)
+    assert hud["HANDS_ON_STEER_WARN"] == want
+    assert hud["HANDS_ON_STEER_WARN_2"] == want
+    assert hud["HANDS_WARN_3_BITS"] == (0b111 if want else 0)
+  state = ci.update([(tick[0] * 10_000_000, frames(packer, speed=20.0, lkas_block=1) +
+                      [ti_feedback(packer, state=TI_STATE.OFF)])])
+  tick[0] += 1
+  assert state.steerFaultTemporary
+
+  # Stock CX-5 2022+ (no TI, minSteerSpeed = 0): dash chime stays active at low speed
+  ci_22 = CarInterface(stock_params(CAR.MAZDA_CX5_2022))
+  _, hud_22 = apply_hud(ci_22, speed=35.0, lkas_block=1)
+  assert ci_22.CS.hud_lkas_allowed_speed is True
+  assert hud_22["HANDS_ON_STEER_WARN"] == 1
+
+  # Stock Gen1 CX-5 (no TI, minSteerSpeed > 0): keeps stock speed hysteresis
+  ci_st = CarInterface(stock_params(CAR.MAZDA_CX5))
+  _, hud_low = apply_hud(ci_st, speed=35.0, lkas_block=1)
+  assert hud_low["HANDS_ON_STEER_WARN"] == 0
+  _, hud_hi = apply_hud(ci_st, speed=55.0, lkas_block=0)
+  assert hud_hi["HANDS_ON_STEER_WARN"] == 1

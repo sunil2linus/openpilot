@@ -36,6 +36,15 @@ class DashboardCameraParser(CANParser):
     return result
 
 
+def stock_lkas_speed_allowed(prev: bool, speed_kph: float, lkas_blocked: bool) -> bool:
+  """Stock Gen1 Mazda LKAS speed hysteresis: enables above 52 kph once LKAS_BLOCK clears, disables below 45 kph."""
+  if speed_kph > LKAS_LIMITS.ENABLE_SPEED and not lkas_blocked:
+    return True
+  if speed_kph < LKAS_LIMITS.DISABLE_SPEED:
+    return False
+  return prev
+
+
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -49,6 +58,7 @@ class CarState(CarStateBase):
     self.radar_has_lead = False
     self.acc_active_last = False
     self.lkas_allowed_speed = False
+    self.hud_lkas_allowed_speed = False
 
     self.distance_button = 0
     self.accel_button = 0
@@ -136,12 +146,18 @@ class CarState(CarStateBase):
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down
       # wait for LKAS_BLOCK signal to clear when going up since it lags behind the speed sometimes
-      if speed_kph > LKAS_LIMITS.ENABLE_SPEED and not lkas_blocked:
-        self.lkas_allowed_speed = True
-      elif speed_kph < LKAS_LIMITS.DISABLE_SPEED:
-        self.lkas_allowed_speed = False
+      self.lkas_allowed_speed = stock_lkas_speed_allowed(self.lkas_allowed_speed, speed_kph, lkas_blocked)
+      self.hud_lkas_allowed_speed = self.lkas_allowed_speed
     else:
       self.lkas_allowed_speed = True
+      if self.torque_interceptor:
+        # Restore the stock Mazda dash HUD speed gate on TI cars: below the EPS's LKAS speed (~28-32 mph),
+        # keep "Turn Exceeds Steering Limit" on the openpilot screen without sending the factory
+        # "hold steering wheel" chime to the dash. self.lkas_allowed_speed stays True so TI-dropout
+        # steerFaultTemporary still works at low speed.
+        self.hud_lkas_allowed_speed = stock_lkas_speed_allowed(self.hud_lkas_allowed_speed, speed_kph, lkas_blocked)
+      else:
+        self.hud_lkas_allowed_speed = True
 
     # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
     #       it should be used for carState.cruiseState.nonAdaptive instead
