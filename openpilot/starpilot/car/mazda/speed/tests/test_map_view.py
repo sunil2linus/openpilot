@@ -213,6 +213,9 @@ def test_round_w_half_day_rd_directional_prefix_and_steep_jog_skipped():
   pair[0]["name"] = "Half Day Road"
   pair[1]["name"] = "Milwaukee Avenue"
   assert V.jogs(pair, oneway) == set()
+  # sideways > 9 m keeps steeper 35-45 deg S-bends, while <= 35 deg still skips up to 12 m
+  assert V.jogs(jog_pair(turn1=42.5, turn2=40.7, gap=4.0, offset_m=10.5), oneway) == set()
+  assert V.jogs(jog_pair(turn1=32.0, turn2=32.0, gap=4.0, offset_m=10.5), oneway) == {(1, 100.0), (1, 136.0)}
   # sideways > 12 m real S-bend stays
   assert V.jogs(jog_pair(turn1=42.5, turn2=40.7, gap=4.0, offset_m=15.0), oneway) == set()
 
@@ -227,7 +230,32 @@ def test_round_w_motorway_short_kink_skipped_at_read_time(tmp_path):
   assert not V.motorway_kink({"cls": 3, "len": 30.0, "turn": 15.0, "adv": 0.0})
   assert not V.motorway_kink({"cls": 7, "len": 30.0, "turn": 15.0, "adv": 0.0})
 
-  # Real 265 m / 30 deg motorway curve stays while a short shallow kink is omitted and an advisory bend stays
+  # Neighboring same-direction pieces of a real split bend (Fisher Fwy middle piece, Southfield Fwy trailing two pieces)
+  left1 = {"chain": 10, "s_a": 100.0, "s_b": 220.0, "dir": "L", "cls": 1, "len": 120.0, "turn": 50.0, "adv": 0.0}
+  mid = {"chain": 10, "s_a": 240.0, "s_b": 280.0, "dir": "L", "cls": 1, "len": 40.0, "turn": 15.0, "adv": 0.0}
+  left2 = {"chain": 10, "s_a": 300.0, "s_b": 420.0, "dir": "L", "cls": 1, "len": 120.0, "turn": 59.0, "adv": 0.0}
+  assert not V.motorway_kink(mid, [left1, mid, left2])
+  big_l = {"chain": 11, "s_a": 450.0, "s_b": 590.0, "dir": "L", "cls": 1, "len": 140.0, "turn": 46.0, "adv": 0.0,
+           "r": 500.0, "a": (LAT0 + 50 * M_LAT, LON0), "b": (LAT0 + 190 * M_LAT, LON0),
+           "a_hdg": 0.0, "b_hdg": 180.0, "name": "Southfield Freeway", "ways": [1], "prof": [[0.0, 500.0], [140.0, 500.0]]}
+  short1_l = {"chain": 11, "s_a": 605.0, "s_b": 645.0, "dir": "L", "cls": 1, "len": 40.0, "turn": 14.0, "adv": 0.0,
+              "r": 240.0, "a": (LAT0 + 205 * M_LAT, LON0), "b": (LAT0 + 245 * M_LAT, LON0),
+              "a_hdg": 0.0, "b_hdg": 180.0, "name": "Southfield Freeway", "ways": [1],
+              "prof": [[0.0, 400.0], [20.0, 240.0], [40.0, 400.0]]}
+  short2_l = {"chain": 11, "s_a": 660.0, "s_b": 695.0, "dir": "L", "cls": 1, "len": 35.0, "turn": 14.0, "adv": 0.0,
+              "r": 245.0, "a": (LAT0 + 260 * M_LAT, LON0), "b": (LAT0 + 295 * M_LAT, LON0),
+              "a_hdg": 0.0, "b_hdg": 180.0, "name": "Southfield Freeway", "ways": [1],
+              "prof": [[0.0, 400.0], [17.5, 245.0], [35.0, 400.0]]}
+  sf = [big_l, short1_l, short2_l]
+  assert not V.motorway_kink(short1_l, sf)
+  assert not V.motorway_kink(short2_l, sf)
+  kink_iso = {"chain": 12, "s_a": 100.0, "s_b": 144.0, "dir": "R", "cls": 1, "len": 44.0, "turn": 12.1, "adv": 0.0}
+  opp_near = {"chain": 12, "s_a": 180.0, "s_b": 320.0, "dir": "L", "cls": 1, "len": 140.0, "turn": 45.0, "adv": 0.0}
+  same_far = {"chain": 12, "s_a": 280.0, "s_b": 420.0, "dir": "R", "cls": 1, "len": 140.0, "turn": 45.0, "adv": 0.0}
+  assert V.motorway_kink(kink_iso, [kink_iso, opp_near])
+  assert V.motorway_kink(kink_iso, [kink_iso, same_far])
+
+  # Real 265 m / 30 deg motorway curve stays while an isolated short kink is omitted and an advisory bend stays
   a = straight(0, -400, 0, 400, step=10)
   c = arc_m(-265, 0, 265, 0, 30, 3.0)
   ex, ey = c[-1]
@@ -240,12 +268,12 @@ def test_round_w_motorway_short_kink_skipped_at_read_time(tmp_path):
   cid = next(iter(store.curves))
   real = store.curves[cid][0]
   assert not V.motorway_kink(real)
-  kink = {"chain": cid, "s_a": 150.0, "s_b": 194.0, "dir": "R", "cls": 1, "len": 44.0, "turn": 12.1,
-          "r": 266.5, "adv": 0.0, "a": (LAT0 - 250 * M_LAT, LON0), "b": (LAT0 - 206 * M_LAT, LON0),
+  kink = {"chain": cid, "s_a": 100.0, "s_b": 144.0, "dir": "R", "cls": 1, "len": 44.0, "turn": 12.1,
+          "r": 266.5, "adv": 0.0, "a": (LAT0 - 300 * M_LAT, LON0), "b": (LAT0 - 256 * M_LAT, LON0),
           "a_hdg": 0.0, "b_hdg": 180.0, "name": "Tri-State Tollway", "ways": [1],
           "prof": [[0.0, 400.0], [22.0, 266.5], [44.0, 400.0]]}
-  signed = dict(kink, s_a=220.0, s_b=264.0, r=260.0, adv=20.0,
-                a=(LAT0 - 180 * M_LAT, LON0), b=(LAT0 - 136 * M_LAT, LON0),
+  signed = dict(kink, s_a=250.0, s_b=294.0, dir="L", r=260.0, adv=20.0,
+                a=(LAT0 - 150 * M_LAT, LON0), b=(LAT0 - 106 * M_LAT, LON0),
                 prof=[[0.0, 400.0], [22.0, 260.0], [44.0, 400.0]])
   store.curves[cid] = [kink, signed, real]
   out = mv.update(10.0, gps_at(0.0, -300.0, 0.0))
@@ -253,3 +281,10 @@ def test_round_w_motorway_short_kink_skipped_at_read_time(tmp_path):
   assert not any(abs(r - 266.5) < 0.2 for r in rmins), rmins
   assert any(abs(r - 260.0) < 0.2 for r in rmins), rmins
   assert any(abs(r - real["r"]) / real["r"] < 0.05 for r in rmins), rmins
+
+  # Both trailing short pieces of a split real bend are kept end-to-end
+  store.curves[cid] = [dict(x, chain=cid) for x in sf]
+  out2 = mv.update(10.1, gps_at(0.0, -299.0, 0.0))
+  rmins2 = [min(r for _, r in cv["pts"]) for cv in out2["curves"]]
+  assert any(abs(r - 240.0) < 0.2 for r in rmins2), rmins2
+  assert any(abs(r - 245.0) < 0.2 for r in rmins2), rmins2

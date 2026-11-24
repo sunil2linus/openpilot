@@ -195,15 +195,25 @@ def test_sources_camera_steps_aside_only_for_pressed_map_curves():
 def test_camera_curve_ignores_targets_far_above_v_ego():
   cam = CameraCurve(CFG, dt=0.01)
   ctx = {"path": path(1 / 500.0), "v_ego": 28 * MPH, "model_age": 0.0, "gps_ok": True}
-  assert cam.raw_target(ctx) is None and cam.raw_vmin is None
   for _ in range(60):
     assert cam(dict(ctx)).target is None
+  assert cam.last_vmin is None
   # tight curve near or below v_ego still activates after CAM_CONFIRM
   tight = dict(ctx, path=path(1 / 50.0))
   for _ in range(60):
     t = cam(dict(tight)).target
   assert t is not None
-  # moderate ~45 mph curve acts at 40 mph (<= 40 + 10) and is ignored at 30 mph (> 30 + 10)
+  # start-only gate: ~45 mph curve does not start at 30 mph, starts at 40 mph, then holds without
+  # flip-flopping if traffic drops v_ego to 30 mph until the curve ends
+  cam = CameraCurve(CFG, dt=0.01)
   mod_k = 2.0 / (45 * MPH) ** 2
-  assert CameraCurve(CFG).raw_target({"path": path(mod_k), "v_ego": 40 * MPH, "model_age": 0.0, "gps_ok": True}) is not None
-  assert CameraCurve(CFG).raw_target({"path": path(mod_k), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}) is None
+  for _ in range(60):
+    assert cam({"path": path(mod_k), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}).target is None
+  for _ in range(60):
+    t = cam({"path": path(mod_k), "v_ego": 40 * MPH, "model_age": 0.0, "gps_ok": True}).target
+  assert t is not None
+  for _ in range(60):
+    assert cam({"path": path(mod_k), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}).target is not None
+  assert cam({"path": path(0.0), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}).target is None
+  for _ in range(60):
+    assert cam({"path": path(mod_k), "v_ego": 30 * MPH, "model_age": 0.0, "gps_ok": True}).target is None
