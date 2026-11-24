@@ -513,7 +513,7 @@ def test_on_a_link_his_signal_does_not_turn_the_camera_curve_off(tmp_path, monke
   plan.mapCurveMode = 2
   got = []
   orig = c.curve_target.update
-  monkeypatch.setattr(c.curve_target, "update", lambda *a: (got.append(a[3]), orig(*a))[1])
+  monkeypatch.setattr(c.curve_target, "update", lambda *a, **kw: (got.append(a[3]), orig(*a, **kw))[1])
   state = W.car_state(28, 30)
   state.out.rightBlinker = True
   plan.mapRoadClass = 1                                         # a lane change on the highway: as before

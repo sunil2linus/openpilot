@@ -42,7 +42,8 @@ END_GAP = 1.0 * MS_PER_MPH      # m/s: the curve is over once it needs less than
 # Round W, W1 (Chicago drive 18:08-18:10, 18:31, 18:55): crawling in traffic at 20-30 mph with set 80-85 mph,
 # low-speed LKAS_BLOCK turns on TI_ONLY_LAT (1.8 m/s^2) and gentle bends / path wiggles give 60-83 mph camera
 # targets, repeatedly tapping SET- far above v_ego. Camera lookahead is only a few seconds ahead, so a camera
-# curve target more than CAM_CSC_ABOVE_V above the car's actual speed cannot need slowing now.
+# curve target more than CAM_CSC_ABOVE_V above the car's actual speed cannot start a slowdown now (once active,
+# it holds until the curve ends so drifting around v_ego + 10 mph does not flip-flop).
 CAM_CSC_ABOVE_V = 10.0 * MS_PER_MPH
 MIN_CURVATURE = 1e-5            # 1/m (100 km radius)
 NO_CURVE = 1000.0               # m/s: "no limit"
@@ -124,8 +125,8 @@ class CurveTarget:
 
   def update(self, curvature, driver_speed, plan_alive=True, blinker=False, v_ego=None):
     """curvature: starpilotPlan.roadCurvature; driver_speed: the driver's own set speed (m/s);
-    v_ego: actual car speed (m/s, optional: when set, targets more than CAM_CSC_ABOVE_V above it do not act).
-    Returns (active, target speed m/s)."""
+    v_ego: actual car speed (m/s, optional: when set, a target more than CAM_CSC_ABOVE_V above it will not start
+    a slowdown; once active it holds until the curve ends). Returns (active, target speed m/s)."""
     if not plan_alive:
       self.reset()
       return False, NO_CURVE
@@ -133,11 +134,11 @@ class CurveTarget:
     self.raw = NO_CURVE if blinker else curve_speed(curvature, lat)
     self.window.append(self.raw)
     self.speed = max(self.window)
-    ref = driver_speed if v_ego is None else min(driver_speed, v_ego + CAM_CSC_ABOVE_V)
+    start_ref = driver_speed if v_ego is None else min(driver_speed, v_ego + CAM_CSC_ABOVE_V)
     if not self.active:
-      self.active = len(self.window) == self.window.maxlen and self.speed <= ref - START_GAP
+      self.active = len(self.window) == self.window.maxlen and self.speed <= start_ref - START_GAP
     else:
-      self.active = self.speed < ref - END_GAP
+      self.active = self.speed < driver_speed - END_GAP
     return self.active, self.speed
 
   @property

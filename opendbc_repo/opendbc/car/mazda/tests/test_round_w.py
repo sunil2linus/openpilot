@@ -60,33 +60,39 @@ def test_w1_camera_csc_normal_cruising_and_in_curve_unchanged():
     a2, s2 = t_v.update(k_72, 80.0 * MPH, v_ego=80.0 * MPH)
   assert a1 and a2 and abs(s1 - s2) < 1e-9
 
-  # enter a 45 mph curve at 70 mph and decelerate through it: stays active down through 40 mph,
-  # releasing only if traffic slows the car far below it (>= 10 mph below curve speed)
+  # enter a 45 mph curve at 70 mph and decelerate through it: once active, holds even if traffic slows below
+  # curve_speed - 10 mph (no flip-flop); once the curve ends, does not re-start at 30 mph
   k_45 = 3.0 / (45.0 * MPH) ** 2
   t = CT.CurveTarget(3.0)
-  for v_mph in (70.0, 50.0, 45.0, 40.0):
+  for v_mph in (70.0, 50.0, 45.0, 40.0, 35.0):
     for _ in range(120):
       act, _ = t.update(k_45, 70.0 * MPH, v_ego=v_mph * MPH)
     assert act, v_mph
   for _ in range(120):
-    act, _ = t.update(k_45, 70.0 * MPH, v_ego=35.0 * MPH)
+    act, _ = t.update(0.0, 70.0 * MPH, v_ego=30.0 * MPH)
+  assert not act
+  for _ in range(120):
+    act, _ = t.update(k_45, 70.0 * MPH, v_ego=30.0 * MPH)
   assert not act
 
 
 def test_w1_camera_csc_v_ego_hysteresis():
   k_50 = 3.0 / (50.0 * MPH) ** 2
   t = CT.CurveTarget(3.0)
-  # v_ego = 41.5 -> ref = 51.5; needs <= 49.5 (START_GAP=2) to activate -> False
+  # v_ego = 41.5 -> start_ref = 51.5; needs <= 49.5 (START_GAP=2) to start -> False
   for _ in range(150):
     assert not t.update(k_50, 80.0 * MPH, v_ego=41.5 * MPH)[0]
-  # v_ego = 42.5 -> ref = 52.5; 50 <= 50.5 -> activates
+  # v_ego = 42.5 -> start_ref = 52.5; 50 <= 50.5 -> starts
   for _ in range(10):
     act, _ = t.update(k_50, 80.0 * MPH, v_ego=42.5 * MPH)
   assert act
-  # drops to 41.5 -> ref = 51.5; stays active while 50 < 50.5 (END_GAP=1)
-  assert t.update(k_50, 80.0 * MPH, v_ego=41.5 * MPH)[0]
-  # drops to 40.5 -> ref = 50.5; 50 >= 49.5 -> releases
-  assert not t.update(k_50, 80.0 * MPH, v_ego=40.5 * MPH)[0]
+  # drifting down around v_ego + 10 (41.5, 40.5, 39.5, 35.0) stays active until the curve ends
+  for v_mph in (41.5, 40.5, 39.5, 35.0, 40.5):
+    assert t.update(k_50, 80.0 * MPH, v_ego=v_mph * MPH)[0], v_mph
+  # once the curve ends, stays inactive and will not restart while at 41.5 mph
+  for _ in range(120):
+    assert not t.update(0.0, 80.0 * MPH, v_ego=41.5 * MPH)[0]
+  assert not t.update(k_50, 80.0 * MPH, v_ego=41.5 * MPH)[0]
 
 
 # ---- W2: read-time motorway short-kink filter (Tri-State / I-96 / Kingery / I-80 / M-14) ----
@@ -189,3 +195,62 @@ def test_w3_different_names_two_way_wide_sbend_and_links_stay():
   c2 = {"chain": 88, "s_a": 134.0, "s_b": 162.0, "dir": "L", "cls": 6, "turn": 40.0, "name": "Half Day Road",
         "ways": [2], "a": (42.00034, -86.99995), "b": (42.0006, -86.9999), "a_hdg": 35.0}
   assert MC.jogs([c1, c2], {1}) == set()
+
+  # W3 steep jog cap: 35-45 deg bends only skipped up to 9 m sideways (<= 35 deg still allows up to 12 m)
+  def _pair(turn, off_m):
+    p1 = {"chain": 77, "s_a": 100.0, "s_b": 132.0, "dir": "L", "cls": 5, "turn": turn, "name": "Half Day Road",
+          "ways": [1, 2], "a": (G.LAT0, G.LON0), "b": (G.LAT0 + 32 * G.M_LAT, G.LON0), "a_hdg": 0.0}
+    p2 = {"chain": 77, "s_a": 136.0, "s_b": 168.0, "dir": "R", "cls": 5, "turn": turn, "name": "West Half Day Road",
+          "ways": [2], "a": (G.LAT0 + 36 * G.M_LAT, G.LON0), "b": (G.LAT0 + 68 * G.M_LAT, G.LON0 + off_m * G.M_LON), "a_hdg": 0.0}
+    return [p1, p2]
+  assert MC.jogs(_pair(40.0, 10.5), {2}) == set()
+  assert MC.jogs(_pair(32.0, 10.5), {2}) == {(77, 100.0), (77, 136.0)}
+  assert MC.jogs(_pair(42.5, 7.1), {2}) == {(77, 100.0), (77, 136.0)}
+
+
+def test_w2_motorway_short_pieces_of_real_bend_kept():
+  # Fisher Fwy pattern: short tight middle piece flanked by same-direction curves
+  left1 = {"chain": 10, "s_a": 100.0, "s_b": 220.0, "dir": "L", "cls": 1, "len": 120.0, "turn": 50.0, "adv": 0.0,
+           "r": 250.0, "a": (G.LAT0, G.LON0), "b": (G.LAT0 + 120 * G.M_LAT, G.LON0), "ways": [1]}
+  mid_short = {"chain": 10, "s_a": 240.0, "s_b": 280.0, "dir": "L", "cls": 1, "len": 40.0, "turn": 15.0, "adv": 0.0,
+               "r": 220.0, "a": (G.LAT0 + 140 * G.M_LAT, G.LON0), "b": (G.LAT0 + 180 * G.M_LAT, G.LON0), "ways": [1]}
+  left2 = {"chain": 10, "s_a": 300.0, "s_b": 420.0, "dir": "L", "cls": 1, "len": 120.0, "turn": 59.0, "adv": 0.0,
+           "r": 260.0, "a": (G.LAT0 + 200 * G.M_LAT, G.LON0), "b": (G.LAT0 + 320 * G.M_LAT, G.LON0), "ways": [1]}
+  assert not MC.motorway_kink(mid_short, [left1, mid_short, left2])
+
+  # Southfield Fwy pattern: two consecutive trailing short pieces after a big same-direction curve (both kept)
+  big = {"chain": 11, "s_a": 100.0, "s_b": 240.0, "dir": "L", "cls": 1, "len": 140.0, "turn": 46.0, "adv": 0.0,
+         "r": 280.0, "a": (G.LAT0 + 100 * G.M_LAT, G.LON0), "b": (G.LAT0 + 240 * G.M_LAT, G.LON0), "ways": [1]}
+  short1 = {"chain": 11, "s_a": 255.0, "s_b": 295.0, "dir": "L", "cls": 1, "len": 40.0, "turn": 14.0, "adv": 0.0,
+            "r": 240.0, "a": (G.LAT0 + 255 * G.M_LAT, G.LON0), "b": (G.LAT0 + 295 * G.M_LAT, G.LON0), "ways": [1]}
+  short2 = {"chain": 11, "s_a": 310.0, "s_b": 345.0, "dir": "L", "cls": 1, "len": 35.0, "turn": 14.0, "adv": 0.0,
+            "r": 245.0, "a": (G.LAT0 + 310 * G.M_LAT, G.LON0), "b": (G.LAT0 + 345 * G.M_LAT, G.LON0), "ways": [1]}
+  sf = [big, short1, short2]
+  assert not MC.motorway_kink(short1, sf)
+  assert not MC.motorway_kink(short2, sf)
+
+  # Opposite-direction nearby curve or far (> 100 m) same-direction curve does not protect an isolated kink
+  kink = {"chain": 12, "s_a": 100.0, "s_b": 144.0, "dir": "R", "cls": 1, "len": 44.0, "turn": 12.1, "adv": 0.0, "r": 266.5}
+  opp_near = {"chain": 12, "s_a": 180.0, "s_b": 320.0, "dir": "L", "cls": 1, "len": 140.0, "turn": 45.0, "adv": 0.0, "r": 250.0}
+  same_far = {"chain": 12, "s_a": 280.0, "s_b": 420.0, "dir": "R", "cls": 1, "len": 140.0, "turn": 45.0, "adv": 0.0, "r": 250.0}
+  assert MC.motorway_kink(kink, [kink, opp_near])
+  assert MC.motorway_kink(kink, [kink, same_far])
+
+  # End-to-end MapCurves keeps both trailing short pieces when part of a chain bend
+  root, _, _ = TM.write_files(G.curve_road(r=265.0, turn=30.0, name="Southfield Freeway", cls=1, speed=70))
+  m = TM.planner(root)
+  la, lo = TM.pos(0, -150)
+  m.update(la, lo, 0.0, 1, True)
+  cid = next(iter(m.store.curves))
+  s_a0 = m.store.curves[cid][0]["s_a"]
+  m.store.curves[cid] = [
+    dict(big, chain=cid, s_a=s_a0, s_b=s_a0 + 140.0, r=500.0,
+         a=TM.pos(0, 0), b=TM.pos(0, 140)),
+    dict(short1, chain=cid, s_a=s_a0 + 155.0, s_b=s_a0 + 195.0,
+         a=TM.pos(0, 155), b=TM.pos(0, 195)),
+    dict(short2, chain=cid, s_a=s_a0 + 210.0, s_b=s_a0 + 245.0,
+         a=TM.pos(0, 210), b=TM.pos(0, 245)),
+  ]
+  m.update(la, lo, 0.0, 1, True)
+  assert m.curve is not None and abs(m.curve["r"] - 240.0) < 0.5
+  assert [c["r"] for c, *_ in m._curves_ahead(cid, True, 0.0, s_a0 + 400.0, la, lo, 0.0)] == [500.0, 240.0, 245.0]

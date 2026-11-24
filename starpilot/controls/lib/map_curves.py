@@ -1311,28 +1311,47 @@ class LinkShapes:
 # one-way way meets a two-way way (the loaded shapes' one-way flags), never on a link, and either within JOG_GAP_WIDE with
 # each bend at most JOG_BEND_WIDE (the builder's split_doublets of round Q: files built before round Q still have these,
 # BUILDER_VERSION was not bumped then) or within JOG_GAP with each bend at most JOG_BEND (the 7.0 port's rule: a 30.2 deg
-# bend missed the builder's 30 by 0.2 deg, raised to 45.0 for W3 split jogs).
+# bend missed the builder's 30 by 0.2 deg; W3 raises the bend limit to JOG_BEND_STEEP 45.0 with a tighter
+# JOG_OFFSET_STEEP 9.0 m sideways cap so Half Day Rd 7.1 m stays skipped while steeper wide S-bends remain).
 JOG_NET = 8.0              # deg (build_curve_map.SPLIT_NET_DEG)
 JOG_OFFSET = 12.0          # m (SPLIT_OFFSET_MAX)
 JOG_GAP_WIDE, JOG_BEND_WIDE = 60.0, 30.0   # m from the first's exit to the second's entry, deg (SPLIT_PAIR_GAP, SPLIT_BEND_MAX)
-JOG_GAP, JOG_BEND = 20.0, 45.0
+JOG_GAP, JOG_BEND = 20.0, 35.0
+JOG_BEND_STEEP, JOG_OFFSET_STEEP = 45.0, 9.0
 _JOG_DIR_PREFIXES = ("north ", "south ", "east ", "west ", "n ", "s ", "e ", "w ", "n. ", "s. ", "e. ", "w. ")
 
 # Round W, W2 (Chicago drive, Tri-State Tollway 19:14:07 r=266.5 m len=44 m turn=12.1 deg; plus similar 26-52 m /
 # 12-16 deg OSM node kinks on I-96, I-80, Kingery Hwy, M-14, Jane Addams, Edens Spur): a short shallow kink on a
-# motorway mainline (cls 1, not a ramp, no advisory sign) is an OSM polyline artifact, not a curve to slow for.
-# Filtered at read time (no map rebuild). Real corridor motorway curves are >= 62 m or > 18 deg.
+# motorway mainline (cls 1, not a ramp, no advisory sign) is an OSM polyline artifact, not a curve to slow for,
+# unless another same-direction curve on the same chain lies within MOTORWAY_KINK_NEIGHBOR_GAP (a piece of a
+# larger split bend). Filtered at read time (no map rebuild). Real corridor motorway curves are >= 62 m or > 18 deg.
 MOTORWAY_KINK_LEN = 55.0   # m
 MOTORWAY_KINK_TURN = 18.0  # deg
+MOTORWAY_KINK_NEIGHBOR_GAP = 100.0  # m
 
 
-def motorway_kink(c):
-  """(W2) Short shallow OSM kink on a motorway mainline (cls 1, non-ramp, no advisory sign): not a curve."""
+def motorway_kink(c, curves=None):
+  """(W2) Short shallow OSM kink on a motorway mainline (cls 1, non-ramp, no advisory sign): not a curve.
+  With `curves` (the chain's unfiltered curve list), kept when another same-direction curve lies within
+  MOTORWAY_KINK_NEIGHBOR_GAP (pieces of a larger split bend)."""
   try:
-    return (int(c.get("cls", 0) or 0) == 1 and not c.get("ramp") and
+    if not (int(c.get("cls", 0) or 0) == 1 and not c.get("ramp") and
             float(c.get("adv", 0.0) or 0.0) <= 0.0 and
             float(c.get("len", 0.0) or 0.0) <= MOTORWAY_KINK_LEN and
-            float(c.get("turn", 0.0) or 0.0) <= MOTORWAY_KINK_TURN)
+            float(c.get("turn", 0.0) or 0.0) <= MOTORWAY_KINK_TURN):
+      return False
+    if curves:
+      cdir = c.get("dir")
+      sa, sb = float(c["s_a"]), float(c["s_b"])
+      for o in curves:
+        if o is c or o.get("dir") != cdir:
+          continue
+        oa, ob = float(o["s_a"]), float(o["s_b"])
+        if oa == sa and ob == sb:
+          continue
+        if max(sa - ob, oa - sb) <= MOTORWAY_KINK_NEIGHBOR_GAP:
+          return False
+    return True
   except (KeyError, TypeError, ValueError):
     return False
 
@@ -1365,12 +1384,16 @@ def jogs(curves, oneway_ids):
           _jog_name(c1.get("name")) != _jog_name(c2.get("name")) or abs(float(c1["turn"]) - float(c2["turn"])) >= JOG_NET):
         continue
       gap, bend = float(c2["s_a"]) - float(c1["s_b"]), max(float(c1["turn"]), float(c2["turn"]))
-      if not ((gap <= JOG_GAP_WIDE and bend <= JOG_BEND_WIDE) or (gap <= JOG_GAP and bend <= JOG_BEND)):
+      if (gap <= JOG_GAP_WIDE and bend <= JOG_BEND_WIDE) or (gap <= JOG_GAP and bend <= JOG_BEND):
+        max_off = JOG_OFFSET
+      elif gap <= JOG_GAP and bend <= JOG_BEND_STEEP:
+        max_off = JOG_OFFSET_STEEP
+      else:
         continue
       ws = {int(w) for w in (c1.get("ways") or []) + (c2.get("ways") or [])}
       if not (ws & oneway_ids and ws - oneway_ids):
         continue
-      if _jog_sideways(c1, c2) <= JOG_OFFSET:
+      if _jog_sideways(c1, c2) <= max_off:
         out.update(((c1.get("chain"), c1["s_a"]), (c2.get("chain"), c2["s_a"])))
     except (KeyError, TypeError, ValueError):
       continue
@@ -2246,10 +2269,11 @@ class MapCurves:
        (rv.get("travel") == "ab") == bool(increasing):
       ch = self.store.chains.get(cid) or {}
       cut = float(rv["cut_s"]) if increasing else float(ch.get("len", 0.0) or 0.0) - float(rv["cut_s"])
-    for c in self.store.curves.get(cid, []):
+    chain_curves = self.store.curves.get(cid, [])
+    for c in chain_curves:
       if jog and (c.get("chain"), c["s_a"]) in jog:
         continue                  # (round V, V3) a map jog, not a curve
-      if motorway_kink(c):
+      if motorway_kink(c, chain_curves):
         continue                  # (round W, W2) short shallow motorway OSM kink, not a curve
       if self.odo_ok and c.get("ramp") and c["s_a"] in self.entered:
         left = c["len"] - (self.odo - self.entered[c["s_a"]])
