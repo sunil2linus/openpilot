@@ -13,6 +13,16 @@ STOCK_LKAS_OFF_SPEED = 35 * CV.MPH_TO_MS   # m/s
 STOCK_LKAS_OFF_TIME = 5.0                  # s
 CRZ_INFO_STALE = 20                        # frames (0.2 s; CRZ_INFO comes at 50 Hz): older means "not allowed"
 
+
+def stock_lkas_speed_allowed(prev: bool, speed_kph: float, lkas_blocked: bool) -> bool:
+  """Stock Gen1 Mazda LKAS speed hysteresis: enables above 52 kph once LKAS_BLOCK clears, disables below 45 kph."""
+  if speed_kph > LKAS_LIMITS.ENABLE_SPEED and not lkas_blocked:
+    return True
+  if speed_kph < LKAS_LIMITS.DISABLE_SPEED:
+    return False
+  return prev
+
+
 class CarState(CarStateBase):
   def __init__(self, CP, FPCP):
     super().__init__(CP, FPCP)
@@ -36,6 +46,7 @@ class CarState(CarStateBase):
     self.acc_active_last = False
     self.low_speed_alert = False
     self.lkas_allowed_speed = False
+    self.hud_lkas_allowed_speed = False
     self.lkas_disabled = False
     self.stock_lkas_off_frames = 0
     self.stock_lkas_off = False
@@ -138,12 +149,18 @@ class CarState(CarStateBase):
     if self.CP.minSteerSpeed > 0:
       # LKAS is enabled at 52kph going up and disabled at 45kph going down
       # wait for LKAS_BLOCK signal to clear when going up since it lags behind the speed sometimes
-      if speed_kph > LKAS_LIMITS.ENABLE_SPEED and not lkas_blocked:
-        self.lkas_allowed_speed = True
-      elif speed_kph < LKAS_LIMITS.DISABLE_SPEED:
-        self.lkas_allowed_speed = False
+      self.lkas_allowed_speed = stock_lkas_speed_allowed(self.lkas_allowed_speed, speed_kph, lkas_blocked)
+      self.hud_lkas_allowed_speed = self.lkas_allowed_speed
     else:
       self.lkas_allowed_speed = True
+      if self.CP.flags & MazdaSafetyFlags.TORQUE_INTERCEPTOR:
+        # Restore the stock Mazda dash HUD speed gate on TI cars: below the EPS's LKAS speed (~28-32 mph),
+        # keep "Turn Exceeds Steering Limit" on the openpilot screen without sending the factory
+        # "hold steering wheel" chime to the dash. self.lkas_allowed_speed stays True so TI-dropout
+        # steerFaultTemporary still works at low speed.
+        self.hud_lkas_allowed_speed = stock_lkas_speed_allowed(self.hud_lkas_allowed_speed, speed_kph, lkas_blocked)
+      else:
+        self.hud_lkas_allowed_speed = True
 
     # TODO: the signal used for available seems to be the adaptive cruise signal, instead of the main on
     #       it should be used for carState.cruiseState.nonAdaptive instead
