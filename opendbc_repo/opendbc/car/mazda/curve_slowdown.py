@@ -3209,7 +3209,7 @@ class CurveSlowdown:
     # (curve_target.NO_MAP_LATERAL, round T T6) no usable position for the map curves: the camera target more careful
     self.curve_target.no_map = self._no_gps(plan, self._alive('starpilotPlan'))
     curve_active, curve_speed = self.curve_target.update(self._road_curv, driver_speed, plan_alive,
-                                                         blinker and not ramp_ctx)
+                                                         blinker and not ramp_ctx, v_ego=v_ego)
     curve_active = curve_active and self.curve_enabled
     cam_active0, cam_speed0 = curve_active, curve_speed          # (the camera's own, for camera_curve's release)
 
