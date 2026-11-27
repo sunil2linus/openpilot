@@ -595,3 +595,5 @@ Torque limits, rate limits, the driver torque rule, the CAM_LKAS2 rule and every
 **Different from the old FrogPilot build:** steering starts only after a fresh driver action (see above), and there is
 no steering at a standstill (steering comes back as soon as the car moves). The pandad binary must be rebuilt for the
 new param (its Mazda profile is compiled in); with the old binary AOL simply stays off.
+Rebuild it on the device with `tools/mazda_ti_aol/pandad_device_build.sh` (a separate checkout under /data/aolbuild)
+and check the result with `tools/mazda_ti_aol/check_pandad.py` before committing it; then refresh `prebuilt.json`.
