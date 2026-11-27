@@ -564,3 +564,34 @@ cut (both); Hall Rd 1214344938 turnaround (both). **Changed:** 490860778 (M-59),
 off-ramp running straight across the street onto the on-ramp, like M-53 / 23 Mile Rd), so they are cut now; 8727340
 and 8728850 (Southfield / Jeffries) are not. The two "entrances" 402416597 and 8727616 are short crossovers (23 m /
 51 m) from one carriageway of a divided street to the other, where the real on-ramp starts: cut at that joint.
+
+## Always On Lateral with the Torque Interceptor (TI)
+
+7.0's Always On Lateral (AOL) had a Mazda profile only for the 2022 CX-5 / 2021 CX-9 with safety param 0; a TI car
+was locked out on purpose (mazda.h turned every TX off). Now a Gen1 TI car has its own profile: the same 7.0 AOL
+rules, with three TI changes. It is used only when **Always On Lateral is on** and the TI is on (both read at car
+start, so a change applies at the **next drive**). With AOL off nothing changes (`tests/test_ti_aol.py`).
+
+| | |
+|---|---|
+| Panda bit | 1024 `MAZDA_PARAM_TI_AOL` (C) / `MazdaSafetyFlags.TI_AOL` (Python), added by card with alternative experience 32 |
+| Accepted params | 8 \| 1024, optionally \| 256 \| 512, nothing else (mazda.h `mazda_ti_aol_param`, `ti_aol.native_param`, pandad `mazda_aol_param`) |
+| Python | `opendbc/car/mazda/ti_aol.py` (qualification), `stock_aol.aol_qualified` (either profile), used by card, selfdrived, transport pause, temporary steering and the Mazda intent |
+
+**Steering with the cruise off is allowed only when the panda itself sees all of:** the main switch on (CRZ_CTRL
+bit 17), gear D (0x228), the car moving, the host's AOL request (under 300 ms old) and the AOL heartbeat, every RX
+check healthy, CRZ_CTRL / GEAR / STEER_RATE / camera CAM_LKAS each under 300 ms old, no relay malfunction, no camera
+fault, and the AOL "token". The token needs a fresh driver action, as on the stock cars: the main switch turned on,
+a cruise button pressed, the cruise engaged, or at boot with the main switch already on, the car moving in D with no
+pedal. Brake and gas do not take it away; the main switch off, a fault or lost data do.
+
+**TI changes from the stock profile:** the EPS's LKAS_BLOCK is not a condition (below ~45 km/h the EPS blocks the
+stock path and only the TI steers); nothing is forwarded from the camera (openpilot always sends CAM_LKAS / CAM_LKAS2
+and the HUD); a camera fault (CAM_LKAS ERR_BIT_1, e.g. sun glare or spray) stops steering only while the cruise is
+off and needs a fresh driver action afterwards; with the cruise engaged steering goes on through it, as without AOL.
+Torque limits, rate limits, the driver torque rule, the CAM_LKAS2 rule and every cruise button rule are unchanged.
+
+**On the device:** "Enable Always On Lateral" on; "Brake pause below" 0 (the default) means no pause on brake.
+**Different from the old FrogPilot build:** steering starts only after a fresh driver action (see above), and there is
+no steering at a standstill (steering comes back as soon as the car moves). The pandad binary must be rebuilt for the
+new param (its Mazda profile is compiled in); with the old binary AOL simply stays off.

@@ -569,7 +569,7 @@ class SelfdriveD:
 
     from openpilot.starpilot.car.hyundai.aol import source_deadline_supported
     input_proof = getattr(self, 'aol_step_input_proof', None)
-    from opendbc.car.mazda.stock_aol import qualified as qualified_mazda
+    from opendbc.car.mazda.stock_aol import aol_qualified as qualified_mazda
     reconcile_input = bool(input_proof is not None and not REPLAY and self.aol_replay and self.axis_transport_required and
                            (source_deadline_supported(self.CP) or self.ford_source_deadline_supported() or
                             qualified_mazda(self.CP, marked_only=True) or getattr(self, 'hybrid_input_reconcile', False)) and
@@ -887,7 +887,7 @@ class SelfdriveD:
   def source_deadline_deferral_supported(self):
     from openpilot.starpilot.car.hyundai.aol import source_deadline_supported
     from openpilot.starpilot.car.toyota.aol import qualified as qualified_toyota
-    from opendbc.car.mazda.stock_aol import qualified as qualified_mazda
+    from opendbc.car.mazda.stock_aol import aol_qualified as qualified_mazda
     return (qualified_ioniq6(self.CP) or qualified_gm(self.CP) or source_deadline_supported(self.CP) or
             qualified_toyota(self.CP, marked_only=True) or qualified_mazda(self.CP, marked_only=True) or
             self.ford_source_deadline_supported())

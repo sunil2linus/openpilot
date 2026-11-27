@@ -1,30 +1,39 @@
 from opendbc.car import structs
-from opendbc.car.mazda.stock_aol import qualified, temporary_restriction
+from opendbc.car.mazda import ti_aol
+from opendbc.car.mazda.stock_aol import aol_qualified, qualified, temporary_restriction
 from openpilot.starpilot.aol.policy import AolVehiclePolicy
 from openpilot.starpilot.car.mazda.stock_intent import MazdaStockCardIntent
 
 
+# Two profiles, the same intent and runtime: stock (2022 CX-5 / 2021 CX-9, safety param 0) and the Torque Interceptor
+# one (opendbc/car/mazda/ti_aol.py: the TI_AOL safety param bit is added at car start, like alternative experience 32).
 def policy_for(cp):
-  admitted = qualified(cp)
+  admitted = aol_qualified(cp)
+  ti = ti_aol.qualified(cp)
   return AolVehiclePolicy(intent_supported=admitted, settings_supported=admitted, runtime_supported=admitted,
-                          normal_runtime_supported=admitted, ordinary_axis_ack_required=qualified(cp, marked_only=True),
-                          explicit_latch=admitted, alternative_experience_addition=32 if admitted else 0)
+                          normal_runtime_supported=admitted, ordinary_axis_ack_required=aol_qualified(cp, marked_only=True),
+                          explicit_latch=admitted, alternative_experience_addition=32 if admitted else 0,
+                          safety_param_addition=ti_aol.ADDITION if ti else 0)
 
 
 def native_profile_supported(model, param):
-  return model == int(structs.CarParams.SafetyModel.mazda) and param == 0
+  return model == int(structs.CarParams.SafetyModel.mazda) and (param == 0 or ti_aol.native_param(param))
 
 
 def native_accepts_cp(cp, model, param):
-  return qualified(cp, marked_only=True) and native_profile_supported(model, param)
+  # Each profile accepts only its own native params (stock 0, TI the TI AOL params).
+  if qualified(cp, marked_only=True):
+    return model == int(structs.CarParams.SafetyModel.mazda) and param == 0
+  return bool(ti_aol.qualified(cp, marked_only=True) and model == int(structs.CarParams.SafetyModel.mazda) and
+              ti_aol.native_param(param))
 
 
 def native_latch_rejected(cp, native):
-  return qualified(cp, marked_only=True) and native.requestedLateral and not native.lateralAllowed
+  return aol_qualified(cp, marked_only=True) and native.requestedLateral and not native.lateralAllowed
 
 
 def ordinary_axis_request_allowed(cp, state):
-  return qualified(cp, marked_only=True) and state.canValid and not state.canTimeout and not state.steerFaultPermanent
+  return aol_qualified(cp, marked_only=True) and state.canValid and not state.canTimeout and not state.steerFaultPermanent
 
 
 def retain_on_native_denial(cp, native, state):

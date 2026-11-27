@@ -49,7 +49,7 @@ from openpilot.starpilot.car.rivian.aol import retained_brake_lateral_intent as 
 from opendbc.car.rivian.stock_aol import (qualified as qualified_rivian_aol,
                                          native_observation as rivian_native_observation,
                                          temporary_restriction as rivian_temporary_restriction)
-from opendbc.car.mazda.stock_aol import (qualified as qualified_mazda_aol,
+from opendbc.car.mazda.stock_aol import (aol_qualified as qualified_mazda_aol,
                                         native_observation as mazda_native_observation,
                                         temporary_restriction as mazda_temporary_restriction)
 from opendbc.car.tesla.preap.aol import (
