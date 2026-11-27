@@ -50,9 +50,11 @@ grep -q '1024U' "$PROFILE" || die "this checkout does not have the new Mazda AOL
 
 rm -rf "$OUT" "$REPORT"
 mkdir -p "$OUT" "$REPORT" "$WORK/scons_cache"
-unset PYTHONPATH
 export SCONS_CACHE=$WORK/scons_cache      # never the shared /data/scons_cache (its prune would delete files there)
-VENV=$(python3 -c 'import sys; print(sys.prefix)')
+# scons runs through the repo's own native AGNOS entry point (scripts/native_device_build.sh scons: the device venv's
+# scons, PYTHONPATH bound to this checkout), as a device build of this tree is meant to run
+[[ -x /usr/local/venv/bin/scons ]] || die "no /usr/local/venv/bin/scons"
+VENV=/usr/local/venv
 # Debug info paths as in the committed objects (built in the laptop container), so unchanged code can match
 MAP="-fdebug-prefix-map=$SRC=/audit/nov20-turn-settings-private/build-source"
 MAP+=" -fdebug-prefix-map=$VENV=/work/.venv-linux-arm64"
@@ -64,9 +66,9 @@ MAP+=" -fdebug-prefix-map=/usr/local/include=/opt/tici-sysroot/usr/local/include
   echo "agnos $(cat /VERSION 2>/dev/null)"
   echo "uname $(uname -srm)"
   echo "clang $(clang++ --version | head -1)"
-  echo "scons $(scons --version 2>/dev/null | grep -m1 -i 'engine' || true)"
-  echo "python $(python3 --version 2>&1) prefix $VENV"
-  python3 - <<'PY'
+  echo "scons $(/usr/local/venv/bin/scons --version 2>/dev/null | grep -m1 -i 'engine' || true)"
+  echo "python $($VENV/bin/python3 --version 2>&1) prefix $VENV"
+  $VENV/bin/python3 - <<'PY'
 import importlib.metadata as m
 for name in ("capnproto", "libusb", "json11", "zstd", "ncurses", "acados", "ffmpeg", "numpy", "scons"):
   try:
@@ -89,7 +91,8 @@ build_phase() {
   echo "==> $phase: $commit"
   git checkout -f -q --detach "$commit"
   local started=$(date +%s)
-  if ! scons -j"$JOBS" --cache-disable --verbose --ccflags="$MAP" "$TARGET" > "$REPORT/$phase.scons.log" 2>&1; then
+  if ! bash scripts/native_device_build.sh scons -j"$JOBS" --cache-disable --verbose --ccflags="$MAP" "$TARGET" \
+       > "$REPORT/$phase.scons.log" 2>&1; then
     tail -40 "$REPORT/$phase.scons.log"
     die "$phase build failed (log: $REPORT/$phase.scons.log)"
   fi
