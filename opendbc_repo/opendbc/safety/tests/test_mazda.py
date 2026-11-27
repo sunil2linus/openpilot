@@ -560,11 +560,12 @@ def test_safety_flags_match_mazda_h():
   src = (Path(__file__).resolve().parents[1] / "modes" / "mazda.h").read_text()
   c_flags = {name: int(v) for name, v in re.findall(r"^#define MAZDA_PARAM_(\w+) (\d+)U", src, re.MULTILINE)}
   assert c_flags == {f.name: int(f) for f in MazdaSafetyFlags}
-  assert c_flags == {"TORQUE_INTERCEPTOR": 8, "AUTO_RESUME": 256, "TI_STEER_700": 512}
+  assert c_flags == {"TORQUE_INTERCEPTOR": 8, "AUTO_RESUME": 256, "TI_STEER_700": 512, "TI_AOL": 1024}
   bits = list(c_flags.values())
   assert all(b & (b - 1) == 0 for b in bits) and len(set(bits)) == len(bits)
   # never in CP.flags: the car flags stay GEN1 (| TORQUE_INTERCEPTOR), which the dashboard / AOL checks compare exactly
-  assert not any(int(f) & (int(MazdaSafetyFlags.AUTO_RESUME) | int(MazdaSafetyFlags.TI_STEER_700)) for f in MazdaFlags)
+  assert not any(int(f) & (int(MazdaSafetyFlags.AUTO_RESUME) | int(MazdaSafetyFlags.TI_STEER_700) |
+                           int(MazdaSafetyFlags.TI_AOL)) for f in MazdaFlags)
 
 
 def test_ti_steer_700_needs_both_flags_and_auto_resume_keeps_the_tx_list():

@@ -1,6 +1,12 @@
 #pragma once
 
 static bool mazda_aol_enabled = false;
+// Gen1 + MoreTorque Torque Interceptor AOL profile (mazda.h MAZDA_PARAM_TI_AOL, set by mazda_init). The same rules as
+// the stock profile, except: the EPS's LKAS_BLOCK (0x241 bit 50) is not a source (below ~45 km/h the EPS blocks the
+// stock LKAS path and only the TI steers; the EPS message must still be fresh), a camera fault (0x243 bus 2 ERR_BIT_1)
+// blocks only the AOL token (cruise off) and still clears it, never steering with the cruise engaged (as without AOL),
+// and openpilot always owns CAM_LKAS / CAM_LKAS2 (no camera forwarding: the TI TX table keeps check_relay on).
+static bool mazda_aol_ti = false;
 static bool mazda_aol_startup_pending = true;
 static bool mazda_aol_token = false;
 static bool mazda_aol_neutral = false;
@@ -32,6 +38,7 @@ static void mazda_aol_clear(void) {
 static void mazda_aol_reset(void) {
   mazda_aol_clear();
   mazda_aol_enabled = false;
+  mazda_aol_ti = false;
   mazda_aol_startup_pending = true;
   mazda_aol_requested = false;
   mazda_aol_seen = 0U;
@@ -51,6 +58,13 @@ static bool mazda_aol_current(void) {
     (safety_get_ts_elapsed(now, mazda_aol_gear_ts) <= 300000U) &&
     (safety_get_ts_elapsed(now, mazda_aol_eps_ts) <= 300000U) &&
     (safety_get_ts_elapsed(now, mazda_aol_cam_ts) <= 300000U);
+}
+
+// 1 = gear D (0x228), 2 = EPS LKAS_BLOCK (0x241 bit 50), 4 = camera ERR_BIT_1 (0x243 bus 2). Stock: only "gear D".
+// TI: gear D, LKAS_BLOCK ignored (camera faults are handled separately, see mazda_aol_permission).
+static bool mazda_aol_sources_ok(void) {
+  const uint8_t considered = mazda_aol_ti ? 5U : 7U;
+  return (mazda_aol_sources & considered) == 1U;
 }
 
 static void mazda_aol_request(uint8_t mask) {
@@ -95,13 +109,24 @@ static uint8_t mazda_aol_request_mask(void) {
 static uint8_t mazda_aol_permission(void) {
   const uint8_t request = mazda_aol_request_mask();
   uint8_t permission = 0U;
-  if (acc_main_on && vehicle_moving && (mazda_aol_sources == 1U)) {
+  if (mazda_aol_ti) {
+    // A camera fault leaves the engaged (controls_allowed) path as it is without AOL; it removes the AOL token path.
+    const bool drive = (mazda_aol_sources & 1U) != 0U;
+    const bool camera_ok = (mazda_aol_sources & 4U) == 0U;
+    if (acc_main_on && vehicle_moving && drive && (controls_allowed || (mazda_aol_token && camera_ok))) {
+      permission = request & 1U;
+    }
+    if (acc_main_on && vehicle_moving && drive && controls_allowed) {
+      permission |= request & 2U;
+    }
+  } else if (acc_main_on && vehicle_moving && (mazda_aol_sources == 1U)) {
     if (controls_allowed || mazda_aol_token) {
       permission = request & 1U;
     }
     if (controls_allowed) {
       permission |= request & 2U;
     }
+  } else {
   }
   return permission;
 }
@@ -144,7 +169,7 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
         mazda_aol_neutral = true;
       } else if (mazda_aol_startup_pending && GET_BIT(msg, 3U)) {
         mazda_aol_startup_pending = false;
-      } else if (mazda_aol_startup_pending && vehicle_moving && (mazda_aol_sources == 1U) && !brake_pressed && !gas_pressed &&
+      } else if (mazda_aol_startup_pending && vehicle_moving && mazda_aol_sources_ok() && !brake_pressed && !gas_pressed &&
                  ((aol_host_axis_mask & 1U) != 0U) &&
                  (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US)) {
         // Dom follows fresh MAIN at boot. Wait through physical restrictions,
@@ -183,7 +208,7 @@ static void mazda_aol_engagement(const CANPacket_t *msg, bool cruise_engaged, bo
   if (mazda_aol_enabled && msg_matches(msg, 0x21CU, 0U, 8U)) {
     const bool request_current = !mazda_aol_requested ||
       (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US);
-    const bool healthy = !(mazda_aol_session && !heartbeat_engaged) && acc_main_on && (mazda_aol_sources == 1U) &&
+    const bool healthy = !(mazda_aol_session && !heartbeat_engaged) && acc_main_on && mazda_aol_sources_ok() &&
       !brake_pressed && !gas_pressed && !relay_malfunction && !safety_rx_checks_invalid &&
       request_current && aol_rx_healthy() && mazda_aol_current();
     if (!healthy) {
@@ -200,7 +225,7 @@ static void mazda_aol_engagement(const CANPacket_t *msg, bool cruise_engaged, bo
 }
 
 static void mazda_aol_tx_commit(const CANPacket_t *msg, bool accepted) {
-  if (mazda_aol_enabled && msg_matches(msg, 0x243U, 0U, 8U)) {
+  if (mazda_aol_enabled && !mazda_aol_ti && msg_matches(msg, 0x243U, 0U, 8U)) {
     const unsigned int raw_torque = ((msg->data[0] & 15U) << 8U) | msg->data[1];
     const int torque = (int)raw_torque - 2048;
     mazda_aol_owned = accepted && (torque != 0) && ((mazda_aol_permission() & 1U) != 0U);
@@ -209,7 +234,7 @@ static void mazda_aol_tx_commit(const CANPacket_t *msg, bool accepted) {
 }
 
 static bool mazda_aol_fwd(int bus, int addr) {
-  return mazda_aol_enabled && (bus == 2) && ((addr == 0x243) || (addr == 0x440)) &&
+  return mazda_aol_enabled && !mazda_aol_ti && (bus == 2) && ((addr == 0x243) || (addr == 0x440)) &&
     mazda_aol_owned && ((mazda_aol_permission() & 1U) != 0U) &&
     (safety_get_ts_elapsed(microsecond_timer_get(), mazda_aol_accepted_ts) <= AOL_HOST_REQUEST_TIMEOUT_US);
 }

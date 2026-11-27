@@ -79,6 +79,9 @@ class MazdaSafetyFlags(IntFlag):
   # Stage 3, both off by default and set at car start from the Mazda speed control setting (speed_flags.py):
   AUTO_RESUME = 256     # the gas auto-resume window: RES alone after a brake cancel (mazda.h)
   TI_STEER_700 = 512    # steering limit test: TI limit 700 instead of 600 (ignored without TORQUE_INTERCEPTOR)
+  # Always On Lateral with the TI (ti_aol.py): set at car start, only with TORQUE_INTERCEPTOR and alternative
+  # experience 32, when the Always On Lateral setting is on. Ignored by the panda in any other combination.
+  TI_AOL = 1024
 
 
 @dataclass

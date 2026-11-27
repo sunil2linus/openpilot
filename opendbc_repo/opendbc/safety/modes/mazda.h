@@ -24,6 +24,7 @@
 #define MAZDA_PARAM_TORQUE_INTERCEPTOR 8U
 #define MAZDA_PARAM_AUTO_RESUME 256U      // gas auto-resume window (Mazda speed control "auto_resume", off by default)
 #define MAZDA_PARAM_TI_STEER_700 512U     // steering limit test 700, only together with the TI flag (off by default)
+#define MAZDA_PARAM_TI_AOL 1024U          // Always On Lateral with the TI, only with alternative experience 32 (mazda_ti_aol_param)
 
 static bool mazda_torque_interceptor = false;
 static bool mazda_auto_resume = false;
@@ -217,6 +218,14 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+// The one TI AOL profile: the TI and TI AOL bits, optionally the Stage 3 bits, nothing else. Only with alternative
+// experience 32 (Always On Lateral); with any other alternative experience the TI AOL bit is ignored, as before.
+static bool mazda_ti_aol_param(uint16_t param) {
+  const uint16_t optional = (uint16_t)(MAZDA_PARAM_AUTO_RESUME | MAZDA_PARAM_TI_STEER_700);
+  const uint16_t required = (uint16_t)(MAZDA_PARAM_TORQUE_INTERCEPTOR | MAZDA_PARAM_TI_AOL);
+  return (param & (uint16_t)~optional) == required;
+}
+
 static safety_config mazda_init(uint16_t param) {
   static CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true},
@@ -261,9 +270,12 @@ static safety_config mazda_init(uint16_t param) {
   mazda_ar_frames = 0U;
 
   mazda_aol_reset();
-  mazda_aol_enabled = (param == 0U) && ((unsigned int)alternative_experience == 32U);
-  MAZDA_TX_MSGS[0].check_relay = !mazda_aol_enabled;
-  MAZDA_TX_MSGS[2].check_relay = !mazda_aol_enabled;
+  mazda_aol_ti = ((unsigned int)alternative_experience == 32U) && mazda_ti_aol_param(param);
+  mazda_aol_enabled = (((param == 0U) && ((unsigned int)alternative_experience == 32U)) || mazda_aol_ti);
+  // Stock AOL forwards the camera's LKAS frames while openpilot does not steer; the TI profile uses the TI TX table
+  // (check_relay always on: openpilot sends CAM_LKAS and the HUD in every case).
+  MAZDA_TX_MSGS[0].check_relay = !(mazda_aol_enabled && !mazda_aol_ti);
+  MAZDA_TX_MSGS[2].check_relay = !(mazda_aol_enabled && !mazda_aol_ti);
   if (mazda_aol_enabled) {
     static const AolSafetyPolicy policy = {
       .reset = mazda_aol_reset,
@@ -278,7 +290,7 @@ static safety_config mazda_init(uint16_t param) {
   if (mazda_torque_interceptor) {
     ret = BUILD_SAFETY_CFG(mazda_ti_rx_checks, MAZDA_TI_TX_MSGS);
   }
-  if (((unsigned int)alternative_experience == 32U) && (param != 0U)) {
+  if (((unsigned int)alternative_experience == 32U) && (param != 0U) && !mazda_aol_ti) {
     ret.tx_msgs = NULL;
     ret.tx_msgs_len = 0;
   }
