@@ -28,8 +28,13 @@ class MazdaStockCardIntent(AolCardIntent):
     self.main_pulse = False
     self.cancel_held = False
     self.cancel_ticks = 0
-    self.ti = ti_aol.qualified(cp, marked_only=True)
     self.ti_stop_ns = 0
+
+  @property
+  def ti(self):
+    # read at call time: card creates this intent before it adds the AOL bits to the safety param (card.py), so a value
+    # cached in __init__ would be False for the whole drive
+    return ti_aol.qualified(self.cp, marked_only=True)
 
   def stop_native_rejection(self, native_rejection_ns):
     """A native denial that belongs to a stop (TI profile only): not a rejection."""
@@ -96,10 +101,10 @@ class MazdaStockCardIntent(AolCardIntent):
       self._perform(action)
 
   def update(self, CS, **kwargs):
-    if self.stop_native_rejection(kwargs.get('native_rejection_ns', 0)):
-      kwargs['native_rejection_ns'] = 0
     if self.ti and CS.standstill and CS.canValid and not CS.canTimeout:
       self.ti_stop_ns = kwargs.get('now_ns', 0)
+    if self.stop_native_rejection(kwargs.get('native_rejection_ns', 0)):
+      kwargs['native_rejection_ns'] = 0
     state = structs.CarState(**CS.to_dict())
     events = []
     for event in CS.buttonEvents:

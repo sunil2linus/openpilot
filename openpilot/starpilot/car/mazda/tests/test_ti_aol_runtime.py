@@ -18,12 +18,14 @@ from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.mazda.interface import CarInterface
 from opendbc.car.mazda.torque_interceptor import prepare
 from opendbc.car.mazda.values import CAR
+from openpilot.cereal import messaging
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.starpilot.aol.intent import AolSettings, read_settings
 from openpilot.starpilot.aol.tests.stock_lateral_test_helpers import authority_case
 from openpilot.starpilot.aol.tests.test_ioniq_availability import car_state
-from openpilot.starpilot.aol.vehicle import create_intent, policy_for
+from openpilot.starpilot.aol.transport_pause import AVAILABILITY_EVENTS, TransportPauseFeedback
+from openpilot.starpilot.aol.vehicle import create_intent, intent_disarming_fault, policy_for
 from openpilot.starpilot.car.mazda import aol as mazda_aol
 from openpilot.starpilot.car.mazda.stock_intent import STOP_NATIVE_GRACE_NS
 
@@ -122,6 +124,54 @@ def test_source_expiry_during_aol_with_or_without_the_brake_is_a_pause(pedals):
     assert not sd.aol_authority_lost and 'controlsMismatch' not in names(sd)
 
 
+def card_state(brake, gas):
+  cs = state(brake=brake)
+  cs.gasPressed = gas
+  return cs
+
+
+def card_feedback(sd):
+  # card's side of the same pause: the real TransportPauseFeedback on the messages SelfdriveD just published
+  feedback = TransportPauseFeedback(sd.CP)
+  feedback_sm = messaging.SubMaster(['aolAxisState', 'onroadEvents', 'aolSafetyWire', 'pandaStates'])
+
+  def observe(tick, observed):
+    now = 10_000_000_000 + tick * 10_000_000
+    samples = [sd.pm.messages[name] for name in ('aolAxisState', 'onroadEvents')]
+    for name in ('aolSafetyWire', 'pandaStates'):
+      sample = messaging.new_message(name, len(sd.sm[name]), valid=sd.sm.valid[name], logMonoTime=sd.sm.logMonoTime[name])
+      setattr(sample, name, sd.sm[name])
+      samples.append(sample.as_reader())
+    feedback_sm.update_msgs(now / 1e9, samples)
+    refused = feedback.observe(feedback_sm, sd.CP, observed, now, latched=True, intent_producer_session='authority-card')
+    # card.aol_disarming_fault: a refused pause, or a soft-disable availability event without retention, clears the latch
+    events = list(feedback_sm['onroadEvents'])
+    if feedback.retention_qualified or feedback.retention_pending:
+      events = [e for e in events if not (e.name in AVAILABILITY_EVENTS and e.softDisable and not e.immediateDisable)]
+    return bool(refused or intent_disarming_fault(sd.CP, events, observed))
+  return observe
+
+
+@pytest.mark.parametrize('pedals', ['none', 'brake', 'gas'])
+@pytest.mark.parametrize('ti', [True, False])
+def test_card_keeps_the_latch_through_a_source_expiry_pause(pedals, ti):
+  # the reviewer's finding: SelfdriveD published the pause, but card's feedback refused it and dropped the latch
+  brake, gas = pedals == 'brake', pedals == 'gas'
+  with ExitStack() as cleanup:
+    sd, drive = runtime(cleanup, ti_cp() if ti else stock_cp(), False)
+    observe = card_feedback(sd)
+    for tick in (0, 1, 2):
+      last = tick == 2
+      drive(tick, native_request_long=False, brake=brake and last, gas=gas and last)
+      assert not observe(tick, card_state(brake and last, gas and last))
+    axis, _, _ = drive(6, timeout=True, brake=brake, gas=gas, native_request_long=False)
+    disarmed = observe(6, card_state(brake, gas))
+    if ti:
+      assert str(axis.faultReason) == 'availabilityPause' and not disarmed
+    elif pedals != 'none':
+      assert disarmed               # stock profile: unchanged
+
+
 def test_stock_profile_source_expiry_with_the_brake_unchanged():
   with ExitStack() as cleanup:
     sd, drive = runtime(cleanup, stock_cp(), False)
@@ -140,7 +190,10 @@ def cs(**fields):
 
 
 def armed_intent(cp):
-  intent = create_intent(cp, AolSettings(True, 0., 0, 0, (0, 0, 0), (0, 0, 0)), policy_for(cp))
+  # card's real order (card.py): the intent is created first, the AOL bits are added to the same CarParams after
+  policy = policy_for(cp)
+  intent = create_intent(cp, AolSettings(True, 0., 0, 0, (0, 0, 0), (0, 0, 0)), policy)
+  marked(cp)
   intent.startup_main_pending = False
   intent.allowed_latch = True
   intent._last_latch_edge_ns = 1
@@ -149,7 +202,7 @@ def armed_intent(cp):
 
 @pytest.mark.parametrize('ti', [True, False])
 def test_rejection_from_a_stop_time_native_status(ti):
-  intent = armed_intent(marked(ti_cp() if ti else stock_cp()))
+  intent = armed_intent(ti_cp() if ti else stock_cp())
   now = 1_000_000_000
   for _ in range(5):   # stopped
     now += 10_000_000
@@ -161,7 +214,7 @@ def test_rejection_from_a_stop_time_native_status(ti):
 
 
 def test_a_later_denial_still_rejects():
-  intent = armed_intent(marked(ti_cp()))
+  intent = armed_intent(ti_cp())
   now = 1_000_000_000
   for _ in range(5):
     now += 10_000_000
@@ -175,7 +228,7 @@ def test_a_later_denial_still_rejects():
 
 
 def test_full_engagement_ignores_a_stop_time_rejection():
-  intent = armed_intent(marked(ti_cp()))
+  intent = armed_intent(ti_cp())
   intent.allowed_latch = False
   now = 1_000_000_000
   for _ in range(3):
