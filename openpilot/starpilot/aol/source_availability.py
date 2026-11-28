@@ -30,6 +30,8 @@ def stock_lateral_role(self, CS, native, intent=None, *, allow_independent_cance
         previous=getattr(self, 'aol_axis_decision', None), source_ns=getattr(self, 'aol_car_state_log_ns', 0),
         now_ns=now_ns, axis_session_id=self.aol_session_id))
   brake_role = False
+  from opendbc.car.mazda.ti_aol import qualified as mazda_ti_qualified
+  mazda_ti = bool(self.CP.brand == 'mazda' and mazda_ti_qualified(self.CP, marked_only=True))
   if allow_independent_brake:
     from opendbc.car.hyundai.canfd_angle_aol import command_allowed
     from opendbc.car.hyundai.canfd_stock_aol import qualified as stock_canfd_qualified
@@ -38,7 +40,7 @@ def stock_lateral_role(self, CS, native, intent=None, *, allow_independent_cance
     settings = getattr(self, 'aol_settings', None)
     previous = getattr(self, 'aol_axis_decision', None)
     brake_role = held_lateral_pedal(self, CS) or bool(settings is not None and settings.enabled and CS.brakePressed and not CS.regenBraking and
-      previous is not None and (previous.lateral_active or allow_expired_source or hkg_stock and
+      previous is not None and (previous.lateral_active or allow_expired_source or (hkg_stock or mazda_ti) and
        getattr(self, 'aol_fault_reason', 'none') == 'availabilityPause' and previous.desired_lateral) and
       (previous.native_acknowledged or allow_expired_source) and not previous.longitudinal_active and
       (toyota_qualified(self.CP, marked_only=True) and CS.standstill and not CS.cruiseState.enabled and
@@ -46,6 +48,9 @@ def stock_lateral_role(self, CS, native, intent=None, *, allow_independent_cance
        CS.vEgo >= settings.pause_brake_mps and command_allowed(self.CP, CS) or
        len(self.CP.safetyConfigs) == 1 and (stock_canfd_qualified(self.CP, marked_only=True) or hkg_stock) and
        CS.gearShifter == car.CarState.GearShifter.drive and isfinite(CS.vEgoRaw) and isfinite(CS.vEgo) and
+       (settings.pause_brake_mps <= 0 or CS.vEgo >= settings.pause_brake_mps or CS.standstill) or
+       mazda_ti and not CS.cruiseState.enabled and CS.gearShifter == car.CarState.GearShifter.drive and
+       isfinite(CS.vEgoRaw) and isfinite(CS.vEgo) and
        (settings.pause_brake_mps <= 0 or CS.vEgo >= settings.pause_brake_mps or CS.standstill)))
   gas_role = False
   if allow_independent_gas:
@@ -59,9 +64,9 @@ def stock_lateral_role(self, CS, native, intent=None, *, allow_independent_cance
     gas_role = bool((self.CP.brand == 'hyundai' and len(self.CP.safetyConfigs) == 1 and
       (stock_canfd_qualified(self.CP, marked_only=True) or hkg_stock) or self.CP.brand == 'gm' and qualified_gm(self.CP) and self.CP.pcmCruise and
       not self.CP.openpilotLongitudinalControl or
-      self.CP.brand == 'subaru' and subaru_qualified(self.CP, marked_only=True)) and settings is not None and settings.enabled and
+      self.CP.brand == 'subaru' and subaru_qualified(self.CP, marked_only=True) or mazda_ti) and settings is not None and settings.enabled and
       CS.gasPressed and not CS.brakePressed and not CS.regenBraking and
-      previous is not None and (previous.lateral_active or allow_expired_source or (self.CP.brand in ('gm', 'subaru') or hkg_stock) and
+      previous is not None and (previous.lateral_active or allow_expired_source or (self.CP.brand in ('gm', 'subaru') or hkg_stock or mazda_ti) and
        getattr(self, 'aol_fault_reason', 'none') == 'availabilityPause' and previous.desired_lateral) and
       (previous.native_acknowledged or allow_expired_source) and not previous.longitudinal_active and
       (CS.gearShifter == car.CarState.GearShifter.drive or self.CP.brand == 'gm' and
@@ -143,7 +148,9 @@ def ordinary_source_availability(self, CS, now_ns, native=None, *, replay: bool,
   from openpilot.starpilot.car.toyota.aol import held_lateral_pedal
   toyota_pedal = held_lateral_pedal(self, CS)
   hkg_brake = False
-  if self.CP.brand == 'hyundai' and CS.brakePressed and anchor is not None and CS is anchor[4]:
+  from opendbc.car.mazda.ti_aol import qualified as mazda_ti_qualified
+  mazda_ti = bool(self.CP.brand == 'mazda' and mazda_ti_qualified(self.CP, marked_only=True))
+  if (self.CP.brand == 'hyundai' or mazda_ti) and CS.brakePressed and anchor is not None and CS is anchor[4]:
     native = native or native_provider(self.sm, self.CP, now_ns=now_ns, axis_session_id=self.aol_session_id)
     hkg_brake = stock_lateral_role(self, CS, native, allow_independent_brake=True)
   held_pedal = held_gm_lateral_pedal(self, CS) or toyota_pedal or hkg_brake

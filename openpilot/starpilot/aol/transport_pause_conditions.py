@@ -38,8 +38,11 @@ def stock_lateral_off(cp, cs, native, *, allow_independent_cancel=False, allow_i
   from opendbc.car.hyundai.classic_scc_aol import qualified as classic_stock_qualified
   classic_stock = classic_stock_qualified(cp, marked_only=True)
   independent_angle = angle_qualified(cp, marked_only=True)
+  # Mazda + Torque Interceptor AOL: brake and gas never stop its lateral (the panda keeps the AOL token through both)
+  from opendbc.car.mazda.ti_aol import qualified as mazda_ti_qualified
+  mazda_ti = cp.brand == 'mazda' and mazda_ti_qualified(cp, marked_only=True)
   independent_brake = independent_angle or (allow_independent_brake and (
-    toyota_qualified(cp, marked_only=True) and not cs.cruiseState.enabled or
+    toyota_qualified(cp, marked_only=True) and not cs.cruiseState.enabled or mazda_ti and not cs.cruiseState.enabled or
     cp.brand == 'hyundai' and len(cp.safetyConfigs) == 1 and (stock_canfd_qualified(cp, marked_only=True) or classic_stock)))
   return bool(cp.pcmCruise and (cs.cruiseState.available or allow_independent_main and classic_stock) and
     (not cs.cruiseState.enabled or independent_brake and allow_independent_brake and cs.brakePressed) and
@@ -47,7 +50,7 @@ def stock_lateral_off(cp, cs, native, *, allow_independent_cancel=False, allow_i
     not cs.accFaulted and not cs.doorOpen and not cs.seatbeltUnlatched and
     (not cs.brakePressed or independent_brake and allow_independent_brake) and
     not cs.regenBraking and (not cs.gasPressed or independent_angle or
-      allow_independent_gas and (stock_gas or toyota_qualified(cp, marked_only=True) or
+      allow_independent_gas and (stock_gas or toyota_qualified(cp, marked_only=True) or mazda_ti or
         cp.brand == 'hyundai' and (stock_canfd_qualified(cp, marked_only=True) or classic_stock))) and
     (not physical_cancel(cs, cp) or independent_angle and allow_independent_cancel) and
     native is not None and native.requestedLateral and native.lateralAllowed and not native.requestedLongitudinal)
