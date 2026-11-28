@@ -70,3 +70,20 @@ def physical_cancel_lateral_allowed(cp, cs, intent, native, *, settings, previou
       native.validUntilMonoTime - native.observedMonoTime <= SAFETY_MAX_AGE_NS)
   except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError):
     return False
+
+
+def ti_expected_stopped_lateral_denial(cp, cs, native, *, sm, axis_session_id, now_ns):
+  """A stop with the Torque Interceptor profile: the panda withdraws lateral at a standstill (vehicle_moving); that
+  is an expected pause, not lost permission. Same rule as Hyundai's angle stop (vEgoRaw <= 0.3 m/s, where openpilot
+  does not steer anyway). Intent only: the panda still decides every command."""
+  import math
+  from openpilot.starpilot.aol.transport_pause import _configured_transport_native
+  try:
+    return bool(cp.brand == 'mazda' and ti_aol.qualified(cp, marked_only=True) and
+      cs.canValid and not cs.canTimeout and not cs.steerFaultTemporary and not cs.steerFaultPermanent and
+      not cs.accFaulted and cs.gearShifter == structs.CarState.GearShifter.drive and
+      math.isfinite(cs.vEgoRaw) and 0.0 <= cs.vEgoRaw <= 0.3 and
+      native is not None and native.requestedLateral and not native.lateralAllowed and native.pandaInventory and
+      _configured_transport_native(sm, cp, axis_session_id, now_ns, native, allow_restricted_lateral=True) == native)
+  except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError):
+    return False

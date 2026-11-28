@@ -1,7 +1,15 @@
 from opendbc.car import structs
+from opendbc.car.mazda import ti_aol
 from opendbc.car.mazda.stock_aol import aol_qualified
 from openpilot.selfdrive.car.cruise import CRUISE_LONG_PRESS
 from openpilot.starpilot.aol.intent import AolCardIntent, AOL_TOGGLE, ButtonType
+
+
+# Torque Interceptor profile: the panda withdraws lateral at a standstill (vehicle_moving) and reports it in a native
+# status read up to ~100 ms later. A denial observed while the car was stopped, or within this time after the stop
+# ended, is that stop, not a rejection of the driver's latch (drive 00000002: 128.2 / 446.7 / 567.4 / 671.2 s, the
+# latch was lost on the first moving carState). Intent only: the panda still decides every command.
+STOP_NATIVE_GRACE_NS = 100_000_000
 
 
 class MazdaStockCardIntent(AolCardIntent):
@@ -20,6 +28,18 @@ class MazdaStockCardIntent(AolCardIntent):
     self.main_pulse = False
     self.cancel_held = False
     self.cancel_ticks = 0
+    self.ti = ti_aol.qualified(cp, marked_only=True)
+    self.ti_stop_ns = 0
+
+  def stop_native_rejection(self, native_rejection_ns):
+    """A native denial that belongs to a stop (TI profile only): not a rejection."""
+    return bool(self.ti and native_rejection_ns and self.ti_stop_ns and
+                native_rejection_ns <= self.ti_stop_ns + STOP_NATIVE_GRACE_NS)
+
+  def observe_full_engagement(self, CS, **kwargs):
+    if self.stop_native_rejection(kwargs.get('native_rejection_ns', 0)):
+      kwargs['native_rejection_ns'] = 0
+    return super().observe_full_engagement(CS, **kwargs)
 
   def observe_startup_readiness(self, sm, CS, *, native, panda_ready, now_ns, producer):
     from openpilot.starpilot.aol.intent import disarming_fault
@@ -76,6 +96,10 @@ class MazdaStockCardIntent(AolCardIntent):
       self._perform(action)
 
   def update(self, CS, **kwargs):
+    if self.stop_native_rejection(kwargs.get('native_rejection_ns', 0)):
+      kwargs['native_rejection_ns'] = 0
+    if self.ti and CS.standstill and CS.canValid and not CS.canTimeout:
+      self.ti_stop_ns = kwargs.get('now_ns', 0)
     state = structs.CarState(**CS.to_dict())
     events = []
     for event in CS.buttonEvents:
