@@ -364,22 +364,89 @@ class TestMazdaTiAolBehaviour(MazdaTiAolBase):
     self.feed(buttons=1)                       # a cruise button after a neutral frame
     self.assertEqual(self.permission(), 1)
 
-  def test_boot_main_on_grants_once_moving_in_drive_without_pedals(self):
-    self.configure()
+  def _boot(self, *, gas=0, brake=False):
+    """Boot with the main switch on, parked, then driving off; returns the permission after the host's next request."""
     self.safety.set_aol_test_heartbeat(False)
-    for kwargs in ({'speed': 0, 'gear': 1}, {'speed': 3000, 'gas': 40}):
-      for _ in range(10):
-        self.feed(**kwargs)
+    for _ in range(10):
+      self.feed(speed=0, gear=1)
     self.safety.set_aol_test_heartbeat(True)
-    self.feed(speed=3000, gas=40)
-    self.assertEqual(self.permission(), 0)    # gas held: no startup grant yet
-    self.feed(speed=3000)                      # gas released (seen after this frame's CRZ_CTRL)
-    self.assertEqual(self.permission(), 0)
-    self.feed(speed=3000)                      # the startup grant, waiting for a strictly later host request
+    for _ in range(3):
+      self.feed(speed=3000, gas=gas, brake=brake)
     self.time += 1
     self.safety.set_timer(self.time)
     self.safety.aol_set_host_request(1)
-    self.assertEqual(self.permission(), 1)
+    return self.permission()
+
+  def test_boot_grant_moving_in_drive(self):
+    self.configure()
+    self.assertEqual(self._boot(), 1)
+
+  def test_boot_grant_with_the_gas_pressed(self):
+    # (drive 00000003: the boot request came while driving off with the gas down and was never granted)
+    self.configure()
+    self.assertEqual(self._boot(gas=40), 1)
+
+  def test_no_boot_grant_with_the_brake_pressed(self):
+    self.configure()
+    self.assertEqual(self._boot(brake=True), 0)
+
+  def test_no_boot_grant_with_the_gas_on_the_stock_profile(self):
+    # the stock profile (param 0) is unchanged: the gas still waits
+    self.PARAM = 0
+    self.configure()
+    self.assertEqual(self._boot(gas=40), 0)
+
+  def _engage_after_brake_cancel(self, *, gas):
+    """Cruise on (token), brake cancel, then the cruise engaged again with or without the gas (as the gas auto-resume)."""
+    self.feed(active=True, request=0)
+    for _ in range(20):
+      self.feed(request=0)
+    self.feed(active=True)
+    self.feed(active=True, brake=True)
+    self.feed(brake=True)
+    self.safety.set_aol_test_heartbeat(False)  # the host withdrew: the token is cleared (as after any loss)
+    self.feed(brake=True, request=0)
+    self.safety.set_aol_test_heartbeat(True)
+    for _ in range(3):
+      self.feed(gas=gas)
+    self.assertEqual(self.permission(), 0)
+    self.feed(active=True, gas=gas)              # the engagement edge
+    self.feed(active=True)
+    self.feed(active=True, brake=True)
+    self.feed(brake=True)                        # the next brake cancel
+    return self.permission()
+
+  def test_engagement_with_the_gas_pressed_grants_the_token(self):
+    # (drive 00000002: every engagement by the gas auto-resume RES gave no token, steering stopped at the next brake)
+    self.configure()
+    self.assertEqual(self._engage_after_brake_cancel(gas=50), 1)
+
+  def test_engagement_without_the_gas_grants_the_token(self):
+    self.configure()
+    self.assertEqual(self._engage_after_brake_cancel(gas=0), 1)
+
+  def test_engagement_with_the_gas_on_the_stock_profile_gives_no_token(self):
+    from opendbc.safety.tests.test_mazda_stock_aol import TestMazdaStockAol
+    stock = TestMazdaStockAol(methodName='run')
+    stock.configure()
+    for _ in range(20):
+      stock.feed()
+    stock.safety.safety_rx_hook(stock.packet('ENGINE_DATA', {'SPEED': 80, 'PEDAL_GAS': 50}))
+    stock.safety.safety_rx_hook(stock.packet('CRZ_CTRL', {'CRZ_AVAILABLE': 1, 'CRZ_ACTIVE': 0}))
+    stock.safety.safety_rx_hook(stock.packet('CRZ_CTRL', {'CRZ_AVAILABLE': 1, 'CRZ_ACTIVE': 1}))
+    stock.safety.safety_rx_hook(stock.packet('PEDALS', {'BRAKE_ON': 1}))
+    stock.safety.safety_rx_hook(stock.packet('CRZ_CTRL', {'CRZ_AVAILABLE': 1, 'CRZ_ACTIVE': 0}))
+    self.safety = stock.safety
+    self.assertEqual(stock.safety.aol_get_permission_mask() & 1, 0)
+
+  def test_engagement_with_the_brake_pressed_gives_no_token(self):
+    self.configure()
+    for _ in range(20):
+      self.feed(request=0)
+    self.feed(brake=True)                        # (feed sends CRZ_CTRL before PEDALS: the brake is seen from the next frame)
+    self.feed(active=True, brake=True)
+    self.feed(brake=True)
+    self.assertEqual(self.permission(), 0)
 
   def test_camera_fault_with_the_cruise_off_needs_a_fresh_action(self):
     self.configure()

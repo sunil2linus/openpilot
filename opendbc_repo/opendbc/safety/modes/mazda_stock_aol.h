@@ -169,11 +169,14 @@ static void mazda_aol_rx(const CANPacket_t *msg) {
         mazda_aol_neutral = true;
       } else if (mazda_aol_startup_pending && GET_BIT(msg, 3U)) {
         mazda_aol_startup_pending = false;
-      } else if (mazda_aol_startup_pending && vehicle_moving && mazda_aol_sources_ok() && !brake_pressed && !gas_pressed &&
+      } else if (mazda_aol_startup_pending && vehicle_moving && mazda_aol_sources_ok() && !brake_pressed &&
+                 (mazda_aol_ti || !gas_pressed) &&
                  ((aol_host_axis_mask & 1U) != 0U) &&
                  (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US)) {
         // Dom follows fresh MAIN at boot. Wait through physical restrictions,
         // then require a strictly later host ACK within the original deadline.
+        // TI profile: the gas pressed while driving off is no restriction (drive 00000003: the boot request at 11.5 s
+        // came with the gas down and was never granted); the brake still is.
         mazda_aol_startup_pending = false;
         mazda_aol_grant();
         mazda_aol_pending = true;
@@ -208,8 +211,12 @@ static void mazda_aol_engagement(const CANPacket_t *msg, bool cruise_engaged, bo
   if (mazda_aol_enabled && msg_matches(msg, 0x21CU, 0U, 8U)) {
     const bool request_current = !mazda_aol_requested ||
       (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US);
+    // TI profile: the cruise engaged with the gas pressed (the driver's SET while accelerating, or the gas auto-resume's
+    // RES, which always has the gas down) is a driver engagement too; without it the token was missing and steering
+    // stopped at the next brake (drive 00000002: 858 / 987 / 1013 / 1026 s). The brake rule is unchanged.
+    const bool pedals_ok = !brake_pressed && (mazda_aol_ti || !gas_pressed);
     const bool healthy = !(mazda_aol_session && !heartbeat_engaged) && acc_main_on && mazda_aol_sources_ok() &&
-      !brake_pressed && !gas_pressed && !relay_malfunction && !safety_rx_checks_invalid &&
+      pedals_ok && !relay_malfunction && !safety_rx_checks_invalid &&
       request_current && aol_rx_healthy() && mazda_aol_current();
     if (!healthy) {
       mazda_aol_cruise_neutral = false;
